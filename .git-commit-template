@@ -1,0 +1,20 @@
+#<type>(scope): <subject>
+
+	What happen
+
+[TICKET]
+
+# <type> must be one of the following:
+#
+#    feat       new feature
+#    docs       documentation only changes
+#    test       unit test or testing code
+#    perf       performance tunning or improves
+#    build      change the build system or CI/CD flow
+#    style      change the coding style or UI theme
+#    refactor   code change not affect performance and functionality
+#
+# <scope>       the code affected (e.g., component or file name)
+# <subject>     the short summary of the code change
+# <TICKET>      the ticket number related to this change (e.g., JIRA, GitHub issue)
+#
