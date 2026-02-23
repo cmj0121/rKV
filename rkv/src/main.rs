@@ -268,13 +268,18 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("  namespaces           List all namespaces");
             println!("  drop <namespace>     Drop a namespace and all its data");
             println!();
-            println!("Info:");
+            println!("Admin:");
             println!("  stats                Print database statistics");
             println!("  config               Print current configuration");
             println!();
             println!("Misc:");
+            println!("  clear                Clear the screen");
             println!("  help                 Show this message (alias: ?)");
             println!("  exit                 Quit the REPL (alias: quit)");
+        }
+        "clear" => {
+            print!("\x1B[2J\x1B[H");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
         }
         "exit" | "quit" => return Action::Exit,
         other => eprintln!("unknown command: {other} (type 'help' for usage)"),
