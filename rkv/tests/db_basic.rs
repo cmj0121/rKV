@@ -291,6 +291,38 @@ fn config_bloom_bits_per_key_override() {
     assert_eq!(db.config().bloom_bits_per_key, 20);
 }
 
+// --- Verify checksums config ---
+
+#[test]
+fn config_verify_checksums_default() {
+    let config = Config::new("/tmp/test");
+    assert!(config.verify_checksums);
+}
+
+#[test]
+fn config_verify_checksums_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.verify_checksums = false;
+    let db = DB::open(config).unwrap();
+
+    assert!(!db.config().verify_checksums);
+}
+
+// --- Corruption error variant ---
+
+#[test]
+fn corruption_error_display() {
+    let err = Error::Corruption("bad checksum in block 42".into());
+    assert_eq!(err.to_string(), "corruption: bad checksum in block 42");
+}
+
+#[test]
+fn corruption_error_matches() {
+    let err = Error::Corruption("test".into());
+    assert!(matches!(err, Error::Corruption(_)));
+}
+
 // --- Maintenance operation stubs ---
 
 #[test]
@@ -321,7 +353,10 @@ fn destroy_returns_not_implemented() {
 
 #[test]
 fn repair_returns_not_implemented() {
-    let err = DB::repair(PathBuf::from("/tmp/rkv_test_repair")).unwrap_err();
+    let result = DB::repair(PathBuf::from("/tmp/rkv_test_repair"));
+    let Err(err) = result else {
+        panic!("expected NotImplemented error");
+    };
     assert!(matches!(err, Error::NotImplemented(_)));
 }
 

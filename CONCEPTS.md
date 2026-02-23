@@ -222,6 +222,7 @@ The `Config` struct controls database behavior and LSM tuning parameters:
 | `cache_size`        | `usize`   | 8 MB       | Block cache size for decompressed blocks  |
 | `object_size`       | `usize`   | 1 KB       | Bin object size threshold (see above)     |
 | `compress`          | `bool`    | `true`     | LZ4-compress bin objects on disk          |
+| `verify_checksums`  | `bool`    | `true`     | Verify checksums on read (see below)      |
 
 `Config::new(path)` initializes all fields to their defaults. Fields can be overridden before
 passing the config to `DB::open`.
@@ -267,14 +268,15 @@ reaches durable storage.
 
 #### Destroy / Repair
 
-| Method    | Kind   | Signature                                  | Description                            |
-| --------- | ------ | ------------------------------------------ | -------------------------------------- |
-| `destroy` | static | `(path: impl Into<PathBuf>) -> Result<()>` | Delete a database and all its data     |
-| `repair`  | static | `(path: impl Into<PathBuf>) -> Result<()>` | Attempt to repair a corrupted database |
+| Method    | Kind   | Signature                          | Description                  |
+| --------- | ------ | ---------------------------------- | ---------------------------- |
+| `destroy` | static | `(path) -> Result<()>`             | Delete database and all data |
+| `repair`  | static | `(path) -> Result<RecoveryReport>` | Repair a corrupted database  |
 
 Both are static methods — they operate on a path, not a live `DB` handle. `destroy` removes the
 entire database directory. `repair` scans for structural corruption and rebuilds indices where
-possible.
+possible. It returns a `RecoveryReport` describing what was scanned, recovered, and lost
+(see Data Integrity below).
 
 #### Dump / Load
 
@@ -297,6 +299,62 @@ its own configuration, so no separate `Config` is needed.
 
 Background compaction runs automatically, but `compact` allows manual triggering — useful after
 bulk deletes or to reclaim disk space from resolved tombstones.
+
+### Data Integrity
+
+Every WAL entry and SSTable block carries a CRC32C checksum. On write the engine computes
+the checksum over the raw data; on read the engine recomputes and compares to detect
+corruption caused by bit rot, partial writes, or disk errors.
+
+Bin objects use BLAKE3 content hashes via `ValuePointer` — a separate, complementary
+integrity mechanism (see Value Separation above).
+
+#### Checksum Format
+
+Each checksum is 5 bytes on disk:
+
+| Field   | Type  | Bytes | Description                     |
+| ------- | ----- | ----- | ------------------------------- |
+| `algo`  | `u8`  | 1     | Algorithm tag (`0x01` = CRC32C) |
+| `value` | `u32` | 4     | Big-endian checksum value       |
+
+The algorithm tag allows future extension to stronger checksums without breaking
+existing data files.
+
+#### Read-Time Verification
+
+When `verify_checksums` is enabled (default: `true`), every block and WAL entry read
+from disk is verified against its stored checksum. A mismatch produces a `Corruption`
+error. Disabling verification trades safety for read speed — useful for bulk scans
+where occasional corruption is acceptable.
+
+#### Offline Recovery
+
+`DB::repair(path)` performs an offline scan of a database directory and returns a
+`RecoveryReport`:
+
+| Field                      | Type          | Description                                  |
+| -------------------------- | ------------- | -------------------------------------------- |
+| `wal_records_scanned`      | `u64`         | WAL records examined                         |
+| `wal_records_skipped`      | `u64`         | WAL records skipped due to checksum mismatch |
+| `sstable_blocks_scanned`   | `u64`         | SSTable blocks examined                      |
+| `sstable_blocks_corrupted` | `u64`         | SSTable blocks with checksum mismatch        |
+| `objects_scanned`          | `u64`         | Bin objects examined                         |
+| `objects_corrupted`        | `u64`         | Bin objects with hash mismatch               |
+| `keys_recovered`           | `u64`         | Keys recovered from redundant sources        |
+| `keys_lost`                | `u64`         | Keys permanently lost (no redundant copy)    |
+| `warnings`                 | `Vec<String>` | Human-readable warnings from the repair pass |
+
+Helper methods on `RecoveryReport`:
+
+- `is_clean()` — all corruption counters are zero.
+- `total_corrupted()` — sum of skipped + corrupted counters.
+- `has_data_loss()` — `keys_lost > 0`.
+
+Recovery is best-effort: the engine replays WAL entries and cross-references SSTable
+levels to rebuild data where redundant copies exist. Data with no redundant copy is
+reported as lost. Silent self-healing from bit-flips is not possible without redundancy
+and is out of scope.
 
 ### LSM-Tree Storage
 
