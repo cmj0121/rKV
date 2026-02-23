@@ -14,6 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 dirs-sys = "0.5"
+fast32 = "1.0.3"
 rustyline = "17"
 thiserror = "2"
 

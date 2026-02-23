@@ -74,7 +74,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 return Action::Continue;
             }
             match ns.put(parse_key(tokens[1]), tokens[2].as_bytes()) {
-                Ok(rev) => println!("{rev:032x}"),
+                Ok(rev) => println!("{rev}"),
                 Err(e) => eprintln!("error: {e}"),
             }
         }
@@ -137,6 +137,27 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             Ok(n) => println!("{n}"),
             Err(e) => eprintln!("error: {e}"),
         },
+        "rev" => {
+            if tokens.len() < 2 {
+                eprintln!("usage: rev <key> [index]");
+                return Action::Continue;
+            }
+            let key = parse_key(tokens[1]);
+            if let Some(idx_str) = tokens.get(2) {
+                match idx_str.parse::<u64>() {
+                    Ok(idx) => match ns.rev_get(key, idx) {
+                        Ok(val) => println!("{val}"),
+                        Err(e) => eprintln!("error: {e}"),
+                    },
+                    Err(_) => eprintln!("error: '{idx_str}' is not a valid revision index"),
+                }
+            } else {
+                match ns.rev_count(key) {
+                    Ok(n) => println!("{n}"),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+        }
         "help" | "?" => {
             println!("Data operations:");
             println!("  put <key> <value>    Store a key-value pair");
@@ -146,6 +167,8 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("  scan [prefix] [n]    Forward scan keys");
             println!("  rscan [prefix] [n]   Reverse scan keys");
             println!("  count                Count all keys");
+            println!("  rev <key>            Show total revisions for a key");
+            println!("  rev <key> <index>    Show value at revision index (0 = oldest)");
             println!();
             println!("Namespace:");
             println!("  use <namespace>      Switch to a namespace (create if needed)");
