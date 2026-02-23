@@ -91,7 +91,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             }
             return Action::Switch(tokens[1].to_owned());
         }
-        "namespaces" | "ns" => match db.list_namespaces() {
+        "namespaces" => match db.list_namespaces() {
             Ok(names) => {
                 for name in &names {
                     println!("{name}");
@@ -140,9 +140,9 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 Err(e) => eprintln!("error: {e}"),
             }
         }
-        "delete" | "del" => {
+        "del" => {
             if tokens.len() < 2 {
-                eprintln!("usage: delete <key>");
+                eprintln!("usage: del <key>");
                 return Action::Continue;
             }
             match ns.delete(parse_key(tokens[1])) {
@@ -150,9 +150,9 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 Err(e) => eprintln!("error: {e}"),
             }
         }
-        "exists" => {
+        "has" => {
             if tokens.len() < 2 {
-                eprintln!("usage: exists <key>");
+                eprintln!("usage: has <key>");
                 return Action::Continue;
             }
             match ns.exists(parse_key(tokens[1])) {
@@ -225,8 +225,8 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("Data operations:");
             println!("  put <key> <value> [ttl]  Store a key-value pair (ttl: 10s, 5m, 2h, 1d)");
             println!("  get <key>                Retrieve a value by key");
-            println!("  delete <key>             Remove a key (alias: del)");
-            println!("  exists <key>             Check if a key exists");
+            println!("  del <key>                Remove a key");
+            println!("  has <key>                Check if a key exists");
             println!("  ttl <key>                Show remaining TTL or \"none\"");
             println!("  scan [prefix] [n]        Forward scan keys");
             println!("  rscan [prefix] [n]       Reverse scan keys");
@@ -236,7 +236,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!();
             println!("Namespace:");
             println!("  use <namespace>      Switch to a namespace (create if needed)");
-            println!("  namespaces           List all namespaces (alias: ns)");
+            println!("  namespaces           List all namespaces");
             println!("  drop <namespace>     Drop a namespace and all its data");
             println!();
             println!("Misc:");

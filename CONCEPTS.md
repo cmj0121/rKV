@@ -39,7 +39,7 @@ external coordination.
 
 ### Key-Value Store
 
-The fundamental unit is a `(key, value)` pair. The store provides `put`, `get`, `delete`, `exists`, `scan`, `count`, and
+The fundamental unit is a `(key, value)` pair. The store provides `put`, `get`, `del`, `has`, `scan`, `count`, and
 `rev` (revision history) operations.
 
 ### Key
@@ -54,7 +54,7 @@ Booleans are syntax sugar: `true` → `Int(1)`, `false` → `Int(0)`.
 **Auto-upgrade**: A database starts in **ordered mode** where all keys are `Int` and support comparison. When the first
 `Str` key is inserted, the engine performs an irreversible **key type upgrade**: all existing `Int` keys are widened to
 `Str` (e.g., `Int(42)` becomes `Str("42")`), and the database enters **unordered mode** permanently. Exact-match
-operations (`get`, `exists`, `delete`) continue to work normally in both modes.
+operations (`get`, `has`, `del`) continue to work normally in both modes.
 
 **Scan behavior** depends on the database mode:
 
@@ -82,7 +82,7 @@ independent auto-upgrade state. Namespaces are identified by string names and cr
 
 The default namespace is `_`. The CLI starts on `_` and supports switching with the `use` command.
 
-All data operations (`put`, `get`, `delete`, `exists`, `scan`, `rscan`, `count`) live on the `Namespace` handle, not on
+All data operations (`put`, `get`, `del`, `has`, `scan`, `rscan`, `count`) live on the `Namespace` handle, not on
 `DB` directly. `DB` is responsible for lifecycle (`open`, `close`, `path`) and namespace management (`namespace`).
 
 ### Revision ID
