@@ -221,6 +221,35 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 Err(e) => eprintln!("error: {e}"),
             }
         }
+        "stats" => {
+            let s = db.stats();
+            println!("Storage:");
+            println!("  total_keys:        {}", s.total_keys);
+            println!("  data_size_bytes:   {}", s.data_size_bytes);
+            println!("  namespace_count:   {}", s.namespace_count);
+            println!("LSM:");
+            println!("  level_count:       {}", s.level_count);
+            println!("  sstable_count:     {}", s.sstable_count);
+            println!("  write_buffer_bytes:{}", s.write_buffer_bytes);
+            println!("  pending_compactions:{}", s.pending_compactions);
+            println!("Operations:");
+            println!("  op_puts:           {}", s.op_puts);
+            println!("  op_gets:           {}", s.op_gets);
+            println!("  op_deletes:        {}", s.op_deletes);
+            println!("  cache_hits:        {}", s.cache_hits);
+            println!("  cache_misses:      {}", s.cache_misses);
+            println!("Uptime:");
+            println!("  uptime:            {}", format_duration(s.uptime));
+        }
+        "config" => {
+            let c = db.config();
+            println!("path:              {}", c.path.display());
+            println!("create_if_missing: {}", c.create_if_missing);
+            println!("write_buffer_size: {}", c.write_buffer_size);
+            println!("max_levels:        {}", c.max_levels);
+            println!("block_size:        {}", c.block_size);
+            println!("cache_size:        {}", c.cache_size);
+        }
         "help" | "?" => {
             println!("Data operations:");
             println!("  put <key> <value> [ttl]  Store a key-value pair (ttl: 10s, 5m, 2h, 1d)");
@@ -238,6 +267,10 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("  use <namespace>      Switch to a namespace (create if needed)");
             println!("  namespaces           List all namespaces");
             println!("  drop <namespace>     Drop a namespace and all its data");
+            println!();
+            println!("Info:");
+            println!("  stats                Print database statistics");
+            println!("  config               Print current configuration");
             println!();
             println!("Misc:");
             println!("  help                 Show this message (alias: ?)");
@@ -328,10 +361,8 @@ fn main() {
             .join(".rkv")
     });
 
-    let config = Config {
-        path,
-        create_if_missing: args.create,
-    };
+    let mut config = Config::new(&path);
+    config.create_if_missing = args.create;
 
     let db = match DB::open(config) {
         Ok(db) => db,
