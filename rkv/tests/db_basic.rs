@@ -105,3 +105,25 @@ fn get_returns_not_implemented() {
     let err = ns.get("key").unwrap_err();
     assert!(matches!(err, Error::NotImplemented(_)));
 }
+
+#[test]
+fn rev_count_returns_not_implemented() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE).unwrap();
+
+    let err = ns.rev_count("key").unwrap_err();
+    assert!(matches!(err, Error::NotImplemented(_)));
+}
+
+#[test]
+fn rev_get_returns_not_implemented() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE).unwrap();
+
+    let err = ns.rev_get("key", 0).unwrap_err();
+    assert!(matches!(err, Error::NotImplemented(_)));
+}
