@@ -90,6 +90,10 @@ impl DB {
         &self.config
     }
 
+    pub fn config_mut(&mut self) -> &mut Config {
+        &mut self.config
+    }
+
     /// Switch to a namespace, creating it if it does not exist.
     pub fn namespace(&self, name: &str) -> Result<Namespace<'_>> {
         Namespace::open(self, name)
