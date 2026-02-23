@@ -39,7 +39,7 @@ external coordination.
 
 ### Key-Value Store
 
-The fundamental unit is a `(key, value)` pair. The store provides `put`, `get`, `delete`, `exists`, `scan`, `count`, and
+The fundamental unit is a `(key, value)` pair. The store provides `put`, `get`, `del`, `has`, `scan`, `count`, and
 `rev` (revision history) operations.
 
 ### Key
@@ -54,7 +54,7 @@ Booleans are syntax sugar: `true` → `Int(1)`, `false` → `Int(0)`.
 **Auto-upgrade**: A database starts in **ordered mode** where all keys are `Int` and support comparison. When the first
 `Str` key is inserted, the engine performs an irreversible **key type upgrade**: all existing `Int` keys are widened to
 `Str` (e.g., `Int(42)` becomes `Str("42")`), and the database enters **unordered mode** permanently. Exact-match
-operations (`get`, `exists`, `delete`) continue to work normally in both modes.
+operations (`get`, `has`, `del`) continue to work normally in both modes.
 
 **Scan behavior** depends on the database mode:
 
@@ -82,7 +82,7 @@ independent auto-upgrade state. Namespaces are identified by string names and cr
 
 The default namespace is `_`. The CLI starts on `_` and supports switching with the `use` command.
 
-All data operations (`put`, `get`, `delete`, `exists`, `scan`, `rscan`, `count`) live on the `Namespace` handle, not on
+All data operations (`put`, `get`, `del`, `has`, `scan`, `rscan`, `count`) live on the `Namespace` handle, not on
 `DB` directly. `DB` is responsible for lifecycle (`open`, `close`, `path`) and namespace management (`namespace`).
 
 ### Revision ID
@@ -96,6 +96,16 @@ revision 255).
 History queries use revision indexing: `rev_count(key)` returns the total number of revisions for a key, and
 `rev_get(key, index)` retrieves the value at a specific revision index (0 = oldest). CAS operations use RevisionIDs for
 optimistic concurrency control.
+
+### TTL (Time-to-Live)
+
+A key can be stored with an optional TTL via `put_with_ttl(key, value, ttl)`. After the duration elapses the key is
+considered expired and behaves as if it were deleted — `get` returns "key not found", `exists` returns `false`. The
+`ttl(key)` method returns the remaining duration, or `None` if the key has no expiration. A regular `put` (without TTL)
+stores the key permanently.
+
+TTL is specified as a `std::time::Duration` in the library API. The CLI accepts human-friendly suffixes:
+`10s` (seconds), `5m` (minutes), `2h` (hours), `1d` (days). Plain numbers are treated as seconds.
 
 ### LSM-Tree Storage
 

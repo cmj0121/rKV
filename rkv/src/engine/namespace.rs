@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::Duration;
 
 use super::error::{Error, Result};
 use super::key::Key;
@@ -86,5 +87,23 @@ impl<'db> Namespace<'db> {
     pub fn rev_get(&self, _key: impl Into<Key>, _index: u64) -> Result<Value> {
         let _key = _key.into();
         Err(Error::NotImplemented("rev_get".into()))
+    }
+
+    /// Store a key-value pair with a time-to-live. The key expires after `ttl`.
+    pub fn put_with_ttl(
+        &self,
+        _key: impl Into<Key>,
+        _value: impl Into<Value>,
+        _ttl: Duration,
+    ) -> Result<RevisionID> {
+        let _key = _key.into();
+        let _value = _value.into();
+        Err(Error::NotImplemented("put_with_ttl".into()))
+    }
+
+    /// Returns the remaining TTL for a key, or `None` if the key has no expiration.
+    pub fn ttl(&self, _key: impl Into<Key>) -> Result<Option<Duration>> {
+        let _key = _key.into();
+        Err(Error::NotImplemented("ttl".into()))
     }
 }

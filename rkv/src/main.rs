@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use rkv::{Config, Key, Namespace, DB, DEFAULT_NAMESPACE};
@@ -23,6 +24,46 @@ enum Action {
     Continue,
     Switch(String),
     Exit,
+}
+
+fn parse_duration(s: &str) -> Option<Duration> {
+    let (num, unit) = if let Some(n) = s.strip_suffix('d') {
+        (n.parse::<u64>().ok()?, 86400)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n.parse::<u64>().ok()?, 3600)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n.parse::<u64>().ok()?, 60)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n.parse::<u64>().ok()?, 1)
+    } else {
+        (s.parse::<u64>().ok()?, 1)
+    };
+    Some(Duration::from_secs(num * unit))
+}
+
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs == 0 {
+        return "0s".to_owned();
+    }
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    let s = secs % 60;
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if mins > 0 {
+        parts.push(format!("{mins}m"));
+    }
+    if s > 0 {
+        parts.push(format!("{s}s"));
+    }
+    parts.join("")
 }
 
 fn parse_key(token: &str) -> Key {
@@ -50,7 +91,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             }
             return Action::Switch(tokens[1].to_owned());
         }
-        "namespaces" | "ns" => match db.list_namespaces() {
+        "namespaces" => match db.list_namespaces() {
             Ok(names) => {
                 for name in &names {
                     println!("{name}");
@@ -70,10 +111,21 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
         }
         "put" => {
             if tokens.len() < 3 {
-                eprintln!("usage: put <key> <value>");
+                eprintln!("usage: put <key> <value> [ttl]");
                 return Action::Continue;
             }
-            match ns.put(parse_key(tokens[1]), tokens[2].as_bytes()) {
+            let result = if let Some(ttl_str) = tokens.get(3) {
+                match parse_duration(ttl_str) {
+                    Some(ttl) => ns.put_with_ttl(parse_key(tokens[1]), tokens[2].as_bytes(), ttl),
+                    None => {
+                        eprintln!("error: invalid TTL '{ttl_str}' (e.g., 10s, 5m, 2h, 1d)");
+                        return Action::Continue;
+                    }
+                }
+            } else {
+                ns.put(parse_key(tokens[1]), tokens[2].as_bytes())
+            };
+            match result {
                 Ok(rev) => println!("{rev}"),
                 Err(e) => eprintln!("error: {e}"),
             }
@@ -88,9 +140,9 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 Err(e) => eprintln!("error: {e}"),
             }
         }
-        "delete" | "del" => {
+        "del" => {
             if tokens.len() < 2 {
-                eprintln!("usage: delete <key>");
+                eprintln!("usage: del <key>");
                 return Action::Continue;
             }
             match ns.delete(parse_key(tokens[1])) {
@@ -98,9 +150,9 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 Err(e) => eprintln!("error: {e}"),
             }
         }
-        "exists" => {
+        "has" => {
             if tokens.len() < 2 {
-                eprintln!("usage: exists <key>");
+                eprintln!("usage: has <key>");
                 return Action::Continue;
             }
             match ns.exists(parse_key(tokens[1])) {
@@ -158,21 +210,33 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 }
             }
         }
+        "ttl" => {
+            if tokens.len() < 2 {
+                eprintln!("usage: ttl <key>");
+                return Action::Continue;
+            }
+            match ns.ttl(parse_key(tokens[1])) {
+                Ok(Some(d)) => println!("{}", format_duration(d)),
+                Ok(None) => println!("none"),
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
         "help" | "?" => {
             println!("Data operations:");
-            println!("  put <key> <value>    Store a key-value pair");
-            println!("  get <key>            Retrieve a value by key");
-            println!("  delete <key>         Remove a key (alias: del)");
-            println!("  exists <key>         Check if a key exists");
-            println!("  scan [prefix] [n]    Forward scan keys");
-            println!("  rscan [prefix] [n]   Reverse scan keys");
-            println!("  count                Count all keys");
-            println!("  rev <key>            Show total revisions for a key");
-            println!("  rev <key> <index>    Show value at revision index (0 = oldest)");
+            println!("  put <key> <value> [ttl]  Store a key-value pair (ttl: 10s, 5m, 2h, 1d)");
+            println!("  get <key>                Retrieve a value by key");
+            println!("  del <key>                Remove a key");
+            println!("  has <key>                Check if a key exists");
+            println!("  ttl <key>                Show remaining TTL or \"none\"");
+            println!("  scan [prefix] [n]        Forward scan keys");
+            println!("  rscan [prefix] [n]       Reverse scan keys");
+            println!("  count                    Count all keys");
+            println!("  rev <key>                Show total revisions for a key");
+            println!("  rev <key> <index>        Show value at revision index (0 = oldest)");
             println!();
             println!("Namespace:");
             println!("  use <namespace>      Switch to a namespace (create if needed)");
-            println!("  namespaces           List all namespaces (alias: ns)");
+            println!("  namespaces           List all namespaces");
             println!("  drop <namespace>     Drop a namespace and all its data");
             println!();
             println!("Misc:");
