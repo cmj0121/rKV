@@ -8,6 +8,9 @@ pub enum Error {
     #[error("key not found")]
     KeyNotFound,
 
+    #[error("invalid key: {0}")]
+    InvalidKey(String),
+
     #[error("not implemented: {0}")]
     NotImplemented(String),
 }
