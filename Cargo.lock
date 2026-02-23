@@ -172,6 +172,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
+name = "fast32"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a35a73237400bde66c82e38387343f90d7182a2f2f22729e096a2abd57d75db9"
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -418,6 +424,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "dirs-sys",
+ "fast32",
  "rustyline",
  "tempfile",
  "thiserror",

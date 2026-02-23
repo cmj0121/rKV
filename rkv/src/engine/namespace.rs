@@ -2,6 +2,7 @@ use std::fmt;
 
 use super::error::{Error, Result};
 use super::key::Key;
+use super::revision::Revision;
 use super::value::Value;
 use super::DB;
 
@@ -42,7 +43,7 @@ impl<'db> Namespace<'db> {
         &self.name
     }
 
-    pub fn put(&self, _key: impl Into<Key>, _value: impl Into<Value>) -> Result<u128> {
+    pub fn put(&self, _key: impl Into<Key>, _value: impl Into<Value>) -> Result<Revision> {
         let _key = _key.into();
         let _value = _value.into();
         Err(Error::NotImplemented("put".into()))
@@ -73,5 +74,17 @@ impl<'db> Namespace<'db> {
 
     pub fn count(&self) -> Result<u64> {
         Err(Error::NotImplemented("count".into()))
+    }
+
+    /// Returns the total number of revisions for a key.
+    pub fn rev_count(&self, _key: impl Into<Key>) -> Result<u64> {
+        let _key = _key.into();
+        Err(Error::NotImplemented("rev_count".into()))
+    }
+
+    /// Returns the value at a specific revision index (0 = oldest).
+    pub fn rev_get(&self, _key: impl Into<Key>, _index: u64) -> Result<Value> {
+        let _key = _key.into();
+        Err(Error::NotImplemented("rev_get".into()))
     }
 }

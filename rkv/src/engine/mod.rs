@@ -1,11 +1,13 @@
 mod error;
 mod key;
 mod namespace;
+mod revision;
 mod value;
 
 pub use error::{Error, Result};
 pub use key::Key;
 pub use namespace::Namespace;
+pub use revision::Revision;
 pub use value::Value;
 
 use std::fs;
