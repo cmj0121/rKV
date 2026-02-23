@@ -2,23 +2,35 @@ mod error;
 mod key;
 mod namespace;
 mod revision;
+mod stats;
 mod value;
 
 pub use error::{Error, Result};
 pub use key::Key;
 pub use namespace::Namespace;
 pub use revision::RevisionID;
+pub use stats::Stats;
 pub use value::Value;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// Default namespace name.
 pub const DEFAULT_NAMESPACE: &str = "_";
 
+#[derive(Clone, Debug)]
 pub struct Config {
     pub path: PathBuf,
     pub create_if_missing: bool,
+    /// Write buffer size in bytes (default: 4 MB).
+    pub write_buffer_size: usize,
+    /// Maximum number of LSM levels (default: 3).
+    pub max_levels: usize,
+    /// SSTable block size in bytes (default: 4 KB).
+    pub block_size: usize,
+    /// Block cache size in bytes (default: 8 MB).
+    pub cache_size: usize,
 }
 
 impl Config {
@@ -26,12 +38,17 @@ impl Config {
         Self {
             path: path.into(),
             create_if_missing: true,
+            write_buffer_size: 4 * 1024 * 1024,
+            max_levels: 3,
+            block_size: 4 * 1024,
+            cache_size: 8 * 1024 * 1024,
         }
     }
 }
 
 pub struct DB {
     config: Config,
+    opened_at: Instant,
 }
 
 impl DB {
@@ -39,7 +56,10 @@ impl DB {
         if config.create_if_missing {
             fs::create_dir_all(&config.path)?;
         }
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            opened_at: Instant::now(),
+        })
     }
 
     pub fn close(self) -> Result<()> {
@@ -48,6 +68,18 @@ impl DB {
 
     pub fn path(&self) -> &Path {
         &self.config.path
+    }
+
+    pub fn stats(&self) -> Stats {
+        Stats {
+            level_count: self.config.max_levels,
+            uptime: self.opened_at.elapsed(),
+            ..Stats::default()
+        }
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     /// Switch to a namespace, creating it if it does not exist.
