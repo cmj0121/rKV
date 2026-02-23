@@ -1,3 +1,4 @@
+mod bloom;
 mod error;
 mod key;
 mod namespace;
@@ -37,6 +38,9 @@ pub struct Config {
     pub object_size: usize,
     /// Whether to LZ4-compress bin objects on disk (default: true).
     pub compress: bool,
+    /// Bloom filter bits per key (default: 10, ~1% false-positive rate).
+    /// Set to 0 to disable bloom filters.
+    pub bloom_bits_per_key: usize,
 }
 
 impl Config {
@@ -50,6 +54,7 @@ impl Config {
             cache_size: 8 * 1024 * 1024,
             object_size: 1024,
             compress: true,
+            bloom_bits_per_key: 10,
         }
     }
 }
