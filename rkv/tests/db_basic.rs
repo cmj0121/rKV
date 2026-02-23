@@ -1,4 +1,4 @@
-use rkv::{Config, Error, DB};
+use rkv::{Config, Error, DB, DEFAULT_NAMESPACE};
 
 #[test]
 fn open_creates_directory() {
@@ -25,12 +25,73 @@ fn open_existing_directory() {
 }
 
 #[test]
-fn put_returns_not_implemented() {
+fn namespace_default() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
 
-    let err = db.put("key", "value").unwrap_err();
+    let ns = db.namespace(DEFAULT_NAMESPACE).unwrap();
+    assert_eq!(ns.name(), "_");
+}
+
+#[test]
+fn namespace_custom() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace("users").unwrap();
+    assert_eq!(ns.name(), "users");
+}
+
+#[test]
+fn namespace_empty_name_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let err = db.namespace("").unwrap_err();
+    assert!(matches!(err, Error::InvalidNamespace(_)));
+}
+
+#[test]
+fn list_namespaces_returns_not_implemented() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let err = db.list_namespaces().unwrap_err();
+    assert!(matches!(err, Error::NotImplemented(_)));
+}
+
+#[test]
+fn drop_default_namespace_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let err = db.drop_namespace(DEFAULT_NAMESPACE).unwrap_err();
+    assert!(matches!(err, Error::InvalidNamespace(_)));
+}
+
+#[test]
+fn drop_namespace_returns_not_implemented() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let err = db.drop_namespace("users").unwrap_err();
+    assert!(matches!(err, Error::NotImplemented(_)));
+}
+
+#[test]
+fn put_returns_not_implemented() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE).unwrap();
+
+    let err = ns.put("key", "value").unwrap_err();
     assert!(matches!(err, Error::NotImplemented(_)));
 }
 
@@ -39,7 +100,8 @@ fn get_returns_not_implemented() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE).unwrap();
 
-    let err = db.get("key").unwrap_err();
+    let err = ns.get("key").unwrap_err();
     assert!(matches!(err, Error::NotImplemented(_)));
 }
