@@ -1,0 +1,11 @@
+[package]
+name = "rkv-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rkv"
+crate-type = ["cdylib"]
+
+[dependencies]
+rkv = { path = "../rkv" }
