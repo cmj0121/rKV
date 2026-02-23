@@ -321,7 +321,10 @@ fn destroy_returns_not_implemented() {
 
 #[test]
 fn repair_returns_not_implemented() {
-    let err = DB::repair(PathBuf::from("/tmp/rkv_test_repair")).unwrap_err();
+    let result = DB::repair(PathBuf::from("/tmp/rkv_test_repair"));
+    let Err(err) = result else {
+        panic!("expected NotImplemented error");
+    };
     assert!(matches!(err, Error::NotImplemented(_)));
 }
 

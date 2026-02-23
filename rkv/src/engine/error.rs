@@ -14,6 +14,9 @@ pub enum Error {
     #[error("invalid namespace: {0}")]
     InvalidNamespace(String),
 
+    #[error("corruption: {0}")]
+    Corruption(String),
+
     #[error("not implemented: {0}")]
     NotImplemented(String),
 }

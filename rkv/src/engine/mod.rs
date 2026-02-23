@@ -1,7 +1,9 @@
 mod bloom;
+mod checksum;
 mod error;
 mod key;
 mod namespace;
+mod recovery;
 mod revision;
 mod stats;
 mod value;
@@ -9,6 +11,7 @@ mod value;
 pub use error::{Error, Result};
 pub use key::Key;
 pub use namespace::Namespace;
+pub use recovery::RecoveryReport;
 pub use revision::RevisionID;
 pub use stats::Stats;
 pub use value::Value;
@@ -41,6 +44,10 @@ pub struct Config {
     /// Bloom filter bits per key (default: 10, ~1% false-positive rate).
     /// Set to 0 to disable bloom filters.
     pub bloom_bits_per_key: usize,
+    /// Verify checksums on read (default: true).
+    /// When enabled, every WAL entry and SSTable block is verified against
+    /// its stored checksum during reads. Disabling trades safety for speed.
+    pub verify_checksums: bool,
 }
 
 impl Config {
@@ -55,6 +62,7 @@ impl Config {
             object_size: 1024,
             compress: true,
             bloom_bits_per_key: 10,
+            verify_checksums: true,
         }
     }
 }
@@ -145,7 +153,11 @@ impl DB {
     }
 
     /// Attempt to repair a corrupted database at the given path.
-    pub fn repair(path: impl Into<PathBuf>) -> Result<()> {
+    ///
+    /// Returns a `RecoveryReport` describing what was scanned, recovered,
+    /// and lost. Callers should inspect the report to determine whether
+    /// the database is usable.
+    pub fn repair(path: impl Into<PathBuf>) -> Result<RecoveryReport> {
         let _path = path.into();
         Err(Error::NotImplemented("repair".into()))
     }

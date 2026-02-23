@@ -281,7 +281,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 return Action::Continue;
             }
             match DB::repair(tokens[1]) {
-                Ok(()) => println!("OK"),
+                Ok(_report) => println!("OK"),
                 Err(e) => eprintln!("error: {e}"),
             }
         }
