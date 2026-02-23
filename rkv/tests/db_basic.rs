@@ -239,6 +239,40 @@ fn config_custom_overrides() {
     assert_eq!(c.cache_size, 2048);
 }
 
+// --- Value separation config ---
+
+#[test]
+fn config_object_size_default() {
+    let config = Config::new("/tmp/test");
+    assert_eq!(config.object_size, 1024);
+}
+
+#[test]
+fn config_object_size_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 4096;
+    let db = DB::open(config).unwrap();
+
+    assert_eq!(db.config().object_size, 4096);
+}
+
+#[test]
+fn config_compress_default() {
+    let config = Config::new("/tmp/test");
+    assert!(config.compress);
+}
+
+#[test]
+fn config_compress_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.compress = false;
+    let db = DB::open(config).unwrap();
+
+    assert!(!db.config().compress);
+}
+
 // --- Maintenance operation stubs ---
 
 #[test]
