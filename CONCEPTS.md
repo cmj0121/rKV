@@ -39,8 +39,40 @@ external coordination.
 
 ### Key-Value Store
 
-The fundamental unit is a `(key, value)` pair. Keys are byte strings; values are arbitrary byte vectors. The store
-provides `put`, `get`, `delete`, `exists`, `scan`, and `count` operations.
+The fundamental unit is a `(key, value)` pair. The store provides `put`, `get`, `delete`, `exists`, `scan`, and `count`
+operations.
+
+### Key
+
+A Key identifies a record. It is one of two variants:
+
+- **Int** — a signed 64-bit integer (`i64`). Supports ordering and comparison.
+- **Str** — a UTF-8 string (max 255 bytes, no interior nulls). No ordering guarantee.
+
+Booleans are syntax sugar: `true` → `Int(1)`, `false` → `Int(0)`.
+
+**Auto-upgrade**: A database starts in **ordered mode** where all keys are `Int` and support comparison. When the first
+`Str` key is inserted, the engine performs an irreversible **key type upgrade**: all existing `Int` keys are widened to
+`Str` (e.g., `Int(42)` becomes `Str("42")`), and the database enters **unordered mode** permanently. Exact-match
+operations (`get`, `exists`, `delete`) continue to work normally in both modes.
+
+**Scan behavior** depends on the database mode:
+
+- **Ordered mode** (Int keys): `scan(prefix, limit)` returns keys in ascending order starting from `prefix`;
+  `rscan` returns keys in descending order.
+- **Unordered mode** (Str keys): `scan(prefix, limit)` returns keys whose string representation starts with `prefix`;
+  `rscan` returns the same prefix-matched keys in reverse order. Ordering-based range queries are not available.
+
+### Value
+
+A Value is the payload associated with a key. It has three internal states:
+
+- **Data** — arbitrary-length byte vector. An empty `Data` (zero bytes) is a valid, distinct value.
+- **Null** — the key exists but carries no payload. `Null` is semantically different from empty `Data`.
+- **Tombstone** — an internal deletion marker. When a key is deleted, the engine writes a tombstone instead of
+  physically removing the entry. Tombstones are invisible to the public API — `get` on a tombstoned key returns
+  "key not found", indistinguishable from a key that never existed. Tombstones are resolved (garbage-collected) during
+  SSTable compaction.
 
 ### Revision Awareness
 
