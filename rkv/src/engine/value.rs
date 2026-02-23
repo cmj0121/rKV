@@ -117,6 +117,44 @@ impl From<String> for Value {
     }
 }
 
+/// Internal pointer to a bin object stored in the object store.
+///
+/// When a value exceeds the configured `object_size`, the LSM-tree
+/// entry stores a `ValuePointer` instead of the raw bytes. The pointer
+/// holds the BLAKE3 content hash (which doubles as the object filename)
+/// and the original uncompressed size.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct ValuePointer {
+    /// BLAKE3 content hash — also the object filename.
+    pub(crate) hash: [u8; 32],
+    /// Original (uncompressed) size of the value in bytes.
+    pub(crate) size: u32,
+}
+
+#[allow(dead_code)]
+impl ValuePointer {
+    /// Create a new value pointer.
+    pub(crate) fn new(hash: [u8; 32], size: u32) -> Self {
+        Self { hash, size }
+    }
+
+    /// The encoded size of a `ValuePointer` in bytes (32 + 4 = 36).
+    pub(crate) const fn encoded_size() -> usize {
+        36
+    }
+
+    /// Return the hex-encoded hash string (used as the object filename).
+    pub(crate) fn hex_hash(&self) -> String {
+        self.hash.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Return the fan-out directory prefix (first 2 hex chars).
+    pub(crate) fn fan_out_prefix(&self) -> String {
+        format!("{:02x}", self.hash[0])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +328,50 @@ mod tests {
     #[test]
     fn clone_null() {
         assert_eq!(Value::Null.clone(), Value::Null);
+    }
+
+    // --- ValuePointer ---
+
+    #[test]
+    fn value_pointer_new() {
+        let hash = [0xABu8; 32];
+        let vp = ValuePointer::new(hash, 512);
+        assert_eq!(vp.hash, hash);
+        assert_eq!(vp.size, 512);
+    }
+
+    #[test]
+    fn value_pointer_encoded_size() {
+        assert_eq!(ValuePointer::encoded_size(), 36);
+    }
+
+    #[test]
+    fn value_pointer_equality() {
+        let h1 = [0x01u8; 32];
+        let h2 = [0x02u8; 32];
+        let a = ValuePointer::new(h1, 50);
+        let b = ValuePointer::new(h1, 50);
+        let c = ValuePointer::new(h2, 50);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn value_pointer_hex_hash() {
+        let mut hash = [0u8; 32];
+        hash[0] = 0xAB;
+        hash[1] = 0xCD;
+        let vp = ValuePointer::new(hash, 100);
+        let hex = vp.hex_hash();
+        assert_eq!(hex.len(), 64);
+        assert!(hex.starts_with("abcd"));
+    }
+
+    #[test]
+    fn value_pointer_fan_out_prefix() {
+        let mut hash = [0u8; 32];
+        hash[0] = 0xFF;
+        let vp = ValuePointer::new(hash, 100);
+        assert_eq!(vp.fan_out_prefix(), "ff");
     }
 }

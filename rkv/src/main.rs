@@ -242,6 +242,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("  uptime:            {}", format_duration(s.uptime));
         }
         "config" => {
+            // config print is handled here; config set is handled in run_repl
             let c = db.config();
             println!("path:              {}", c.path.display());
             println!("create_if_missing: {}", c.create_if_missing);
@@ -249,6 +250,8 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("max_levels:        {}", c.max_levels);
             println!("block_size:        {}", c.block_size);
             println!("cache_size:        {}", c.cache_size);
+            println!("object_size:       {}", c.object_size);
+            println!("compress:          {}", c.compress);
         }
         "flush" => match db.flush() {
             Ok(()) => println!("OK"),
@@ -313,6 +316,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("Admin:");
             println!("  stats                Print database statistics");
             println!("  config               Print current configuration");
+            println!("  config <key> <value> Set a configuration value");
             println!("  flush                Flush write buffer to disk");
             println!("  sync                 Flush and fsync to durable storage");
             println!("  compact              Trigger manual compaction");
@@ -336,6 +340,63 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
     Action::Continue
 }
 
+fn set_config(db: &mut DB, key: &str, value: &str) {
+    let c = db.config_mut();
+    match key {
+        "create_if_missing" => match value.parse::<bool>() {
+            Ok(v) => {
+                c.create_if_missing = v;
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected true or false"),
+        },
+        "write_buffer_size" => match value.parse::<usize>() {
+            Ok(v) => {
+                c.write_buffer_size = v;
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected a number"),
+        },
+        "max_levels" => match value.parse::<usize>() {
+            Ok(v) => {
+                c.max_levels = v;
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected a number"),
+        },
+        "block_size" => match value.parse::<usize>() {
+            Ok(v) => {
+                c.block_size = v;
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected a number"),
+        },
+        "cache_size" => match value.parse::<usize>() {
+            Ok(v) => {
+                c.cache_size = v;
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected a number"),
+        },
+        "object_size" => match value.parse::<usize>() {
+            Ok(v) => {
+                c.object_size = v;
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected a number"),
+        },
+        "compress" => match value.parse::<bool>() {
+            Ok(v) => {
+                c.compress = v;
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected true or false"),
+        },
+        "path" => eprintln!("error: path cannot be changed at runtime"),
+        _ => eprintln!("error: unknown config key '{key}'"),
+    }
+}
+
 fn history_path() -> Option<PathBuf> {
     dirs_sys::home_dir().map(|h| h.join(".rkv_history"))
 }
@@ -348,7 +409,7 @@ fn prompt(ns_name: &str) -> String {
     }
 }
 
-fn run_repl(db: &DB, initial_ns: &str) {
+fn run_repl(db: &mut DB, initial_ns: &str) {
     let mut rl = match DefaultEditor::new() {
         Ok(rl) => rl,
         Err(e) => {
@@ -364,22 +425,29 @@ fn run_repl(db: &DB, initial_ns: &str) {
     let mut ns_name = initial_ns.to_owned();
 
     loop {
-        let ns = match db.namespace(&ns_name) {
-            Ok(ns) => ns,
-            Err(e) => {
-                eprintln!("error switching namespace: {e}");
-                ns_name = DEFAULT_NAMESPACE.to_owned();
-                continue;
-            }
-        };
-
-        match rl.readline(&prompt(ns.name())) {
+        match rl.readline(&prompt(&ns_name)) {
             Ok(line) => {
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
                 }
                 let _ = rl.add_history_entry(line);
+
+                // Handle config set before creating namespace (needs &mut db)
+                let tokens: Vec<&str> = line.split_whitespace().collect();
+                if tokens[0] == "config" && tokens.len() == 3 {
+                    set_config(db, tokens[1], tokens[2]);
+                    continue;
+                }
+
+                let ns = match db.namespace(&ns_name) {
+                    Ok(ns) => ns,
+                    Err(e) => {
+                        eprintln!("error switching namespace: {e}");
+                        ns_name = DEFAULT_NAMESPACE.to_owned();
+                        continue;
+                    }
+                };
                 match execute(db, &ns, line) {
                     Action::Continue => {}
                     Action::Switch(name) => ns_name = name,
@@ -417,7 +485,7 @@ fn main() {
     let mut config = Config::new(&path);
     config.create_if_missing = args.create;
 
-    let db = match DB::open(config) {
+    let mut db = match DB::open(config) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("failed to open database: {e}");
@@ -425,7 +493,7 @@ fn main() {
         }
     };
 
-    run_repl(&db, &args.namespace);
+    run_repl(&mut db, &args.namespace);
 
     if let Err(e) = db.close() {
         eprintln!("error closing database: {e}");

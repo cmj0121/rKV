@@ -74,6 +74,107 @@ A Value is the payload associated with a key. It has three internal states:
   "key not found", indistinguishable from a key that never existed. Tombstones are resolved (garbage-collected) during
   SSTable compaction.
 
+### Value Separation (Bin Objects)
+
+In a standard LSM-tree every value — regardless of size — is copied through each compaction level.
+For large values (images, JSON blobs, serialized objects) this causes severe **write amplification**:
+the same multi-KB payload is rewritten from L1 to L2 to L3 even though only the key ordering changes.
+
+rKV uses **value separation** inspired by WiscKey and Git's object model:
+
+- **Small values** (<= `object_size`, default 1 KB) stay **inline** in the LSM-tree, keeping
+  read latency low for common payloads.
+- **Large values** (> `object_size`) are stored as **bin objects** — standalone files in a
+  content-addressable object store. The LSM-tree entry stores a compact `ValuePointer` instead
+  of the raw bytes.
+
+#### Object Identity
+
+Each bin object is identified by its **BLAKE3 content hash** (32 bytes / 64 hex chars). The hash
+serves as both the unique identifier and the filename. Identical values produce the same hash,
+giving **automatic deduplication** — if two keys store the same 5 MB image, only one object file
+exists on disk.
+
+#### Object Store Layout
+
+Object files are stored in a Git-style **fan-out directory** structure using the first byte
+(2 hex chars) of the hash as a subdirectory:
+
+```text
+<db>/objects/
+  ab/cdef0123456789abcdef0123456789abcdef0123456789abcdef01234567
+  ab/ff01234567890abcdef01234567890abcdef01234567890abcdef0123456
+  cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab
+```
+
+This limits the number of entries per directory, scaling to millions of objects without
+hitting filesystem performance cliffs.
+
+#### Object File Format
+
+Each object file contains a 1-byte header followed by the payload:
+
+```text
+[ flags: 1 byte ][ payload ]
+
+flags bit 0: 0 = raw, 1 = LZ4-compressed
+flags bits 1-7: reserved
+```
+
+When `compress` is enabled (default), the payload is LZ4-compressed. The flags byte
+tells the reader how to decode. Compression is applied per-object at write time.
+
+#### Write Path
+
+```text
+put(key, value)
+      │
+      ▼
+  len(value) > object_size?
+      │
+  ┌───┴────┐
+  │ no     │ yes
+  ▼        ▼
+inline   BLAKE3 hash the value
+in LSM   object file exists?
+           │
+         ┌─┴──┐
+         │yes │ no
+         │    ▼
+         │  LZ4 compress (if enabled)
+         │  write to objects/<prefix>/<hash>
+         ▼
+         store ValuePointer in LSM
+```
+
+Deduplication happens naturally: if the object file already exists (same hash), the write
+is skipped and only the LSM entry is created.
+
+#### Read Path
+
+`get(key)` → read `ValuePointer` from LSM → open `objects/<prefix>/<hash>` → read flags byte
+→ decompress if needed → return value.
+
+#### ValuePointer Format (36 bytes fixed)
+
+| Field  | Type       | Bytes | Description                                |
+| ------ | ---------- | ----- | ------------------------------------------ |
+| `hash` | `[u8; 32]` | 32    | BLAKE3 content hash (also object filename) |
+| `size` | `u32`      | 4     | Original uncompressed value size in bytes  |
+
+#### Tuning
+
+The `object_size` and `compress` fields are configurable via the `Config` struct
+(see Configuration below). Setting `object_size` to `0` forces all values to bin objects;
+setting it to `usize::MAX` effectively disables separation.
+
+#### Garbage Collection
+
+GC is deferred to a future phase. Bin objects accumulate on disk; dead entries (overwritten or
+deleted values) are not reclaimed until a GC mechanism is implemented. Because objects are
+content-addressed, an object is safe to delete only when no `ValuePointer` in any LSM level
+references its hash.
+
 ### Namespace
 
 A namespace is an isolated key-value table within a single database. Each namespace has its own key space and
@@ -119,6 +220,8 @@ The `Config` struct controls database behavior and LSM tuning parameters:
 | `max_levels`        | `usize`   | 3          | Maximum number of LSM levels              |
 | `block_size`        | `usize`   | 4 KB       | SSTable block size                        |
 | `cache_size`        | `usize`   | 8 MB       | Block cache size for decompressed blocks  |
+| `object_size`       | `usize`   | 1 KB       | Bin object size threshold (see above)     |
+| `compress`          | `bool`    | `true`     | LZ4-compress bin objects on disk          |
 
 `Config::new(path)` initializes all fields to their defaults. Fields can be overridden before
 passing the config to `DB::open`.
