@@ -74,6 +74,17 @@ A Value is the payload associated with a key. It has three internal states:
   "key not found", indistinguishable from a key that never existed. Tombstones are resolved (garbage-collected) during
   SSTable compaction.
 
+### Namespace
+
+A namespace is an isolated key-value table within a single database. Each namespace has its own key space and
+independent auto-upgrade state. Namespaces are identified by string names and created implicitly on first use via
+`db.namespace("name")`.
+
+The default namespace is `_`. The CLI starts on `_` and supports switching with the `use` command.
+
+All data operations (`put`, `get`, `delete`, `exists`, `scan`, `rscan`, `count`) live on the `Namespace` handle, not on
+`DB` directly. `DB` is responsible for lifecycle (`open`, `close`, `path`) and namespace management (`namespace`).
+
 ### Revision Awareness
 
 Every mutation produces a **Revision ID** — an unsigned 128-bit integer (`u128`) that increases monotonically. `put`
