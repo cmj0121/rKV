@@ -7,7 +7,7 @@ mod value;
 pub use error::{Error, Result};
 pub use key::Key;
 pub use namespace::Namespace;
-pub use revision::Revision;
+pub use revision::RevisionID;
 pub use value::Value;
 
 use std::fs;
