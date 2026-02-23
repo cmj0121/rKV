@@ -2,7 +2,7 @@ use std::fmt;
 
 use super::error::{Error, Result};
 use super::key::Key;
-use super::revision::Revision;
+use super::revision::RevisionID;
 use super::value::Value;
 use super::DB;
 
@@ -43,7 +43,7 @@ impl<'db> Namespace<'db> {
         &self.name
     }
 
-    pub fn put(&self, _key: impl Into<Key>, _value: impl Into<Value>) -> Result<Revision> {
+    pub fn put(&self, _key: impl Into<Key>, _value: impl Into<Value>) -> Result<RevisionID> {
         let _key = _key.into();
         let _value = _value.into();
         Err(Error::NotImplemented("put".into()))
