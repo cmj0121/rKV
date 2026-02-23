@@ -106,4 +106,51 @@ impl DB {
         }
         Err(Error::NotImplemented("drop_namespace".into()))
     }
+
+    // --- Flush / Sync ---
+
+    /// Flush the in-memory write buffer to disk.
+    pub fn flush(&self) -> Result<()> {
+        Err(Error::NotImplemented("flush".into()))
+    }
+
+    /// Flush and fsync all data to durable storage.
+    pub fn sync(&self) -> Result<()> {
+        Err(Error::NotImplemented("sync".into()))
+    }
+
+    // --- Destroy / Repair ---
+
+    /// Destroy the database at the given path, deleting all data.
+    pub fn destroy(path: impl Into<PathBuf>) -> Result<()> {
+        let _path = path.into();
+        Err(Error::NotImplemented("destroy".into()))
+    }
+
+    /// Attempt to repair a corrupted database at the given path.
+    pub fn repair(path: impl Into<PathBuf>) -> Result<()> {
+        let _path = path.into();
+        Err(Error::NotImplemented("repair".into()))
+    }
+
+    // --- Dump / Load ---
+
+    /// Export the database to a portable backup file.
+    pub fn dump(&self, path: impl Into<PathBuf>) -> Result<()> {
+        let _path = path.into();
+        Err(Error::NotImplemented("dump".into()))
+    }
+
+    /// Import a database from a portable backup file.
+    pub fn load(path: impl Into<PathBuf>) -> Result<DB> {
+        let _path = path.into();
+        Err(Error::NotImplemented("load".into()))
+    }
+
+    // --- Compaction ---
+
+    /// Trigger a manual compaction of SSTable levels.
+    pub fn compact(&self) -> Result<()> {
+        Err(Error::NotImplemented("compact".into()))
+    }
 }
