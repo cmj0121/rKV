@@ -3,7 +3,7 @@ use std::os::raw::c_char;
 use std::ptr;
 use std::sync::Mutex;
 
-use rkv::{Config, DB};
+use rkv::{Config, Key, DB};
 
 /// Opaque handle returned to C callers.
 pub struct RkvDb {
@@ -79,7 +79,14 @@ pub unsafe extern "C" fn rkv_put(
         return 0;
     }
     let db = unsafe { &*db };
-    let key = unsafe { std::slice::from_raw_parts(key, key_len) };
+    let key_bytes = unsafe { std::slice::from_raw_parts(key, key_len) };
+    let key = match Key::from_bytes(key_bytes) {
+        Ok(k) => k,
+        Err(e) => {
+            set_last_error(e.to_string());
+            return 0;
+        }
+    };
     let value = unsafe { std::slice::from_raw_parts(value, value_len) };
     match db.inner.put(key, value) {
         Ok(rev) => rev,
@@ -109,17 +116,34 @@ pub unsafe extern "C" fn rkv_get(
         return -1;
     }
     let db = unsafe { &*db };
-    let key = unsafe { std::slice::from_raw_parts(key, key_len) };
-    match db.inner.get(key) {
-        Ok(val) => {
-            let mut boxed = val.into_boxed_slice();
-            unsafe {
-                *out_len = boxed.len();
-                *out = boxed.as_mut_ptr();
-            }
-            std::mem::forget(boxed);
-            0
+    let key_bytes = unsafe { std::slice::from_raw_parts(key, key_len) };
+    let key = match Key::from_bytes(key_bytes) {
+        Ok(k) => k,
+        Err(e) => {
+            set_last_error(e.to_string());
+            return -1;
         }
+    };
+    match db.inner.get(key) {
+        Ok(val) => match val.into_bytes() {
+            Some(bytes) => {
+                let mut boxed = bytes.into_boxed_slice();
+                unsafe {
+                    *out_len = boxed.len();
+                    *out = boxed.as_mut_ptr();
+                }
+                std::mem::forget(boxed);
+                0
+            }
+            None => {
+                // Null value — key exists but no payload
+                unsafe {
+                    *out_len = 0;
+                    *out = ptr::null_mut();
+                }
+                0
+            }
+        },
         Err(e) => {
             set_last_error(e.to_string());
             -1
@@ -138,7 +162,14 @@ pub unsafe extern "C" fn rkv_delete(db: *mut RkvDb, key: *const u8, key_len: usi
         return -1;
     }
     let db = unsafe { &*db };
-    let key = unsafe { std::slice::from_raw_parts(key, key_len) };
+    let key_bytes = unsafe { std::slice::from_raw_parts(key, key_len) };
+    let key = match Key::from_bytes(key_bytes) {
+        Ok(k) => k,
+        Err(e) => {
+            set_last_error(e.to_string());
+            return -1;
+        }
+    };
     match db.inner.delete(key) {
         Ok(()) => 0,
         Err(e) => {

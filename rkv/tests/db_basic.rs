@@ -30,7 +30,7 @@ fn put_returns_not_implemented() {
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
 
-    let err = db.put(b"key", b"value").unwrap_err();
+    let err = db.put("key", "value").unwrap_err();
     assert!(matches!(err, Error::NotImplemented(_)));
 }
 
@@ -40,6 +40,6 @@ fn get_returns_not_implemented() {
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
 
-    let err = db.get(b"key").unwrap_err();
+    let err = db.get("key").unwrap_err();
     assert!(matches!(err, Error::NotImplemented(_)));
 }

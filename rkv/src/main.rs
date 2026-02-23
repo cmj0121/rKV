@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use rkv::{Config, DB};
+use rkv::{Config, Key, DB};
 use rustyline::DefaultEditor;
 
 #[derive(Parser)]
@@ -20,6 +20,17 @@ enum Action {
     Exit,
 }
 
+fn parse_key(token: &str) -> Key {
+    match token {
+        "true" => Key::Int(1),
+        "false" => Key::Int(0),
+        _ => token
+            .parse::<i64>()
+            .map(Key::Int)
+            .unwrap_or_else(|_| Key::from(token)),
+    }
+}
+
 fn execute(db: &DB, line: &str) -> Action {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     if tokens.is_empty() {
@@ -32,7 +43,7 @@ fn execute(db: &DB, line: &str) -> Action {
                 eprintln!("usage: put <key> <value>");
                 return Action::Continue;
             }
-            match db.put(tokens[1].as_bytes(), tokens[2].as_bytes()) {
+            match db.put(parse_key(tokens[1]), tokens[2].as_bytes()) {
                 Ok(rev) => println!("{rev:032x}"),
                 Err(e) => eprintln!("error: {e}"),
             }
@@ -42,8 +53,8 @@ fn execute(db: &DB, line: &str) -> Action {
                 eprintln!("usage: get <key>");
                 return Action::Continue;
             }
-            match db.get(tokens[1].as_bytes()) {
-                Ok(val) => println!("{}", String::from_utf8_lossy(&val)),
+            match db.get(parse_key(tokens[1])) {
+                Ok(val) => println!("{val}"),
                 Err(e) => eprintln!("error: {e}"),
             }
         }
@@ -52,7 +63,7 @@ fn execute(db: &DB, line: &str) -> Action {
                 eprintln!("usage: delete <key>");
                 return Action::Continue;
             }
-            match db.delete(tokens[1].as_bytes()) {
+            match db.delete(parse_key(tokens[1])) {
                 Ok(()) => println!("OK"),
                 Err(e) => eprintln!("error: {e}"),
             }
@@ -62,31 +73,31 @@ fn execute(db: &DB, line: &str) -> Action {
                 eprintln!("usage: exists <key>");
                 return Action::Continue;
             }
-            match db.exists(tokens[1].as_bytes()) {
+            match db.exists(parse_key(tokens[1])) {
                 Ok(true) => println!("true"),
                 Ok(false) => println!("false"),
                 Err(e) => eprintln!("error: {e}"),
             }
         }
         "scan" => {
-            let prefix = tokens.get(1).unwrap_or(&"");
+            let prefix = parse_key(tokens.get(1).unwrap_or(&""));
             let limit: usize = tokens.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
-            match db.scan(prefix.as_bytes(), limit) {
+            match db.scan(&prefix, limit) {
                 Ok(keys) => {
                     for k in &keys {
-                        println!("{}", String::from_utf8_lossy(k));
+                        println!("{k}");
                     }
                 }
                 Err(e) => eprintln!("error: {e}"),
             }
         }
         "rscan" => {
-            let prefix = tokens.get(1).unwrap_or(&"");
+            let prefix = parse_key(tokens.get(1).unwrap_or(&""));
             let limit: usize = tokens.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
-            match db.rscan(prefix.as_bytes(), limit) {
+            match db.rscan(&prefix, limit) {
                 Ok(keys) => {
                     for k in &keys {
-                        println!("{}", String::from_utf8_lossy(k));
+                        println!("{k}");
                     }
                 }
                 Err(e) => eprintln!("error: {e}"),
