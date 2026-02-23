@@ -249,6 +249,8 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("max_levels:        {}", c.max_levels);
             println!("block_size:        {}", c.block_size);
             println!("cache_size:        {}", c.cache_size);
+            println!("object_size:       {}", c.object_size);
+            println!("compress:          {}", c.compress);
         }
         "flush" => match db.flush() {
             Ok(()) => println!("OK"),

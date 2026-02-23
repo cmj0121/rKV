@@ -31,6 +31,12 @@ pub struct Config {
     pub block_size: usize,
     /// Block cache size in bytes (default: 8 MB).
     pub cache_size: usize,
+    /// Object size threshold in bytes for value separation (default: 1 KB).
+    /// Values larger than this are stored as bin objects in the value log;
+    /// smaller values stay inline in the LSM-tree.
+    pub object_size: usize,
+    /// Whether to LZ4-compress bin objects on disk (default: true).
+    pub compress: bool,
 }
 
 impl Config {
@@ -42,6 +48,8 @@ impl Config {
             max_levels: 3,
             block_size: 4 * 1024,
             cache_size: 8 * 1024 * 1024,
+            object_size: 1024,
+            compress: true,
         }
     }
 }
