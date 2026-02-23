@@ -252,6 +252,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("cache_size:        {}", c.cache_size);
             println!("object_size:       {}", c.object_size);
             println!("compress:          {}", c.compress);
+            println!("verify_checksums:  {}", c.verify_checksums);
         }
         "flush" => match db.flush() {
             Ok(()) => println!("OK"),
@@ -281,7 +282,36 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 return Action::Continue;
             }
             match DB::repair(tokens[1]) {
-                Ok(_report) => println!("OK"),
+                Ok(report) => {
+                    println!("Repair complete:");
+                    println!("  wal_records_scanned:     {}", report.wal_records_scanned);
+                    println!("  wal_records_skipped:     {}", report.wal_records_skipped);
+                    println!(
+                        "  sstable_blocks_scanned:  {}",
+                        report.sstable_blocks_scanned
+                    );
+                    println!(
+                        "  sstable_blocks_corrupted:{}",
+                        report.sstable_blocks_corrupted
+                    );
+                    println!("  objects_scanned:         {}", report.objects_scanned);
+                    println!("  objects_corrupted:       {}", report.objects_corrupted);
+                    println!("  keys_recovered:          {}", report.keys_recovered);
+                    println!("  keys_lost:               {}", report.keys_lost);
+                    if report.is_clean() {
+                        println!("  status: clean");
+                    } else if report.has_data_loss() {
+                        println!("  status: DATA LOSS ({} keys lost)", report.keys_lost);
+                    } else {
+                        println!(
+                            "  status: repaired ({} corrupted entries fixed)",
+                            report.total_corrupted()
+                        );
+                    }
+                    for warning in &report.warnings {
+                        println!("  warning: {warning}");
+                    }
+                }
                 Err(e) => eprintln!("error: {e}"),
             }
         }
@@ -388,6 +418,13 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
         "compress" => match value.parse::<bool>() {
             Ok(v) => {
                 c.compress = v;
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected true or false"),
+        },
+        "verify_checksums" => match value.parse::<bool>() {
+            Ok(v) => {
+                c.verify_checksums = v;
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected true or false"),
