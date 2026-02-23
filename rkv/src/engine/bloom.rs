@@ -102,3 +102,156 @@ impl BloomFilter {
         Err(Error::NotImplemented("BloomFilter::from_bytes".into()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Construction ---
+
+    #[test]
+    fn new_default_bits_per_key() {
+        let bf = BloomFilter::new(10);
+        assert_eq!(bf.bits_per_key(), 10);
+        assert!(bf.is_empty());
+        assert_eq!(bf.len(), 0);
+    }
+
+    #[test]
+    fn new_custom_bits_per_key() {
+        let bf = BloomFilter::new(20);
+        assert_eq!(bf.bits_per_key(), 20);
+    }
+
+    #[test]
+    fn new_zero_bits_per_key() {
+        let bf = BloomFilter::new(0);
+        assert_eq!(bf.bits_per_key(), 0);
+        assert!(bf.is_empty());
+    }
+
+    // --- Insert / query ---
+
+    #[test]
+    fn may_contain_always_true() {
+        let bf = BloomFilter::new(10);
+        assert!(bf.may_contain(b"anything"));
+        assert!(bf.may_contain(b""));
+        assert!(bf.may_contain(b"nonexistent"));
+    }
+
+    #[test]
+    fn insert_increments_count() {
+        let mut bf = BloomFilter::new(10);
+        bf.insert(b"key1");
+        assert_eq!(bf.len(), 1);
+        bf.insert(b"key2");
+        assert_eq!(bf.len(), 2);
+    }
+
+    #[test]
+    fn may_contain_after_insert() {
+        let mut bf = BloomFilter::new(10);
+        bf.insert(b"hello");
+        assert!(bf.may_contain(b"hello"));
+        assert!(bf.may_contain(b"world")); // stub: always true
+    }
+
+    // --- len / is_empty ---
+
+    #[test]
+    fn len_empty() {
+        let bf = BloomFilter::new(10);
+        assert_eq!(bf.len(), 0);
+        assert!(bf.is_empty());
+    }
+
+    #[test]
+    fn len_after_inserts() {
+        let mut bf = BloomFilter::new(10);
+        bf.insert(b"a");
+        bf.insert(b"b");
+        bf.insert(b"c");
+        assert_eq!(bf.len(), 3);
+        assert!(!bf.is_empty());
+    }
+
+    // --- clear ---
+
+    #[test]
+    fn clear_resets_to_empty() {
+        let mut bf = BloomFilter::new(10);
+        bf.insert(b"key1");
+        bf.insert(b"key2");
+        assert_eq!(bf.len(), 2);
+
+        bf.clear();
+        assert_eq!(bf.len(), 0);
+        assert!(bf.is_empty());
+    }
+
+    // --- bits_per_key ---
+
+    #[test]
+    fn bits_per_key_returns_configured_value() {
+        assert_eq!(BloomFilter::new(10).bits_per_key(), 10);
+        assert_eq!(BloomFilter::new(15).bits_per_key(), 15);
+        assert_eq!(BloomFilter::new(0).bits_per_key(), 0);
+    }
+
+    // --- estimated_fpr ---
+
+    #[test]
+    fn estimated_fpr_returns_one() {
+        let bf = BloomFilter::new(10);
+        assert!((bf.estimated_fpr() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn estimated_fpr_after_insert() {
+        let mut bf = BloomFilter::new(10);
+        bf.insert(b"key");
+        assert!((bf.estimated_fpr() - 1.0).abs() < f64::EPSILON);
+    }
+
+    // --- Serialization stubs ---
+
+    #[test]
+    fn to_bytes_returns_empty_vec() {
+        let bf = BloomFilter::new(10);
+        assert!(bf.to_bytes().is_empty());
+    }
+
+    #[test]
+    fn from_bytes_returns_not_implemented() {
+        let result = BloomFilter::from_bytes(&[1, 2, 3]);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, Error::NotImplemented(ref msg) if msg.contains("BloomFilter")),
+            "expected NotImplemented, got: {err}",
+        );
+    }
+
+    // --- Clone ---
+
+    #[test]
+    fn clone_preserves_state() {
+        let mut bf = BloomFilter::new(10);
+        bf.insert(b"key1");
+        bf.insert(b"key2");
+
+        let cloned = bf.clone();
+        assert_eq!(cloned.len(), bf.len());
+        assert_eq!(cloned.bits_per_key(), bf.bits_per_key());
+    }
+
+    // --- Debug ---
+
+    #[test]
+    fn debug_format() {
+        let bf = BloomFilter::new(10);
+        let debug = format!("{bf:?}");
+        assert!(debug.contains("BloomFilter"));
+    }
+}

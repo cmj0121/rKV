@@ -273,6 +273,24 @@ fn config_compress_override() {
     assert!(!db.config().compress);
 }
 
+// --- Bloom filter config ---
+
+#[test]
+fn config_bloom_bits_per_key_default() {
+    let config = Config::new("/tmp/test");
+    assert_eq!(config.bloom_bits_per_key, 10);
+}
+
+#[test]
+fn config_bloom_bits_per_key_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.bloom_bits_per_key = 20;
+    let db = DB::open(config).unwrap();
+
+    assert_eq!(db.config().bloom_bits_per_key, 20);
+}
+
 // --- Maintenance operation stubs ---
 
 #[test]
