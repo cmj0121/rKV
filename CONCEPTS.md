@@ -107,6 +107,45 @@ stores the key permanently.
 TTL is specified as a `std::time::Duration` in the library API. The CLI accepts human-friendly suffixes:
 `10s` (seconds), `5m` (minutes), `2h` (hours), `1d` (days). Plain numbers are treated as seconds.
 
+### Configuration
+
+The `Config` struct controls database behavior and LSM tuning parameters:
+
+| Field               | Type      | Default    | Description                               |
+| ------------------- | --------- | ---------- | ----------------------------------------- |
+| `path`              | `PathBuf` | (required) | Database directory path                   |
+| `create_if_missing` | `bool`    | `true`     | Create the directory if it does not exist |
+| `write_buffer_size` | `usize`   | 4 MB       | In-memory write buffer size before flush  |
+| `max_levels`        | `usize`   | 3          | Maximum number of LSM levels              |
+| `block_size`        | `usize`   | 4 KB       | SSTable block size                        |
+| `cache_size`        | `usize`   | 8 MB       | Block cache size for decompressed blocks  |
+
+`Config::new(path)` initializes all fields to their defaults. Fields can be overridden before
+passing the config to `DB::open`.
+
+### Statistics
+
+`db.stats()` returns a `Stats` snapshot with counters and metadata:
+
+| Field                 | Type       | Description                           |
+| --------------------- | ---------- | ------------------------------------- |
+| `total_keys`          | `u64`      | Total number of live keys             |
+| `data_size_bytes`     | `u64`      | Approximate on-disk data size         |
+| `namespace_count`     | `u64`      | Number of namespaces                  |
+| `level_count`         | `usize`    | Number of LSM levels (from config)    |
+| `sstable_count`       | `u64`      | Total SSTable files across all levels |
+| `write_buffer_bytes`  | `u64`      | Current write buffer usage            |
+| `pending_compactions` | `u64`      | Pending compaction tasks              |
+| `op_puts`             | `u64`      | Cumulative put operations             |
+| `op_gets`             | `u64`      | Cumulative get operations             |
+| `op_deletes`          | `u64`      | Cumulative delete operations          |
+| `cache_hits`          | `u64`      | Block cache hits                      |
+| `cache_misses`        | `u64`      | Block cache misses                    |
+| `uptime`              | `Duration` | Time since `DB::open`                 |
+
+`stats()` returns `Stats` directly (not `Result<Stats>`) — it cannot fail. In the stub phase most
+counters are zero; `level_count` reflects the configured `max_levels` and `uptime` is computed live.
+
 ### LSM-Tree Storage
 
 Data is organized in levels (L1-L3). Fresh writes land in an in-memory buffer and are periodically flushed to sorted
