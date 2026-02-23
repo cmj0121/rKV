@@ -11,6 +11,9 @@ pub enum Error {
     #[error("invalid key: {0}")]
     InvalidKey(String),
 
+    #[error("invalid namespace: {0}")]
+    InvalidNamespace(String),
+
     #[error("not implemented: {0}")]
     NotImplemented(String),
 }

@@ -3,7 +3,7 @@ use std::os::raw::c_char;
 use std::ptr;
 use std::sync::Mutex;
 
-use rkv::{Config, Key, DB};
+use rkv::{Config, Key, DB, DEFAULT_NAMESPACE};
 
 /// Opaque handle returned to C callers.
 pub struct RkvDb {
@@ -62,7 +62,8 @@ pub unsafe extern "C" fn rkv_close(db: *mut RkvDb) {
     }
 }
 
-/// Store a key-value pair. Returns the revision ID (u128) on success, 0 on failure.
+/// Store a key-value pair in the default namespace.
+/// Returns the revision ID (u128) on success, 0 on failure.
 ///
 /// # Safety
 /// `db` must be a valid pointer. `key` and `value` must be valid pointers with the given lengths.
@@ -79,6 +80,13 @@ pub unsafe extern "C" fn rkv_put(
         return 0;
     }
     let db = unsafe { &*db };
+    let ns = match db.inner.namespace(DEFAULT_NAMESPACE) {
+        Ok(ns) => ns,
+        Err(e) => {
+            set_last_error(e.to_string());
+            return 0;
+        }
+    };
     let key_bytes = unsafe { std::slice::from_raw_parts(key, key_len) };
     let key = match Key::from_bytes(key_bytes) {
         Ok(k) => k,
@@ -88,7 +96,7 @@ pub unsafe extern "C" fn rkv_put(
         }
     };
     let value = unsafe { std::slice::from_raw_parts(value, value_len) };
-    match db.inner.put(key, value) {
+    match ns.put(key, value) {
         Ok(rev) => rev,
         Err(e) => {
             set_last_error(e.to_string());
@@ -97,7 +105,8 @@ pub unsafe extern "C" fn rkv_put(
     }
 }
 
-/// Retrieve a value by key. On success, writes the value pointer to `out` and length to `out_len`.
+/// Retrieve a value by key from the default namespace.
+/// On success, writes the value pointer to `out` and length to `out_len`.
 /// The caller must free the returned buffer with `rkv_free`. Returns 0 on success, -1 on failure.
 ///
 /// # Safety
@@ -116,6 +125,13 @@ pub unsafe extern "C" fn rkv_get(
         return -1;
     }
     let db = unsafe { &*db };
+    let ns = match db.inner.namespace(DEFAULT_NAMESPACE) {
+        Ok(ns) => ns,
+        Err(e) => {
+            set_last_error(e.to_string());
+            return -1;
+        }
+    };
     let key_bytes = unsafe { std::slice::from_raw_parts(key, key_len) };
     let key = match Key::from_bytes(key_bytes) {
         Ok(k) => k,
@@ -124,7 +140,7 @@ pub unsafe extern "C" fn rkv_get(
             return -1;
         }
     };
-    match db.inner.get(key) {
+    match ns.get(key) {
         Ok(val) => match val.into_bytes() {
             Some(bytes) => {
                 let mut boxed = bytes.into_boxed_slice();
@@ -151,7 +167,7 @@ pub unsafe extern "C" fn rkv_get(
     }
 }
 
-/// Delete a key. Returns 0 on success, -1 on failure.
+/// Delete a key from the default namespace. Returns 0 on success, -1 on failure.
 ///
 /// # Safety
 /// `db` must be a valid pointer. `key` must be valid with the given length.
@@ -162,6 +178,13 @@ pub unsafe extern "C" fn rkv_delete(db: *mut RkvDb, key: *const u8, key_len: usi
         return -1;
     }
     let db = unsafe { &*db };
+    let ns = match db.inner.namespace(DEFAULT_NAMESPACE) {
+        Ok(ns) => ns,
+        Err(e) => {
+            set_last_error(e.to_string());
+            return -1;
+        }
+    };
     let key_bytes = unsafe { std::slice::from_raw_parts(key, key_len) };
     let key = match Key::from_bytes(key_bytes) {
         Ok(k) => k,
@@ -170,7 +193,7 @@ pub unsafe extern "C" fn rkv_delete(db: *mut RkvDb, key: *const u8, key_len: usi
             return -1;
         }
     };
-    match db.inner.delete(key) {
+    match ns.delete(key) {
         Ok(()) => 0,
         Err(e) => {
             set_last_error(e.to_string());

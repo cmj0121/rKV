@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use rkv::{Config, Key, DB};
+use rkv::{Config, Key, Namespace, DB, DEFAULT_NAMESPACE};
 use rustyline::DefaultEditor;
 
 #[derive(Parser)]
@@ -10,6 +10,10 @@ struct Args {
     /// Database directory path
     path: Option<String>,
 
+    /// Initial namespace to use
+    #[arg(short, long, default_value = DEFAULT_NAMESPACE)]
+    namespace: String,
+
     /// Create the database if it does not exist
     #[arg(short, long, default_value_t = true)]
     create: bool,
@@ -17,6 +21,7 @@ struct Args {
 
 enum Action {
     Continue,
+    Switch(String),
     Exit,
 }
 
@@ -31,19 +36,44 @@ fn parse_key(token: &str) -> Key {
     }
 }
 
-fn execute(db: &DB, line: &str) -> Action {
+fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     if tokens.is_empty() {
         return Action::Continue;
     }
 
     match tokens[0] {
+        "use" => {
+            if tokens.len() < 2 {
+                eprintln!("usage: use <namespace>");
+                return Action::Continue;
+            }
+            return Action::Switch(tokens[1].to_owned());
+        }
+        "namespaces" | "ns" => match db.list_namespaces() {
+            Ok(names) => {
+                for name in &names {
+                    println!("{name}");
+                }
+            }
+            Err(e) => eprintln!("error: {e}"),
+        },
+        "drop" => {
+            if tokens.len() < 2 {
+                eprintln!("usage: drop <namespace>");
+                return Action::Continue;
+            }
+            match db.drop_namespace(tokens[1]) {
+                Ok(()) => println!("OK"),
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
         "put" => {
             if tokens.len() < 3 {
                 eprintln!("usage: put <key> <value>");
                 return Action::Continue;
             }
-            match db.put(parse_key(tokens[1]), tokens[2].as_bytes()) {
+            match ns.put(parse_key(tokens[1]), tokens[2].as_bytes()) {
                 Ok(rev) => println!("{rev:032x}"),
                 Err(e) => eprintln!("error: {e}"),
             }
@@ -53,7 +83,7 @@ fn execute(db: &DB, line: &str) -> Action {
                 eprintln!("usage: get <key>");
                 return Action::Continue;
             }
-            match db.get(parse_key(tokens[1])) {
+            match ns.get(parse_key(tokens[1])) {
                 Ok(val) => println!("{val}"),
                 Err(e) => eprintln!("error: {e}"),
             }
@@ -63,7 +93,7 @@ fn execute(db: &DB, line: &str) -> Action {
                 eprintln!("usage: delete <key>");
                 return Action::Continue;
             }
-            match db.delete(parse_key(tokens[1])) {
+            match ns.delete(parse_key(tokens[1])) {
                 Ok(()) => println!("OK"),
                 Err(e) => eprintln!("error: {e}"),
             }
@@ -73,7 +103,7 @@ fn execute(db: &DB, line: &str) -> Action {
                 eprintln!("usage: exists <key>");
                 return Action::Continue;
             }
-            match db.exists(parse_key(tokens[1])) {
+            match ns.exists(parse_key(tokens[1])) {
                 Ok(true) => println!("true"),
                 Ok(false) => println!("false"),
                 Err(e) => eprintln!("error: {e}"),
@@ -82,7 +112,7 @@ fn execute(db: &DB, line: &str) -> Action {
         "scan" => {
             let prefix = parse_key(tokens.get(1).unwrap_or(&""));
             let limit: usize = tokens.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
-            match db.scan(&prefix, limit) {
+            match ns.scan(&prefix, limit) {
                 Ok(keys) => {
                     for k in &keys {
                         println!("{k}");
@@ -94,7 +124,7 @@ fn execute(db: &DB, line: &str) -> Action {
         "rscan" => {
             let prefix = parse_key(tokens.get(1).unwrap_or(&""));
             let limit: usize = tokens.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
-            match db.rscan(&prefix, limit) {
+            match ns.rscan(&prefix, limit) {
                 Ok(keys) => {
                     for k in &keys {
                         println!("{k}");
@@ -103,12 +133,12 @@ fn execute(db: &DB, line: &str) -> Action {
                 Err(e) => eprintln!("error: {e}"),
             }
         }
-        "count" => match db.count() {
+        "count" => match ns.count() {
             Ok(n) => println!("{n}"),
             Err(e) => eprintln!("error: {e}"),
         },
         "help" | "?" => {
-            println!("Commands:");
+            println!("Data operations:");
             println!("  put <key> <value>    Store a key-value pair");
             println!("  get <key>            Retrieve a value by key");
             println!("  delete <key>         Remove a key (alias: del)");
@@ -116,6 +146,13 @@ fn execute(db: &DB, line: &str) -> Action {
             println!("  scan [prefix] [n]    Forward scan keys");
             println!("  rscan [prefix] [n]   Reverse scan keys");
             println!("  count                Count all keys");
+            println!();
+            println!("Namespace:");
+            println!("  use <namespace>      Switch to a namespace (create if needed)");
+            println!("  namespaces           List all namespaces (alias: ns)");
+            println!("  drop <namespace>     Drop a namespace and all its data");
+            println!();
+            println!("Misc:");
             println!("  help                 Show this message (alias: ?)");
             println!("  exit                 Quit the REPL (alias: quit)");
         }
@@ -130,7 +167,15 @@ fn history_path() -> Option<PathBuf> {
     dirs_sys::home_dir().map(|h| h.join(".rkv_history"))
 }
 
-fn run_repl(db: &DB) {
+fn prompt(ns_name: &str) -> String {
+    if ns_name == DEFAULT_NAMESPACE {
+        "rkv> ".to_owned()
+    } else {
+        format!("rkv [{ns_name}]> ")
+    }
+}
+
+fn run_repl(db: &DB, initial_ns: &str) {
     let mut rl = match DefaultEditor::new() {
         Ok(rl) => rl,
         Err(e) => {
@@ -143,16 +188,28 @@ fn run_repl(db: &DB) {
         let _ = rl.load_history(&path);
     }
 
+    let mut ns_name = initial_ns.to_owned();
+
     loop {
-        match rl.readline("rkv> ") {
+        let ns = match db.namespace(&ns_name) {
+            Ok(ns) => ns,
+            Err(e) => {
+                eprintln!("error switching namespace: {e}");
+                ns_name = DEFAULT_NAMESPACE.to_owned();
+                continue;
+            }
+        };
+
+        match rl.readline(&prompt(ns.name())) {
             Ok(line) => {
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
                 }
                 let _ = rl.add_history_entry(line);
-                match execute(db, line) {
+                match execute(db, &ns, line) {
                     Action::Continue => {}
+                    Action::Switch(name) => ns_name = name,
                     Action::Exit => break,
                 }
             }
@@ -171,6 +228,8 @@ fn run_repl(db: &DB) {
     if let Some(path) = history_path() {
         let _ = rl.save_history(&path);
     }
+
+    println!("~ Bye ~");
 }
 
 fn main() {
@@ -195,7 +254,7 @@ fn main() {
         }
     };
 
-    run_repl(&db);
+    run_repl(&db, &args.namespace);
 
     if let Err(e) = db.close() {
         eprintln!("error closing database: {e}");
