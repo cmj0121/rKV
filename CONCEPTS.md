@@ -97,6 +97,16 @@ History queries use revision indexing: `rev_count(key)` returns the total number
 `rev_get(key, index)` retrieves the value at a specific revision index (0 = oldest). CAS operations use RevisionIDs for
 optimistic concurrency control.
 
+### TTL (Time-to-Live)
+
+A key can be stored with an optional TTL via `put_with_ttl(key, value, ttl)`. After the duration elapses the key is
+considered expired and behaves as if it were deleted — `get` returns "key not found", `exists` returns `false`. The
+`ttl(key)` method returns the remaining duration, or `None` if the key has no expiration. A regular `put` (without TTL)
+stores the key permanently.
+
+TTL is specified as a `std::time::Duration` in the library API. The CLI accepts human-friendly suffixes:
+`10s` (seconds), `5m` (minutes), `2h` (hours), `1d` (days). Plain numbers are treated as seconds.
+
 ### LSM-Tree Storage
 
 Data is organized in levels (L1-L3). Fresh writes land in an in-memory buffer and are periodically flushed to sorted
