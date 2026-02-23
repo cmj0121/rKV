@@ -24,3 +24,22 @@ pub struct RecoveryReport {
     /// Human-readable warnings generated during repair.
     pub warnings: Vec<String>,
 }
+
+impl RecoveryReport {
+    /// Returns `true` if no corruption was detected.
+    pub fn is_clean(&self) -> bool {
+        self.wal_records_skipped == 0
+            && self.sstable_blocks_corrupted == 0
+            && self.objects_corrupted == 0
+    }
+
+    /// Total number of corrupted entries across all sources.
+    pub fn total_corrupted(&self) -> u64 {
+        self.wal_records_skipped + self.sstable_blocks_corrupted + self.objects_corrupted
+    }
+
+    /// Returns `true` if any keys were permanently lost.
+    pub fn has_data_loss(&self) -> bool {
+        self.keys_lost > 0
+    }
+}
