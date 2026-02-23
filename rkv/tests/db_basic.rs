@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use rkv::{Config, Error, DB, DEFAULT_NAMESPACE};
+use rkv::{Config, Error, Stats, DB, DEFAULT_NAMESPACE};
 
 #[test]
 fn open_creates_directory() {
@@ -152,4 +152,88 @@ fn ttl_returns_not_implemented() {
 
     let err = ns.ttl("key").unwrap_err();
     assert!(matches!(err, Error::NotImplemented(_)));
+}
+
+// --- Stats & Config tests ---
+
+#[test]
+fn stats_returns_default_counters() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let s = db.stats();
+
+    assert_eq!(s.total_keys, 0);
+    assert_eq!(s.data_size_bytes, 0);
+    assert_eq!(s.namespace_count, 0);
+    assert_eq!(s.sstable_count, 0);
+    assert_eq!(s.op_puts, 0);
+    assert_eq!(s.op_gets, 0);
+    assert_eq!(s.op_deletes, 0);
+    assert_eq!(s.cache_hits, 0);
+    assert_eq!(s.cache_misses, 0);
+}
+
+#[test]
+fn stats_level_count_matches_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.max_levels = 5;
+    let db = DB::open(config).unwrap();
+
+    assert_eq!(db.stats().level_count, 5);
+}
+
+#[test]
+fn stats_uptime_is_nonzero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    std::thread::sleep(Duration::from_millis(10));
+    assert!(db.stats().uptime >= Duration::from_millis(10));
+}
+
+#[test]
+fn stats_default_trait() {
+    let s = Stats::default();
+    assert_eq!(s.level_count, 0);
+    assert_eq!(s.uptime, Duration::ZERO);
+}
+
+#[test]
+fn config_returns_reference() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let c = db.config();
+    assert_eq!(c.path, tmp.path());
+    assert!(c.create_if_missing);
+}
+
+#[test]
+fn config_defaults() {
+    let config = Config::new("/tmp/test");
+    assert_eq!(config.write_buffer_size, 4 * 1024 * 1024);
+    assert_eq!(config.max_levels, 3);
+    assert_eq!(config.block_size, 4 * 1024);
+    assert_eq!(config.cache_size, 8 * 1024 * 1024);
+}
+
+#[test]
+fn config_custom_overrides() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.write_buffer_size = 1024;
+    config.max_levels = 7;
+    config.block_size = 512;
+    config.cache_size = 2048;
+    let db = DB::open(config).unwrap();
+
+    let c = db.config();
+    assert_eq!(c.write_buffer_size, 1024);
+    assert_eq!(c.max_levels, 7);
+    assert_eq!(c.block_size, 512);
+    assert_eq!(c.cache_size, 2048);
 }
