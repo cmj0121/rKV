@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use rkv::{Config, Error, Stats, DB, DEFAULT_NAMESPACE};
@@ -236,4 +237,67 @@ fn config_custom_overrides() {
     assert_eq!(c.max_levels, 7);
     assert_eq!(c.block_size, 512);
     assert_eq!(c.cache_size, 2048);
+}
+
+// --- Maintenance operation stubs ---
+
+#[test]
+fn flush_returns_not_implemented() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let err = db.flush().unwrap_err();
+    assert!(matches!(err, Error::NotImplemented(_)));
+}
+
+#[test]
+fn sync_returns_not_implemented() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let err = db.sync().unwrap_err();
+    assert!(matches!(err, Error::NotImplemented(_)));
+}
+
+#[test]
+fn destroy_returns_not_implemented() {
+    let err = DB::destroy(PathBuf::from("/tmp/rkv_test_destroy")).unwrap_err();
+    assert!(matches!(err, Error::NotImplemented(_)));
+}
+
+#[test]
+fn repair_returns_not_implemented() {
+    let err = DB::repair(PathBuf::from("/tmp/rkv_test_repair")).unwrap_err();
+    assert!(matches!(err, Error::NotImplemented(_)));
+}
+
+#[test]
+fn dump_returns_not_implemented() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let err = db.dump("/tmp/rkv_test_dump.bak").unwrap_err();
+    assert!(matches!(err, Error::NotImplemented(_)));
+}
+
+#[test]
+fn load_returns_not_implemented() {
+    let result = DB::load(PathBuf::from("/tmp/rkv_test_load.bak"));
+    let Err(err) = result else {
+        panic!("expected NotImplemented error");
+    };
+    assert!(matches!(err, Error::NotImplemented(_)));
+}
+
+#[test]
+fn compact_returns_not_implemented() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let err = db.compact().unwrap_err();
+    assert!(matches!(err, Error::NotImplemented(_)));
 }

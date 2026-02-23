@@ -146,6 +146,55 @@ passing the config to `DB::open`.
 `stats()` returns `Stats` directly (not `Result<Stats>`) — it cannot fail. In the stub phase most
 counters are zero; `level_count` reflects the configured `max_levels` and `uptime` is computed live.
 
+### Maintenance Operations
+
+Maintenance operations handle durability, recovery, backup, and storage optimization. All
+maintenance methods return `Result` and are stubs (`NotImplemented`) during the scaffold phase.
+
+#### Flush / Sync
+
+| Method  | Kind     | Signature             | Description                                 |
+| ------- | -------- | --------------------- | ------------------------------------------- |
+| `flush` | instance | `&self -> Result<()>` | Flush the in-memory write buffer to disk    |
+| `sync`  | instance | `&self -> Result<()>` | Flush and fsync all data to durable storage |
+
+`flush` writes the current write buffer to an L1 SSTable but does not guarantee durability —
+data may remain in OS page cache. `sync` calls `flush` followed by `fsync`, ensuring all data
+reaches durable storage.
+
+#### Destroy / Repair
+
+| Method    | Kind   | Signature                                  | Description                            |
+| --------- | ------ | ------------------------------------------ | -------------------------------------- |
+| `destroy` | static | `(path: impl Into<PathBuf>) -> Result<()>` | Delete a database and all its data     |
+| `repair`  | static | `(path: impl Into<PathBuf>) -> Result<()>` | Attempt to repair a corrupted database |
+
+Both are static methods — they operate on a path, not a live `DB` handle. `destroy` removes the
+entire database directory. `repair` scans for structural corruption and rebuilds indices where
+possible.
+
+#### Dump / Load
+
+| Method | Kind     | Signature                                       | Description                               |
+| ------ | -------- | ----------------------------------------------- | ----------------------------------------- |
+| `dump` | instance | `&self, path: impl Into<PathBuf> -> Result<()>` | Export database to a portable backup file |
+| `load` | static   | `(path: impl Into<PathBuf>) -> Result<DB>`      | Import database from a backup file        |
+
+`dump` serializes the entire database (all namespaces, keys, values, and metadata) into a
+self-contained backup file. `load` is static and returns a new `DB` — the backup file encodes
+its own configuration, so no separate `Config` is needed.
+
+`load` is not exposed in the CLI because it would require replacing the live DB handle mid-session.
+
+#### Compaction
+
+| Method    | Kind     | Signature             | Description                                 |
+| --------- | -------- | --------------------- | ------------------------------------------- |
+| `compact` | instance | `&self -> Result<()>` | Trigger manual compaction of SSTable levels |
+
+Background compaction runs automatically, but `compact` allows manual triggering — useful after
+bulk deletes or to reclaim disk space from resolved tombstones.
+
 ### LSM-Tree Storage
 
 Data is organized in levels (L1-L3). Fresh writes land in an in-memory buffer and are periodically flushed to sorted

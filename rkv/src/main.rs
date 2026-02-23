@@ -250,6 +250,48 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("block_size:        {}", c.block_size);
             println!("cache_size:        {}", c.cache_size);
         }
+        "flush" => match db.flush() {
+            Ok(()) => println!("OK"),
+            Err(e) => eprintln!("error: {e}"),
+        },
+        "sync" => match db.sync() {
+            Ok(()) => println!("OK"),
+            Err(e) => eprintln!("error: {e}"),
+        },
+        "compact" => match db.compact() {
+            Ok(()) => println!("OK"),
+            Err(e) => eprintln!("error: {e}"),
+        },
+        "destroy" => {
+            if tokens.len() < 2 {
+                eprintln!("usage: destroy <path>");
+                return Action::Continue;
+            }
+            match DB::destroy(tokens[1]) {
+                Ok(()) => println!("OK"),
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
+        "repair" => {
+            if tokens.len() < 2 {
+                eprintln!("usage: repair <path>");
+                return Action::Continue;
+            }
+            match DB::repair(tokens[1]) {
+                Ok(()) => println!("OK"),
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
+        "dump" => {
+            if tokens.len() < 2 {
+                eprintln!("usage: dump <path>");
+                return Action::Continue;
+            }
+            match db.dump(tokens[1]) {
+                Ok(()) => println!("OK"),
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
         "help" | "?" => {
             println!("Data operations:");
             println!("  put <key> <value> [ttl]  Store a key-value pair (ttl: 10s, 5m, 2h, 1d)");
@@ -271,6 +313,12 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("Admin:");
             println!("  stats                Print database statistics");
             println!("  config               Print current configuration");
+            println!("  flush                Flush write buffer to disk");
+            println!("  sync                 Flush and fsync to durable storage");
+            println!("  compact              Trigger manual compaction");
+            println!("  destroy <path>       Destroy a database (all data deleted)");
+            println!("  repair <path>        Attempt to repair a corrupted database");
+            println!("  dump <path>          Export database to a backup file");
             println!();
             println!("Misc:");
             println!("  clear                Clear the screen");
