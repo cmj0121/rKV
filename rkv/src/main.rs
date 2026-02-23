@@ -244,16 +244,43 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
         "config" => {
             // config print is handled here; config set is handled in run_repl
             let c = db.config();
-            println!("path:              {}", c.path.display());
-            println!("create_if_missing: {}", c.create_if_missing);
-            println!("write_buffer_size: {}", c.write_buffer_size);
-            println!("max_levels:        {}", c.max_levels);
-            println!("block_size:        {}", c.block_size);
-            println!("cache_size:        {}", c.cache_size);
-            println!("object_size:       {}", c.object_size);
-            println!("compress:          {}", c.compress);
-            println!("verify_checksums:  {}", c.verify_checksums);
-            println!("bloom_bits_per_key:{}", c.bloom_bits_per_key);
+            println!(
+                "path:              {}  # database directory",
+                c.path.display()
+            );
+            println!(
+                "create_if_missing: {}  # create dir if absent",
+                c.create_if_missing
+            );
+            println!(
+                "write_buffer_size: {}  # memtable size (bytes)",
+                c.write_buffer_size
+            );
+            println!("max_levels:        {}  # LSM levels", c.max_levels);
+            println!(
+                "block_size:        {}  # SSTable block size (bytes)",
+                c.block_size
+            );
+            println!(
+                "cache_size:        {}  # block cache size (bytes)",
+                c.cache_size
+            );
+            println!(
+                "object_size:       {}  # value separation threshold (bytes)",
+                c.object_size
+            );
+            println!(
+                "compress:          {}  # LZ4-compress bin objects",
+                c.compress
+            );
+            println!(
+                "verify_checksums:  {}  # verify on read",
+                c.verify_checksums
+            );
+            println!(
+                "bloom_bits:        {}  # bits per key (0 = disabled)",
+                c.bloom_bits
+            );
         }
         "flush" => match db.flush() {
             Ok(()) => println!("OK"),
@@ -430,9 +457,9 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
             }
             Err(_) => eprintln!("error: expected true or false"),
         },
-        "bloom_bits_per_key" => match value.parse::<usize>() {
+        "bloom_bits" => match value.parse::<usize>() {
             Ok(v) => {
-                c.bloom_bits_per_key = v;
+                c.bloom_bits = v;
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected a number"),

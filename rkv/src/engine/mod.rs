@@ -43,7 +43,7 @@ pub struct Config {
     pub compress: bool,
     /// Bloom filter bits per key (default: 10, ~1% false-positive rate).
     /// Set to 0 to disable bloom filters.
-    pub bloom_bits_per_key: usize,
+    pub bloom_bits: usize,
     /// Verify checksums on read (default: true).
     /// When enabled, every WAL entry and SSTable block is verified against
     /// its stored checksum during reads. Disabling trades safety for speed.
@@ -61,7 +61,7 @@ impl Config {
             cache_size: 8 * 1024 * 1024,
             object_size: 1024,
             compress: true,
-            bloom_bits_per_key: 10,
+            bloom_bits: 10,
             verify_checksums: true,
         }
     }

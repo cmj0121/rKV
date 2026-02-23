@@ -222,6 +222,7 @@ The `Config` struct controls database behavior and LSM tuning parameters:
 | `cache_size`        | `usize`   | 8 MB       | Block cache size for decompressed blocks  |
 | `object_size`       | `usize`   | 1 KB       | Bin object size threshold (see above)     |
 | `compress`          | `bool`    | `true`     | LZ4-compress bin objects on disk          |
+| `bloom_bits`        | `usize`   | 10         | Bloom filter bits per key (0 = disabled)  |
 | `verify_checksums`  | `bool`    | `true`     | Verify checksums on read (see below)      |
 
 `Config::new(path)` initializes all fields to their defaults. Fields can be overridden before
