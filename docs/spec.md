@@ -76,6 +76,10 @@ rKV/
         error.rs                # Error enum, Result type alias
     tests/
       db_basic.rs               # integration tests
+  rkv-ffi/
+    Cargo.toml                  # cdylib crate, lib name "rkv" → librkv.dylib / librkv.so
+    src/
+      lib.rs                    # C FFI functions wrapping the engine API
 ```
 
 ### Public API Surface (`lib.rs`)
@@ -137,6 +141,22 @@ All methods take `&self`. Stub methods return `Err(Error::NotImplemented(...))`.
 - `execute(db, line) -> Action` — private function, dispatches on first token.
 - `run_repl(db)` — REPL loop using `rustyline`.
 - `main()` — parses args, opens DB, runs REPL.
+
+### FFI Crate (`rkv-ffi/src/lib.rs`)
+
+The `rkv-ffi` crate produces a C dynamic library (`cdylib`) named `rkv`. It wraps the engine API with C-callable
+functions using opaque `RkvDb` handles:
+
+- `rkv_open(path) -> *mut RkvDb` — open a database, returns null on failure.
+- `rkv_close(db)` — close and free a database handle.
+- `rkv_put(db, key, key_len, value, value_len) -> u128` — store a pair, returns revision ID (0 on failure).
+- `rkv_get(db, key, key_len, out, out_len) -> i32` — retrieve a value (0 = success, -1 = failure).
+- `rkv_delete(db, key, key_len) -> i32` — delete a key (0 = success, -1 = failure).
+- `rkv_free(ptr, len)` — free a buffer returned by `rkv_get`.
+- `rkv_last_error(buf, buf_len) -> i32` — copy last error message into buffer.
+
+All engine methods currently return stub errors. The FFI layer itself is functional (open/close work, error reporting
+works), but data operations propagate `NotImplemented` errors through `rkv_last_error`.
 
 ### Dependencies
 
