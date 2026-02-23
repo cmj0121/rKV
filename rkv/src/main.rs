@@ -253,6 +253,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("object_size:       {}", c.object_size);
             println!("compress:          {}", c.compress);
             println!("verify_checksums:  {}", c.verify_checksums);
+            println!("bloom_bits_per_key:{}", c.bloom_bits_per_key);
         }
         "flush" => match db.flush() {
             Ok(()) => println!("OK"),
@@ -428,6 +429,13 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected true or false"),
+        },
+        "bloom_bits_per_key" => match value.parse::<usize>() {
+            Ok(v) => {
+                c.bloom_bits_per_key = v;
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected a number"),
         },
         "path" => eprintln!("error: path cannot be changed at runtime"),
         _ => eprintln!("error: unknown config key '{key}'"),
