@@ -6,12 +6,16 @@ all: $(SUBDIR) 		# default action
 
 clean: $(SUBDIR)	# clean-up environment
 	@find . -name '*.sw[po]' -delete
+	cargo clean
 
 test:				# run all tests (all features)
+	cargo test --workspace
 
 run:				# run in the local environment
+	cargo run -p rkv
 
 build:				# build the binary/library (all features)
+	cargo build --workspace --release
 
 bench:				# run benchmarks and update BENCH.md
 
