@@ -15,19 +15,21 @@ pub struct Namespace<'db> {
     #[allow(dead_code)]
     db: &'db DB,
     name: String,
+    encrypted: bool,
 }
 
 impl fmt::Debug for Namespace<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Namespace")
             .field("name", &self.name)
+            .field("encrypted", &self.encrypted)
             .finish()
     }
 }
 
 impl<'db> Namespace<'db> {
     /// Open (or create) a namespace within the given database.
-    pub(crate) fn open(db: &'db DB, name: &str) -> Result<Self> {
+    pub(crate) fn open(db: &'db DB, name: &str, password: Option<&str>) -> Result<Self> {
         if name.is_empty() {
             return Err(Error::InvalidNamespace(
                 "namespace name must not be empty".into(),
@@ -36,12 +38,18 @@ impl<'db> Namespace<'db> {
         Ok(Self {
             db,
             name: name.to_owned(),
+            encrypted: password.is_some(),
         })
     }
 
     /// Returns the namespace name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Returns whether this namespace was opened with encryption.
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypted
     }
 
     pub fn put(&self, _key: impl Into<Key>, _value: impl Into<Value>) -> Result<RevisionID> {
