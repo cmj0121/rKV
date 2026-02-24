@@ -76,31 +76,39 @@ mod tests {
 
     #[test]
     fn is_clean_with_wal_corruption() {
-        let mut report = RecoveryReport::default();
-        report.wal_records_skipped = 1;
+        let report = RecoveryReport {
+            wal_records_skipped: 1,
+            ..Default::default()
+        };
         assert!(!report.is_clean());
     }
 
     #[test]
     fn is_clean_with_sstable_corruption() {
-        let mut report = RecoveryReport::default();
-        report.sstable_blocks_corrupted = 1;
+        let report = RecoveryReport {
+            sstable_blocks_corrupted: 1,
+            ..Default::default()
+        };
         assert!(!report.is_clean());
     }
 
     #[test]
     fn is_clean_with_object_corruption() {
-        let mut report = RecoveryReport::default();
-        report.objects_corrupted = 1;
+        let report = RecoveryReport {
+            objects_corrupted: 1,
+            ..Default::default()
+        };
         assert!(!report.is_clean());
     }
 
     #[test]
     fn is_clean_ignores_scanned_counters() {
-        let mut report = RecoveryReport::default();
-        report.wal_records_scanned = 100;
-        report.sstable_blocks_scanned = 200;
-        report.objects_scanned = 50;
+        let report = RecoveryReport {
+            wal_records_scanned: 100,
+            sstable_blocks_scanned: 200,
+            objects_scanned: 50,
+            ..Default::default()
+        };
         assert!(report.is_clean());
     }
 
@@ -108,18 +116,22 @@ mod tests {
 
     #[test]
     fn total_corrupted_sums_all_corruption() {
-        let mut report = RecoveryReport::default();
-        report.wal_records_skipped = 3;
-        report.sstable_blocks_corrupted = 5;
-        report.objects_corrupted = 2;
+        let report = RecoveryReport {
+            wal_records_skipped: 3,
+            sstable_blocks_corrupted: 5,
+            objects_corrupted: 2,
+            ..Default::default()
+        };
         assert_eq!(report.total_corrupted(), 10);
     }
 
     #[test]
     fn total_corrupted_excludes_recovery_counts() {
-        let mut report = RecoveryReport::default();
-        report.keys_recovered = 100;
-        report.keys_lost = 50;
+        let report = RecoveryReport {
+            keys_recovered: 100,
+            keys_lost: 50,
+            ..Default::default()
+        };
         assert_eq!(report.total_corrupted(), 0);
     }
 
@@ -133,15 +145,19 @@ mod tests {
 
     #[test]
     fn has_data_loss_true_when_keys_lost() {
-        let mut report = RecoveryReport::default();
-        report.keys_lost = 1;
+        let report = RecoveryReport {
+            keys_lost: 1,
+            ..Default::default()
+        };
         assert!(report.has_data_loss());
     }
 
     #[test]
     fn has_data_loss_independent_of_recovered() {
-        let mut report = RecoveryReport::default();
-        report.keys_recovered = 100;
+        let report = RecoveryReport {
+            keys_recovered: 100,
+            ..Default::default()
+        };
         assert!(!report.has_data_loss());
     }
 
@@ -149,8 +165,10 @@ mod tests {
 
     #[test]
     fn warnings_can_be_added() {
-        let mut report = RecoveryReport::default();
-        report.warnings.push("truncated WAL tail".into());
+        let report = RecoveryReport {
+            warnings: vec!["truncated WAL tail".into()],
+            ..Default::default()
+        };
         assert_eq!(report.warnings.len(), 1);
         assert!(report.is_clean()); // warnings don't affect clean status
     }
@@ -159,10 +177,12 @@ mod tests {
 
     #[test]
     fn clone_preserves_state() {
-        let mut report = RecoveryReport::default();
-        report.wal_records_scanned = 42;
-        report.keys_lost = 3;
-        report.warnings.push("test".into());
+        let report = RecoveryReport {
+            wal_records_scanned: 42,
+            keys_lost: 3,
+            warnings: vec!["test".into()],
+            ..Default::default()
+        };
 
         let cloned = report.clone();
         assert_eq!(cloned.wal_records_scanned, 42);

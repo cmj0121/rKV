@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn byte_sort_matches_key_ord() {
-        let keys = vec![
+        let keys = [
             Key::Int(i64::MIN),
             Key::Int(-1),
             Key::Int(0),
