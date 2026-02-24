@@ -17,6 +17,12 @@ pub enum Error {
     #[error("corruption: {0}")]
     Corruption(String),
 
+    #[error("encryption required: {0}")]
+    EncryptionRequired(String),
+
+    #[error("namespace is not encrypted: {0}")]
+    NotEncrypted(String),
+
     #[error("not implemented: {0}")]
     NotImplemented(String),
 }

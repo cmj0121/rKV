@@ -22,7 +22,7 @@ struct Args {
 
 enum Action {
     Continue,
-    Switch(String),
+    Switch(String, Option<String>),
     Exit,
 }
 
@@ -104,10 +104,27 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
     match tokens[0] {
         "use" => {
             if tokens.len() < 2 {
-                eprintln!("usage: use <namespace>");
+                eprintln!("usage: use <namespace> [+]");
                 return Action::Continue;
             }
-            return Action::Switch(tokens[1].to_owned());
+            let name = tokens[1].to_owned();
+            let password = if tokens.get(2) == Some(&"+") {
+                eprint!("Password: ");
+                match rpassword::read_password() {
+                    Ok(pw) if pw.is_empty() => {
+                        eprintln!("error: password must not be empty");
+                        return Action::Continue;
+                    }
+                    Ok(pw) => Some(pw),
+                    Err(e) => {
+                        eprintln!("error: failed to read password: {e}");
+                        return Action::Continue;
+                    }
+                }
+            } else {
+                None
+            };
+            return Action::Switch(name, password);
         }
         "namespaces" => match db.list_namespaces() {
             Ok(names) => {
@@ -408,7 +425,9 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("  rev <key> <index>        Show value at revision index (0 = oldest)");
             println!();
             println!("Namespace:");
-            println!("  use <namespace>      Switch to a namespace (create if needed)");
+            println!(
+                "  use <namespace> [+]  Switch to namespace (+ = encrypted, prompts for password)"
+            );
             println!("  namespaces           List all namespaces");
             println!("  drop <namespace>     Drop a namespace and all its data");
             println!();
@@ -514,9 +533,11 @@ fn history_path() -> Option<PathBuf> {
     dirs_sys::home_dir().map(|h| h.join(".rkv_history"))
 }
 
-fn prompt(ns_name: &str) -> String {
+fn prompt(ns_name: &str, encrypted: bool) -> String {
     if ns_name == DEFAULT_NAMESPACE {
         "rkv> ".to_owned()
+    } else if encrypted {
+        format!("rkv [{ns_name}+]> ")
     } else {
         format!("rkv [{ns_name}]> ")
     }
@@ -536,9 +557,11 @@ fn run_repl(db: &mut DB, initial_ns: &str) {
     }
 
     let mut ns_name = initial_ns.to_owned();
+    let mut ns_password: Option<String> = None;
+    let mut ns_encrypted = false;
 
     loop {
-        match rl.readline(&prompt(&ns_name)) {
+        match rl.readline(&prompt(&ns_name, ns_encrypted)) {
             Ok(line) => {
                 let line = line.trim();
                 if line.is_empty() {
@@ -553,17 +576,30 @@ fn run_repl(db: &mut DB, initial_ns: &str) {
                     continue;
                 }
 
-                let ns = match db.namespace(&ns_name) {
+                let ns = match db.namespace(&ns_name, ns_password.as_deref()) {
                     Ok(ns) => ns,
                     Err(e) => {
                         eprintln!("error switching namespace: {e}");
                         ns_name = DEFAULT_NAMESPACE.to_owned();
+                        ns_password = None;
+                        ns_encrypted = false;
                         continue;
                     }
                 };
                 match execute(db, &ns, line) {
                     Action::Continue => {}
-                    Action::Switch(name) => ns_name = name,
+                    Action::Switch(name, pw) => {
+                        // Validate the switch before committing state
+                        let encrypted = pw.is_some();
+                        match db.namespace(&name, pw.as_deref()) {
+                            Ok(_) => {
+                                ns_name = name;
+                                ns_password = pw;
+                                ns_encrypted = encrypted;
+                            }
+                            Err(e) => eprintln!("error: {e}"),
+                        }
+                    }
                     Action::Exit => break,
                 }
             }

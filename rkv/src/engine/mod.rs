@@ -16,8 +16,10 @@ pub use revision::RevisionID;
 pub use stats::Stats;
 pub use value::Value;
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Instant;
 
 /// Default namespace name.
@@ -70,6 +72,7 @@ impl Config {
 pub struct DB {
     config: Config,
     opened_at: Instant,
+    encrypted_namespaces: Mutex<HashMap<String, bool>>,
 }
 
 impl DB {
@@ -80,6 +83,7 @@ impl DB {
         Ok(Self {
             config,
             opened_at: Instant::now(),
+            encrypted_namespaces: Mutex::new(HashMap::new()),
         })
     }
 
@@ -108,8 +112,29 @@ impl DB {
     }
 
     /// Switch to a namespace, creating it if it does not exist.
-    pub fn namespace(&self, name: &str) -> Result<Namespace<'_>> {
-        Namespace::open(self, name)
+    ///
+    /// Pass `password: Some("...")` to open an encrypted namespace, or `None`
+    /// for a non-encrypted one. The encryption state is recorded on first
+    /// access and enforced on subsequent calls within the same session.
+    pub fn namespace(&self, name: &str, password: Option<&str>) -> Result<Namespace<'_>> {
+        let encrypted = password.is_some();
+        let mut map = self.encrypted_namespaces.lock().unwrap();
+        if let Some(&was_encrypted) = map.get(name) {
+            if was_encrypted && !encrypted {
+                return Err(Error::EncryptionRequired(format!(
+                    "namespace '{name}' requires a password"
+                )));
+            }
+            if !was_encrypted && encrypted {
+                return Err(Error::NotEncrypted(format!(
+                    "namespace '{name}' is not encrypted"
+                )));
+            }
+        } else {
+            map.insert(name.to_owned(), encrypted);
+        }
+        drop(map);
+        Namespace::open(self, name, password)
     }
 
     /// List all namespace names.

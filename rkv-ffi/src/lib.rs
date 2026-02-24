@@ -80,7 +80,7 @@ pub unsafe extern "C" fn rkv_put(
         return 0;
     }
     let db = unsafe { &*db };
-    let ns = match db.inner.namespace(DEFAULT_NAMESPACE) {
+    let ns = match db.inner.namespace(DEFAULT_NAMESPACE, None) {
         Ok(ns) => ns,
         Err(e) => {
             set_last_error(e.to_string());
@@ -125,7 +125,7 @@ pub unsafe extern "C" fn rkv_get(
         return -1;
     }
     let db = unsafe { &*db };
-    let ns = match db.inner.namespace(DEFAULT_NAMESPACE) {
+    let ns = match db.inner.namespace(DEFAULT_NAMESPACE, None) {
         Ok(ns) => ns,
         Err(e) => {
             set_last_error(e.to_string());
@@ -178,7 +178,7 @@ pub unsafe extern "C" fn rkv_delete(db: *mut RkvDb, key: *const u8, key_len: usi
         return -1;
     }
     let db = unsafe { &*db };
-    let ns = match db.inner.namespace(DEFAULT_NAMESPACE) {
+    let ns = match db.inner.namespace(DEFAULT_NAMESPACE, None) {
         Ok(ns) => ns,
         Err(e) => {
             set_last_error(e.to_string());

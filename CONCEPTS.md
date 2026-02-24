@@ -179,12 +179,34 @@ references its hash.
 
 A namespace is an isolated key-value table within a single database. Each namespace has its own key space and
 independent auto-upgrade state. Namespaces are identified by string names and created implicitly on first use via
-`db.namespace("name")`.
+`db.namespace("name", None)`.
 
 The default namespace is `_`. The CLI starts on `_` and supports switching with the `use` command.
 
 All data operations (`put`, `get`, `del`, `has`, `scan`, `rscan`, `count`) live on the `Namespace` handle, not on
 `DB` directly. `DB` is responsible for lifecycle (`open`, `close`, `path`) and namespace management (`namespace`).
+
+### Namespace Encryption
+
+Each namespace can independently be encrypted with a user-supplied password. Encryption is
+opt-in per namespace — non-encrypted and encrypted namespaces coexist within the same database.
+
+The unified API uses a single method with an optional password parameter:
+
+- `db.namespace("users", None)` — open as non-encrypted
+- `db.namespace("users", Some("s3cret"))` — open as encrypted
+
+The encryption state is recorded on first access and enforced within the session:
+
+- Opening an encrypted namespace without a password → `EncryptionRequired` error
+- Opening a non-encrypted namespace with a password → `NotEncrypted` error
+
+**CLI syntax**: `use myns +` prompts for a password (hidden input). The prompt indicator shows
+`rkv [myns+]>` for encrypted namespaces and `rkv [myns]>` for non-encrypted ones.
+
+**Stub status**: The API surface, error handling, and in-memory state tracking are implemented.
+Cryptographic operations (key derivation via Argon2, AES-256-GCM encryption/decryption of
+WAL entries and SSTable blocks) are deferred to a future phase.
 
 ### Revision ID
 
