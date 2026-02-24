@@ -23,6 +23,9 @@ pub enum Error {
     #[error("namespace is not encrypted: {0}")]
     NotEncrypted(String),
 
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
+
     #[error("not implemented: {0}")]
     NotImplemented(String),
 }

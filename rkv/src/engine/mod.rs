@@ -1,6 +1,7 @@
 mod bloom;
 mod checksum;
 mod error;
+mod io;
 mod key;
 mod namespace;
 mod recovery;
@@ -17,13 +18,60 @@ pub use stats::Stats;
 pub use value::Value;
 
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Instant;
 
 /// Default namespace name.
 pub const DEFAULT_NAMESPACE: &str = "_";
+
+/// I/O model for file access.
+///
+/// Controls how the engine reads and writes data files. The three modes are
+/// mutually exclusive.
+#[derive(Clone, Debug, PartialEq)]
+pub enum IoModel {
+    /// Buffered I/O — relies on the OS page cache.
+    None,
+    /// Direct I/O — bypasses the OS page cache (O_DIRECT).
+    DirectIO,
+    /// Memory-mapped I/O — zero-copy reads via mmap (default).
+    Mmap,
+}
+
+impl Default for IoModel {
+    fn default() -> Self {
+        Self::Mmap
+    }
+}
+
+impl fmt::Display for IoModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => write!(f, "none"),
+            Self::DirectIO => write!(f, "directio"),
+            Self::Mmap => write!(f, "mmap"),
+        }
+    }
+}
+
+impl FromStr for IoModel {
+    type Err = Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "none" => Ok(Self::None),
+            "directio" => Ok(Self::DirectIO),
+            "mmap" => Ok(Self::Mmap),
+            _ => Err(Error::InvalidConfig(format!(
+                "unknown io_model '{s}' (expected: none, directio, mmap)"
+            ))),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -50,6 +98,8 @@ pub struct Config {
     /// When enabled, every WAL entry and SSTable block is verified against
     /// its stored checksum during reads. Disabling trades safety for speed.
     pub verify_checksums: bool,
+    /// I/O model for file access (default: Mmap).
+    pub io_model: IoModel,
 }
 
 impl Config {
@@ -65,6 +115,7 @@ impl Config {
             compress: true,
             bloom_bits: 10,
             verify_checksums: true,
+            io_model: IoModel::default(),
         }
     }
 }
@@ -73,6 +124,8 @@ pub struct DB {
     config: Config,
     opened_at: Instant,
     encrypted_namespaces: Mutex<HashMap<String, bool>>,
+    #[allow(dead_code)]
+    io_backend: Box<dyn io::IoBackend>,
 }
 
 impl DB {
@@ -80,10 +133,12 @@ impl DB {
         if config.create_if_missing {
             fs::create_dir_all(&config.path)?;
         }
+        let io_backend = io::create_backend(&config.io_model);
         Ok(Self {
             config,
             opened_at: Instant::now(),
             encrypted_namespaces: Mutex::new(HashMap::new()),
+            io_backend,
         })
     }
 
