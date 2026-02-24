@@ -327,6 +327,13 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                     "LZ4-compress bin objects",
                     c.compress.to_string(),
                 ),
+                ("", "", String::new()),
+                ("I/O", "", String::new()),
+                (
+                    "  io_model",
+                    "file I/O strategy (none, directio, mmap)",
+                    c.io_model.to_string(),
+                ),
             ];
             for (key, desc, val) in items {
                 if key.is_empty() {
@@ -523,6 +530,13 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected a number"),
+        },
+        "io_model" => match value.parse::<rkv::IoModel>() {
+            Ok(v) => {
+                c.io_model = v;
+                println!("OK");
+            }
+            Err(e) => eprintln!("error: {e}"),
         },
         "path" => eprintln!("error: path cannot be changed at runtime"),
         _ => eprintln!("error: unknown config key '{key}'"),
