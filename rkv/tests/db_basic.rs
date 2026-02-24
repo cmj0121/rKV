@@ -184,7 +184,7 @@ fn scan_ordered_mode() {
     ns.put(1_i64, "a", None).unwrap();
     ns.put(2_i64, "b", None).unwrap();
 
-    let keys = ns.scan(&Key::Int(1), 10).unwrap();
+    let keys = ns.scan(&Key::Int(1), 10, 0).unwrap();
     assert_eq!(keys, vec![Key::Int(1), Key::Int(2), Key::Int(3)]);
 }
 
@@ -199,7 +199,7 @@ fn rscan_ordered_mode() {
     ns.put(2_i64, "b", None).unwrap();
     ns.put(3_i64, "c", None).unwrap();
 
-    let keys = ns.rscan(&Key::Int(3), 10).unwrap();
+    let keys = ns.rscan(&Key::Int(3), 10, 0).unwrap();
     assert_eq!(keys, vec![Key::Int(3), Key::Int(2), Key::Int(1)]);
 }
 
@@ -214,10 +214,54 @@ fn scan_unordered_mode() {
     ns.put("user:2", "b", None).unwrap();
     ns.put("post:1", "c", None).unwrap();
 
-    let keys = ns.scan(&Key::from("user:"), 10).unwrap();
+    let keys = ns.scan(&Key::from("user:"), 10, 0).unwrap();
     assert_eq!(keys.len(), 2);
     assert!(keys.contains(&Key::from("user:1")));
     assert!(keys.contains(&Key::from("user:2")));
+}
+
+#[test]
+fn scan_with_offset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put(1_i64, "a", None).unwrap();
+    ns.put(2_i64, "b", None).unwrap();
+    ns.put(3_i64, "c", None).unwrap();
+    ns.put(4_i64, "d", None).unwrap();
+    ns.put(5_i64, "e", None).unwrap();
+
+    // Skip first 2, take next 2
+    let keys = ns.scan(&Key::Int(1), 2, 2).unwrap();
+    assert_eq!(keys, vec![Key::Int(3), Key::Int(4)]);
+
+    // Skip all
+    let keys = ns.scan(&Key::Int(1), 10, 10).unwrap();
+    assert!(keys.is_empty());
+}
+
+#[test]
+fn rscan_with_offset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put(1_i64, "a", None).unwrap();
+    ns.put(2_i64, "b", None).unwrap();
+    ns.put(3_i64, "c", None).unwrap();
+    ns.put(4_i64, "d", None).unwrap();
+    ns.put(5_i64, "e", None).unwrap();
+
+    // rscan from 5, skip first 1 (5), take next 2 (4, 3)
+    let keys = ns.rscan(&Key::Int(5), 2, 1).unwrap();
+    assert_eq!(keys, vec![Key::Int(4), Key::Int(3)]);
+
+    // Skip all
+    let keys = ns.rscan(&Key::Int(5), 10, 10).unwrap();
+    assert!(keys.is_empty());
 }
 
 #[test]

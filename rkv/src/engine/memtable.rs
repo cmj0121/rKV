@@ -139,12 +139,13 @@ impl MemTable {
     /// - **Unordered mode** (Str keys): prefix matching on string representation.
     ///
     /// Tombstoned and expired keys are excluded.
-    pub(crate) fn scan(&self, prefix: &Key, limit: usize) -> Vec<Key> {
+    pub(crate) fn scan(&self, prefix: &Key, limit: usize, offset: usize) -> Vec<Key> {
         if self.ordered_mode {
             self.entries
                 .range(prefix..)
                 .filter(|(_, entries)| self.is_live(entries))
                 .map(|(k, _)| k.clone())
+                .skip(offset)
                 .take(limit)
                 .collect()
         } else {
@@ -155,6 +156,7 @@ impl MemTable {
                     k.to_string().starts_with(&prefix_str) && self.is_live(entries)
                 })
                 .map(|(k, _)| k.clone())
+                .skip(offset)
                 .take(limit)
                 .collect()
         }
@@ -166,17 +168,14 @@ impl MemTable {
     /// - **Unordered mode**: prefix matching, reverse iteration order.
     ///
     /// Tombstoned and expired keys are excluded.
-    pub(crate) fn rscan(&self, prefix: &Key, limit: usize) -> Vec<Key> {
+    pub(crate) fn rscan(&self, prefix: &Key, limit: usize, offset: usize) -> Vec<Key> {
         if self.ordered_mode {
-            // Collect keys >= prefix, then reverse
-            // For rscan we want keys <= prefix in descending order
-            // Actually per the plan: rscan returns keys in descending order
-            // We scan from prefix downward
             self.entries
                 .range(..=prefix.clone())
                 .rev()
                 .filter(|(_, entries)| self.is_live(entries))
                 .map(|(k, _)| k.clone())
+                .skip(offset)
                 .take(limit)
                 .collect()
         } else {
@@ -188,6 +187,7 @@ impl MemTable {
                     k.to_string().starts_with(&prefix_str) && self.is_live(entries)
                 })
                 .map(|(k, _)| k.clone())
+                .skip(offset)
                 .take(limit)
                 .collect()
         }
@@ -459,7 +459,7 @@ mod tests {
         mt.put(Key::Int(3), Value::from("c"), RevisionID::from(2u128), None);
         mt.put(Key::Int(2), Value::from("b"), RevisionID::from(3u128), None);
 
-        let keys = mt.scan(&Key::Int(1), 10);
+        let keys = mt.scan(&Key::Int(1), 10, 0);
         assert_eq!(keys, vec![Key::Int(1), Key::Int(2), Key::Int(3)]);
     }
 
@@ -470,7 +470,7 @@ mod tests {
         mt.put(Key::Int(2), Value::from("b"), RevisionID::from(2u128), None);
         mt.put(Key::Int(3), Value::from("c"), RevisionID::from(3u128), None);
 
-        let keys = mt.scan(&Key::Int(1), 2);
+        let keys = mt.scan(&Key::Int(1), 2, 0);
         assert_eq!(keys, vec![Key::Int(1), Key::Int(2)]);
     }
 
@@ -481,7 +481,7 @@ mod tests {
         mt.put(Key::Int(2), Value::from("b"), RevisionID::from(2u128), None);
         mt.delete(Key::Int(2), RevisionID::from(3u128));
 
-        let keys = mt.scan(&Key::Int(1), 10);
+        let keys = mt.scan(&Key::Int(1), 10, 0);
         assert_eq!(keys, vec![Key::Int(1)]);
     }
 
@@ -492,7 +492,7 @@ mod tests {
         mt.put(Key::Int(2), Value::from("b"), RevisionID::from(2u128), None);
         mt.put(Key::Int(3), Value::from("c"), RevisionID::from(3u128), None);
 
-        let keys = mt.rscan(&Key::Int(3), 10);
+        let keys = mt.rscan(&Key::Int(3), 10, 0);
         assert_eq!(keys, vec![Key::Int(3), Key::Int(2), Key::Int(1)]);
     }
 
@@ -518,10 +518,28 @@ mod tests {
             None,
         );
 
-        let keys = mt.scan(&Key::from("user:"), 10);
+        let keys = mt.scan(&Key::from("user:"), 10, 0);
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&Key::from("user:1")));
         assert!(keys.contains(&Key::from("user:2")));
+    }
+
+    #[test]
+    fn scan_with_offset() {
+        let mut mt = MemTable::new();
+        mt.put(Key::Int(1), Value::from("a"), RevisionID::from(1u128), None);
+        mt.put(Key::Int(2), Value::from("b"), RevisionID::from(2u128), None);
+        mt.put(Key::Int(3), Value::from("c"), RevisionID::from(3u128), None);
+        mt.put(Key::Int(4), Value::from("d"), RevisionID::from(4u128), None);
+        mt.put(Key::Int(5), Value::from("e"), RevisionID::from(5u128), None);
+
+        // Skip 2, take 2
+        let keys = mt.scan(&Key::Int(1), 2, 2);
+        assert_eq!(keys, vec![Key::Int(3), Key::Int(4)]);
+
+        // Offset beyond results
+        let keys = mt.scan(&Key::Int(1), 10, 10);
+        assert!(keys.is_empty());
     }
 
     // --- Count ---

@@ -89,16 +89,16 @@ impl<'db> Namespace<'db> {
         Ok(mt.exists(&key))
     }
 
-    pub fn scan(&self, prefix: &Key, limit: usize) -> Result<Vec<Key>> {
+    pub fn scan(&self, prefix: &Key, limit: usize, offset: usize) -> Result<Vec<Key>> {
         let mt = self.db.get_or_create_memtable(&self.name);
         let mt = mt.lock().unwrap();
-        Ok(mt.scan(prefix, limit))
+        Ok(mt.scan(prefix, limit, offset))
     }
 
-    pub fn rscan(&self, prefix: &Key, limit: usize) -> Result<Vec<Key>> {
+    pub fn rscan(&self, prefix: &Key, limit: usize, offset: usize) -> Result<Vec<Key>> {
         let mt = self.db.get_or_create_memtable(&self.name);
         let mt = mt.lock().unwrap();
-        Ok(mt.rscan(prefix, limit))
+        Ok(mt.rscan(prefix, limit, offset))
     }
 
     pub fn count(&self) -> Result<u64> {

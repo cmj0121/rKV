@@ -56,12 +56,14 @@ Booleans are syntax sugar: `true` → `Int(1)`, `false` → `Int(0)`.
 `Str` (e.g., `Int(42)` becomes `Str("42")`), and the database enters **unordered mode** permanently. Exact-match
 operations (`get`, `has`, `del`) continue to work normally in both modes.
 
-**Scan behavior** depends on the database mode:
+**Scan behavior** depends on the database mode. Both `scan` and `rscan` accept `(prefix, limit, offset)` where
+`offset` skips the first N matching keys before collecting up to `limit` results (for pagination).
 
-- **Ordered mode** (Int keys): `scan(prefix, limit)` returns keys in ascending order starting from `prefix`;
+- **Ordered mode** (Int keys): `scan(prefix, limit, offset)` returns keys in ascending order starting from `prefix`;
   `rscan` returns keys in descending order.
-- **Unordered mode** (Str keys): `scan(prefix, limit)` returns keys whose string representation starts with `prefix`;
-  `rscan` returns the same prefix-matched keys in reverse order. Ordering-based range queries are not available.
+- **Unordered mode** (Str keys): `scan(prefix, limit, offset)` returns keys whose string representation starts with
+  `prefix`; `rscan` returns the same prefix-matched keys in reverse order. Ordering-based range queries are not
+  available.
 
 ### Value
 
@@ -445,7 +447,8 @@ backed by a `BTreeMap<Key, Vec<MemEntry>>` — each key maps to its full revisio
 (oldest entry at index 0). The MemTable provides:
 
 - **put/get/delete/exists** — core key-value operations
-- **scan/rscan** — ordered iteration (range queries in ordered mode, prefix matching in unordered mode)
+- **scan/rscan** — ordered iteration with offset/limit pagination (range queries in ordered mode,
+  prefix matching in unordered mode)
 - **count** — live key count (excludes tombstones and expired entries)
 - **rev_count/rev_get** — revision history access
 - **ttl** — remaining time-to-live for a key
