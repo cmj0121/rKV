@@ -263,20 +263,47 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             // config print is handled here; config set is handled in run_repl
             let c = db.config();
             println!("Storage:");
-            println!("  path:              {}", c.path.display());
-            println!("  create_if_missing: {}", c.create_if_missing);
+            println!(
+                "  path:              {}  # database directory",
+                c.path.display()
+            );
+            println!(
+                "  create_if_missing: {}  # create dir if absent",
+                c.create_if_missing
+            );
             println!();
             println!("LSM:");
-            println!("  write_buffer_size: {}", format_bytes(c.write_buffer_size));
-            println!("  max_levels:        {}", c.max_levels);
-            println!("  block_size:        {}", format_bytes(c.block_size));
-            println!("  cache_size:        {}", format_bytes(c.cache_size));
-            println!("  bloom_bits:        {}", c.bloom_bits);
-            println!("  verify_checksums:  {}", c.verify_checksums);
+            println!(
+                "  write_buffer_size: {}  # memtable flush threshold",
+                format_bytes(c.write_buffer_size)
+            );
+            println!("  max_levels:        {}  # SSTable levels", c.max_levels);
+            println!(
+                "  block_size:        {}  # SSTable block size",
+                format_bytes(c.block_size)
+            );
+            println!(
+                "  cache_size:        {}  # block cache size",
+                format_bytes(c.cache_size)
+            );
+            println!(
+                "  bloom_bits:        {}  # bits per key (0 = disabled)",
+                c.bloom_bits
+            );
+            println!(
+                "  verify_checksums:  {}  # verify on read",
+                c.verify_checksums
+            );
             println!();
             println!("Objects:");
-            println!("  object_size:       {}", format_bytes(c.object_size));
-            println!("  compress:          {}", c.compress);
+            println!(
+                "  object_size:       {}  # value separation threshold",
+                format_bytes(c.object_size)
+            );
+            println!(
+                "  compress:          {}  # LZ4-compress bin objects",
+                c.compress
+            );
         }
         "flush" => match db.flush() {
             Ok(()) => println!("OK"),
