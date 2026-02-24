@@ -149,19 +149,20 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 eprintln!("usage: put <key> <value> [ttl]");
                 return Action::Continue;
             }
-            let result = if let Some(ttl_str) = tokens.get(3) {
+            let ttl = if let Some(ttl_str) = tokens.get(3) {
                 match parse_duration(ttl_str) {
-                    Some(ttl) => ns.put_with_ttl(parse_key(tokens[1]), tokens[2].as_bytes(), ttl),
+                    Some(ttl) => Some(ttl),
                     None => {
                         eprintln!("error: invalid TTL '{ttl_str}' (e.g., 10s, 5m, 2h, 1d)");
                         return Action::Continue;
                     }
                 }
             } else {
-                ns.put(parse_key(tokens[1]), tokens[2].as_bytes())
+                None
             };
+            let result = ns.put(parse_key(tokens[1]), tokens[2].as_bytes(), ttl);
             match result {
-                Ok(rev) => println!("{rev}"),
+                Ok(_) => {}
                 Err(e) => eprintln!("error: {e}"),
             }
         }
@@ -196,22 +197,30 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 Err(e) => eprintln!("error: {e}"),
             }
         }
-        "scan" => {
-            let prefix = parse_key(tokens.get(1).unwrap_or(&""));
-            let limit: usize = tokens.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
-            match ns.scan(&prefix, limit) {
-                Ok(keys) => {
-                    for k in &keys {
-                        println!("{k}");
+        "scan" | "rscan" => {
+            let mut prefix_token = "";
+            let mut limit: usize = 10;
+            let mut offset: usize = 0;
+            for tok in &tokens[1..] {
+                if let Some(n) = tok.strip_prefix(':') {
+                    if let Ok(v) = n.parse::<usize>() {
+                        limit = v;
                     }
+                } else if let Some(n) = tok.strip_prefix('+') {
+                    if let Ok(v) = n.parse::<usize>() {
+                        offset = v;
+                    }
+                } else if prefix_token.is_empty() {
+                    prefix_token = tok;
                 }
-                Err(e) => eprintln!("error: {e}"),
             }
-        }
-        "rscan" => {
-            let prefix = parse_key(tokens.get(1).unwrap_or(&""));
-            let limit: usize = tokens.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
-            match ns.rscan(&prefix, limit) {
+            let prefix = parse_key(prefix_token);
+            let result = if tokens[0] == "scan" {
+                ns.scan(&prefix, limit, offset)
+            } else {
+                ns.rscan(&prefix, limit, offset)
+            };
+            match result {
                 Ok(keys) => {
                     for k in &keys {
                         println!("{k}");
@@ -334,6 +343,15 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                     "file I/O strategy (none, directio, mmap)",
                     c.io_model.to_string(),
                 ),
+                ("", "", String::new()),
+                ("Revision", "", String::new()),
+                (
+                    "  cluster_id",
+                    "RevisionID cluster (none = random)",
+                    c.cluster_id
+                        .map(|id| format!("{id}"))
+                        .unwrap_or_else(|| "none".to_owned()),
+                ),
             ];
             for (key, desc, val) in items {
                 if key.is_empty() {
@@ -425,8 +443,8 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("  del <key>                Remove a key");
             println!("  has <key>                Check if a key exists");
             println!("  ttl <key>                Show remaining TTL or \"none\"");
-            println!("  scan [prefix] [n]        Forward scan keys");
-            println!("  rscan [prefix] [n]       Reverse scan keys");
+            println!("  scan [prefix] [:n] [+offset]   Forward scan keys");
+            println!("  rscan [prefix] [:n] [+offset]  Reverse scan keys");
             println!("  count                    Count all keys");
             println!("  rev <key>                Show total revisions for a key");
             println!("  rev <key> <index>        Show value at revision index (0 = oldest)");
@@ -537,6 +555,19 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
                 println!("OK");
             }
             Err(e) => eprintln!("error: {e}"),
+        },
+        "cluster_id" => match value {
+            "none" => {
+                c.cluster_id = None;
+                println!("OK");
+            }
+            _ => match value.parse::<u16>() {
+                Ok(v) => {
+                    c.cluster_id = Some(v);
+                    println!("OK");
+                }
+                Err(_) => eprintln!("error: expected a number or 'none'"),
+            },
         },
         "path" => eprintln!("error: path cannot be changed at runtime"),
         _ => eprintln!("error: unknown config key '{key}'"),

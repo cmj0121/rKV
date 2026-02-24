@@ -425,6 +425,7 @@ dependencies = [
  "clap",
  "dirs-sys",
  "fast32",
+ "fastrand",
  "rpassword",
  "rustyline",
  "tempfile",

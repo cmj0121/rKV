@@ -3,6 +3,7 @@ mod checksum;
 mod error;
 mod io;
 mod key;
+mod memtable;
 mod namespace;
 mod recovery;
 mod revision;
@@ -22,7 +23,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
 /// Default namespace name.
@@ -100,6 +101,8 @@ pub struct Config {
     pub verify_checksums: bool,
     /// I/O model for file access (default: Mmap).
     pub io_model: IoModel,
+    /// Cluster ID for RevisionID generation (default: None = random at startup).
+    pub cluster_id: Option<u16>,
 }
 
 impl Config {
@@ -116,6 +119,7 @@ impl Config {
             bloom_bits: 10,
             verify_checksums: true,
             io_model: IoModel::default(),
+            cluster_id: None,
         }
     }
 }
@@ -126,6 +130,8 @@ pub struct DB {
     encrypted_namespaces: Mutex<HashMap<String, bool>>,
     #[allow(dead_code)]
     io_backend: Box<dyn io::IoBackend>,
+    revision_gen: revision::RevisionGen,
+    namespace_data: RwLock<HashMap<String, Mutex<memtable::MemTable>>>,
 }
 
 impl DB {
@@ -134,11 +140,14 @@ impl DB {
             fs::create_dir_all(&config.path)?;
         }
         let io_backend = io::create_backend(&config.io_model);
+        let revision_gen = revision::RevisionGen::new(config.cluster_id);
         Ok(Self {
             config,
             opened_at: Instant::now(),
             encrypted_namespaces: Mutex::new(HashMap::new()),
             io_backend,
+            revision_gen,
+            namespace_data: RwLock::new(HashMap::new()),
         })
     }
 
@@ -261,5 +270,32 @@ impl DB {
     /// Trigger a manual compaction of SSTable levels.
     pub fn compact(&self) -> Result<()> {
         Err(Error::NotImplemented("compact".into()))
+    }
+
+    // --- Internal helpers ---
+
+    pub(crate) fn generate_revision(&self) -> RevisionID {
+        self.revision_gen.generate()
+    }
+
+    pub(crate) fn get_or_create_memtable(&self, name: &str) -> &Mutex<memtable::MemTable> {
+        // Fast path: read lock to check if memtable already exists
+        {
+            let map = self.namespace_data.read().unwrap();
+            if map.contains_key(name) {
+                // SAFETY: The RwLock<HashMap> only grows (we never remove entries),
+                // so a reference obtained under the read lock remains valid.
+                let ptr = map.get(name).unwrap() as *const Mutex<memtable::MemTable>;
+                return unsafe { &*ptr };
+            }
+        }
+
+        // Slow path: write lock to insert
+        let mut map = self.namespace_data.write().unwrap();
+        map.entry(name.to_owned())
+            .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
+        let ptr = map.get(name).unwrap() as *const Mutex<memtable::MemTable>;
+        // SAFETY: Same as above — the HashMap only grows, so the reference is stable.
+        unsafe { &*ptr }
     }
 }
