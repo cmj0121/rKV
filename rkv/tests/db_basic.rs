@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use rkv::{Config, Error, Stats, DB, DEFAULT_NAMESPACE};
+use rkv::{Config, Error, IoModel, Stats, DB, DEFAULT_NAMESPACE};
 
 #[test]
 fn open_creates_directory() {
@@ -466,4 +466,58 @@ fn not_encrypted_error_display() {
         err.to_string(),
         "namespace is not encrypted: namespace 'public' is not encrypted"
     );
+}
+
+// --- I/O model config ---
+
+#[test]
+fn config_io_model_default() {
+    let config = Config::new("/tmp/test");
+    assert_eq!(config.io_model, IoModel::Mmap);
+}
+
+#[test]
+fn config_io_model_direct() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.io_model = IoModel::DirectIO;
+    let db = DB::open(config).unwrap();
+
+    assert_eq!(db.config().io_model, IoModel::DirectIO);
+}
+
+#[test]
+fn config_io_model_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.io_model = IoModel::None;
+    let db = DB::open(config).unwrap();
+
+    assert_eq!(db.config().io_model, IoModel::None);
+}
+
+#[test]
+fn io_model_display() {
+    assert_eq!(IoModel::None.to_string(), "none");
+    assert_eq!(IoModel::DirectIO.to_string(), "directio");
+    assert_eq!(IoModel::Mmap.to_string(), "mmap");
+}
+
+#[test]
+fn io_model_from_str() {
+    assert_eq!("none".parse::<IoModel>().unwrap(), IoModel::None);
+    assert_eq!("directio".parse::<IoModel>().unwrap(), IoModel::DirectIO);
+    assert_eq!("mmap".parse::<IoModel>().unwrap(), IoModel::Mmap);
+}
+
+#[test]
+fn io_model_from_str_invalid() {
+    let err = "bad".parse::<IoModel>().unwrap_err();
+    assert!(matches!(err, Error::InvalidConfig(_)));
+}
+
+#[test]
+fn invalid_config_error_display() {
+    let err = Error::InvalidConfig("unknown io_model 'bad'".into());
+    assert_eq!(err.to_string(), "invalid config: unknown io_model 'bad'");
 }
