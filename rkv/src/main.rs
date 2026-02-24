@@ -149,17 +149,18 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 eprintln!("usage: put <key> <value> [ttl]");
                 return Action::Continue;
             }
-            let result = if let Some(ttl_str) = tokens.get(3) {
+            let ttl = if let Some(ttl_str) = tokens.get(3) {
                 match parse_duration(ttl_str) {
-                    Some(ttl) => ns.put_with_ttl(parse_key(tokens[1]), tokens[2].as_bytes(), ttl),
+                    Some(ttl) => Some(ttl),
                     None => {
                         eprintln!("error: invalid TTL '{ttl_str}' (e.g., 10s, 5m, 2h, 1d)");
                         return Action::Continue;
                     }
                 }
             } else {
-                ns.put(parse_key(tokens[1]), tokens[2].as_bytes())
+                None
             };
+            let result = ns.put(parse_key(tokens[1]), tokens[2].as_bytes(), ttl);
             match result {
                 Ok(rev) => println!("{rev}"),
                 Err(e) => eprintln!("error: {e}"),
@@ -333,6 +334,15 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                     "  io_model",
                     "file I/O strategy (none, directio, mmap)",
                     c.io_model.to_string(),
+                ),
+                ("", "", String::new()),
+                ("Revision", "", String::new()),
+                (
+                    "  cluster_id",
+                    "RevisionID cluster (none = random)",
+                    c.cluster_id
+                        .map(|id| format!("{id}"))
+                        .unwrap_or_else(|| "none".to_owned()),
                 ),
             ];
             for (key, desc, val) in items {
@@ -537,6 +547,19 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
                 println!("OK");
             }
             Err(e) => eprintln!("error: {e}"),
+        },
+        "cluster_id" => match value {
+            "none" => {
+                c.cluster_id = None;
+                println!("OK");
+            }
+            _ => match value.parse::<u16>() {
+                Ok(v) => {
+                    c.cluster_id = Some(v);
+                    println!("OK");
+                }
+                Err(_) => eprintln!("error: expected a number or 'none'"),
+            },
         },
         "path" => eprintln!("error: path cannot be changed at runtime"),
         _ => eprintln!("error: unknown config key '{key}'"),

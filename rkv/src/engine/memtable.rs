@@ -6,8 +6,8 @@ use super::revision::RevisionID;
 use super::value::Value;
 
 /// A single revision record stored in the MemTable.
-#[allow(dead_code)]
 pub(crate) struct MemEntry {
+    #[allow(dead_code)]
     pub revision: RevisionID,
     pub value: Value,
     pub expires_at: Option<Instant>,
@@ -18,7 +18,6 @@ pub(crate) struct MemEntry {
 /// Holds all active writes for a namespace before they are flushed to disk.
 /// Keys are stored in a BTreeMap for ordered iteration; each key maps to a
 /// Vec of MemEntry records (oldest first) for revision history.
-#[allow(dead_code)]
 pub(crate) struct MemTable {
     entries: BTreeMap<Key, Vec<MemEntry>>,
     last_rev: HashMap<Key, RevisionID>,
@@ -26,7 +25,6 @@ pub(crate) struct MemTable {
     ordered_mode: bool,
 }
 
-#[allow(dead_code)]
 impl MemTable {
     pub(crate) fn new() -> Self {
         Self {

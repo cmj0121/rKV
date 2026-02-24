@@ -66,13 +66,11 @@ impl From<RevisionID> for u128 {
 }
 
 /// Generates ULID-like RevisionIDs with a 48-16-16-48 bit layout.
-#[allow(dead_code)]
 pub(crate) struct RevisionGen {
     cluster_id: u16,
     process_id: u16,
 }
 
-#[allow(dead_code)]
 impl RevisionGen {
     pub(crate) fn new(cluster_id: Option<u16>) -> Self {
         Self {

@@ -96,7 +96,7 @@ pub unsafe extern "C" fn rkv_put(
         }
     };
     let value = unsafe { std::slice::from_raw_parts(value, value_len) };
-    match ns.put(key, value) {
+    match ns.put(key, value, None) {
         Ok(rev) => rev.as_u128(),
         Err(e) => {
             set_last_error(e.to_string());
