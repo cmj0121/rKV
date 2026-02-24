@@ -262,48 +262,64 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
         "config" => {
             // config print is handled here; config set is handled in run_repl
             let c = db.config();
-            println!("Storage:");
-            println!(
-                "  path:              {}  # database directory",
-                c.path.display()
-            );
-            println!(
-                "  create_if_missing: {}  # create dir if absent",
-                c.create_if_missing
-            );
-            println!();
-            println!("LSM:");
-            println!(
-                "  write_buffer_size: {}  # memtable flush threshold",
-                format_bytes(c.write_buffer_size)
-            );
-            println!("  max_levels:        {}  # SSTable levels", c.max_levels);
-            println!(
-                "  block_size:        {}  # SSTable block size",
-                format_bytes(c.block_size)
-            );
-            println!(
-                "  cache_size:        {}  # block cache size",
-                format_bytes(c.cache_size)
-            );
-            println!(
-                "  bloom_bits:        {}  # bits per key (0 = disabled)",
-                c.bloom_bits
-            );
-            println!(
-                "  verify_checksums:  {}  # verify on read",
-                c.verify_checksums
-            );
-            println!();
-            println!("Objects:");
-            println!(
-                "  object_size:       {}  # value separation threshold",
-                format_bytes(c.object_size)
-            );
-            println!(
-                "  compress:          {}  # LZ4-compress bin objects",
-                c.compress
-            );
+            let items: &[(&str, &str, String)] = &[
+                ("Storage", "", String::new()),
+                ("  path", "database directory", c.path.display().to_string()),
+                (
+                    "  create_if_missing",
+                    "create dir if absent",
+                    c.create_if_missing.to_string(),
+                ),
+                ("", "", String::new()),
+                ("LSM", "", String::new()),
+                (
+                    "  write_buffer_size",
+                    "memtable flush threshold",
+                    format_bytes(c.write_buffer_size),
+                ),
+                ("  max_levels", "SSTable levels", c.max_levels.to_string()),
+                (
+                    "  block_size",
+                    "SSTable block size",
+                    format_bytes(c.block_size),
+                ),
+                (
+                    "  cache_size",
+                    "block cache size",
+                    format_bytes(c.cache_size),
+                ),
+                (
+                    "  bloom_bits",
+                    "bits per key (0 = disabled)",
+                    c.bloom_bits.to_string(),
+                ),
+                (
+                    "  verify_checksums",
+                    "verify on read",
+                    c.verify_checksums.to_string(),
+                ),
+                ("", "", String::new()),
+                ("Objects", "", String::new()),
+                (
+                    "  object_size",
+                    "value separation threshold",
+                    format_bytes(c.object_size),
+                ),
+                (
+                    "  compress",
+                    "LZ4-compress bin objects",
+                    c.compress.to_string(),
+                ),
+            ];
+            for (key, desc, val) in items {
+                if key.is_empty() {
+                    println!();
+                } else if desc.is_empty() {
+                    println!("{key}:");
+                } else {
+                    println!("  {:<18} {:<7} # {}", &key[2..], val, desc);
+                }
+            }
         }
         "flush" => match db.flush() {
             Ok(()) => println!("OK"),
