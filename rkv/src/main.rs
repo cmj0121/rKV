@@ -264,7 +264,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             let c = db.config();
             let items: &[(&str, &str, String)] = &[
                 ("Storage", "", String::new()),
-                ("  path", "database directory", c.path.display().to_string()),
+                ("  path", "", c.path.display().to_string()),
                 (
                     "  create_if_missing",
                     "create dir if absent",
@@ -314,8 +314,10 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             for (key, desc, val) in items {
                 if key.is_empty() {
                     println!();
-                } else if desc.is_empty() {
+                } else if desc.is_empty() && !key.starts_with(' ') {
                     println!("{key}:");
+                } else if desc.is_empty() {
+                    println!("  {:<18} {}", &key[2..], val);
                 } else {
                     println!("  {:<18} {:<7} # {}", &key[2..], val, desc);
                 }
