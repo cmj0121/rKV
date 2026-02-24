@@ -813,3 +813,312 @@ fn invalid_config_error_display() {
     let err = Error::InvalidConfig("unknown io_model 'bad'".into());
     assert_eq!(err.to_string(), "invalid config: unknown io_model 'bad'");
 }
+
+// --- AOL persistence tests ---
+
+#[test]
+fn persist_put_survives_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put("key", "value", None).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        assert_eq!(ns.get("key").unwrap(), Value::from("value"));
+    }
+}
+
+#[test]
+fn persist_multiple_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put("a", "1", None).unwrap();
+        ns.put("b", "2", None).unwrap();
+        ns.put("c", "3", None).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        assert_eq!(ns.get("a").unwrap(), Value::from("1"));
+        assert_eq!(ns.get("b").unwrap(), Value::from("2"));
+        assert_eq!(ns.get("c").unwrap(), Value::from("3"));
+    }
+}
+
+#[test]
+fn persist_multiple_namespaces() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns1 = db.namespace("ns1", None).unwrap();
+        let ns2 = db.namespace("ns2", None).unwrap();
+        ns1.put("k", "v1", None).unwrap();
+        ns2.put("k", "v2", None).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns1 = db.namespace("ns1", None).unwrap();
+        let ns2 = db.namespace("ns2", None).unwrap();
+        assert_eq!(ns1.get("k").unwrap(), Value::from("v1"));
+        assert_eq!(ns2.get("k").unwrap(), Value::from("v2"));
+    }
+}
+
+#[test]
+fn persist_ttl_expired_on_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put("k", "v", Some(Duration::from_millis(1))).unwrap();
+        db.close().unwrap();
+    }
+
+    // Wait for TTL to expire
+    std::thread::sleep(Duration::from_millis(10));
+
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        let err = ns.get("k").unwrap_err();
+        assert!(matches!(err, Error::KeyNotFound));
+    }
+}
+
+#[test]
+fn persist_ttl_alive_on_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put("k", "v", Some(Duration::from_secs(3600))).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        assert_eq!(ns.get("k").unwrap(), Value::from("v"));
+        let remaining = ns.ttl("k").unwrap().unwrap();
+        assert!(remaining.as_secs() > 3500);
+    }
+}
+
+#[test]
+fn persist_delete_tombstone() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put("k", "v", None).unwrap();
+        ns.delete("k").unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        let err = ns.get("k").unwrap_err();
+        assert!(matches!(err, Error::KeyNotFound));
+        assert!(!ns.exists("k").unwrap());
+    }
+}
+
+#[test]
+fn persist_overwrite_latest_wins() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put("k", "v1", None).unwrap();
+        ns.put("k", "v2", None).unwrap();
+        ns.put("k", "v3", None).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        assert_eq!(ns.get("k").unwrap(), Value::from("v3"));
+    }
+}
+
+#[test]
+fn persist_revision_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put("k", "v1", None).unwrap();
+        ns.put("k", "v2", None).unwrap();
+        ns.put("k", "v3", None).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        assert_eq!(ns.rev_count("k").unwrap(), 3);
+        assert_eq!(ns.rev_get("k", 0).unwrap(), Value::from("v1"));
+        assert_eq!(ns.rev_get("k", 1).unwrap(), Value::from("v2"));
+        assert_eq!(ns.rev_get("k", 2).unwrap(), Value::from("v3"));
+    }
+}
+
+#[test]
+fn persist_auto_upgrade_str_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put(42_i64, "int_val", None).unwrap();
+        ns.put("hello", "str_val", None).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        // After replay, Int(42) was replayed first (still Int), then Str triggers upgrade
+        // so Int(42) should be widened to Str("42")
+        let err = ns.get(42_i64).unwrap_err();
+        assert!(matches!(err, Error::KeyNotFound));
+        assert_eq!(ns.get("42").unwrap(), Value::from("int_val"));
+        assert_eq!(ns.get("hello").unwrap(), Value::from("str_val"));
+    }
+}
+
+#[test]
+fn persist_count_correct_after_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put("a", "1", None).unwrap();
+        ns.put("b", "2", None).unwrap();
+        ns.put("c", "3", None).unwrap();
+        ns.delete("b").unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        assert_eq!(ns.count().unwrap(), 2);
+    }
+}
+
+#[test]
+fn persist_scan_after_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put("user:1", "a", None).unwrap();
+        ns.put("user:2", "b", None).unwrap();
+        ns.put("post:1", "c", None).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        let keys = ns.scan(&Key::from("user:"), 10, 0).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&Key::from("user:1")));
+        assert!(keys.contains(&Key::from("user:2")));
+    }
+}
+
+#[test]
+fn persist_null_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put("k", Value::Null, None).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        assert_eq!(ns.get("k").unwrap(), Value::Null);
+    }
+}
+
+#[test]
+fn persist_int_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put(1_i64, "a", None).unwrap();
+        ns.put(2_i64, "b", None).unwrap();
+        ns.put(3_i64, "c", None).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        assert_eq!(ns.get(1_i64).unwrap(), Value::from("a"));
+        assert_eq!(ns.get(2_i64).unwrap(), Value::from("b"));
+        assert_eq!(ns.get(3_i64).unwrap(), Value::from("c"));
+        // Scan should work in ordered mode
+        let keys = ns.scan(&Key::Int(1), 10, 0).unwrap();
+        assert_eq!(keys, vec![Key::Int(1), Key::Int(2), Key::Int(3)]);
+    }
+}
+
+#[test]
+fn persist_data_appended_across_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put("a", "1", None).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put("b", "2", None).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        assert_eq!(ns.get("a").unwrap(), Value::from("1"));
+        assert_eq!(ns.get("b").unwrap(), Value::from("2"));
+        assert_eq!(ns.count().unwrap(), 2);
+    }
+}
