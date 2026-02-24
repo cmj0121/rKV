@@ -33,7 +33,7 @@ fn namespace_default() {
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
 
-    let ns = db.namespace(DEFAULT_NAMESPACE).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
     assert_eq!(ns.name(), "_");
 }
 
@@ -43,7 +43,7 @@ fn namespace_custom() {
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
 
-    let ns = db.namespace("users").unwrap();
+    let ns = db.namespace("users", None).unwrap();
     assert_eq!(ns.name(), "users");
 }
 
@@ -53,7 +53,7 @@ fn namespace_empty_name_rejected() {
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
 
-    let err = db.namespace("").unwrap_err();
+    let err = db.namespace("", None).unwrap_err();
     assert!(matches!(err, Error::InvalidNamespace(_)));
 }
 
@@ -92,7 +92,7 @@ fn put_returns_not_implemented() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
-    let ns = db.namespace(DEFAULT_NAMESPACE).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
     let err = ns.put("key", "value").unwrap_err();
     assert!(matches!(err, Error::NotImplemented(_)));
@@ -103,7 +103,7 @@ fn get_returns_not_implemented() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
-    let ns = db.namespace(DEFAULT_NAMESPACE).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
     let err = ns.get("key").unwrap_err();
     assert!(matches!(err, Error::NotImplemented(_)));
@@ -114,7 +114,7 @@ fn rev_count_returns_not_implemented() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
-    let ns = db.namespace(DEFAULT_NAMESPACE).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
     let err = ns.rev_count("key").unwrap_err();
     assert!(matches!(err, Error::NotImplemented(_)));
@@ -125,7 +125,7 @@ fn rev_get_returns_not_implemented() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
-    let ns = db.namespace(DEFAULT_NAMESPACE).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
     let err = ns.rev_get("key", 0).unwrap_err();
     assert!(matches!(err, Error::NotImplemented(_)));
@@ -136,7 +136,7 @@ fn put_with_ttl_returns_not_implemented() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
-    let ns = db.namespace(DEFAULT_NAMESPACE).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
     let err = ns
         .put_with_ttl("key", "value", Duration::from_secs(60))
@@ -149,7 +149,7 @@ fn ttl_returns_not_implemented() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
-    let ns = db.namespace(DEFAULT_NAMESPACE).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
     let err = ns.ttl("key").unwrap_err();
     assert!(matches!(err, Error::NotImplemented(_)));
@@ -387,4 +387,83 @@ fn compact_returns_not_implemented() {
 
     let err = db.compact().unwrap_err();
     assert!(matches!(err, Error::NotImplemented(_)));
+}
+
+// --- Namespace encryption stubs ---
+
+#[test]
+fn namespace_encrypted_stub() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace("secret", Some("s3cret")).unwrap();
+    let err = ns.put("key", "value").unwrap_err();
+    assert!(matches!(err, Error::NotImplemented(_)));
+}
+
+#[test]
+fn namespace_is_encrypted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace("secret", Some("s3cret")).unwrap();
+    assert!(ns.is_encrypted());
+}
+
+#[test]
+fn namespace_not_encrypted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace("public", None).unwrap();
+    assert!(!ns.is_encrypted());
+}
+
+#[test]
+fn namespace_mismatch_requires_password() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    // First access with password — marks as encrypted
+    db.namespace("vault", Some("pw")).unwrap();
+
+    // Second access without password — should fail
+    let err = db.namespace("vault", None).unwrap_err();
+    assert!(matches!(err, Error::EncryptionRequired(_)));
+}
+
+#[test]
+fn namespace_mismatch_not_encrypted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    // First access without password — marks as non-encrypted
+    db.namespace("public", None).unwrap();
+
+    // Second access with password — should fail
+    let err = db.namespace("public", Some("pw")).unwrap_err();
+    assert!(matches!(err, Error::NotEncrypted(_)));
+}
+
+#[test]
+fn encryption_required_error_display() {
+    let err = Error::EncryptionRequired("namespace 'vault' requires a password".into());
+    assert_eq!(
+        err.to_string(),
+        "encryption required: namespace 'vault' requires a password"
+    );
+}
+
+#[test]
+fn not_encrypted_error_display() {
+    let err = Error::NotEncrypted("namespace 'public' is not encrypted".into());
+    assert_eq!(
+        err.to_string(),
+        "namespace is not encrypted: namespace 'public' is not encrypted"
+    );
 }
