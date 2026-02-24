@@ -18,6 +18,7 @@ build:				# build the binary/library (all features)
 	cargo build --workspace --release
 
 bench:				# run benchmarks and update BENCH.md
+	cargo run --bin bench --release
 
 upgrade:			# upgrade all the necessary packages
 	pre-commit autoupdate
