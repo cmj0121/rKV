@@ -1122,3 +1122,87 @@ fn persist_data_appended_across_sessions() {
         assert_eq!(ns.count().unwrap(), 2);
     }
 }
+
+// --- AOL buffered flush tests ---
+
+#[test]
+fn config_aol_buffer_size_default() {
+    let config = Config::new("/tmp/test");
+    assert_eq!(config.aol_buffer_size, 128);
+}
+
+#[test]
+fn config_aol_buffer_size_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.aol_buffer_size = 64;
+    let db = DB::open(config).unwrap();
+
+    assert_eq!(db.config().aol_buffer_size, 64);
+}
+
+#[test]
+fn persist_with_buffered_flush_after_close() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let mut config = Config::new(tmp.path());
+        config.aol_buffer_size = 1000; // large threshold — nothing auto-flushes
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put("a", "1", None).unwrap();
+        ns.put("b", "2", None).unwrap();
+        ns.put("c", "3", None).unwrap();
+        // close() triggers final flush via background thread shutdown
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        assert_eq!(ns.get("a").unwrap(), Value::from("1"));
+        assert_eq!(ns.get("b").unwrap(), Value::from("2"));
+        assert_eq!(ns.get("c").unwrap(), Value::from("3"));
+    }
+}
+
+#[test]
+fn persist_with_per_record_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let mut config = Config::new(tmp.path());
+        config.aol_buffer_size = 0; // per-record flush
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put("k", "v", None).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        assert_eq!(ns.get("k").unwrap(), Value::from("v"));
+    }
+}
+
+#[test]
+fn persist_buffered_flush_threshold_triggers() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let mut config = Config::new(tmp.path());
+        config.aol_buffer_size = 2; // flush every 2 records
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put("a", "1", None).unwrap();
+        ns.put("b", "2", None).unwrap(); // triggers flush at threshold
+        ns.put("c", "3", None).unwrap(); // buffered, flushed on close
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        assert_eq!(ns.get("a").unwrap(), Value::from("1"));
+        assert_eq!(ns.get("b").unwrap(), Value::from("2"));
+        assert_eq!(ns.get("c").unwrap(), Value::from("3"));
+    }
+}
