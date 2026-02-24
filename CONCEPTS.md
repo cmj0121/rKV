@@ -276,6 +276,7 @@ The `Config` struct controls database behavior and LSM tuning parameters:
 | `verify_checksums`  | `bool`        | `true`     | Verify checksums on read (see below)       |
 | `io_model`          | `IoModel`     | `Mmap`     | File I/O strategy (see I/O Modes below)    |
 | `cluster_id`        | `Option<u16>` | `None`     | Cluster ID for RevisionID (random if None) |
+| `aol_buffer_size`   | `usize`       | 128        | AOL flush threshold in records (0 = every) |
 
 `Config::new(path)` initializes all fields to their defaults. Fields can be overridden before
 passing the config to `DB::open`.
@@ -529,8 +530,12 @@ skip counter). This handles partial writes from crashes during append.
 
 - **No truncation**: The AOL grows without bound until flush/compaction is implemented.
   Once SSTable flushing lands, the AOL will be truncated after a successful flush.
-- **No fsync on every write**: The current implementation flushes the userspace buffer but
-  does not call `fsync` per record. A future `sync_mode` config option will control this.
+- **Buffered flush**: The AOL buffers up to `aol_buffer_size` records (default 128) before
+  flushing to the OS. A background thread flushes every 60 s if dirty data exists. On a
+  hard crash, up to `aol_buffer_size` records (or 60 s of writes) may be lost. Set to 0
+  for per-record flush (maximum durability). `DB::close()` always flushes remaining data.
+- **No fsync on every write**: The implementation flushes the userspace buffer but does not
+  call `fsync` per record. A future `sync_mode` config option will control this.
 
 ### Embeddable Library
 
