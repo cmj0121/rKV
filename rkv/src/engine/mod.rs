@@ -1,3 +1,4 @@
+mod aol;
 mod bloom;
 mod checksum;
 mod error;
@@ -23,8 +24,10 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Mutex, RwLock};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Default namespace name.
 pub const DEFAULT_NAMESPACE: &str = "_";
@@ -103,6 +106,9 @@ pub struct Config {
     pub io_model: IoModel,
     /// Cluster ID for RevisionID generation (default: None = random at startup).
     pub cluster_id: Option<u16>,
+    /// AOL flush threshold in records (default: 128).
+    /// Set to 0 for per-record flush (maximum durability).
+    pub aol_buffer_size: usize,
 }
 
 impl Config {
@@ -120,6 +126,7 @@ impl Config {
             verify_checksums: true,
             io_model: IoModel::default(),
             cluster_id: None,
+            aol_buffer_size: 128,
         }
     }
 }
@@ -132,6 +139,9 @@ pub struct DB {
     io_backend: Box<dyn io::IoBackend>,
     revision_gen: revision::RevisionGen,
     namespace_data: RwLock<HashMap<String, Mutex<memtable::MemTable>>>,
+    aol: Arc<Mutex<aol::Aol>>,
+    flush_stop: Arc<AtomicBool>,
+    flush_thread: Option<JoinHandle<()>>,
 }
 
 impl DB {
@@ -141,17 +151,87 @@ impl DB {
         }
         let io_backend = io::create_backend(&config.io_model);
         let revision_gen = revision::RevisionGen::new(config.cluster_id);
+
+        // Replay AOL to reconstruct memtables
+        let namespace_data = RwLock::new(HashMap::new());
+        let (records, _skipped) = aol::Aol::replay(&config.path, config.verify_checksums)?;
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        {
+            let mut map = namespace_data.write().unwrap();
+            for record in records {
+                // Skip expired records
+                if record.expires_at_ms > 0 && record.expires_at_ms <= now_ms {
+                    continue;
+                }
+
+                let mt = map
+                    .entry(record.namespace)
+                    .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
+                let mt = mt.get_mut().unwrap();
+
+                let rev = RevisionID::from(record.revision);
+                let ttl = if record.expires_at_ms > 0 {
+                    // Convert absolute expiry back to remaining duration
+                    let remaining_ms = record.expires_at_ms.saturating_sub(now_ms);
+                    Some(Duration::from_millis(remaining_ms))
+                } else {
+                    None
+                };
+
+                mt.put(record.key, record.value, rev, ttl);
+            }
+        }
+
+        // Open AOL for appending
+        let aol = Arc::new(Mutex::new(aol::Aol::open(
+            &config.path,
+            config.aol_buffer_size,
+        )?));
+
+        let flush_stop = Arc::new(AtomicBool::new(false));
+        let flush_thread = {
+            let aol = Arc::clone(&aol);
+            let stop = Arc::clone(&flush_stop);
+            Some(thread::spawn(move || {
+                let mut tick = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_secs(1));
+                    tick += 1;
+                    if tick >= 60 {
+                        tick = 0;
+                        let mut aol = aol.lock().unwrap();
+                        let _ = aol.flush_if_dirty();
+                    }
+                }
+                // Final flush on shutdown
+                let mut aol = aol.lock().unwrap();
+                let _ = aol.flush_if_dirty();
+            }))
+        };
+
         Ok(Self {
             config,
             opened_at: Instant::now(),
             encrypted_namespaces: Mutex::new(HashMap::new()),
             io_backend,
             revision_gen,
-            namespace_data: RwLock::new(HashMap::new()),
+            namespace_data,
+            aol,
+            flush_stop,
+            flush_thread,
         })
     }
 
-    pub fn close(self) -> Result<()> {
+    pub fn close(mut self) -> Result<()> {
+        self.flush_stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.flush_thread.take() {
+            let _ = handle.join();
+        }
         Ok(())
     }
 
@@ -278,6 +358,18 @@ impl DB {
         self.revision_gen.generate()
     }
 
+    pub(crate) fn append_to_aol(
+        &self,
+        ns: &str,
+        rev: u128,
+        key: &Key,
+        value: &Value,
+        ttl: Option<Duration>,
+    ) -> Result<()> {
+        let mut aol = self.aol.lock().unwrap();
+        aol.append(ns, rev, key, value, ttl)
+    }
+
     pub(crate) fn get_or_create_memtable(&self, name: &str) -> &Mutex<memtable::MemTable> {
         // Fast path: read lock to check if memtable already exists
         {
@@ -297,5 +389,14 @@ impl DB {
         let ptr = map.get(name).unwrap() as *const Mutex<memtable::MemTable>;
         // SAFETY: Same as above — the HashMap only grows, so the reference is stable.
         unsafe { &*ptr }
+    }
+}
+
+impl Drop for DB {
+    fn drop(&mut self) {
+        self.flush_stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.flush_thread.take() {
+            let _ = handle.join();
+        }
     }
 }

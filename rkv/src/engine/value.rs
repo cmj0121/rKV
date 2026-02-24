@@ -23,6 +23,27 @@ impl Value {
         Value::Tombstone
     }
 
+    /// Serialize the variant to a 1-byte tag for on-disk encoding.
+    pub(crate) fn to_tag(&self) -> u8 {
+        match self {
+            Value::Data(_) => 0x00,
+            Value::Null => 0x01,
+            Value::Tombstone => 0x02,
+        }
+    }
+
+    /// Reconstruct a Value from a tag byte and optional data payload.
+    pub(crate) fn from_tag(tag: u8, data: &[u8]) -> super::error::Result<Self> {
+        match tag {
+            0x00 => Ok(Value::Data(data.to_vec())),
+            0x01 => Ok(Value::Null),
+            0x02 => Ok(Value::Tombstone),
+            _ => Err(super::error::Error::Corruption(format!(
+                "unknown value tag: 0x{tag:02x}"
+            ))),
+        }
+    }
+
     /// Check whether this value is a tombstone (crate-internal only).
     #[allow(dead_code)]
     pub(crate) fn is_tombstone(&self) -> bool {
@@ -328,6 +349,53 @@ mod tests {
     #[test]
     fn clone_null() {
         assert_eq!(Value::Null.clone(), Value::Null);
+    }
+
+    // --- Tag serialization ---
+
+    #[test]
+    fn to_tag_data() {
+        assert_eq!(Value::Data(vec![1, 2]).to_tag(), 0x00);
+    }
+
+    #[test]
+    fn to_tag_null() {
+        assert_eq!(Value::Null.to_tag(), 0x01);
+    }
+
+    #[test]
+    fn to_tag_tombstone() {
+        assert_eq!(Value::tombstone().to_tag(), 0x02);
+    }
+
+    #[test]
+    fn from_tag_data() {
+        let v = Value::from_tag(0x00, b"hello").unwrap();
+        assert_eq!(v, Value::Data(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn from_tag_data_empty() {
+        let v = Value::from_tag(0x00, b"").unwrap();
+        assert_eq!(v, Value::Data(vec![]));
+    }
+
+    #[test]
+    fn from_tag_null() {
+        let v = Value::from_tag(0x01, b"").unwrap();
+        assert_eq!(v, Value::Null);
+    }
+
+    #[test]
+    fn from_tag_tombstone() {
+        let v = Value::from_tag(0x02, b"").unwrap();
+        assert_eq!(v, Value::tombstone());
+    }
+
+    #[test]
+    fn from_tag_unknown() {
+        let err = Value::from_tag(0xFF, b"").unwrap_err();
+        assert!(matches!(err, super::super::error::Error::Corruption(_)));
     }
 
     // --- ValuePointer ---

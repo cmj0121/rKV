@@ -344,6 +344,13 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                     c.io_model.to_string(),
                 ),
                 ("", "", String::new()),
+                ("AOL", "", String::new()),
+                (
+                    "  aol_buffer_size",
+                    "flush threshold (0 = per-record)",
+                    c.aol_buffer_size.to_string(),
+                ),
+                ("", "", String::new()),
                 ("Revision", "", String::new()),
                 (
                     "  cluster_id",
@@ -568,6 +575,13 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
                 }
                 Err(_) => eprintln!("error: expected a number or 'none'"),
             },
+        },
+        "aol_buffer_size" => match value.parse::<usize>() {
+            Ok(v) => {
+                c.aol_buffer_size = v;
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected a number"),
         },
         "path" => eprintln!("error: path cannot be changed at runtime"),
         _ => eprintln!("error: unknown config key '{key}'"),
