@@ -3,6 +3,7 @@ mod checksum;
 mod error;
 mod io;
 mod key;
+mod memtable;
 mod namespace;
 mod recovery;
 mod revision;
