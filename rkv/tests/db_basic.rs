@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use rkv::{Config, Error, IoModel, Stats, DB, DEFAULT_NAMESPACE};
+use rkv::{Config, Error, IoModel, Key, RevisionID, Stats, Value, DB, DEFAULT_NAMESPACE};
 
 #[test]
 fn open_creates_directory() {
@@ -87,72 +87,320 @@ fn drop_namespace_returns_not_implemented() {
     assert!(matches!(err, Error::NotImplemented(_)));
 }
 
+// --- Data operations (memtable-backed) ---
+
 #[test]
-fn put_returns_not_implemented() {
+fn put_returns_revision() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
-    let err = ns.put("key", "value").unwrap_err();
-    assert!(matches!(err, Error::NotImplemented(_)));
+    let rev = ns.put("key", "value", None).unwrap();
+    assert_ne!(rev, RevisionID::ZERO);
 }
 
 #[test]
-fn get_returns_not_implemented() {
+fn get_after_put() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("key", "value", None).unwrap();
+    let val = ns.get("key").unwrap();
+    assert_eq!(val, Value::from("value"));
+}
+
+#[test]
+fn get_missing_key_returns_key_not_found() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
     let err = ns.get("key").unwrap_err();
-    assert!(matches!(err, Error::NotImplemented(_)));
+    assert!(matches!(err, Error::KeyNotFound));
 }
 
 #[test]
-fn rev_count_returns_not_implemented() {
+fn put_get_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
-    let err = ns.rev_count("key").unwrap_err();
-    assert!(matches!(err, Error::NotImplemented(_)));
+    ns.put("hello", "world", None).unwrap();
+    assert_eq!(ns.get("hello").unwrap(), Value::from("world"));
 }
 
 #[test]
-fn rev_get_returns_not_implemented() {
+fn put_overwrite() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
-    let err = ns.rev_get("key", 0).unwrap_err();
-    assert!(matches!(err, Error::NotImplemented(_)));
+    ns.put("k", "v1", None).unwrap();
+    ns.put("k", "v2", None).unwrap();
+    assert_eq!(ns.get("k").unwrap(), Value::from("v2"));
 }
 
 #[test]
-fn put_with_ttl_returns_not_implemented() {
+fn delete_makes_key_not_found() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
-    let err = ns
-        .put_with_ttl("key", "value", Duration::from_secs(60))
-        .unwrap_err();
-    assert!(matches!(err, Error::NotImplemented(_)));
+    ns.put("k", "v", None).unwrap();
+    ns.delete("k").unwrap();
+    let err = ns.get("k").unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound));
 }
 
 #[test]
-fn ttl_returns_not_implemented() {
+fn exists_after_put_and_delete() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
-    let err = ns.ttl("key").unwrap_err();
-    assert!(matches!(err, Error::NotImplemented(_)));
+    ns.put("k", "v", None).unwrap();
+    assert!(ns.exists("k").unwrap());
+
+    ns.delete("k").unwrap();
+    assert!(!ns.exists("k").unwrap());
+}
+
+#[test]
+fn scan_ordered_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put(3_i64, "c", None).unwrap();
+    ns.put(1_i64, "a", None).unwrap();
+    ns.put(2_i64, "b", None).unwrap();
+
+    let keys = ns.scan(&Key::Int(1), 10).unwrap();
+    assert_eq!(keys, vec![Key::Int(1), Key::Int(2), Key::Int(3)]);
+}
+
+#[test]
+fn rscan_ordered_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put(1_i64, "a", None).unwrap();
+    ns.put(2_i64, "b", None).unwrap();
+    ns.put(3_i64, "c", None).unwrap();
+
+    let keys = ns.rscan(&Key::Int(3), 10).unwrap();
+    assert_eq!(keys, vec![Key::Int(3), Key::Int(2), Key::Int(1)]);
+}
+
+#[test]
+fn scan_unordered_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("user:1", "a", None).unwrap();
+    ns.put("user:2", "b", None).unwrap();
+    ns.put("post:1", "c", None).unwrap();
+
+    let keys = ns.scan(&Key::from("user:"), 10).unwrap();
+    assert_eq!(keys.len(), 2);
+    assert!(keys.contains(&Key::from("user:1")));
+    assert!(keys.contains(&Key::from("user:2")));
+}
+
+#[test]
+fn count_excludes_tombstones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put(1_i64, "a", None).unwrap();
+    ns.put(2_i64, "b", None).unwrap();
+    ns.delete(2_i64).unwrap();
+
+    assert_eq!(ns.count().unwrap(), 1);
+}
+
+#[test]
+fn rev_count_tracks_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("k", "v1", None).unwrap();
+    ns.put("k", "v2", None).unwrap();
+    ns.put("k", "v3", None).unwrap();
+
+    assert_eq!(ns.rev_count("k").unwrap(), 3);
+}
+
+#[test]
+fn rev_count_missing_key_returns_key_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let err = ns.rev_count("k").unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound));
+}
+
+#[test]
+fn rev_get_returns_by_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("k", "v1", None).unwrap();
+    ns.put("k", "v2", None).unwrap();
+    ns.put("k", "v3", None).unwrap();
+
+    assert_eq!(ns.rev_get("k", 0).unwrap(), Value::from("v1"));
+    assert_eq!(ns.rev_get("k", 2).unwrap(), Value::from("v3"));
+}
+
+#[test]
+fn rev_get_missing_key_returns_key_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let err = ns.rev_get("k", 0).unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound));
+}
+
+#[test]
+fn ttl_expires_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("k", "v", Some(Duration::from_millis(1))).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+
+    let err = ns.get("k").unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound));
+}
+
+#[test]
+fn ttl_returns_remaining() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("k", "v", Some(Duration::from_secs(60))).unwrap();
+
+    let remaining = ns.ttl("k").unwrap().unwrap();
+    assert!(remaining.as_secs() > 50);
+}
+
+#[test]
+fn ttl_none_for_permanent_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("k", "v", None).unwrap();
+    assert_eq!(ns.ttl("k").unwrap(), None);
+}
+
+#[test]
+fn ttl_missing_key_returns_key_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let err = ns.ttl("k").unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound));
+}
+
+#[test]
+fn auto_upgrade_widens_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put(42_i64, "int_value", None).unwrap();
+    // First Str key triggers auto-upgrade
+    ns.put("hello", "str_value", None).unwrap();
+
+    // Original Int(42) is now Str("42")
+    let err = ns.get(42_i64).unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound));
+    assert_eq!(ns.get("42").unwrap(), Value::from("int_value"));
+    assert_eq!(ns.get("hello").unwrap(), Value::from("str_value"));
+}
+
+#[test]
+fn namespace_isolation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns1 = db.namespace("ns1", None).unwrap();
+    let ns2 = db.namespace("ns2", None).unwrap();
+
+    ns1.put("k", "v1", None).unwrap();
+    ns2.put("k", "v2", None).unwrap();
+
+    assert_eq!(ns1.get("k").unwrap(), Value::from("v1"));
+    assert_eq!(ns2.get("k").unwrap(), Value::from("v2"));
+}
+
+#[test]
+fn revision_monotonic_per_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let r1 = ns.put("k", "v1", None).unwrap();
+    let r2 = ns.put("k", "v2", None).unwrap();
+    let r3 = ns.put("k", "v3", None).unwrap();
+
+    assert!(r1 < r2);
+    assert!(r2 < r3);
+}
+
+#[test]
+fn revision_id_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.cluster_id = Some(0x1234);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let rev = ns.put("k", "v", None).unwrap();
+    assert!(rev.timestamp_ms() > 0);
+    assert_eq!(rev.cluster_id(), 0x1234);
+    assert_eq!(rev.process_id(), std::process::id() as u16);
+}
+
+#[test]
+fn config_cluster_id_default() {
+    let config = Config::new("/tmp/test");
+    assert_eq!(config.cluster_id, None);
 }
 
 // --- Stats & Config tests ---
@@ -389,17 +637,17 @@ fn compact_returns_not_implemented() {
     assert!(matches!(err, Error::NotImplemented(_)));
 }
 
-// --- Namespace encryption stubs ---
+// --- Namespace encryption ---
 
 #[test]
-fn namespace_encrypted_stub() {
+fn namespace_encrypted_put_works() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
 
     let ns = db.namespace("secret", Some("s3cret")).unwrap();
-    let err = ns.put("key", "value").unwrap_err();
-    assert!(matches!(err, Error::NotImplemented(_)));
+    let rev = ns.put("key", "value", None).unwrap();
+    assert_ne!(rev, RevisionID::ZERO);
 }
 
 #[test]
