@@ -246,9 +246,36 @@ The `Config` struct controls database behavior and LSM tuning parameters:
 | `compress`          | `bool`    | `true`     | LZ4-compress bin objects on disk          |
 | `bloom_bits`        | `usize`   | 10         | Bloom filter bits per key (0 = disabled)  |
 | `verify_checksums`  | `bool`    | `true`     | Verify checksums on read (see below)      |
+| `io_model`          | `IoModel` | `Mmap`     | File I/O strategy (see I/O Modes below)   |
 
 `Config::new(path)` initializes all fields to their defaults. Fields can be overridden before
 passing the config to `DB::open`.
+
+### I/O Modes
+
+The `io_model` field selects the file I/O strategy used by the storage engine. The three
+modes are mutually exclusive:
+
+| Mode       | Enum variant        | Description                                                       |
+| ---------- | ------------------- | ----------------------------------------------------------------- |
+| `none`     | `IoModel::None`     | Buffered I/O — all reads and writes go through the OS page cache. |
+| `directio` | `IoModel::DirectIO` | Direct I/O — bypasses the OS page cache (O_DIRECT on Linux).      |
+| `mmap`     | `IoModel::Mmap`     | Memory-mapped I/O — zero-copy reads via mmap. **(default)**       |
+
+**Buffered** is the simplest strategy: the OS manages caching. It works well for
+general workloads but gives the engine no control over eviction or write ordering.
+
+**Direct I/O** is useful when the engine manages its own block cache and wants to avoid
+double-caching (once in the engine cache, once in the OS page cache). This mode requires
+aligned buffers and is more complex to implement.
+
+**Mmap** maps data files directly into the process address space, enabling zero-copy reads.
+It is the default because it provides excellent read throughput with minimal syscall
+overhead. The trade-off is that write-heavy workloads may trigger unpredictable page faults
+and the engine has less control over I/O scheduling.
+
+**Stub status**: All three backends are defined but return `NotImplemented`. The actual
+I/O logic will be implemented when the storage layer is built.
 
 ### Statistics
 
