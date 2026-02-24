@@ -17,10 +17,6 @@ pub(crate) enum ChecksumAlgo {
 /// Every WAL entry and SSTable block carries a `Checksum`. On write the
 /// engine computes the checksum over the raw data; on read the engine
 /// recomputes and compares to detect corruption.
-///
-/// **Stub implementation**: `compute()` returns a zeroed checksum and
-/// `verify()` always succeeds. Actual CRC32C logic will be wired in
-/// when the persistence layer lands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) struct Checksum {
@@ -30,21 +26,28 @@ pub(crate) struct Checksum {
 
 #[allow(dead_code)]
 impl Checksum {
-    /// Compute a checksum over `data`.
-    ///
-    /// Stub: returns a zeroed CRC32C checksum.
-    pub(crate) fn compute(_data: &[u8]) -> Self {
+    /// Compute a CRC32C checksum over `data`.
+    pub(crate) fn compute(data: &[u8]) -> Self {
         Self {
             algo: ChecksumAlgo::Crc32c,
-            value: 0,
+            value: crc32c::crc32c(data),
         }
     }
 
     /// Verify this checksum against `data`.
     ///
-    /// Stub: always succeeds.
-    pub(crate) fn verify(&self, _data: &[u8]) -> Result<()> {
-        Ok(())
+    /// Returns `Ok(())` if the recomputed checksum matches, or
+    /// `Error::Corruption` on mismatch.
+    pub(crate) fn verify(&self, data: &[u8]) -> Result<()> {
+        let expected = crc32c::crc32c(data);
+        if self.value == expected {
+            Ok(())
+        } else {
+            Err(Error::Corruption(format!(
+                "checksum mismatch: stored 0x{:08x}, computed 0x{expected:08x}",
+                self.value
+            )))
+        }
     }
 
     /// Return the algorithm used for this checksum.
@@ -75,9 +78,25 @@ impl Checksum {
 
     /// Deserialize a checksum from bytes.
     ///
-    /// Stub: returns `NotImplemented`.
-    pub(crate) fn from_bytes(_data: &[u8]) -> Result<Self> {
-        Err(Error::NotImplemented("Checksum::from_bytes".into()))
+    /// Expects exactly 5 bytes: `[algo_tag, value_be(4)]`.
+    pub(crate) fn from_bytes(data: &[u8]) -> Result<Self> {
+        if data.len() != Self::encoded_size() {
+            return Err(Error::Corruption(format!(
+                "checksum expected {} bytes, got {}",
+                Self::encoded_size(),
+                data.len()
+            )));
+        }
+        let algo = match data[0] {
+            0x01 => ChecksumAlgo::Crc32c,
+            tag => {
+                return Err(Error::Corruption(format!(
+                    "unknown checksum algorithm tag: 0x{tag:02x}"
+                )));
+            }
+        };
+        let value = u32::from_be_bytes(data[1..5].try_into().unwrap());
+        Ok(Self { algo, value })
     }
 
     /// Construct a checksum directly from an algorithm and value.
@@ -93,17 +112,17 @@ mod tests {
     // --- Construction ---
 
     #[test]
-    fn compute_returns_zeroed_crc32c() {
+    fn compute_returns_crc32c() {
         let cs = Checksum::compute(b"hello");
         assert_eq!(cs.algo(), ChecksumAlgo::Crc32c);
-        assert_eq!(cs.value(), 0);
+        assert_eq!(cs.value(), crc32c::crc32c(b"hello"));
     }
 
     #[test]
     fn compute_empty_data() {
         let cs = Checksum::compute(b"");
         assert_eq!(cs.algo(), ChecksumAlgo::Crc32c);
-        assert_eq!(cs.value(), 0);
+        assert_eq!(cs.value(), crc32c::crc32c(b""));
     }
 
     #[test]
@@ -116,10 +135,16 @@ mod tests {
     // --- Verify ---
 
     #[test]
-    fn verify_always_succeeds() {
+    fn verify_matching_data() {
         let cs = Checksum::compute(b"data");
         assert!(cs.verify(b"data").is_ok());
-        assert!(cs.verify(b"different").is_ok()); // stub: always ok
+    }
+
+    #[test]
+    fn verify_mismatched_data() {
+        let cs = Checksum::compute(b"data");
+        let err = cs.verify(b"different").unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)));
     }
 
     // --- Accessors ---
@@ -155,27 +180,29 @@ mod tests {
     }
 
     #[test]
-    fn to_bytes_zeroed() {
-        let cs = Checksum::compute(b"anything");
-        let bytes = cs.to_bytes();
-        assert_eq!(bytes, vec![0x01, 0x00, 0x00, 0x00, 0x00]);
-    }
-
-    #[test]
     fn to_bytes_length_matches_encoded_size() {
         let cs = Checksum::from_raw(ChecksumAlgo::Crc32c, u32::MAX);
         assert_eq!(cs.to_bytes().len(), Checksum::encoded_size());
     }
 
     #[test]
-    fn from_bytes_returns_not_implemented() {
-        let result = Checksum::from_bytes(&[0x01, 0x00, 0x00, 0x00, 0x00]);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, Error::NotImplemented(ref msg) if msg.contains("Checksum")),
-            "expected NotImplemented, got: {err}",
-        );
+    fn from_bytes_roundtrip() {
+        let cs = Checksum::compute(b"hello world");
+        let bytes = cs.to_bytes();
+        let parsed = Checksum::from_bytes(&bytes).unwrap();
+        assert_eq!(cs, parsed);
+    }
+
+    #[test]
+    fn from_bytes_wrong_length() {
+        let result = Checksum::from_bytes(&[0x01, 0x00, 0x00]);
+        assert!(matches!(result.unwrap_err(), Error::Corruption(_)));
+    }
+
+    #[test]
+    fn from_bytes_unknown_algo() {
+        let result = Checksum::from_bytes(&[0xFF, 0x00, 0x00, 0x00, 0x00]);
+        assert!(matches!(result.unwrap_err(), Error::Corruption(_)));
     }
 
     // --- Equality ---
