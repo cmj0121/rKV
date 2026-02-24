@@ -60,6 +60,8 @@ impl<'db> Namespace<'db> {
         let key = key.into();
         let value = value.into();
         let rev = self.db.generate_revision();
+        self.db
+            .append_to_aol(&self.name, rev.as_u128(), &key, &value, ttl)?;
         let mt = self.db.get_or_create_memtable(&self.name);
         let mut mt = mt.lock().unwrap();
         let actual_rev = mt.put(key, value, rev, ttl);
@@ -76,6 +78,8 @@ impl<'db> Namespace<'db> {
     pub fn delete(&self, key: impl Into<Key>) -> Result<()> {
         let key = key.into();
         let rev = self.db.generate_revision();
+        self.db
+            .append_to_aol(&self.name, rev.as_u128(), &key, &Value::tombstone(), None)?;
         let mt = self.db.get_or_create_memtable(&self.name);
         let mut mt = mt.lock().unwrap();
         mt.delete(key, rev);

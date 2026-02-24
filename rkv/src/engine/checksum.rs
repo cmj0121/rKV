@@ -6,7 +6,6 @@ use super::error::{Error, Result};
 /// checksum value so readers can identify the algorithm without external
 /// metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum ChecksumAlgo {
     /// CRC32C (Castagnoli) — hardware-accelerated on modern x86/ARM.
     Crc32c = 0x01,
@@ -18,13 +17,11 @@ pub(crate) enum ChecksumAlgo {
 /// engine computes the checksum over the raw data; on read the engine
 /// recomputes and compares to detect corruption.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct Checksum {
     algo: ChecksumAlgo,
     value: u32,
 }
 
-#[allow(dead_code)]
 impl Checksum {
     /// Compute a CRC32C checksum over `data`.
     pub(crate) fn compute(data: &[u8]) -> Self {
@@ -51,11 +48,13 @@ impl Checksum {
     }
 
     /// Return the algorithm used for this checksum.
+    #[allow(dead_code)]
     pub(crate) fn algo(&self) -> ChecksumAlgo {
         self.algo
     }
 
     /// Return the raw checksum value.
+    #[allow(dead_code)]
     pub(crate) fn value(&self) -> u32 {
         self.value
     }
@@ -100,6 +99,7 @@ impl Checksum {
     }
 
     /// Construct a checksum directly from an algorithm and value.
+    #[allow(dead_code)]
     pub(crate) fn from_raw(algo: ChecksumAlgo, value: u32) -> Self {
         Self { algo, value }
     }

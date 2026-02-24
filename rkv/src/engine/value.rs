@@ -24,7 +24,6 @@ impl Value {
     }
 
     /// Serialize the variant to a 1-byte tag for on-disk encoding.
-    #[allow(dead_code)]
     pub(crate) fn to_tag(&self) -> u8 {
         match self {
             Value::Data(_) => 0x00,
@@ -34,7 +33,6 @@ impl Value {
     }
 
     /// Reconstruct a Value from a tag byte and optional data payload.
-    #[allow(dead_code)]
     pub(crate) fn from_tag(tag: u8, data: &[u8]) -> super::error::Result<Self> {
         match tag {
             0x00 => Ok(Value::Data(data.to_vec())),
