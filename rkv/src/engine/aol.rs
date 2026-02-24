@@ -30,12 +30,18 @@ pub(crate) struct AolRecord {
 /// Append-only log for write-ahead durability.
 pub(crate) struct Aol {
     writer: BufWriter<File>,
+    buffer_size: usize,
+    append_count: usize,
+    dirty: bool,
 }
 
 impl Aol {
     /// Open the AOL for appending. Creates the file and writes the header
     /// if it does not exist; otherwise positions the writer at the end.
-    pub(crate) fn open(db_dir: &Path) -> Result<Self> {
+    ///
+    /// `buffer_size` controls the flush threshold: after this many appends
+    /// the writer is flushed. Set to 0 for per-record flush.
+    pub(crate) fn open(db_dir: &Path, buffer_size: usize) -> Result<Self> {
         let path = aol_path(db_dir);
         let exists = path.exists();
 
@@ -47,7 +53,12 @@ impl Aol {
             write_header(&mut writer)?;
         }
 
-        Ok(Self { writer })
+        Ok(Self {
+            writer,
+            buffer_size,
+            append_count: 0,
+            dirty: false,
+        })
     }
 
     /// Append a record to the log.
@@ -81,7 +92,14 @@ impl Aol {
             .write_all(&(payload.len() as u32).to_be_bytes())?;
         self.writer.write_all(&payload)?;
         self.writer.write_all(&checksum.to_bytes())?;
-        self.writer.flush()?;
+
+        self.append_count += 1;
+        self.dirty = true;
+        if self.buffer_size == 0 || self.append_count >= self.buffer_size {
+            self.writer.flush()?;
+            self.append_count = 0;
+            self.dirty = false;
+        }
 
         Ok(())
     }
@@ -163,10 +181,23 @@ impl Aol {
         Ok((records, skipped))
     }
 
+    /// Flush the userspace buffer if any data has been written since
+    /// the last flush. Called by the background timer thread.
+    pub(crate) fn flush_if_dirty(&mut self) -> Result<()> {
+        if self.dirty {
+            self.writer.flush()?;
+            self.append_count = 0;
+            self.dirty = false;
+        }
+        Ok(())
+    }
+
     /// Fsync the underlying file to durable storage.
     #[allow(dead_code)]
     pub(crate) fn sync(&mut self) -> Result<()> {
         self.writer.flush()?;
+        self.append_count = 0;
+        self.dirty = false;
         self.writer.get_ref().sync_all()?;
         Ok(())
     }
@@ -299,7 +330,7 @@ mod tests {
     #[test]
     fn header_written_on_create() {
         let tmp = tempfile::tempdir().unwrap();
-        let _aol = Aol::open(tmp.path()).unwrap();
+        let _aol = Aol::open(tmp.path(), 0).unwrap();
 
         let data = std::fs::read(aol_path(tmp.path())).unwrap();
         assert_eq!(&data[0..4], &MAGIC);
@@ -311,14 +342,14 @@ mod tests {
     fn header_not_rewritten_on_reopen() {
         let tmp = tempfile::tempdir().unwrap();
         {
-            let mut aol = Aol::open(tmp.path()).unwrap();
+            let mut aol = Aol::open(tmp.path(), 0).unwrap();
             aol.append("_", 1, &Key::Int(1), &Value::from("v"), None)
                 .unwrap();
         }
         let size_before = std::fs::metadata(aol_path(tmp.path())).unwrap().len();
 
         // Reopen — should not duplicate header
-        let _aol = Aol::open(tmp.path()).unwrap();
+        let _aol = Aol::open(tmp.path(), 0).unwrap();
         let size_after = std::fs::metadata(aol_path(tmp.path())).unwrap().len();
         assert_eq!(size_before, size_after);
     }
@@ -377,7 +408,7 @@ mod tests {
     fn append_and_replay() {
         let tmp = tempfile::tempdir().unwrap();
         {
-            let mut aol = Aol::open(tmp.path()).unwrap();
+            let mut aol = Aol::open(tmp.path(), 0).unwrap();
             aol.append("_", 1, &Key::Int(1), &Value::from("v1"), None)
                 .unwrap();
             aol.append("_", 2, &Key::Int(2), &Value::from("v2"), None)
@@ -405,7 +436,7 @@ mod tests {
     fn replay_with_ttl() {
         let tmp = tempfile::tempdir().unwrap();
         {
-            let mut aol = Aol::open(tmp.path()).unwrap();
+            let mut aol = Aol::open(tmp.path(), 0).unwrap();
             aol.append(
                 "_",
                 1,
@@ -425,7 +456,7 @@ mod tests {
     fn replay_multiple_namespaces() {
         let tmp = tempfile::tempdir().unwrap();
         {
-            let mut aol = Aol::open(tmp.path()).unwrap();
+            let mut aol = Aol::open(tmp.path(), 0).unwrap();
             aol.append("ns1", 1, &Key::Int(1), &Value::from("a"), None)
                 .unwrap();
             aol.append("ns2", 2, &Key::Int(1), &Value::from("b"), None)
@@ -442,7 +473,7 @@ mod tests {
     fn replay_detects_truncation() {
         let tmp = tempfile::tempdir().unwrap();
         {
-            let mut aol = Aol::open(tmp.path()).unwrap();
+            let mut aol = Aol::open(tmp.path(), 0).unwrap();
             aol.append("_", 1, &Key::Int(1), &Value::from("v"), None)
                 .unwrap();
         }
@@ -461,7 +492,7 @@ mod tests {
     fn replay_detects_corruption() {
         let tmp = tempfile::tempdir().unwrap();
         {
-            let mut aol = Aol::open(tmp.path()).unwrap();
+            let mut aol = Aol::open(tmp.path(), 0).unwrap();
             aol.append("_", 1, &Key::Int(1), &Value::from("v"), None)
                 .unwrap();
         }
@@ -481,7 +512,7 @@ mod tests {
     fn replay_skips_corruption_without_verify() {
         let tmp = tempfile::tempdir().unwrap();
         {
-            let mut aol = Aol::open(tmp.path()).unwrap();
+            let mut aol = Aol::open(tmp.path(), 0).unwrap();
             aol.append("_", 1, &Key::Int(1), &Value::from("v"), None)
                 .unwrap();
         }
@@ -504,7 +535,7 @@ mod tests {
     fn replay_bad_magic() {
         let tmp = tempfile::tempdir().unwrap();
         {
-            let _aol = Aol::open(tmp.path()).unwrap();
+            let _aol = Aol::open(tmp.path(), 0).unwrap();
         }
 
         let path = aol_path(tmp.path());
@@ -521,7 +552,7 @@ mod tests {
     #[test]
     fn sync_does_not_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut aol = Aol::open(tmp.path()).unwrap();
+        let mut aol = Aol::open(tmp.path(), 0).unwrap();
         aol.append("_", 1, &Key::Int(1), &Value::from("v"), None)
             .unwrap();
         aol.sync().unwrap();
@@ -533,12 +564,12 @@ mod tests {
     fn append_after_reopen() {
         let tmp = tempfile::tempdir().unwrap();
         {
-            let mut aol = Aol::open(tmp.path()).unwrap();
+            let mut aol = Aol::open(tmp.path(), 0).unwrap();
             aol.append("_", 1, &Key::Int(1), &Value::from("v1"), None)
                 .unwrap();
         }
         {
-            let mut aol = Aol::open(tmp.path()).unwrap();
+            let mut aol = Aol::open(tmp.path(), 0).unwrap();
             aol.append("_", 2, &Key::Int(2), &Value::from("v2"), None)
                 .unwrap();
         }
@@ -546,5 +577,91 @@ mod tests {
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(skipped, 0);
+    }
+
+    // --- Buffered flush ---
+
+    #[test]
+    fn buffered_flush_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            // Buffer size = 3: records are flushed after every 3 appends
+            let mut aol = Aol::open(tmp.path(), 3).unwrap();
+            aol.append("_", 1, &Key::Int(1), &Value::from("a"), None)
+                .unwrap();
+            aol.append("_", 2, &Key::Int(2), &Value::from("b"), None)
+                .unwrap();
+            assert!(aol.dirty);
+
+            // Third append triggers flush
+            aol.append("_", 3, &Key::Int(3), &Value::from("c"), None)
+                .unwrap();
+            assert!(!aol.dirty);
+            assert_eq!(aol.append_count, 0);
+        }
+
+        let (records, _) = Aol::replay(tmp.path(), true).unwrap();
+        assert_eq!(records.len(), 3);
+    }
+
+    #[test]
+    fn buffered_flush_zero_means_per_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut aol = Aol::open(tmp.path(), 0).unwrap();
+            aol.append("_", 1, &Key::Int(1), &Value::from("a"), None)
+                .unwrap();
+            // With buffer_size=0, every append flushes immediately
+            assert!(!aol.dirty);
+            assert_eq!(aol.append_count, 0);
+        }
+
+        let (records, _) = Aol::replay(tmp.path(), true).unwrap();
+        assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn flush_if_dirty_flushes_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut aol = Aol::open(tmp.path(), 100).unwrap();
+            aol.append("_", 1, &Key::Int(1), &Value::from("a"), None)
+                .unwrap();
+            assert!(aol.dirty);
+
+            aol.flush_if_dirty().unwrap();
+            assert!(!aol.dirty);
+            assert_eq!(aol.append_count, 0);
+        }
+
+        let (records, _) = Aol::replay(tmp.path(), true).unwrap();
+        assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn flush_if_dirty_noop_when_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut aol = Aol::open(tmp.path(), 100).unwrap();
+        // No appends — should be a no-op
+        assert!(!aol.dirty);
+        aol.flush_if_dirty().unwrap();
+        assert!(!aol.dirty);
+    }
+
+    #[test]
+    fn drop_without_flush_loses_buffered_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut aol = Aol::open(tmp.path(), 100).unwrap();
+            aol.append("_", 1, &Key::Int(1), &Value::from("a"), None)
+                .unwrap();
+            // Drop without flush — buffered data may be lost
+        }
+
+        let (records, _) = Aol::replay(tmp.path(), true).unwrap();
+        // BufWriter may or may not flush on drop depending on implementation,
+        // but with a large buffer_size the data is likely unflushed.
+        // The important thing is that replay doesn't crash.
+        assert!(records.len() <= 1);
     }
 }

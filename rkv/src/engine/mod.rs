@@ -24,7 +24,9 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Default namespace name.
@@ -104,6 +106,9 @@ pub struct Config {
     pub io_model: IoModel,
     /// Cluster ID for RevisionID generation (default: None = random at startup).
     pub cluster_id: Option<u16>,
+    /// AOL flush threshold in records (default: 128).
+    /// Set to 0 for per-record flush (maximum durability).
+    pub aol_buffer_size: usize,
 }
 
 impl Config {
@@ -121,6 +126,7 @@ impl Config {
             verify_checksums: true,
             io_model: IoModel::default(),
             cluster_id: None,
+            aol_buffer_size: 128,
         }
     }
 }
@@ -133,7 +139,9 @@ pub struct DB {
     io_backend: Box<dyn io::IoBackend>,
     revision_gen: revision::RevisionGen,
     namespace_data: RwLock<HashMap<String, Mutex<memtable::MemTable>>>,
-    aol: Mutex<aol::Aol>,
+    aol: Arc<Mutex<aol::Aol>>,
+    flush_stop: Arc<AtomicBool>,
+    flush_thread: Option<JoinHandle<()>>,
 }
 
 impl DB {
@@ -180,7 +188,31 @@ impl DB {
         }
 
         // Open AOL for appending
-        let aol = aol::Aol::open(&config.path)?;
+        let aol = Arc::new(Mutex::new(aol::Aol::open(
+            &config.path,
+            config.aol_buffer_size,
+        )?));
+
+        let flush_stop = Arc::new(AtomicBool::new(false));
+        let flush_thread = {
+            let aol = Arc::clone(&aol);
+            let stop = Arc::clone(&flush_stop);
+            Some(thread::spawn(move || {
+                let mut tick = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_secs(1));
+                    tick += 1;
+                    if tick >= 60 {
+                        tick = 0;
+                        let mut aol = aol.lock().unwrap();
+                        let _ = aol.flush_if_dirty();
+                    }
+                }
+                // Final flush on shutdown
+                let mut aol = aol.lock().unwrap();
+                let _ = aol.flush_if_dirty();
+            }))
+        };
 
         Ok(Self {
             config,
@@ -189,11 +221,17 @@ impl DB {
             io_backend,
             revision_gen,
             namespace_data,
-            aol: Mutex::new(aol),
+            aol,
+            flush_stop,
+            flush_thread,
         })
     }
 
-    pub fn close(self) -> Result<()> {
+    pub fn close(mut self) -> Result<()> {
+        self.flush_stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.flush_thread.take() {
+            let _ = handle.join();
+        }
         Ok(())
     }
 
@@ -351,5 +389,14 @@ impl DB {
         let ptr = map.get(name).unwrap() as *const Mutex<memtable::MemTable>;
         // SAFETY: Same as above — the HashMap only grows, so the reference is stable.
         unsafe { &*ptr }
+    }
+}
+
+impl Drop for DB {
+    fn drop(&mut self) {
+        self.flush_stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.flush_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
