@@ -459,9 +459,78 @@ Each namespace has its own independent MemTable. The `DB` struct holds a
 on first access. A shared `RevisionGen` produces candidate RevisionIDs; individual MemTables
 enforce per-key monotonicity.
 
-**Current status**: The MemTable makes rKV a functional **in-memory** key-value store. Data
-is not persisted — WAL and SSTable flushing are future work. All data is lost when the
-process exits.
+**Current status**: The MemTable is the in-memory component of the write path. On startup,
+the AOL is replayed to reconstruct memtable state (see Append-Only Log below).
+
+#### Append-Only Log (AOL)
+
+The AOL is the durability layer in the write path. Every mutation is appended to the AOL
+**before** being applied to the MemTable. On crash recovery, `DB::open()` replays the AOL
+to reconstruct the in-memory state.
+
+**Write path**: `Client API -> AOL (append + flush) -> MemTable -> Response`
+
+##### AOL File Format
+
+The AOL is a single file (`aol`) in the database directory. It begins with an 8-byte header
+followed by a sequence of variable-length records.
+
+**Header (8 bytes, written once)**:
+
+| Offset | Size | Field    | Value                         |
+| ------ | ---- | -------- | ----------------------------- |
+| 0      | 4    | magic    | `0x724B564C` (ASCII `"rKVL"`) |
+| 4      | 2    | version  | `0x0001` (u16 BE)             |
+| 6      | 2    | reserved | `0x0000`                      |
+
+**Record layout (repeated)**:
+
+```text
+[payload_len: u32 BE (4B)] [payload: var] [checksum: 5B]
+```
+
+- `payload_len`: byte count of the payload (excludes length prefix and checksum)
+- `checksum`: CRC32C over the payload bytes (`Checksum::to_bytes()` format)
+- Total overhead per record: 9 bytes
+
+**Payload layout**:
+
+```text
+[ns_len: u16 BE] [namespace: ns_len bytes] [revision: u128 BE (16B)]
+[expires_at_ms: u64 BE] [key_len: u16 BE] [key_bytes: key_len bytes]
+[value_tag: u8] [value_data: remaining bytes]
+```
+
+- `revision`: candidate RevisionID from `RevisionGen` (MemTable enforces per-key monotonicity on replay)
+- `expires_at_ms`: absolute expiry as ms since Unix epoch (0 = no expiry)
+- `value_tag`: `0x00` = Data, `0x01` = Null, `0x02` = Tombstone
+- `value_data`: present only for Data variant
+
+##### TTL Encoding
+
+TTL is stored as an **absolute timestamp** (ms since Unix epoch) rather than a relative
+duration. This ensures correct expiry semantics on replay — if a key was set to expire at
+time T, it expires at time T regardless of when the database is reopened. Expired records
+are skipped during replay.
+
+##### Replay Semantics
+
+On `DB::open()`, the engine replays the AOL sequentially:
+
+1. Skip records where `expires_at_ms > 0` and `expires_at_ms <= now`
+2. For surviving records, get-or-create the namespace's MemTable
+3. Feed each record through `MemTable::put()` with the stored revision and remaining TTL
+4. Per-key monotonicity is enforced by the MemTable (candidate revisions may be bumped)
+
+Truncated or corrupted records at the tail of the file are silently skipped (counted in the
+skip counter). This handles partial writes from crashes during append.
+
+##### Limitations
+
+- **No truncation**: The AOL grows without bound until flush/compaction is implemented.
+  Once SSTable flushing lands, the AOL will be truncated after a successful flush.
+- **No fsync on every write**: The current implementation flushes the userspace buffer but
+  does not call `fsync` per record. A future `sync_mode` config option will control this.
 
 ### Embeddable Library
 
