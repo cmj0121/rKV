@@ -7,6 +7,10 @@ edition = "2021"
 name = "rkv"
 path = "src/main.rs"
 
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
 [lib]
 name = "rkv"
 path = "src/lib.rs"
@@ -17,8 +21,7 @@ dirs-sys = "0.5"
 fast32 = "1.0.3"
 fastrand = "2"
 rpassword = "5"
+sysinfo = "0.34"
 rustyline = "17"
-thiserror = "2"
-
-[dev-dependencies]
 tempfile = "3"
+thiserror = "2"
