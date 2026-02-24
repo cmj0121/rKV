@@ -162,7 +162,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             };
             let result = ns.put(parse_key(tokens[1]), tokens[2].as_bytes(), ttl);
             match result {
-                Ok(rev) => println!("{rev}"),
+                Ok(_) => {}
                 Err(e) => eprintln!("error: {e}"),
             }
         }
