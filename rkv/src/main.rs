@@ -66,6 +66,24 @@ fn format_duration(d: Duration) -> String {
     parts.join("")
 }
 
+fn format_bytes(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * 1024;
+    const GB: usize = 1024 * 1024 * 1024;
+
+    if bytes == 0 {
+        "0".to_owned()
+    } else if bytes.is_multiple_of(GB) {
+        format!("{} GB", bytes / GB)
+    } else if bytes.is_multiple_of(MB) {
+        format!("{} MB", bytes / MB)
+    } else if bytes.is_multiple_of(KB) {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{bytes}")
+    }
+}
+
 fn parse_key(token: &str) -> Key {
     match token {
         "true" => Key::Int(1),
@@ -244,43 +262,21 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
         "config" => {
             // config print is handled here; config set is handled in run_repl
             let c = db.config();
-            println!(
-                "path:              {}  # database directory",
-                c.path.display()
-            );
-            println!(
-                "create_if_missing: {}  # create dir if absent",
-                c.create_if_missing
-            );
-            println!(
-                "write_buffer_size: {}  # memtable size (bytes)",
-                c.write_buffer_size
-            );
-            println!("max_levels:        {}  # LSM levels", c.max_levels);
-            println!(
-                "block_size:        {}  # SSTable block size (bytes)",
-                c.block_size
-            );
-            println!(
-                "cache_size:        {}  # block cache size (bytes)",
-                c.cache_size
-            );
-            println!(
-                "object_size:       {}  # value separation threshold (bytes)",
-                c.object_size
-            );
-            println!(
-                "compress:          {}  # LZ4-compress bin objects",
-                c.compress
-            );
-            println!(
-                "verify_checksums:  {}  # verify on read",
-                c.verify_checksums
-            );
-            println!(
-                "bloom_bits:        {}  # bits per key (0 = disabled)",
-                c.bloom_bits
-            );
+            println!("Storage:");
+            println!("  path:              {}", c.path.display());
+            println!("  create_if_missing: {}", c.create_if_missing);
+            println!();
+            println!("LSM:");
+            println!("  write_buffer_size: {}", format_bytes(c.write_buffer_size));
+            println!("  max_levels:        {}", c.max_levels);
+            println!("  block_size:        {}", format_bytes(c.block_size));
+            println!("  cache_size:        {}", format_bytes(c.cache_size));
+            println!("  bloom_bits:        {}", c.bloom_bits);
+            println!("  verify_checksums:  {}", c.verify_checksums);
+            println!();
+            println!("Objects:");
+            println!("  object_size:       {}", format_bytes(c.object_size));
+            println!("  compress:          {}", c.compress);
         }
         "flush" => match db.flush() {
             Ok(()) => println!("OK"),
