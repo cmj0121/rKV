@@ -141,6 +141,7 @@ pub struct DB {
     revision_gen: revision::RevisionGen,
     namespace_data: RwLock<HashMap<String, Mutex<memtable::MemTable>>>,
     aol: Arc<Mutex<aol::Aol>>,
+    object_store: objects::ObjectStore,
     flush_stop: Arc<AtomicBool>,
     flush_thread: Option<JoinHandle<()>>,
 }
@@ -188,6 +189,9 @@ impl DB {
             }
         }
 
+        // Open object store
+        let object_store = objects::ObjectStore::open(&config.path)?;
+
         // Open AOL for appending
         let aol = Arc::new(Mutex::new(aol::Aol::open(
             &config.path,
@@ -223,6 +227,7 @@ impl DB {
             revision_gen,
             namespace_data,
             aol,
+            object_store,
             flush_stop,
             flush_thread,
         })
@@ -354,6 +359,28 @@ impl DB {
     }
 
     // --- Internal helpers ---
+
+    /// If the value exceeds the configured `object_size`, write it to the
+    /// object store and return a `Value::Pointer`. Otherwise pass through.
+    pub(crate) fn maybe_separate_value(&self, value: Value) -> Result<Value> {
+        if let Value::Data(ref data) = value {
+            if data.len() > self.config.object_size {
+                let vp = self.object_store.write(data, self.config.compress)?;
+                return Ok(Value::Pointer(vp));
+            }
+        }
+        Ok(value)
+    }
+
+    /// If the value is a `Pointer`, read the data from the object store.
+    /// Otherwise clone the value through.
+    pub(crate) fn resolve_value(&self, value: &Value) -> Result<Value> {
+        if let Value::Pointer(vp) = value {
+            let data = self.object_store.read(vp, self.config.verify_checksums)?;
+            return Ok(Value::Data(data));
+        }
+        Ok(value.clone())
+    }
 
     pub(crate) fn generate_revision(&self) -> RevisionID {
         self.revision_gen.generate()

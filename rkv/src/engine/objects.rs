@@ -5,7 +5,6 @@ use super::error::{Error, Result};
 use super::value::ValuePointer;
 
 /// Object file flags — bit 0 indicates LZ4 compression.
-#[allow(dead_code)]
 const FLAG_LZ4: u8 = 0x01;
 
 /// Content-addressable object store for bin objects.
@@ -13,12 +12,10 @@ const FLAG_LZ4: u8 = 0x01;
 /// Large values are stored as standalone files identified by their BLAKE3
 /// content hash. The directory layout uses a fan-out prefix (first byte of
 /// the hash) to avoid excessive entries per directory.
-#[allow(dead_code)]
 pub(crate) struct ObjectStore {
     base: PathBuf,
 }
 
-#[allow(dead_code)]
 impl ObjectStore {
     /// Open (or create) the object store directory under `db_dir`.
     pub(crate) fn open(db_dir: &Path) -> Result<Self> {
@@ -117,6 +114,7 @@ impl ObjectStore {
     }
 
     /// Check if an object file exists.
+    #[allow(dead_code)]
     pub(crate) fn exists(&self, vp: &ValuePointer) -> bool {
         self.object_path(vp).exists()
     }

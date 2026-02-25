@@ -183,7 +183,6 @@ pub(crate) struct ValuePointer {
 
 impl ValuePointer {
     /// Create a new value pointer.
-    #[allow(dead_code)]
     pub(crate) fn new(hash: [u8; 32], size: u32) -> Self {
         Self { hash, size }
     }
@@ -199,7 +198,6 @@ impl ValuePointer {
     }
 
     /// Return the fan-out directory prefix (first 2 hex chars).
-    #[allow(dead_code)]
     pub(crate) fn fan_out_prefix(&self) -> String {
         format!("{:02x}", self.hash[0])
     }

@@ -58,7 +58,7 @@ impl<'db> Namespace<'db> {
         ttl: Option<Duration>,
     ) -> Result<RevisionID> {
         let key = key.into();
-        let value = value.into();
+        let value = self.db.maybe_separate_value(value.into())?;
         let rev = self.db.generate_revision();
         self.db
             .append_to_aol(&self.name, rev.as_u128(), &key, &value, ttl)?;
@@ -70,9 +70,12 @@ impl<'db> Namespace<'db> {
 
     pub fn get(&self, key: impl Into<Key>) -> Result<Value> {
         let key = key.into();
-        let mt = self.db.get_or_create_memtable(&self.name);
-        let mt = mt.lock().unwrap();
-        mt.get(&key).cloned().ok_or(Error::KeyNotFound)
+        let value = {
+            let mt = self.db.get_or_create_memtable(&self.name);
+            let mt = mt.lock().unwrap();
+            mt.get(&key).cloned().ok_or(Error::KeyNotFound)?
+        };
+        self.db.resolve_value(&value)
     }
 
     pub fn delete(&self, key: impl Into<Key>) -> Result<()> {
@@ -122,9 +125,12 @@ impl<'db> Namespace<'db> {
     /// Returns the value at a specific revision index (0 = oldest).
     pub fn rev_get(&self, key: impl Into<Key>, index: u64) -> Result<Value> {
         let key = key.into();
-        let mt = self.db.get_or_create_memtable(&self.name);
-        let mt = mt.lock().unwrap();
-        mt.rev_get(&key, index).cloned().ok_or(Error::KeyNotFound)
+        let value = {
+            let mt = self.db.get_or_create_memtable(&self.name);
+            let mt = mt.lock().unwrap();
+            mt.rev_get(&key, index).cloned().ok_or(Error::KeyNotFound)?
+        };
+        self.db.resolve_value(&value)
     }
 
     /// Returns the remaining TTL for a key, or `None` if the key has no expiration.
