@@ -827,6 +827,195 @@ fn dump_basic_roundtrip() {
 }
 
 #[test]
+fn dump_multiple_namespaces() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("src");
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+
+    let ns1 = db.namespace("users", None).unwrap();
+    ns1.put("alice", "admin", None).unwrap();
+    drop(ns1);
+
+    let ns2 = db.namespace("orders", None).unwrap();
+    ns2.put("ord1", "shipped", None).unwrap();
+    drop(ns2);
+
+    let dump_path = tmp.path().join("multi.rkv");
+    db.dump(&dump_path).unwrap();
+    db.close().unwrap();
+
+    std::fs::remove_dir_all(&db_path).unwrap();
+    let db2 = DB::load(&dump_path).unwrap();
+
+    let ns1 = db2.namespace("users", None).unwrap();
+    assert_eq!(ns1.get("alice").unwrap(), Value::from("admin"));
+
+    let ns2 = db2.namespace("orders", None).unwrap();
+    assert_eq!(ns2.get("ord1").unwrap(), Value::from("shipped"));
+}
+
+#[test]
+fn dump_filters_tombstones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("src");
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "alive", None).unwrap();
+    ns.put(2, "deleted", None).unwrap();
+    ns.delete(2).unwrap();
+    drop(ns);
+
+    let dump_path = tmp.path().join("tomb.rkv");
+    db.dump(&dump_path).unwrap();
+    db.close().unwrap();
+
+    std::fs::remove_dir_all(&db_path).unwrap();
+    let db2 = DB::load(&dump_path).unwrap();
+    let ns2 = db2.namespace("_", None).unwrap();
+
+    assert_eq!(ns2.get(1).unwrap(), Value::from("alive"));
+    let err = ns2.get(2).unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound));
+}
+
+#[test]
+fn dump_empty_db() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("src");
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+
+    let dump_path = tmp.path().join("empty.rkv");
+    db.dump(&dump_path).unwrap();
+    db.close().unwrap();
+
+    std::fs::remove_dir_all(&db_path).unwrap();
+    let db2 = DB::load(&dump_path).unwrap();
+    let names = db2.list_namespaces().unwrap();
+    assert!(names.is_empty());
+}
+
+#[test]
+fn dump_large_values_resolved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("src");
+    let mut config = Config::new(&db_path);
+    config.object_size = 16; // tiny threshold to force value separation
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let big_value = "x".repeat(100);
+    ns.put(1, big_value.as_str(), None).unwrap();
+    drop(ns);
+
+    let dump_path = tmp.path().join("large.rkv");
+    db.dump(&dump_path).unwrap();
+    db.close().unwrap();
+
+    // Load with default object_size — the value should be inline
+    std::fs::remove_dir_all(&db_path).unwrap();
+    let db2 = DB::load(&dump_path).unwrap();
+    let ns2 = db2.namespace("_", None).unwrap();
+    assert_eq!(ns2.get(1).unwrap(), Value::from(big_value.as_str()));
+}
+
+#[test]
+fn dump_after_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("src");
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "old", None).unwrap();
+    db.flush().unwrap();
+    ns.put(1, "new", None).unwrap();
+    db.flush().unwrap();
+    db.compact().unwrap();
+    drop(ns);
+
+    let dump_path = tmp.path().join("compacted.rkv");
+    db.dump(&dump_path).unwrap();
+    db.close().unwrap();
+
+    std::fs::remove_dir_all(&db_path).unwrap();
+    let db2 = DB::load(&dump_path).unwrap();
+    let ns2 = db2.namespace("_", None).unwrap();
+    assert_eq!(ns2.get(1).unwrap(), Value::from("new"));
+}
+
+#[test]
+fn load_rejects_nonempty_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("src");
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+    ns.put(1, "data", None).unwrap();
+    drop(ns);
+
+    let dump_path = tmp.path().join("backup.rkv");
+    db.dump(&dump_path).unwrap();
+    db.close().unwrap();
+
+    // Target path still has data — load should refuse
+    let Err(err) = DB::load(&dump_path) else {
+        panic!("expected InvalidConfig error");
+    };
+    assert!(matches!(err, Error::InvalidConfig(_)));
+}
+
+#[test]
+fn load_rejects_corrupt_dump() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dump_path = tmp.path().join("corrupt.rkv");
+    std::fs::write(&dump_path, b"not a valid dump file").unwrap();
+
+    let Err(err) = DB::load(&dump_path) else {
+        panic!("expected Corruption error");
+    };
+    assert!(matches!(err, Error::Corruption(_)));
+}
+
+#[test]
+fn dump_load_survives_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("src");
+
+    // Write data across multiple flushes
+    {
+        let config = Config::new(&db_path);
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+        ns.put(1, "a", None).unwrap();
+        db.flush().unwrap();
+        ns.put(2, "b", None).unwrap();
+        db.flush().unwrap();
+        drop(ns);
+
+        let dump_path = tmp.path().join("backup.rkv");
+        db.dump(&dump_path).unwrap();
+        db.close().unwrap();
+    }
+
+    // Remove source, load, close, reopen
+    std::fs::remove_dir_all(&db_path).unwrap();
+    {
+        let db = DB::load(tmp.path().join("backup.rkv")).unwrap();
+        db.close().unwrap();
+    }
+
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+    assert_eq!(ns.get(1).unwrap(), Value::from("a"));
+    assert_eq!(ns.get(2).unwrap(), Value::from("b"));
+}
+
+#[test]
 fn compact_empty_db_is_noop() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
