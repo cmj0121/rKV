@@ -6,6 +6,7 @@ mod io;
 mod key;
 mod memtable;
 mod namespace;
+mod objects;
 mod recovery;
 mod revision;
 mod stats;
