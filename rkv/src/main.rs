@@ -280,8 +280,12 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 Err(e) => eprintln!("error: {e}"),
             }
         }
-        "stats" => {
-            let s = db.stats();
+        "stats" | "analyze" => {
+            let s = if tokens[0] == "analyze" {
+                db.analyze()
+            } else {
+                db.stats()
+            };
             println!("Storage:");
             println!("  total_keys:        {}", s.total_keys);
             println!("  data_size_bytes:   {}", s.data_size_bytes);
@@ -491,6 +495,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!();
             println!("Admin:");
             println!("  stats                Print database statistics");
+            println!("  analyze              Re-derive stats and persist counters");
             println!("  config                    Print current configuration");
             println!("  config <group.key> <value> Set a configuration value");
             println!("  flush                Flush write buffer to disk");

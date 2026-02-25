@@ -338,6 +338,14 @@ impl DB {
         }
     }
 
+    /// Re-derive all statistics from current engine state and persist
+    /// operation counters. Useful as an admin recovery tool when stats
+    /// may have drifted.
+    pub fn analyze(&self) -> Stats {
+        self.save_stats_meta();
+        self.stats()
+    }
+
     pub fn config(&self) -> &Config {
         &self.config
     }
