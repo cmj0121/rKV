@@ -509,7 +509,6 @@ impl SSTableReader {
     }
 
     /// Return the total size of the SSTable data in bytes.
-    #[allow(dead_code)] // consumed by compact() in a later commit
     pub(crate) fn size_bytes(&self) -> usize {
         self.data.len()
     }

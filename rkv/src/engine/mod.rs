@@ -615,9 +615,9 @@ impl DB {
 
     /// Trigger a manual compaction.
     ///
-    /// Merges all L0 + existing L1 SSTables for each namespace into a
-    /// single new L1 SSTable. Old files are deleted after the merge.
-    /// Tombstones are preserved (they may shadow data in deeper levels).
+    /// For each namespace, merges L0 into L1, then cascades through
+    /// deeper levels when a level exceeds its size threshold. Tombstones
+    /// are dropped only at the bottommost level (`max_levels - 1`).
     pub fn compact(&self) -> Result<()> {
         let namespaces: Vec<String> = {
             let sst = self.sstables.read().unwrap();
@@ -631,8 +631,20 @@ impl DB {
         Ok(())
     }
 
-    /// Compact a single namespace: merge L0 + L1 into a new L1 SSTable.
+    /// Compact a single namespace with cascading level merges.
+    ///
+    /// 1. Merge L0 → L1 (drop tombstones if L1 is the bottommost level).
+    /// 2. For each subsequent level, if it exceeds its size threshold,
+    ///    merge into the next level. Tombstones are dropped when the
+    ///    target is the bottommost level (`max_levels - 1`).
     fn compact_namespace(&self, ns: &str) -> Result<()> {
+        let max_levels = self.config.max_levels;
+
+        // Nothing to do with fewer than 2 levels
+        if max_levels < 2 {
+            return Ok(());
+        }
+
         // Nothing to compact if L0 is empty
         {
             let sst = self.sstables.read().unwrap();
@@ -645,7 +657,20 @@ impl DB {
             }
         }
 
-        self.merge_two_levels(ns, 0, 1, false)?;
+        // Step 1: merge L0 → L1
+        let is_bottom = max_levels <= 2;
+        self.merge_two_levels(ns, 0, 1, is_bottom)?;
+
+        // Step 2: cascade through deeper levels
+        for level in 1..max_levels - 1 {
+            if self.level_total_size(ns, level) <= self.level_max_size(level) {
+                break;
+            }
+            let target = level + 1;
+            let drop = target >= max_levels - 1;
+            self.merge_two_levels(ns, level, target, drop)?;
+        }
+
         Ok(())
     }
 
@@ -795,13 +820,21 @@ impl DB {
     }
 
     /// Maximum size in bytes for a given level before it should be compacted.
-    #[allow(dead_code)] // consumed by cascade compaction in a later commit
     fn level_max_size(&self, level: usize) -> usize {
         match level {
             0 => usize::MAX, // L0 uses count/size triggers, not a cap
             1 => self.config.l1_max_size,
             _ => self.config.default_max_size,
         }
+    }
+
+    /// Total size in bytes of all SSTables at a given level for a namespace.
+    fn level_total_size(&self, ns: &str, level: usize) -> usize {
+        let sst = self.sstables.read().unwrap();
+        sst.get(ns)
+            .and_then(|levels| levels.get(level))
+            .map(|readers| readers.iter().map(|r| r.size_bytes()).sum())
+            .unwrap_or(0)
     }
 
     // --- Internal helpers ---
