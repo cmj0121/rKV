@@ -333,24 +333,46 @@ I/O logic will be implemented when the storage layer is built.
 
 `db.stats()` returns a `Stats` snapshot with counters and metadata:
 
-| Field                 | Type       | Description                           |
-| --------------------- | ---------- | ------------------------------------- |
-| `total_keys`          | `u64`      | Total number of live keys             |
-| `data_size_bytes`     | `u64`      | Approximate on-disk data size         |
-| `namespace_count`     | `u64`      | Number of namespaces                  |
-| `level_count`         | `usize`    | Number of LSM levels (from config)    |
-| `sstable_count`       | `u64`      | Total SSTable files across all levels |
-| `write_buffer_bytes`  | `u64`      | Current write buffer usage            |
-| `pending_compactions` | `u64`      | Pending compaction tasks              |
-| `op_puts`             | `u64`      | Cumulative put operations             |
-| `op_gets`             | `u64`      | Cumulative get operations             |
-| `op_deletes`          | `u64`      | Cumulative delete operations          |
-| `cache_hits`          | `u64`      | Block cache hits                      |
-| `cache_misses`        | `u64`      | Block cache misses                    |
-| `uptime`              | `Duration` | Time since `DB::open`                 |
+| Field                 | Type       | Source                 | Description                           |
+| --------------------- | ---------- | ---------------------- | ------------------------------------- |
+| `total_keys`          | `u64`      | MemTable (live)        | Total number of live keys             |
+| `data_size_bytes`     | `u64`      | MemTable (live)        | Approximate data size in bytes        |
+| `namespace_count`     | `u64`      | MemTable map (live)    | Number of namespaces                  |
+| `level_count`         | `usize`    | Config                 | Number of LSM levels (from config)    |
+| `sstable_count`       | `u64`      | Stub (0)               | Total SSTable files across all levels |
+| `write_buffer_bytes`  | `u64`      | MemTable (live)        | Current write buffer usage            |
+| `pending_compactions` | `u64`      | Stub (0)               | Pending compaction tasks              |
+| `op_puts`             | `u64`      | AtomicU64 (persistent) | Cumulative put operations             |
+| `op_gets`             | `u64`      | AtomicU64 (persistent) | Cumulative get operations             |
+| `op_deletes`          | `u64`      | AtomicU64 (persistent) | Cumulative delete operations          |
+| `cache_hits`          | `u64`      | Stub (0)               | Block cache hits                      |
+| `cache_misses`        | `u64`      | Stub (0)               | Block cache misses                    |
+| `uptime`              | `Duration` | Instant (live)         | Time since `DB::open`                 |
 
-`stats()` returns `Stats` directly (not `Result<Stats>`) — it cannot fail. In the stub phase most
-counters are zero; `level_count` reflects the configured `max_levels` and `uptime` is computed live.
+`stats()` returns `Stats` directly (not `Result<Stats>`) — it cannot fail. Live fields are derived
+from MemTable state on each call. Operation counters are tracked via `AtomicU64` (Relaxed ordering)
+and persisted to `stats.meta` on `DB::close()` / `Drop`, so they accumulate across restarts.
+
+#### Stats Persistence
+
+Operation counters (`op_puts`, `op_gets`, `op_deletes`) are stored in a 30-byte binary file
+`<db>/stats.meta`:
+
+| Offset | Size | Field           |
+| ------ | ---- | --------------- |
+| 0      | 4    | Magic `rKVT`    |
+| 4      | 2    | Version (BE)    |
+| 6      | 8    | op_puts (BE)    |
+| 14     | 8    | op_gets (BE)    |
+| 22     | 8    | op_deletes (BE) |
+
+Written atomically via write-to-temp + rename. Missing or malformed files default counters to zero.
+
+#### Analyze Command
+
+`db.analyze()` re-derives all statistics from current engine state and persists operation counters
+to disk. In the CLI, the `analyze` command calls this method and prints the results. Useful as an
+admin recovery tool when stats may have drifted.
 
 ### Maintenance Operations
 

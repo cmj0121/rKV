@@ -497,6 +497,158 @@ fn stats_default_trait() {
 }
 
 #[test]
+fn stats_op_counters_increment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "a", None).unwrap();
+    ns.put(2, "b", None).unwrap();
+    ns.get(1).unwrap();
+    ns.delete(2).unwrap();
+
+    let s = db.stats();
+    assert_eq!(s.op_puts, 2);
+    assert_eq!(s.op_gets, 1);
+    assert_eq!(s.op_deletes, 1);
+}
+
+#[test]
+fn stats_total_keys_and_namespace_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace("_", None).unwrap();
+    ns.put(1, "a", None).unwrap();
+    ns.put(2, "b", None).unwrap();
+
+    let s = db.stats();
+    assert_eq!(s.total_keys, 2);
+    assert_eq!(s.namespace_count, 1);
+
+    // Add a second namespace
+    let ns2 = db.namespace("other", None).unwrap();
+    ns2.put(1, "x", None).unwrap();
+
+    let s = db.stats();
+    assert_eq!(s.total_keys, 3);
+    assert_eq!(s.namespace_count, 2);
+}
+
+#[test]
+fn stats_write_buffer_bytes_nonzero_after_put() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    assert_eq!(db.stats().write_buffer_bytes, 0);
+
+    ns.put(1, "hello", None).unwrap();
+
+    let s = db.stats();
+    assert!(s.write_buffer_bytes > 0);
+    assert_eq!(s.data_size_bytes, s.write_buffer_bytes);
+}
+
+#[test]
+fn stats_total_keys_excludes_tombstones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "a", None).unwrap();
+    ns.put(2, "b", None).unwrap();
+    ns.delete(1).unwrap();
+
+    let s = db.stats();
+    assert_eq!(s.total_keys, 1);
+}
+
+#[test]
+fn stats_op_counters_persist_across_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Session 1: perform operations then close
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+        ns.put(1, "a", None).unwrap();
+        ns.put(2, "b", None).unwrap();
+        ns.get(1).unwrap();
+        ns.delete(2).unwrap();
+        db.close().unwrap();
+    }
+
+    // Session 2: counters should be restored
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let s = db.stats();
+        assert_eq!(s.op_puts, 2);
+        assert_eq!(s.op_gets, 1);
+        assert_eq!(s.op_deletes, 1);
+    }
+}
+
+#[test]
+fn stats_op_counters_accumulate_across_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Session 1
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+        ns.put(1, "a", None).unwrap();
+        db.close().unwrap();
+    }
+
+    // Session 2: more operations
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+        ns.put(2, "b", None).unwrap();
+        ns.put(3, "c", None).unwrap();
+
+        let s = db.stats();
+        assert_eq!(s.op_puts, 3); // 1 from session 1 + 2 from session 2
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn stats_analyze_persists_and_returns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "a", None).unwrap();
+    ns.put(2, "b", None).unwrap();
+    ns.get(1).unwrap();
+
+    let s = db.analyze();
+    assert_eq!(s.op_puts, 2);
+    assert_eq!(s.op_gets, 1);
+    assert_eq!(s.total_keys, 2);
+    assert!(s.write_buffer_bytes > 0);
+    drop(db);
+
+    // Reopen — counters should have been persisted by analyze
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let s = db.stats();
+    assert_eq!(s.op_puts, 2);
+    assert_eq!(s.op_gets, 1);
+}
+
+#[test]
 fn config_returns_reference() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
