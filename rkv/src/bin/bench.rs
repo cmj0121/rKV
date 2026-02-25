@@ -114,6 +114,55 @@ fn bench_delete(n: usize) -> std::time::Duration {
     start.elapsed()
 }
 
+/// Build a distinct 4 KB value for key index `i`.
+/// First 8 bytes encode the index so each key produces a unique BLAKE3 hash,
+/// preventing ObjectStore dedup.
+fn make_object_value(i: usize) -> Vec<u8> {
+    let mut v = vec![0u8; 4096];
+    v[..8].copy_from_slice(&(i as u64).to_le_bytes());
+    v
+}
+
+/// Sequential inserts of N distinct 4 KB values through the ObjectStore path.
+/// Each value has a unique BLAKE3 hash, so N object files are created on disk.
+fn bench_put_objects(n: usize) -> std::time::Duration {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 0; // force all values to bin objects
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let start = Instant::now();
+    for i in 0..n {
+        let value = make_object_value(i);
+        ns.put(i as i64, value.as_slice(), None).unwrap();
+    }
+    start.elapsed()
+}
+
+/// Random reads of N keys, each resolving a distinct bin object from disk.
+fn bench_get_objects(n: usize) -> std::time::Duration {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 0;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 0..n {
+        let value = make_object_value(i);
+        ns.put(i as i64, value.as_slice(), None).unwrap();
+    }
+
+    let mut indices: Vec<i64> = (0..n as i64).collect();
+    fastrand::shuffle(&mut indices);
+
+    let start = Instant::now();
+    for &i in &indices {
+        ns.get(i).unwrap();
+    }
+    start.elapsed()
+}
+
 fn bench_scan(n: usize) -> std::time::Duration {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
@@ -147,6 +196,8 @@ fn main() {
         ("get", bench_get),
         ("delete", bench_delete),
         ("scan", bench_scan),
+        ("put_obj", bench_put_objects),
+        ("get_obj", bench_get_objects),
     ];
 
     // header row
@@ -187,6 +238,8 @@ fn main() {
     md.push_str("| get       | Random reads of N existing keys (shuffled order) |\n");
     md.push_str("| delete    | Sequential deletes of N existing keys |\n");
     md.push_str("| scan      | Forward scan of all keys (limit=N, offset=0) |\n");
+    md.push_str("| put_obj   | Sequential inserts of N keys with 4 KB values via ObjectStore |\n");
+    md.push_str("| get_obj   | Random reads of N keys resolved from ObjectStore |\n");
 
     md.push_str("\n## Results\n\n");
 

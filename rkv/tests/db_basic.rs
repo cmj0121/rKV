@@ -1406,3 +1406,61 @@ fn value_sep_null_value_not_separated() {
     let result = ns.get("null_key").unwrap();
     assert_eq!(result, Value::Null);
 }
+
+/// Generate `n` distinct 256-byte values, each with a unique 8-byte prefix.
+fn make_distinct_values(n: usize) -> Vec<Vec<u8>> {
+    (0..n)
+        .map(|i| {
+            let mut v = vec![0u8; 256];
+            v[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            v
+        })
+        .collect()
+}
+
+#[test]
+fn value_sep_many_distinct_large_values() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 10;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let values = make_distinct_values(100);
+    for (i, val) in values.iter().enumerate() {
+        ns.put(i as i64, val.as_slice(), None).unwrap();
+    }
+
+    // Verify all values round-trip correctly
+    for (i, expected) in values.iter().enumerate() {
+        let result = ns.get(i as i64).unwrap();
+        assert_eq!(result.as_bytes().unwrap(), expected.as_slice());
+    }
+}
+
+#[test]
+fn value_sep_many_distinct_survive_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let values = make_distinct_values(50);
+
+    {
+        let mut config = Config::new(tmp.path());
+        config.object_size = 10;
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        for (i, val) in values.iter().enumerate() {
+            ns.put(i as i64, val.as_slice(), None).unwrap();
+        }
+        db.close().unwrap();
+    }
+    {
+        let mut config = Config::new(tmp.path());
+        config.object_size = 10;
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        for (i, expected) in values.iter().enumerate() {
+            let result = ns.get(i as i64).unwrap();
+            assert_eq!(result.as_bytes().unwrap(), expected.as_slice());
+        }
+    }
+}
