@@ -390,11 +390,34 @@ impl DB {
     }
 
     /// List all namespace names.
+    ///
+    /// Returns the sorted union of namespaces known to the in-memory
+    /// MemTable map and the L0 SSTable cache.
     pub fn list_namespaces(&self) -> Result<Vec<String>> {
-        Err(Error::NotImplemented("list_namespaces".into()))
+        let mut names = std::collections::BTreeSet::new();
+
+        {
+            let map = self.namespace_data.read().unwrap();
+            for key in map.keys() {
+                names.insert(key.clone());
+            }
+        }
+        {
+            let l0 = self.l0_sstables.read().unwrap();
+            for key in l0.keys() {
+                names.insert(key.clone());
+            }
+        }
+
+        Ok(names.into_iter().collect())
     }
 
     /// Drop a namespace and all its data. The default namespace cannot be dropped.
+    ///
+    /// Removes in-memory state (MemTable, L0 readers, object store, encryption
+    /// tracking), deletes on-disk files (SSTables, bin objects, crypto salt),
+    /// and flushes remaining namespaces + truncates the AOL so the dropped
+    /// namespace cannot reappear on restart.
     pub fn drop_namespace(&self, name: &str) -> Result<()> {
         if name == DEFAULT_NAMESPACE {
             return Err(Error::InvalidNamespace(
@@ -406,7 +429,63 @@ impl DB {
                 "namespace name must not be empty".into(),
             ));
         }
-        Err(Error::NotImplemented("drop_namespace".into()))
+
+        // Check the namespace actually exists
+        let exists = {
+            let nd = self.namespace_data.read().unwrap();
+            let l0 = self.l0_sstables.read().unwrap();
+            nd.contains_key(name) || l0.contains_key(name)
+        };
+        if !exists {
+            return Err(Error::InvalidNamespace(format!(
+                "namespace '{name}' does not exist"
+            )));
+        }
+
+        // 1. Remove from in-memory maps
+        {
+            let mut map = self.namespace_data.write().unwrap();
+            map.remove(name);
+        }
+        {
+            let mut map = self.l0_sstables.write().unwrap();
+            map.remove(name);
+        }
+        {
+            let mut map = self.object_stores.write().unwrap();
+            map.remove(name);
+        }
+        {
+            let mut map = self.encrypted_namespaces.lock().unwrap();
+            map.remove(name);
+        }
+
+        // 2. Delete on-disk data
+        let sst_dir = self.sst_namespace_dir(name);
+        if sst_dir.exists() {
+            fs::remove_dir_all(&sst_dir)?;
+        }
+        let obj_dir = self.config.path.join("objects").join(name);
+        if obj_dir.exists() {
+            fs::remove_dir_all(&obj_dir)?;
+        }
+        let salt_path = self.config.path.join("crypto").join(format!("{name}.salt"));
+        if salt_path.exists() {
+            fs::remove_file(&salt_path)?;
+        }
+
+        // 3. Flush remaining namespaces + truncate AOL so the dropped
+        //    namespace's records don't resurrect on restart.
+        //    flush() only truncates when it actually writes SSTables, so we
+        //    force-truncate afterwards to cover the case where no other
+        //    namespaces have pending data.
+        self.flush()?;
+        {
+            let mut aol = self.aol.lock().unwrap();
+            aol.truncate(&self.config.path)?;
+        }
+
+        Ok(())
     }
 
     // --- Flush / Sync ---
