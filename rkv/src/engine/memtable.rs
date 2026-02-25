@@ -273,6 +273,34 @@ impl MemTable {
             .collect()
     }
 
+    /// Drain the latest value for each key in sorted order.
+    ///
+    /// Returns a `Vec<(Key, Value)>` containing the most recent non-expired
+    /// value for every key, **including tombstones** (needed for correctness
+    /// when flushing to SSTable — a tombstone must shadow older SSTables).
+    ///
+    /// Expired entries are skipped entirely. After draining, the MemTable's
+    /// entries and bookkeeping are cleared, but `ordered_mode` is preserved.
+    pub(crate) fn drain_latest(&mut self) -> Vec<(Key, Value)> {
+        let entries = std::mem::take(&mut self.entries);
+        self.last_rev.clear();
+        self.approximate_size = 0;
+
+        let mut result = Vec::with_capacity(entries.len());
+        for (key, revisions) in entries {
+            if let Some(latest) = revisions.last() {
+                // Skip expired entries
+                if let Some(expires_at) = latest.expires_at {
+                    if Instant::now() > expires_at {
+                        continue;
+                    }
+                }
+                result.push((key, latest.value.clone()));
+            }
+        }
+        result
+    }
+
     /// Check if the latest entry for a key is live (non-tombstone, non-expired).
     fn is_live(&self, entries: &[MemEntry]) -> bool {
         let Some(latest) = entries.last() else {
@@ -695,6 +723,108 @@ mod tests {
         mt.delete(Key::Int(1), RevisionID::from(2u128));
 
         assert_eq!(mt.ttl(&Key::Int(1)), None);
+    }
+
+    // --- drain_latest ---
+
+    #[test]
+    fn drain_latest_returns_sorted_entries() {
+        let mut mt = MemTable::new();
+        mt.put(Key::Int(3), Value::from("c"), RevisionID::from(1u128), None);
+        mt.put(Key::Int(1), Value::from("a"), RevisionID::from(2u128), None);
+        mt.put(Key::Int(2), Value::from("b"), RevisionID::from(3u128), None);
+
+        let drained = mt.drain_latest();
+        assert_eq!(drained.len(), 3);
+        assert_eq!(drained[0], (Key::Int(1), Value::from("a")));
+        assert_eq!(drained[1], (Key::Int(2), Value::from("b")));
+        assert_eq!(drained[2], (Key::Int(3), Value::from("c")));
+    }
+
+    #[test]
+    fn drain_latest_takes_most_recent_revision() {
+        let mut mt = MemTable::new();
+        mt.put(
+            Key::Int(1),
+            Value::from("v1"),
+            RevisionID::from(1u128),
+            None,
+        );
+        mt.put(
+            Key::Int(1),
+            Value::from("v2"),
+            RevisionID::from(2u128),
+            None,
+        );
+
+        let drained = mt.drain_latest();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].1, Value::from("v2"));
+    }
+
+    #[test]
+    fn drain_latest_includes_tombstones() {
+        let mut mt = MemTable::new();
+        mt.put(Key::Int(1), Value::from("a"), RevisionID::from(1u128), None);
+        mt.delete(Key::Int(1), RevisionID::from(2u128));
+
+        let drained = mt.drain_latest();
+        assert_eq!(drained.len(), 1);
+        assert!(drained[0].1.is_tombstone());
+    }
+
+    #[test]
+    fn drain_latest_skips_expired() {
+        let mut mt = MemTable::new();
+        mt.put(
+            Key::Int(1),
+            Value::from("a"),
+            RevisionID::from(1u128),
+            Some(Duration::from_millis(1)),
+        );
+        mt.put(Key::Int(2), Value::from("b"), RevisionID::from(2u128), None);
+
+        std::thread::sleep(Duration::from_millis(10));
+
+        let drained = mt.drain_latest();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, Key::Int(2));
+    }
+
+    #[test]
+    fn drain_latest_clears_memtable() {
+        let mut mt = MemTable::new();
+        mt.put(Key::Int(1), Value::from("a"), RevisionID::from(1u128), None);
+        mt.put(Key::Int(2), Value::from("b"), RevisionID::from(2u128), None);
+
+        let _ = mt.drain_latest();
+        assert!(mt.is_empty());
+        assert_eq!(mt.approximate_size(), 0);
+        assert_eq!(mt.count(), 0);
+    }
+
+    #[test]
+    fn drain_latest_preserves_ordered_mode() {
+        let mut mt = MemTable::new();
+        // Insert Str key to trigger unordered mode
+        mt.put(
+            Key::from("hello"),
+            Value::from("a"),
+            RevisionID::from(1u128),
+            None,
+        );
+        assert!(!mt.ordered_mode);
+
+        let _ = mt.drain_latest();
+        // ordered_mode should be preserved after drain
+        assert!(!mt.ordered_mode);
+    }
+
+    #[test]
+    fn drain_latest_empty_memtable() {
+        let mut mt = MemTable::new();
+        let drained = mt.drain_latest();
+        assert!(drained.is_empty());
     }
 
     #[test]

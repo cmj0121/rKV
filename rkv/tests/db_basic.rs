@@ -772,13 +772,13 @@ fn corruption_error_matches() {
 // --- Maintenance operation stubs ---
 
 #[test]
-fn flush_returns_not_implemented() {
+fn flush_empty_db_is_noop() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
 
-    let err = db.flush().unwrap_err();
-    assert!(matches!(err, Error::NotImplemented(_)));
+    // Flushing an empty DB should succeed without error
+    db.flush().unwrap();
 }
 
 #[test]
@@ -2149,4 +2149,213 @@ fn encrypted_scan_returns_keys() {
 
     let keys = ns.scan(&Key::from("user:"), 10, 0).unwrap();
     assert_eq!(keys.len(), 2);
+}
+
+// --- Flush + SSTable read path ---
+
+#[test]
+fn flush_and_get_roundtrip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "hello", None).unwrap();
+    ns.put(2, "world", None).unwrap();
+
+    db.flush().unwrap();
+
+    // Data should be readable from SSTable after flush
+    assert_eq!(ns.get(1).unwrap(), Value::from("hello"));
+    assert_eq!(ns.get(2).unwrap(), Value::from("world"));
+}
+
+#[test]
+fn flush_persistence_across_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+        ns.put(1, "persisted", None).unwrap();
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+
+    // Reopen — data should come from SSTable (AOL was truncated)
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+    assert_eq!(ns.get(1).unwrap(), Value::from("persisted"));
+}
+
+#[test]
+fn flush_tombstone_survives() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "value", None).unwrap();
+    ns.delete(1).unwrap();
+
+    db.flush().unwrap();
+
+    // Tombstone in SSTable should return KeyNotFound
+    let err = ns.get(1).unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound));
+}
+
+#[test]
+fn flush_tombstone_shadows_older_sstable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    // Flush 1: write key=1
+    ns.put(1, "old", None).unwrap();
+    db.flush().unwrap();
+
+    // Flush 2: delete key=1
+    ns.delete(1).unwrap();
+    db.flush().unwrap();
+
+    // Tombstone in newer SSTable should shadow value in older SSTable
+    let err = ns.get(1).unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound));
+}
+
+#[test]
+fn flush_multiple_creates_multiple_l0_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "first", None).unwrap();
+    db.flush().unwrap();
+
+    ns.put(2, "second", None).unwrap();
+    db.flush().unwrap();
+
+    // Both keys should be readable
+    assert_eq!(ns.get(1).unwrap(), Value::from("first"));
+    assert_eq!(ns.get(2).unwrap(), Value::from("second"));
+
+    // Should have 2 SSTable files
+    let sst_dir = tmp.path().join("sst").join("_");
+    let count = std::fs::read_dir(&sst_dir).unwrap().count();
+    assert_eq!(count, 2);
+}
+
+#[test]
+fn flush_newer_value_wins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "old", None).unwrap();
+    db.flush().unwrap();
+
+    ns.put(1, "new", None).unwrap();
+    db.flush().unwrap();
+
+    // Newer SSTable value should win
+    assert_eq!(ns.get(1).unwrap(), Value::from("new"));
+}
+
+#[test]
+fn flush_encrypted_namespace() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("secret", Some("pass123")).unwrap();
+        ns.put("key", "encrypted-data", None).unwrap();
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+
+    // Reopen with correct password — should decrypt from SSTable
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("secret", Some("pass123")).unwrap();
+    assert_eq!(ns.get("key").unwrap(), Value::from("encrypted-data"));
+}
+
+#[test]
+fn flush_with_bin_objects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 10; // Force value separation for values > 10 bytes
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let large_value = "x".repeat(100);
+    ns.put(1, large_value.as_str(), None).unwrap();
+    db.flush().unwrap();
+
+    // ValuePointer should be in SSTable, resolved via ObjectStore
+    assert_eq!(ns.get(1).unwrap(), Value::from(large_value.as_str()));
+}
+
+#[test]
+fn flush_multiple_namespaces() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns1 = db.namespace("ns1", None).unwrap();
+    let ns2 = db.namespace("ns2", None).unwrap();
+
+    ns1.put("a", "from-ns1", None).unwrap();
+    ns2.put("a", "from-ns2", None).unwrap();
+
+    db.flush().unwrap();
+
+    assert_eq!(ns1.get("a").unwrap(), Value::from("from-ns1"));
+    assert_eq!(ns2.get("a").unwrap(), Value::from("from-ns2"));
+
+    // Each namespace should have its own SSTable directory
+    assert!(tmp.path().join("sst").join("ns1").exists());
+    assert!(tmp.path().join("sst").join("ns2").exists());
+}
+
+#[test]
+fn flush_memtable_miss_sstable_hit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "flushed", None).unwrap();
+    db.flush().unwrap();
+
+    // Put a new key in MemTable (key=2), but key=1 only in SSTable
+    ns.put(2, "in-memory", None).unwrap();
+
+    assert_eq!(ns.get(1).unwrap(), Value::from("flushed"));
+    assert_eq!(ns.get(2).unwrap(), Value::from("in-memory"));
+}
+
+#[test]
+fn flush_aol_truncated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.aol_buffer_size = 0; // Per-record flush so writes hit disk immediately
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "data", None).unwrap();
+
+    let aol_path = tmp.path().join("aol");
+    let size_before = std::fs::metadata(&aol_path).unwrap().len();
+    assert!(size_before > 8); // More than just header
+
+    db.flush().unwrap();
+
+    let size_after = std::fs::metadata(&aol_path).unwrap().len();
+    assert_eq!(size_after, 8); // Header only (magic + version + reserved)
 }

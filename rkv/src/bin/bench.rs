@@ -163,6 +163,43 @@ fn bench_get_objects(n: usize) -> std::time::Duration {
     start.elapsed()
 }
 
+fn bench_flush(n: usize) -> std::time::Duration {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 0..n {
+        ns.put(i as i64, VALUE.as_slice(), None).unwrap();
+    }
+
+    let start = Instant::now();
+    db.flush().unwrap();
+    start.elapsed()
+}
+
+fn bench_get_sst(n: usize) -> std::time::Duration {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 0..n {
+        ns.put(i as i64, VALUE.as_slice(), None).unwrap();
+    }
+    db.flush().unwrap();
+
+    // MemTable is now empty — all reads go through SSTable
+    let mut indices: Vec<i64> = (0..n as i64).collect();
+    fastrand::shuffle(&mut indices);
+
+    let start = Instant::now();
+    for &i in &indices {
+        ns.get(i).unwrap();
+    }
+    start.elapsed()
+}
+
 fn bench_scan(n: usize) -> std::time::Duration {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
@@ -196,6 +233,8 @@ fn main() {
         ("get", bench_get),
         ("delete", bench_delete),
         ("scan", bench_scan),
+        ("flush", bench_flush),
+        ("get_sst", bench_get_sst),
         ("put_obj", bench_put_objects),
         ("get_obj", bench_get_objects),
     ];
@@ -218,7 +257,7 @@ fn main() {
     // Build markdown
     let mut md = String::new();
     md.push_str("# Benchmark\n\n");
-    md.push_str("> MemTable-backed (in-memory) performance of core rKV operations.\n\n");
+    md.push_str("> Performance of core rKV operations (MemTable and SSTable paths).\n\n");
 
     // Machine table
     md.push_str("## Environment\n\n");
@@ -238,6 +277,8 @@ fn main() {
     md.push_str("| get       | Random reads of N existing keys (shuffled order) |\n");
     md.push_str("| delete    | Sequential deletes of N existing keys |\n");
     md.push_str("| scan      | Forward scan of all keys (limit=N, offset=0) |\n");
+    md.push_str("| flush     | Flush N keys from MemTable to L0 SSTable |\n");
+    md.push_str("| get_sst   | Random reads of N keys from SSTable (after flush) |\n");
     md.push_str("| put_obj   | Sequential inserts of N keys with 4 KB values via ObjectStore |\n");
     md.push_str("| get_obj   | Random reads of N keys resolved from ObjectStore |\n");
 

@@ -105,11 +105,25 @@ impl<'db> Namespace<'db> {
     pub fn get(&self, key: impl Into<Key>) -> Result<Value> {
         let key = key.into();
         self.db.inc_op_gets();
-        let value = {
+
+        // 1. Check MemTable first
+        let mt_value = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap();
-            mt.get(&key).cloned().ok_or(Error::KeyNotFound)?
+            mt.get(&key).cloned()
         };
+
+        let value = if let Some(v) = mt_value {
+            v
+        } else {
+            // 2. Fall through to L0 SSTables (newest first)
+            match self.db.get_from_sstables(&self.name, &key)? {
+                Some(v) if v.is_tombstone() => return Err(Error::KeyNotFound),
+                Some(v) => v,
+                None => return Err(Error::KeyNotFound),
+            }
+        };
+
         let value = self.db.resolve_value(&self.name, &value)?;
         self.decrypt_value(value)
     }
