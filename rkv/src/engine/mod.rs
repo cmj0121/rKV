@@ -9,6 +9,8 @@ mod namespace;
 mod objects;
 mod recovery;
 mod revision;
+#[allow(dead_code)]
+mod sstable;
 mod stats;
 mod value;
 
