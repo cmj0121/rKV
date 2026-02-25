@@ -360,6 +360,10 @@ The `Config` struct controls database behavior and LSM tuning parameters:
 | `io_model`          | `IoModel`     | `Mmap`     | File I/O strategy (see I/O Modes below)    |
 | `cluster_id`        | `Option<u16>` | `None`     | Cluster ID for RevisionID (random if None) |
 | `aol_buffer_size`   | `usize`       | 128        | AOL flush threshold in records (0 = every) |
+| `l0_max_count`      | `usize`       | 4          | Max L0 SSTable count before compaction     |
+| `l0_max_size`       | `usize`       | 64 MB      | Max total L0 size before compaction        |
+| `l1_max_size`       | `usize`       | 256 MB     | Max L1 size before merge to L2             |
+| `default_max_size`  | `usize`       | 2 GB       | Default max size for L2+ levels            |
 
 The CLI uses dot-notation keys for `config <key> <value>`:
 
@@ -379,6 +383,10 @@ The CLI uses dot-notation keys for `config <key> <value>`:
 | `io_model`          | `io.model`                  |
 | `cluster_id`        | `revision.cluster_id`       |
 | `aol_buffer_size`   | `aol.buffer_size`           |
+| `l0_max_count`      | `lsm.l0_max_count`          |
+| `l0_max_size`       | `lsm.l0_max_size`           |
+| `l1_max_size`       | `lsm.l1_max_size`           |
+| `default_max_size`  | `lsm.default_max_size`      |
 
 `Config::new(path)` initializes all fields to their defaults. Fields can be overridden before
 passing the config to `DB::open`.
@@ -457,8 +465,8 @@ admin recovery tool when stats may have drifted.
 ### Maintenance Operations
 
 Maintenance operations handle durability, recovery, backup, and storage optimization.
-Most maintenance methods return `Result`. `flush`, `list_namespaces`, and `drop_namespace`
-are implemented; remaining methods are stubs (`NotImplemented`).
+Most maintenance methods return `Result`. `flush`, `compact`, `list_namespaces`, and
+`drop_namespace` are implemented; remaining methods are stubs (`NotImplemented`).
 
 #### Flush / Sync
 
@@ -481,9 +489,10 @@ DB::flush()
   truncate AOL
 ```
 
-L0 SSTable files are stored at `<db>/sst/<namespace>/<seq>.sst` where `<seq>` is a
-zero-padded monotonically increasing counter (e.g., `000001.sst`). On `DB::open()`, the
-engine scans these directories to recover the L0 reader cache and sequence counter.
+SSTable files are stored at `<db>/sst/<namespace>/L<level>/<seq>.sst` where `<level>` is
+the LSM level (0, 1, ...) and `<seq>` is a zero-padded monotonically increasing counter
+(e.g., `000001.sst`). On `DB::open()`, the engine scans these directories to recover the
+reader cache and sequence counter across all levels.
 
 `sync` calls `flush` followed by `fsync`, ensuring all data reaches durable storage
 (currently a stub).
@@ -525,8 +534,39 @@ its own configuration, so no separate `Config` is needed.
 | --------- | -------- | --------------------- | ------------------------------------------- |
 | `compact` | instance | `&self -> Result<()>` | Trigger manual compaction of SSTable levels |
 
-Background compaction runs automatically, but `compact` allows manual triggering — useful after
-bulk deletes or to reclaim disk space from resolved tombstones.
+`compact` merges L0 SSTables into L1, then cascades through deeper levels when a
+level exceeds its size threshold. The merge processes entries oldest-to-newest so that
+newer values overwrite older ones. Old source files are deleted after a successful merge.
+
+The compaction path per namespace:
+
+```text
+DB::compact()
+  for each namespace with L0 SSTables:
+    1. Merge L0 + L1 → new L1 SSTable
+    2. For level in 1..max_levels-1:
+         if level_total_size <= level_max_size: stop
+         Merge level + (level+1) → new (level+1) SSTable
+         Drop tombstones if target is the bottommost level
+```
+
+Level size thresholds:
+
+| Level | Threshold          | Config field       |
+| ----- | ------------------ | ------------------ |
+| L0    | n/a (count-based)  | `l0_max_count`     |
+| L1    | `l1_max_size`      | `l1_max_size`      |
+| L2+   | `default_max_size` | `default_max_size` |
+
+Tombstones are preserved at intermediate levels because they may shadow data in
+deeper levels. At the bottommost level (`max_levels - 1`), tombstones are dropped
+because no deeper level exists to shadow.
+
+Compaction is idempotent — calling it when L0 is empty is a no-op. After compaction,
+new flushes continue writing to L0 and a subsequent compact merges them into L1 again.
+When `max_levels` is 1, compaction is a no-op (no merge target available).
+
+The CLI exposes compaction via the `compact` REPL command.
 
 ### Data Integrity
 
@@ -587,9 +627,9 @@ and is out of scope.
 ### LSM-Tree Storage
 
 Data is organized in levels. Fresh writes land in an in-memory buffer (MemTable) and are
-flushed to sorted L0 SSTable files on disk via `DB::flush()`. The read path checks the
-MemTable first, then searches L0 SSTables from newest to oldest. Background merge
-compaction (L0 to deeper levels) is planned but not yet implemented.
+flushed to sorted L0 SSTable files on disk via `DB::flush()`. `DB::compact()` merges L0
+files into a single L1 SSTable. The read path checks the MemTable first, then searches
+SSTables from newest to oldest across all levels.
 
 #### Block Compression
 
@@ -668,26 +708,27 @@ checksum before parsing the index.
 
 #### SSTable Read Path
 
-Point lookups (`get`) check the MemTable first, then search L0 SSTables from newest to
-oldest. The first match wins:
+Point lookups (`get`) check the MemTable first, then search SSTables level by level
+(L0 newest-first, then L1, L2, ...). The first match wins:
 
 ```text
 Namespace::get(key)
   1. MemTable lookup — if found, return value
-  2. For each L0 SSTable (newest first):
-     a. Binary search index for candidate block
-     b. Decompress + verify checksum
-     c. Linear scan entries for key
-     d. If found:
-        - Tombstone → return KeyNotFound
-        - Pointer → resolve via ObjectStore
-        - Data/Null → return value
+  2. For each level (L0, L1, L2, ...):
+     For each SSTable in the level (L0: newest first; L1+: ascending):
+       a. Binary search index for candidate block
+       b. Decompress + verify checksum
+       c. Linear scan entries for key
+       d. If found:
+          - Tombstone → return KeyNotFound
+          - Pointer → resolve via ObjectStore
+          - Data/Null → return value
   3. Not found in any SSTable → return KeyNotFound
 ```
 
-On `DB::open()`, the engine scans `<db>/sst/<namespace>/` directories and opens all
-`.sst` files into an in-memory reader cache. Readers are ordered newest-first based on
-the sequence number in the filename.
+On `DB::open()`, the engine scans `<db>/sst/<namespace>/L<n>/` directories and opens all
+`.sst` files into an in-memory reader cache. L0 readers are ordered newest-first; L1+
+readers are ordered by ascending sequence number.
 
 #### WriteBuffer (MemTable)
 

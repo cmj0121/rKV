@@ -159,6 +159,14 @@ pub struct Config {
     /// AOL flush threshold in records (default: 128).
     /// Set to 0 for per-record flush (maximum durability).
     pub aol_buffer_size: usize,
+    /// Maximum number of L0 SSTable files before compaction (default: 4).
+    pub l0_max_count: usize,
+    /// Maximum total L0 size in bytes before compaction (default: 64 MB).
+    pub l0_max_size: usize,
+    /// Maximum L1 size in bytes before compaction to L2 (default: 256 MB).
+    pub l1_max_size: usize,
+    /// Default maximum size in bytes for L2+ levels (default: 2 GB).
+    pub default_max_size: usize,
 }
 
 impl Config {
@@ -178,9 +186,16 @@ impl Config {
             io_model: IoModel::default(),
             cluster_id: None,
             aol_buffer_size: 128,
+            l0_max_count: 4,
+            l0_max_size: 64 * 1024 * 1024,
+            l1_max_size: 256 * 1024 * 1024,
+            default_max_size: 2 * 1024 * 1024 * 1024,
         }
     }
 }
+
+/// Per-namespace, per-level SSTable readers.
+type LeveledSSTables = HashMap<String, Vec<Vec<sstable::SSTableReader>>>;
 
 /// Stats metadata file name within the DB directory.
 const STATS_META: &str = "stats.meta";
@@ -199,10 +214,13 @@ pub struct DB {
     namespace_data: RwLock<HashMap<String, Mutex<memtable::MemTable>>>,
     aol: Arc<Mutex<aol::Aol>>,
     object_stores: RwLock<HashMap<String, objects::ObjectStore>>,
-    /// Per-namespace L0 SSTable readers, ordered newest-first.
-    l0_sstables: RwLock<HashMap<String, Vec<sstable::SSTableReader>>>,
+    /// Per-namespace, per-level SSTable readers.
+    /// `sstables[ns][level]` = Vec of readers.
+    /// Level 0: newest-first (overlapping key ranges).
+    /// Level 1+: key-order (non-overlapping key ranges after compaction).
+    sstables: RwLock<LeveledSSTables>,
     /// Monotonically increasing counter for SSTable file naming.
-    l0_sequence: AtomicU64,
+    sst_sequence: AtomicU64,
     flush_stop: Arc<AtomicBool>,
     flush_thread: Option<JoinHandle<()>>,
     // Operation counters (persistent across restarts)
@@ -257,8 +275,8 @@ impl DB {
         // Per-namespace object stores (created lazily on first access)
         let object_stores = RwLock::new(HashMap::new());
 
-        // Scan existing L0 SSTable files and recover sequence counter
-        let (l0_sstables, l0_sequence) = Self::scan_l0_sstables(&config.path)?;
+        // Scan existing SSTable files across all levels and recover sequence counter
+        let (sstables, sst_sequence) = Self::scan_sstables(&config.path, config.max_levels)?;
 
         // Open AOL for appending
         let aol = Arc::new(Mutex::new(aol::Aol::open(
@@ -299,8 +317,8 @@ impl DB {
             namespace_data,
             aol,
             object_stores,
-            l0_sstables: RwLock::new(l0_sstables),
-            l0_sequence: AtomicU64::new(l0_sequence),
+            sstables: RwLock::new(sstables),
+            sst_sequence: AtomicU64::new(sst_sequence),
             flush_stop,
             flush_thread,
             op_puts: AtomicU64::new(op_puts),
@@ -403,8 +421,8 @@ impl DB {
             }
         }
         {
-            let l0 = self.l0_sstables.read().unwrap();
-            for key in l0.keys() {
+            let sst = self.sstables.read().unwrap();
+            for key in sst.keys() {
                 names.insert(key.clone());
             }
         }
@@ -433,8 +451,8 @@ impl DB {
         // Check the namespace actually exists
         let exists = {
             let nd = self.namespace_data.read().unwrap();
-            let l0 = self.l0_sstables.read().unwrap();
-            nd.contains_key(name) || l0.contains_key(name)
+            let sst = self.sstables.read().unwrap();
+            nd.contains_key(name) || sst.contains_key(name)
         };
         if !exists {
             return Err(Error::InvalidNamespace(format!(
@@ -448,7 +466,7 @@ impl DB {
             map.remove(name);
         }
         {
-            let mut map = self.l0_sstables.write().unwrap();
+            let mut map = self.sstables.write().unwrap();
             map.remove(name);
         }
         {
@@ -493,8 +511,8 @@ impl DB {
     /// Flush all in-memory write buffers to L0 SSTable files.
     ///
     /// For each namespace with a non-empty MemTable, drains the latest
-    /// entry per key, writes an SSTable to `<db>/sst/<namespace>/`, and
-    /// appends the reader to the L0 cache. After all namespaces are
+    /// entry per key, writes an SSTable to `<db>/sst/<namespace>/L0/`,
+    /// and prepends the reader to the L0 cache. After all namespaces are
     /// flushed, the AOL is truncated.
     pub fn flush(&self) -> Result<()> {
         let namespaces: Vec<String> = {
@@ -519,10 +537,10 @@ impl DB {
             }
 
             // Allocate a new sequence number and write the SSTable
-            let seq = self.l0_sequence.fetch_add(1, Ordering::Relaxed) + 1;
-            let sst_dir = self.sst_namespace_dir(ns_name);
-            fs::create_dir_all(&sst_dir)?;
-            let sst_path = sst_dir.join(format!("{seq:06}.sst"));
+            let seq = self.sst_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+            let l0_dir = self.sst_level_dir(ns_name, 0);
+            fs::create_dir_all(&l0_dir)?;
+            let sst_path = l0_dir.join(format!("{seq:06}.sst"));
 
             let mut writer = sstable::SSTableWriter::new(
                 &sst_path,
@@ -536,8 +554,14 @@ impl DB {
 
             // Open the reader and prepend to L0 cache (newest first)
             let reader = sstable::SSTableReader::open(&sst_path)?;
-            let mut l0 = self.l0_sstables.write().unwrap();
-            l0.entry(ns_name.clone()).or_default().insert(0, reader);
+            let mut sst = self.sstables.write().unwrap();
+            let levels = sst
+                .entry(ns_name.clone())
+                .or_insert_with(|| vec![Vec::new()]);
+            if levels.is_empty() {
+                levels.push(Vec::new());
+            }
+            levels[0].insert(0, reader);
 
             flushed_any = true;
         }
@@ -589,9 +613,228 @@ impl DB {
 
     // --- Compaction ---
 
-    /// Trigger a manual compaction of SSTable levels.
+    /// Trigger a manual compaction.
+    ///
+    /// For each namespace, merges L0 into L1, then cascades through
+    /// deeper levels when a level exceeds its size threshold. Tombstones
+    /// are dropped only at the bottommost level (`max_levels - 1`).
     pub fn compact(&self) -> Result<()> {
-        Err(Error::NotImplemented("compact".into()))
+        let namespaces: Vec<String> = {
+            let sst = self.sstables.read().unwrap();
+            sst.keys().cloned().collect()
+        };
+
+        for ns_name in &namespaces {
+            self.compact_namespace(ns_name)?;
+        }
+
+        Ok(())
+    }
+
+    /// Compact a single namespace with cascading level merges.
+    ///
+    /// 1. Merge L0 → L1 (drop tombstones if L1 is the bottommost level).
+    /// 2. For each subsequent level, if it exceeds its size threshold,
+    ///    merge into the next level. Tombstones are dropped when the
+    ///    target is the bottommost level (`max_levels - 1`).
+    fn compact_namespace(&self, ns: &str) -> Result<()> {
+        let max_levels = self.config.max_levels;
+
+        // Nothing to do with fewer than 2 levels
+        if max_levels < 2 {
+            return Ok(());
+        }
+
+        // Nothing to compact if L0 is empty
+        {
+            let sst = self.sstables.read().unwrap();
+            let has_l0 = sst
+                .get(ns)
+                .and_then(|levels| levels.first())
+                .is_some_and(|l0| !l0.is_empty());
+            if !has_l0 {
+                return Ok(());
+            }
+        }
+
+        // Step 1: merge L0 → L1
+        let is_bottom = max_levels <= 2;
+        self.merge_two_levels(ns, 0, 1, is_bottom)?;
+
+        // Step 2: cascade through deeper levels
+        for level in 1..max_levels - 1 {
+            if self.level_total_size(ns, level) <= self.level_max_size(level) {
+                break;
+            }
+            let target = level + 1;
+            let drop = target >= max_levels - 1;
+            self.merge_two_levels(ns, level, target, drop)?;
+        }
+
+        Ok(())
+    }
+
+    /// Merge all SSTables from `source_level` into `target_level`.
+    ///
+    /// Target entries are loaded first (oldest), then source entries
+    /// (newer wins via BTreeMap). For L0 source, readers are iterated
+    /// in reverse (oldest-to-newest); for L1+ source, natural order.
+    ///
+    /// If `drop_tombstones` is true, tombstones are filtered from the
+    /// output (safe only when target is the bottommost level).
+    ///
+    /// Returns the output SSTable size in bytes (0 if nothing to merge).
+    fn merge_two_levels(
+        &self,
+        ns: &str,
+        source_level: usize,
+        target_level: usize,
+        drop_tombstones: bool,
+    ) -> Result<usize> {
+        let (source_paths, merged) = {
+            let sst = self.sstables.read().unwrap();
+            let levels = match sst.get(ns) {
+                Some(l) => l,
+                None => return Ok(0),
+            };
+
+            let source = levels
+                .get(source_level)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let target = levels
+                .get(target_level)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+
+            if source.is_empty() {
+                return Ok(0);
+            }
+
+            // Merge all entries: process oldest-to-newest so newer values
+            // overwrite older ones in the BTreeMap.
+            let mut merged = std::collections::BTreeMap::<Key, Value>::new();
+
+            // Target entries are oldest
+            for reader in target {
+                for (key, value) in reader.iter_entries(self.config.verify_checksums)? {
+                    merged.insert(key, value);
+                }
+            }
+
+            // Source entries: L0 iterate oldest-to-newest (reverse of newest-first);
+            // L1+ iterate in natural order.
+            if source_level == 0 {
+                for reader in source.iter().rev() {
+                    for (key, value) in reader.iter_entries(self.config.verify_checksums)? {
+                        merged.insert(key, value);
+                    }
+                }
+            } else {
+                for reader in source {
+                    for (key, value) in reader.iter_entries(self.config.verify_checksums)? {
+                        merged.insert(key, value);
+                    }
+                }
+            }
+
+            // Filter tombstones if requested
+            if drop_tombstones {
+                merged.retain(|_, v| !v.is_tombstone());
+            }
+
+            // Collect source file paths for cleanup by scanning disk
+            let mut source_paths = Vec::new();
+            for level in [source_level, target_level] {
+                let level_dir = self.sst_level_dir(ns, level);
+                if level_dir.exists() {
+                    for entry in fs::read_dir(&level_dir)? {
+                        let entry = entry?;
+                        let fname = entry.file_name().to_string_lossy().to_string();
+                        if fname.ends_with(".sst") {
+                            source_paths.push(entry.path());
+                        }
+                    }
+                }
+            }
+
+            (source_paths, merged)
+        };
+
+        if merged.is_empty() {
+            // All entries were tombstones or empty — clean up source files
+            for path in &source_paths {
+                let _ = fs::remove_file(path);
+            }
+            let mut sst = self.sstables.write().unwrap();
+            if let Some(levels) = sst.get_mut(ns) {
+                if let Some(s) = levels.get_mut(source_level) {
+                    s.clear();
+                }
+                if let Some(t) = levels.get_mut(target_level) {
+                    t.clear();
+                }
+            }
+            return Ok(0);
+        }
+
+        // Write merged output as a new SSTable in target level
+        let seq = self.sst_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        let target_dir = self.sst_level_dir(ns, target_level);
+        fs::create_dir_all(&target_dir)?;
+        let output_path = target_dir.join(format!("{seq:06}.sst"));
+
+        let mut writer = sstable::SSTableWriter::new(
+            &output_path,
+            self.config.block_size,
+            self.config.compression.clone(),
+        )?;
+        for (key, value) in &merged {
+            writer.add(key, value)?;
+        }
+        writer.finish()?;
+
+        // Delete old source files
+        for path in &source_paths {
+            let _ = fs::remove_file(path);
+        }
+
+        // Open the new reader and update the in-memory level structure
+        let reader = sstable::SSTableReader::open(&output_path)?;
+        let output_size = reader.size_bytes();
+        let mut sst = self.sstables.write().unwrap();
+        let levels = sst.entry(ns.to_owned()).or_insert_with(|| vec![Vec::new()]);
+
+        // Clear source level
+        if let Some(s) = levels.get_mut(source_level) {
+            s.clear();
+        }
+
+        // Set target level to the single merged reader
+        while levels.len() <= target_level {
+            levels.push(Vec::new());
+        }
+        levels[target_level] = vec![reader];
+
+        Ok(output_size)
+    }
+
+    /// Maximum size in bytes for a given level before it should be compacted.
+    fn level_max_size(&self, level: usize) -> usize {
+        match level {
+            0 => usize::MAX, // L0 uses count/size triggers, not a cap
+            1 => self.config.l1_max_size,
+            _ => self.config.default_max_size,
+        }
+    }
+
+    /// Total size in bytes of all SSTables at a given level for a namespace.
+    fn level_total_size(&self, ns: &str, level: usize) -> usize {
+        let sst = self.sstables.read().unwrap();
+        sst.get(ns)
+            .and_then(|levels| levels.get(level))
+            .map(|readers| readers.iter().map(|r| r.size_bytes()).sum())
+            .unwrap_or(0)
     }
 
     // --- Internal helpers ---
@@ -659,17 +902,19 @@ impl DB {
         Ok(unsafe { &*ptr })
     }
 
-    /// Look up a key in the L0 SSTable cache for a namespace.
+    /// Look up a key across all SSTable levels for a namespace.
     ///
-    /// Searches newest-to-oldest. Returns:
+    /// Searches L0 (newest-first), then L1, L2, etc. Returns:
     /// - `Ok(Some(value))` if found (may be `Tombstone`)
     /// - `Ok(None)` if not found in any SSTable
     pub(crate) fn get_from_sstables(&self, ns: &str, key: &Key) -> Result<Option<Value>> {
-        let l0 = self.l0_sstables.read().unwrap();
-        if let Some(readers) = l0.get(ns) {
-            for reader in readers {
-                if let Some(value) = reader.get(key, self.config.verify_checksums)? {
-                    return Ok(Some(value));
+        let sst = self.sstables.read().unwrap();
+        if let Some(levels) = sst.get(ns) {
+            for level_readers in levels {
+                for reader in level_readers {
+                    if let Some(value) = reader.get(key, self.config.verify_checksums)? {
+                        return Ok(Some(value));
+                    }
                 }
             }
         }
@@ -681,16 +926,23 @@ impl DB {
         self.config.path.join("sst").join(ns)
     }
 
-    /// Scan existing L0 SSTable files on startup.
+    /// SSTable directory for a specific level: `<db>/sst/<namespace>/L<level>/`.
+    fn sst_level_dir(&self, ns: &str, level: usize) -> PathBuf {
+        self.config
+            .path
+            .join("sst")
+            .join(ns)
+            .join(format!("L{level}"))
+    }
+
+    /// Scan existing SSTable files across all levels on startup.
     ///
-    /// Walks `<db>/sst/<namespace>/` directories, opens each `.sst` file,
-    /// and returns the per-namespace reader lists (newest first) plus the
+    /// Walks `<db>/sst/<namespace>/L<n>/` directories, opens each `.sst`
+    /// file, and returns the per-namespace leveled reader lists plus the
     /// next sequence number to use.
-    fn scan_l0_sstables(
-        db_path: &Path,
-    ) -> Result<(HashMap<String, Vec<sstable::SSTableReader>>, u64)> {
+    fn scan_sstables(db_path: &Path, max_levels: usize) -> Result<(LeveledSSTables, u64)> {
         let sst_root = db_path.join("sst");
-        let mut result: HashMap<String, Vec<sstable::SSTableReader>> = HashMap::new();
+        let mut result: LeveledSSTables = HashMap::new();
         let mut max_seq: u64 = 0;
 
         if !sst_root.exists() {
@@ -704,31 +956,46 @@ impl DB {
                 continue;
             }
             let ns_name = ns_entry.file_name().to_string_lossy().to_string();
+            let mut levels: Vec<Vec<sstable::SSTableReader>> = Vec::new();
 
-            let mut files: Vec<(u64, PathBuf)> = Vec::new();
-            for file_entry in fs::read_dir(ns_entry.path())? {
-                let file_entry = file_entry?;
-                let fname = file_entry.file_name().to_string_lossy().to_string();
-                if let Some(seq_str) = fname.strip_suffix(".sst") {
-                    if let Ok(seq) = seq_str.parse::<u64>() {
-                        files.push((seq, file_entry.path()));
-                        if seq > max_seq {
-                            max_seq = seq;
+            for level in 0..max_levels {
+                let level_dir = db_path.join("sst").join(&ns_name).join(format!("L{level}"));
+                if !level_dir.exists() {
+                    levels.push(Vec::new());
+                    continue;
+                }
+
+                let mut files: Vec<(u64, PathBuf)> = Vec::new();
+                for file_entry in fs::read_dir(&level_dir)? {
+                    let file_entry = file_entry?;
+                    let fname = file_entry.file_name().to_string_lossy().to_string();
+                    if let Some(seq_str) = fname.strip_suffix(".sst") {
+                        if let Ok(seq) = seq_str.parse::<u64>() {
+                            files.push((seq, file_entry.path()));
+                            if seq > max_seq {
+                                max_seq = seq;
+                            }
                         }
                     }
                 }
+
+                // L0: sort descending (newest first); L1+: sort ascending (key order)
+                if level == 0 {
+                    files.sort_by(|a, b| b.0.cmp(&a.0));
+                } else {
+                    files.sort_by(|a, b| a.0.cmp(&b.0));
+                }
+
+                let mut readers = Vec::with_capacity(files.len());
+                for (_seq, path) in &files {
+                    readers.push(sstable::SSTableReader::open(path)?);
+                }
+                levels.push(readers);
             }
 
-            // Sort descending by sequence (newest first)
-            files.sort_by(|a, b| b.0.cmp(&a.0));
-
-            let mut readers = Vec::with_capacity(files.len());
-            for (_seq, path) in &files {
-                readers.push(sstable::SSTableReader::open(path)?);
-            }
-
-            if !readers.is_empty() {
-                result.insert(ns_name, readers);
+            // Only insert if at least one level has readers
+            if levels.iter().any(|l| !l.is_empty()) {
+                result.insert(ns_name, levels);
             }
         }
 

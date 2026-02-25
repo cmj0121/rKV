@@ -232,6 +232,9 @@ pub(super) fn decompress_block(tag: u8, data: &[u8]) -> Result<Vec<u8>> {
 
 // --- SSTableReader ---
 
+/// Raw entry parsed from a data block: (key_bytes, value_tag, value_data).
+type RawEntry = (Vec<u8>, u8, Vec<u8>);
+
 /// Index entry parsed from an SSTable's index block.
 struct IndexEntry {
     /// Last key in this data block (serialized bytes).
@@ -405,8 +408,9 @@ impl SSTableReader {
         Self::scan_block_for_key(&block_data, &key_bytes)
     }
 
-    /// Linear scan through a decompressed block looking for a specific key.
-    fn scan_block_for_key(block: &[u8], target: &[u8]) -> Result<Option<Value>> {
+    /// Parse all entries from a decompressed block.
+    fn parse_block_entries(block: &[u8]) -> Result<Vec<RawEntry>> {
+        let mut entries = Vec::new();
         let mut pos = 0;
         while pos < block.len() {
             // [key_len: u16 BE][key_bytes][value_tag: u8][value_len: u32 BE][value_data]
@@ -423,7 +427,7 @@ impl SSTableReader {
                     "SSTable entry truncated at key_bytes".into(),
                 ));
             }
-            let entry_key = &block[pos..pos + kl];
+            let key_bytes = block[pos..pos + kl].to_vec();
             pos += kl;
 
             if pos + 1 > block.len() {
@@ -447,14 +451,66 @@ impl SSTableReader {
                     "SSTable entry truncated at value_data".into(),
                 ));
             }
-            let value_data = &block[pos..pos + vl];
+            let value_data = block[pos..pos + vl].to_vec();
             pos += vl;
 
-            if entry_key == target {
-                return Ok(Some(Value::from_tag(value_tag, value_data)?));
+            entries.push((key_bytes, value_tag, value_data));
+        }
+        Ok(entries)
+    }
+
+    /// Linear scan through a decompressed block looking for a specific key.
+    fn scan_block_for_key(block: &[u8], target: &[u8]) -> Result<Option<Value>> {
+        for (key_bytes, value_tag, value_data) in Self::parse_block_entries(block)? {
+            if key_bytes == target {
+                return Ok(Some(Value::from_tag(value_tag, &value_data)?));
             }
         }
         Ok(None)
+    }
+
+    /// Iterate all entries in sorted key order.
+    ///
+    /// Reads every data block, decompresses, and returns `(Key, Value)` pairs.
+    pub(crate) fn iter_entries(&self, verify_checksums: bool) -> Result<Vec<(Key, Value)>> {
+        let mut result = Vec::with_capacity(self.entry_count as usize);
+
+        for ie in &self.index {
+            let block_start = ie.offset as usize;
+            let block_end = block_start + ie.size as usize;
+
+            if block_end > self.data.len() {
+                return Err(Error::Corruption(format!(
+                    "SSTable block out of bounds: {block_start}..{block_end} (file size {})",
+                    self.data.len()
+                )));
+            }
+
+            let block_on_disk = &self.data[block_start..block_end];
+            let cksum_start = block_on_disk.len() - Checksum::encoded_size();
+
+            if verify_checksums {
+                let checksum = Checksum::from_bytes(&block_on_disk[cksum_start..])?;
+                checksum.verify(&block_on_disk[..cksum_start])?;
+            }
+
+            let compression_tag = block_on_disk[0];
+            let compressed_payload = &block_on_disk[1..cksum_start];
+            let block_data = decompress_block(compression_tag, compressed_payload)?;
+
+            for (key_bytes, value_tag, value_data) in Self::parse_block_entries(&block_data)? {
+                let key = Key::from_bytes(&key_bytes)?;
+                let value = Value::from_tag(value_tag, &value_data)?;
+                result.push((key, value));
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Return the total size of the SSTable data in bytes.
+    pub(crate) fn size_bytes(&self) -> usize {
+        self.data.len()
     }
 
     /// Return the total number of entries in this SSTable.
@@ -855,5 +911,104 @@ mod tests {
             Some(Value::from("v99"))
         );
         assert_eq!(r.get(&Key::Int(100), true).unwrap(), None);
+    }
+
+    // --- iter_entries ---
+
+    #[test]
+    fn iter_entries_single_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iter.sst");
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None).unwrap();
+        w.add(&Key::Int(1), &Value::from("a")).unwrap();
+        w.add(&Key::Int(2), &Value::from("b")).unwrap();
+        w.add(&Key::Int(3), &Value::from("c")).unwrap();
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path).unwrap();
+        let entries = r.iter_entries(true).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0], (Key::Int(1), Value::from("a")));
+        assert_eq!(entries[1], (Key::Int(2), Value::from("b")));
+        assert_eq!(entries[2], (Key::Int(3), Value::from("c")));
+    }
+
+    #[test]
+    fn iter_entries_multi_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iter_multi.sst");
+        let mut w = SSTableWriter::new(&path, 32, Compression::None).unwrap();
+        for i in 0..20 {
+            w.add(&Key::Int(i), &Value::from(format!("v{i}").as_str()))
+                .unwrap();
+        }
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path).unwrap();
+        let entries = r.iter_entries(true).unwrap();
+        assert_eq!(entries.len(), 20);
+        for (i, (key, value)) in entries.iter().enumerate() {
+            assert_eq!(*key, Key::Int(i as i64));
+            assert_eq!(*value, Value::from(format!("v{i}").as_str()));
+        }
+    }
+
+    #[test]
+    fn iter_entries_with_tombstones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iter_tomb.sst");
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None).unwrap();
+        w.add(&Key::Int(1), &Value::from("live")).unwrap();
+        w.add(&Key::Int(2), &Value::tombstone()).unwrap();
+        w.add(&Key::Int(3), &Value::Null).unwrap();
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path).unwrap();
+        let entries = r.iter_entries(true).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[1].1, Value::tombstone());
+        assert_eq!(entries[2].1, Value::Null);
+    }
+
+    #[test]
+    fn iter_entries_empty_sstable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("empty.sst");
+        let w = SSTableWriter::new(&path, 4096, Compression::None).unwrap();
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path).unwrap();
+        let entries = r.iter_entries(true).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn iter_entries_with_compression() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("iter_lz4.sst");
+        let mut w = SSTableWriter::new(&path, 4096, Compression::LZ4).unwrap();
+        for i in 0..10 {
+            w.add(&Key::Int(i), &Value::from(format!("val{i}").as_str()))
+                .unwrap();
+        }
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path).unwrap();
+        let entries = r.iter_entries(true).unwrap();
+        assert_eq!(entries.len(), 10);
+        assert_eq!(entries[0], (Key::Int(0), Value::from("val0")));
+        assert_eq!(entries[9], (Key::Int(9), Value::from("val9")));
+    }
+
+    #[test]
+    fn size_bytes_nonzero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("size.sst");
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None).unwrap();
+        w.add(&Key::Int(1), &Value::from("data")).unwrap();
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path).unwrap();
+        assert!(r.size_bytes() > FOOTER_SIZE);
     }
 }

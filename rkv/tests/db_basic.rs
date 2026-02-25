@@ -826,13 +826,12 @@ fn load_returns_not_implemented() {
 }
 
 #[test]
-fn compact_returns_not_implemented() {
+fn compact_empty_db_is_noop() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
 
-    let err = db.compact().unwrap_err();
-    assert!(matches!(err, Error::NotImplemented(_)));
+    db.compact().unwrap();
 }
 
 // --- Namespace encryption ---
@@ -2243,9 +2242,9 @@ fn flush_multiple_creates_multiple_l0_files() {
     assert_eq!(ns.get(1).unwrap(), Value::from("first"));
     assert_eq!(ns.get(2).unwrap(), Value::from("second"));
 
-    // Should have 2 SSTable files
-    let sst_dir = tmp.path().join("sst").join("_");
-    let count = std::fs::read_dir(&sst_dir).unwrap().count();
+    // Should have 2 SSTable files in L0
+    let l0_dir = tmp.path().join("sst").join("_").join("L0");
+    let count = std::fs::read_dir(&l0_dir).unwrap().count();
     assert_eq!(count, 2);
 }
 
@@ -2358,6 +2357,379 @@ fn flush_aol_truncated() {
 
     let size_after = std::fs::metadata(&aol_path).unwrap().len();
     assert_eq!(size_after, 8); // Header only (magic + version + reserved)
+}
+
+// --- Compaction tests ---
+
+#[test]
+fn compact_merges_l0_into_l1() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    // Create two L0 SSTables
+    ns.put(1, "first", None).unwrap();
+    db.flush().unwrap();
+    ns.put(2, "second", None).unwrap();
+    db.flush().unwrap();
+
+    let l0_dir = tmp.path().join("sst").join("_").join("L0");
+    assert_eq!(std::fs::read_dir(&l0_dir).unwrap().count(), 2);
+
+    db.compact().unwrap();
+
+    // L0 should be empty, L1 should have exactly 1 SSTable
+    let l0_count = std::fs::read_dir(&l0_dir).map(|rd| rd.count()).unwrap_or(0);
+    assert_eq!(l0_count, 0);
+
+    let l1_dir = tmp.path().join("sst").join("_").join("L1");
+    assert_eq!(std::fs::read_dir(&l1_dir).unwrap().count(), 1);
+
+    // Data should still be accessible
+    assert_eq!(ns.get(1).unwrap(), Value::from("first"));
+    assert_eq!(ns.get(2).unwrap(), Value::from("second"));
+}
+
+#[test]
+fn compact_newer_value_wins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "old", None).unwrap();
+    db.flush().unwrap();
+
+    ns.put(1, "new", None).unwrap();
+    db.flush().unwrap();
+
+    db.compact().unwrap();
+
+    assert_eq!(ns.get(1).unwrap(), Value::from("new"));
+}
+
+#[test]
+fn compact_tombstone_preserved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "alive", None).unwrap();
+    db.flush().unwrap();
+
+    ns.delete(1).unwrap();
+    db.flush().unwrap();
+
+    db.compact().unwrap();
+
+    // Tombstone should survive compaction
+    let err = ns.get(1).unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound));
+}
+
+#[test]
+fn compact_data_survives_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+
+        ns.put(1, "a", None).unwrap();
+        db.flush().unwrap();
+        ns.put(2, "b", None).unwrap();
+        db.flush().unwrap();
+
+        db.compact().unwrap();
+        db.close().unwrap();
+    }
+
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    assert_eq!(ns.get(1).unwrap(), Value::from("a"));
+    assert_eq!(ns.get(2).unwrap(), Value::from("b"));
+}
+
+#[test]
+fn compact_multiple_namespaces() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns1 = db.namespace("ns1", None).unwrap();
+    let ns2 = db.namespace("ns2", None).unwrap();
+
+    ns1.put("a", "from-ns1", None).unwrap();
+    ns2.put("a", "from-ns2", None).unwrap();
+    db.flush().unwrap();
+
+    ns1.put("b", "more-ns1", None).unwrap();
+    ns2.put("b", "more-ns2", None).unwrap();
+    db.flush().unwrap();
+
+    db.compact().unwrap();
+
+    // Both namespaces should have L1 SSTables
+    let l1_ns1 = tmp.path().join("sst").join("ns1").join("L1");
+    let l1_ns2 = tmp.path().join("sst").join("ns2").join("L1");
+    assert!(l1_ns1.exists());
+    assert!(l1_ns2.exists());
+
+    assert_eq!(ns1.get("a").unwrap(), Value::from("from-ns1"));
+    assert_eq!(ns2.get("b").unwrap(), Value::from("more-ns2"));
+}
+
+#[test]
+fn compact_no_l0_is_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    // Only put data in memtable, no flush → no L0 SSTables
+    ns.put(1, "memonly", None).unwrap();
+
+    db.compact().unwrap();
+
+    // No L1 directory should have been created
+    let l1_dir = tmp.path().join("sst").join("_").join("L1");
+    assert!(!l1_dir.exists());
+
+    // Memtable data should still be accessible
+    assert_eq!(ns.get(1).unwrap(), Value::from("memonly"));
+}
+
+#[test]
+fn compact_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "value", None).unwrap();
+    db.flush().unwrap();
+
+    db.compact().unwrap();
+    db.compact().unwrap(); // second compact is a no-op (L0 is empty)
+
+    assert_eq!(ns.get(1).unwrap(), Value::from("value"));
+
+    let l1_dir = tmp.path().join("sst").join("_").join("L1");
+    assert_eq!(std::fs::read_dir(&l1_dir).unwrap().count(), 1);
+}
+
+#[test]
+fn compact_then_flush_adds_new_l0() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "before", None).unwrap();
+    db.flush().unwrap();
+    db.compact().unwrap();
+
+    // New writes go to L0 again
+    ns.put(2, "after", None).unwrap();
+    db.flush().unwrap();
+
+    let l0_dir = tmp.path().join("sst").join("_").join("L0");
+    assert_eq!(std::fs::read_dir(&l0_dir).unwrap().count(), 1);
+
+    assert_eq!(ns.get(1).unwrap(), Value::from("before"));
+    assert_eq!(ns.get(2).unwrap(), Value::from("after"));
+}
+
+// --- Multi-level compaction tests ---
+
+#[test]
+fn compact_cascades_l1_to_l2() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.max_levels = 4;
+    config.l1_max_size = 1; // tiny threshold forces cascade
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "a", None).unwrap();
+    db.flush().unwrap();
+    ns.put(2, "b", None).unwrap();
+    db.flush().unwrap();
+
+    db.compact().unwrap();
+
+    // L0 and L1 should be empty, L2 should have data
+    let l0_dir = tmp.path().join("sst").join("_").join("L0");
+    let l0_count = std::fs::read_dir(&l0_dir).map(|rd| rd.count()).unwrap_or(0);
+    assert_eq!(l0_count, 0);
+
+    let l2_dir = tmp.path().join("sst").join("_").join("L2");
+    assert!(l2_dir.exists());
+    assert_eq!(std::fs::read_dir(&l2_dir).unwrap().count(), 1);
+
+    assert_eq!(ns.get(1).unwrap(), Value::from("a"));
+    assert_eq!(ns.get(2).unwrap(), Value::from("b"));
+}
+
+#[test]
+fn compact_cascades_to_deepest_level() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.max_levels = 4;
+    config.l1_max_size = 1;
+    config.default_max_size = 1; // force cascade through all levels
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "val1", None).unwrap();
+    db.flush().unwrap();
+    ns.put(2, "val2", None).unwrap();
+    db.flush().unwrap();
+
+    db.compact().unwrap();
+
+    // Data should land at the deepest level (L3)
+    let l3_dir = tmp.path().join("sst").join("_").join("L3");
+    assert!(l3_dir.exists());
+    assert_eq!(std::fs::read_dir(&l3_dir).unwrap().count(), 1);
+
+    assert_eq!(ns.get(1).unwrap(), Value::from("val1"));
+    assert_eq!(ns.get(2).unwrap(), Value::from("val2"));
+}
+
+#[test]
+fn compact_tombstone_dropped_at_bottom() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.max_levels = 3;
+    config.l1_max_size = 1;
+    config.default_max_size = 1; // cascade to L2 (bottom)
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "alive", None).unwrap();
+    db.flush().unwrap();
+    ns.delete(1).unwrap();
+    db.flush().unwrap();
+
+    db.compact().unwrap();
+
+    // Tombstone should be dropped at bottom level — L2 SSTable
+    // should be empty or non-existent (all entries were tombstones).
+    let l2_dir = tmp.path().join("sst").join("_").join("L2");
+    let l2_count = std::fs::read_dir(&l2_dir).map(|rd| rd.count()).unwrap_or(0);
+    assert_eq!(l2_count, 0);
+
+    let err = ns.get(1).unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound));
+}
+
+#[test]
+fn compact_tombstone_preserved_at_intermediate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.max_levels = 4;
+    // Only cascade to L1 (not the bottom level L3)
+    config.l1_max_size = 256 * 1024 * 1024; // big enough to stop cascade
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "alive", None).unwrap();
+    db.flush().unwrap();
+    ns.delete(1).unwrap();
+    db.flush().unwrap();
+
+    db.compact().unwrap();
+
+    // Tombstone should survive at L1 (not the bottom level)
+    let l1_dir = tmp.path().join("sst").join("_").join("L1");
+    assert!(l1_dir.exists());
+    assert_eq!(std::fs::read_dir(&l1_dir).unwrap().count(), 1);
+
+    let err = ns.get(1).unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound));
+}
+
+#[test]
+fn compact_respects_max_levels_cap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.max_levels = 3;
+    config.l1_max_size = 1;
+    config.default_max_size = 1;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "val", None).unwrap();
+    db.flush().unwrap();
+    ns.put(2, "val2", None).unwrap();
+    db.flush().unwrap();
+
+    db.compact().unwrap();
+
+    // No L3 should exist (max_levels = 3 means L0, L1, L2)
+    let l3_dir = tmp.path().join("sst").join("_").join("L3");
+    assert!(!l3_dir.exists());
+
+    // Data lands at L2 (the bottommost)
+    let l2_dir = tmp.path().join("sst").join("_").join("L2");
+    assert!(l2_dir.exists());
+
+    assert_eq!(ns.get(1).unwrap(), Value::from("val"));
+    assert_eq!(ns.get(2).unwrap(), Value::from("val2"));
+}
+
+#[test]
+fn compact_cascade_survives_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let mut config = Config::new(tmp.path());
+        config.max_levels = 4;
+        config.l1_max_size = 1;
+        config.default_max_size = 1;
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+
+        ns.put(1, "deep", None).unwrap();
+        db.flush().unwrap();
+        ns.put(2, "deeper", None).unwrap();
+        db.flush().unwrap();
+
+        db.compact().unwrap();
+        db.close().unwrap();
+    }
+
+    let mut config = Config::new(tmp.path());
+    config.max_levels = 4;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    assert_eq!(ns.get(1).unwrap(), Value::from("deep"));
+    assert_eq!(ns.get(2).unwrap(), Value::from("deeper"));
+}
+
+#[test]
+fn compact_max_levels_one_is_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.max_levels = 1;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "val", None).unwrap();
+    db.flush().unwrap();
+
+    db.compact().unwrap();
+
+    // L0 files should be untouched (no merge target available)
+    let l0_dir = tmp.path().join("sst").join("_").join("L0");
+    assert_eq!(std::fs::read_dir(&l0_dir).unwrap().count(), 1);
+
+    assert_eq!(ns.get(1).unwrap(), Value::from("val"));
 }
 
 // --- Namespace management tests ---
