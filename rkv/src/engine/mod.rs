@@ -580,6 +580,23 @@ impl DB {
         Ok(unsafe { &*ptr })
     }
 
+    /// Look up a key in the L0 SSTable cache for a namespace.
+    ///
+    /// Searches newest-to-oldest. Returns:
+    /// - `Ok(Some(value))` if found (may be `Tombstone`)
+    /// - `Ok(None)` if not found in any SSTable
+    pub(crate) fn get_from_sstables(&self, ns: &str, key: &Key) -> Result<Option<Value>> {
+        let l0 = self.l0_sstables.read().unwrap();
+        if let Some(readers) = l0.get(ns) {
+            for reader in readers {
+                if let Some(value) = reader.get(key, self.config.verify_checksums)? {
+                    return Ok(Some(value));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// SSTable directory for a namespace: `<db>/sst/<namespace>/`.
     fn sst_namespace_dir(&self, ns: &str) -> PathBuf {
         self.config.path.join("sst").join(ns)
