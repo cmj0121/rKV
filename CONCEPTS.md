@@ -188,7 +188,8 @@ independent auto-upgrade state. Namespaces are identified by string names and cr
 The default namespace is `_`. The CLI starts on `_` and supports switching with the `use` command.
 
 All data operations (`put`, `get`, `del`, `has`, `scan`, `rscan`, `count`) live on the `Namespace` handle, not on
-`DB` directly. `DB` is responsible for lifecycle (`open`, `close`, `path`) and namespace management (`namespace`).
+`DB` directly. `DB` is responsible for lifecycle (`open`, `close`, `path`) and namespace management (`namespace`,
+`list_namespaces`, `drop_namespace`).
 
 ### Namespace Encryption
 
@@ -236,6 +237,31 @@ Key names are stored in plaintext (required for BTreeMap ordering and scans).
 
 Using the wrong password to open an encrypted namespace will produce `Corruption`
 errors on `get`/`rev_get` (the GCM tag verification fails).
+
+### Listing and Dropping Namespaces
+
+Two management methods live on `DB`:
+
+| Method            | Signature                         | Description                              |
+| ----------------- | --------------------------------- | ---------------------------------------- |
+| `list_namespaces` | `&self -> Result<Vec<String>>`    | Sorted list of all known namespace names |
+| `drop_namespace`  | `&self, name: &str -> Result<()>` | Remove a namespace and all its data      |
+
+**`list_namespaces`** returns the sorted union of namespaces from the in-memory MemTable map and the L0
+SSTable cache. This covers namespaces created at runtime, replayed from the AOL, and persisted in SSTables.
+
+**`drop_namespace`** performs a complete removal:
+
+1. Remove in-memory state — MemTable, L0 SSTable readers, object store, encryption tracking
+2. Delete on-disk files — `<db>/sst/<namespace>/`, `<db>/objects/<namespace>/`, `<db>/crypto/<namespace>.salt`
+3. Flush remaining namespaces and force-truncate the AOL to prevent the dropped namespace from reappearing
+   on restart via AOL replay
+
+Constraints:
+
+- The default namespace `_` cannot be dropped → `InvalidNamespace` error
+- Dropping a non-existent namespace → `InvalidNamespace` error
+- **CLI**: dropping the current namespace auto-switches the prompt back to `_`
 
 ### Revision ID
 
@@ -430,8 +456,9 @@ admin recovery tool when stats may have drifted.
 
 ### Maintenance Operations
 
-Maintenance operations handle durability, recovery, backup, and storage optimization. All
-maintenance methods return `Result` and are stubs (`NotImplemented`) during the scaffold phase.
+Maintenance operations handle durability, recovery, backup, and storage optimization.
+Most maintenance methods return `Result`. `flush`, `list_namespaces`, and `drop_namespace`
+are implemented; remaining methods are stubs (`NotImplemented`).
 
 #### Flush / Sync
 
