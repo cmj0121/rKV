@@ -534,25 +534,37 @@ its own configuration, so no separate `Config` is needed.
 | --------- | -------- | --------------------- | ------------------------------------------- |
 | `compact` | instance | `&self -> Result<()>` | Trigger manual compaction of SSTable levels |
 
-`compact` merges all L0 SSTables plus any existing L1 SSTables into a single new L1
-SSTable per namespace. The merge processes entries oldest-to-newest so that newer values
-overwrite older ones. Tombstones are preserved in the output because they may shadow data
-in deeper levels. Old source files are deleted after a successful merge.
+`compact` merges L0 SSTables into L1, then cascades through deeper levels when a
+level exceeds its size threshold. The merge processes entries oldest-to-newest so that
+newer values overwrite older ones. Old source files are deleted after a successful merge.
 
 The compaction path per namespace:
 
 ```text
 DB::compact()
   for each namespace with L0 SSTables:
-    1. Read all L1 entries (oldest)
-    2. Read all L0 entries oldest-to-newest (newer overwrites)
-    3. Write merged entries to a new L1 SSTable
-    4. Delete old L0 + L1 files
-    5. Update in-memory reader cache
+    1. Merge L0 + L1 → new L1 SSTable
+    2. For level in 1..max_levels-1:
+         if level_total_size <= level_max_size: stop
+         Merge level + (level+1) → new (level+1) SSTable
+         Drop tombstones if target is the bottommost level
 ```
+
+Level size thresholds:
+
+| Level | Threshold          | Config field       |
+| ----- | ------------------ | ------------------ |
+| L0    | n/a (count-based)  | `l0_max_count`     |
+| L1    | `l1_max_size`      | `l1_max_size`      |
+| L2+   | `default_max_size` | `default_max_size` |
+
+Tombstones are preserved at intermediate levels because they may shadow data in
+deeper levels. At the bottommost level (`max_levels - 1`), tombstones are dropped
+because no deeper level exists to shadow.
 
 Compaction is idempotent — calling it when L0 is empty is a no-op. After compaction,
 new flushes continue writing to L0 and a subsequent compact merges them into L1 again.
+When `max_levels` is 1, compaction is a no-op (no merge target available).
 
 The CLI exposes compaction via the `compact` REPL command.
 
