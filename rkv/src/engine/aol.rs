@@ -192,6 +192,27 @@ impl Aol {
         Ok(())
     }
 
+    /// Truncate the AOL back to a fresh header-only state.
+    ///
+    /// Called after a successful flush — all data is now persisted in SSTables,
+    /// so the AOL can be reset to prevent unbounded growth.
+    #[allow(dead_code)]
+    pub(crate) fn truncate(&mut self, db_dir: &Path) -> Result<()> {
+        // Flush any pending writes before truncating
+        self.writer.flush()?;
+
+        // Re-create the AOL file from scratch
+        let path = aol_path(db_dir);
+        let file = std::fs::File::create(&path)?;
+        let mut writer = BufWriter::new(file);
+        write_header(&mut writer)?;
+
+        self.writer = writer;
+        self.append_count = 0;
+        self.dirty = false;
+        Ok(())
+    }
+
     /// Fsync the underlying file to durable storage.
     #[allow(dead_code)]
     pub(crate) fn sync(&mut self) -> Result<()> {
@@ -641,6 +662,53 @@ mod tests {
 
         let (records, _) = Aol::replay(tmp.path(), true).unwrap();
         assert_eq!(records.len(), 1);
+    }
+
+    // --- Truncate ---
+
+    #[test]
+    fn truncate_resets_to_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut aol = Aol::open(tmp.path(), 0).unwrap();
+            aol.append("_", 1, &Key::Int(1), &Value::from("v1"), None)
+                .unwrap();
+            aol.append("_", 2, &Key::Int(2), &Value::from("v2"), None)
+                .unwrap();
+
+            aol.truncate(tmp.path()).unwrap();
+        }
+
+        // After truncate, replay should return zero records
+        let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
+        assert!(records.is_empty());
+        assert_eq!(skipped, 0);
+
+        // File should be exactly the header size
+        let data = std::fs::read(aol_path(tmp.path())).unwrap();
+        assert_eq!(data.len(), HEADER_SIZE);
+    }
+
+    #[test]
+    fn truncate_allows_new_appends() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut aol = Aol::open(tmp.path(), 0).unwrap();
+            aol.append("_", 1, &Key::Int(1), &Value::from("old"), None)
+                .unwrap();
+
+            aol.truncate(tmp.path()).unwrap();
+
+            // New appends after truncate should work
+            aol.append("_", 2, &Key::Int(2), &Value::from("new"), None)
+                .unwrap();
+        }
+
+        let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(skipped, 0);
+        assert_eq!(records[0].key, Key::Int(2));
+        assert_eq!(records[0].value, Value::from("new"));
     }
 
     #[test]
