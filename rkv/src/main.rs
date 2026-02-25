@@ -404,7 +404,14 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 return Action::Continue;
             }
             match db.drop_namespace(tokens[1]) {
-                Ok(()) => println!("OK"),
+                Ok(()) => {
+                    println!("OK");
+                    // If the user dropped the namespace they're currently in,
+                    // switch back to the default namespace.
+                    if tokens[1] == ns.name() {
+                        return Action::Switch(DEFAULT_NAMESPACE.to_owned(), None);
+                    }
+                }
                 Err(e) => eprintln!("error: {e}"),
             }
         }
