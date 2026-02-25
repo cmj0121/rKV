@@ -276,6 +276,7 @@ The `Config` struct controls database behavior and LSM tuning parameters:
 | `compress`          | `bool`        | `true`     | LZ4-compress bin objects on disk           |
 | `bloom_bits`        | `usize`       | 10         | Bloom filter bits per key (0 = disabled)   |
 | `verify_checksums`  | `bool`        | `true`     | Verify checksums on read (see below)       |
+| `compression`       | `Compression` | `LZ4`      | SSTable block compression (see above)      |
 | `io_model`          | `IoModel`     | `Mmap`     | File I/O strategy (see I/O Modes below)    |
 | `cluster_id`        | `Option<u16>` | `None`     | Cluster ID for RevisionID (random if None) |
 | `aol_buffer_size`   | `usize`       | 128        | AOL flush threshold in records (0 = every) |
@@ -292,6 +293,7 @@ The CLI uses dot-notation keys for `config <key> <value>`:
 | `cache_size`        | `lsm.cache_size`            |
 | `bloom_bits`        | `lsm.bloom_bits`            |
 | `verify_checksums`  | `lsm.verify_checksums`      |
+| `compression`       | `lsm.compression`           |
 | `object_size`       | `object.size`               |
 | `compress`          | `object.compress`           |
 | `io_model`          | `io.model`                  |
@@ -460,6 +462,26 @@ and is out of scope.
 
 Data is organized in levels (L1-L3). Fresh writes land in an in-memory buffer and are periodically flushed to sorted
 SSTable files on disk. Background merge compaction keeps read amplification bounded.
+
+#### Block Compression
+
+SSTable data blocks can be compressed to reduce disk usage and I/O bandwidth. The `compression`
+config field selects the algorithm applied when blocks are flushed to disk:
+
+| Algorithm | Enum variant        | Characteristics                            |
+| --------- | ------------------- | ------------------------------------------ |
+| `none`    | `Compression::None` | No compression — lowest CPU, largest files |
+| `lz4`     | `Compression::LZ4`  | Fast with moderate ratio **(default)**     |
+| `zstd`    | `Compression::Zstd` | Better ratio, higher CPU cost              |
+
+Compression is applied per block at flush time and reversed on read. The block cache stores
+**decompressed** blocks, so the CPU cost is paid once per cache miss, not per read.
+
+Block compression is independent of bin object compression (`compress` config field), which
+controls LZ4 compression of large values in the object store.
+
+**Stub status**: The `Compression` enum and config field are defined. Actual block-level
+compress/decompress logic will be implemented alongside the SSTable writer/reader.
 
 #### WriteBuffer (MemTable)
 
