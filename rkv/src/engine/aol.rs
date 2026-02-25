@@ -218,8 +218,13 @@ fn write_header(writer: &mut BufWriter<File>) -> Result<()> {
 /// Encode a record payload (without length prefix or checksum).
 fn encode_payload(ns: &str, rev: u128, expires_at_ms: u64, key: &Key, value: &Value) -> Vec<u8> {
     let key_bytes = key.to_bytes();
-    let value_data = match value {
+    let value_data_vec;
+    let value_data: &[u8] = match value {
         Value::Data(d) => d.as_slice(),
+        Value::Pointer(vp) => {
+            value_data_vec = vp.to_bytes();
+            &value_data_vec
+        }
         _ => &[],
     };
 

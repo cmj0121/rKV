@@ -14,6 +14,10 @@ pub enum Value {
     /// Internal deletion marker. **Do not construct externally.**
     #[doc(hidden)]
     Tombstone,
+    /// Internal pointer to a bin object. **Do not construct externally.**
+    #[doc(hidden)]
+    #[allow(private_interfaces)]
+    Pointer(ValuePointer),
 }
 
 impl Value {
@@ -29,6 +33,7 @@ impl Value {
             Value::Data(_) => 0x00,
             Value::Null => 0x01,
             Value::Tombstone => 0x02,
+            Value::Pointer(_) => 0x03,
         }
     }
 
@@ -38,6 +43,7 @@ impl Value {
             0x00 => Ok(Value::Data(data.to_vec())),
             0x01 => Ok(Value::Null),
             0x02 => Ok(Value::Tombstone),
+            0x03 => Ok(Value::Pointer(ValuePointer::from_bytes(data)?)),
             _ => Err(super::error::Error::Corruption(format!(
                 "unknown value tag: 0x{tag:02x}"
             ))),
@@ -60,7 +66,22 @@ impl Value {
         matches!(self, Value::Data(_))
     }
 
-    /// Returns the byte payload, or `None` for `Null` and tombstones.
+    /// Returns `true` if this value is a `Pointer` (crate-internal only).
+    #[allow(dead_code)]
+    pub(crate) fn is_pointer(&self) -> bool {
+        matches!(self, Value::Pointer(_))
+    }
+
+    /// Returns the inner `ValuePointer`, or `None` if not a `Pointer`.
+    #[allow(dead_code)]
+    pub(crate) fn as_pointer(&self) -> Option<&ValuePointer> {
+        match self {
+            Value::Pointer(vp) => Some(vp),
+            _ => None,
+        }
+    }
+
+    /// Returns the byte payload, or `None` for `Null`, tombstones, and pointers.
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Value::Data(bytes) => Some(bytes),
@@ -68,8 +89,8 @@ impl Value {
         }
     }
 
-    /// Consumes the value and returns the byte payload, or `None` for `Null`
-    /// and tombstones.
+    /// Consumes the value and returns the byte payload, or `None` for `Null`,
+    /// tombstones, and pointers.
     pub fn into_bytes(self) -> Option<Vec<u8>> {
         match self {
             Value::Data(bytes) => Some(bytes),
@@ -77,10 +98,14 @@ impl Value {
         }
     }
 
-    /// Returns the byte length of the payload. `Null` and tombstones return 0.
+    /// Returns the byte length of the payload.
+    ///
+    /// For `Data`, returns the data length. For `Pointer`, returns the original
+    /// uncompressed size. `Null` and tombstones return 0.
     pub fn len(&self) -> usize {
         match self {
             Value::Data(bytes) => bytes.len(),
+            Value::Pointer(vp) => vp.size as usize,
             _ => 0,
         }
     }
@@ -108,6 +133,10 @@ impl fmt::Display for Value {
             },
             Value::Null => write!(f, "(null)"),
             Value::Tombstone => write!(f, "(tombstone)"),
+            Value::Pointer(vp) => {
+                let hex = vp.hex_hash();
+                write!(f, "(object:{}...)", &hex[..8])
+            }
         }
     }
 }
@@ -145,7 +174,6 @@ impl From<String> for Value {
 /// holds the BLAKE3 content hash (which doubles as the object filename)
 /// and the original uncompressed size.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct ValuePointer {
     /// BLAKE3 content hash — also the object filename.
     pub(crate) hash: [u8; 32],
@@ -153,9 +181,9 @@ pub(crate) struct ValuePointer {
     pub(crate) size: u32,
 }
 
-#[allow(dead_code)]
 impl ValuePointer {
     /// Create a new value pointer.
+    #[allow(dead_code)]
     pub(crate) fn new(hash: [u8; 32], size: u32) -> Self {
         Self { hash, size }
     }
@@ -171,8 +199,32 @@ impl ValuePointer {
     }
 
     /// Return the fan-out directory prefix (first 2 hex chars).
+    #[allow(dead_code)]
     pub(crate) fn fan_out_prefix(&self) -> String {
         format!("{:02x}", self.hash[0])
+    }
+
+    /// Serialize to 36 bytes: `[hash: 32][size: 4 BE]`.
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::encoded_size());
+        buf.extend_from_slice(&self.hash);
+        buf.extend_from_slice(&self.size.to_be_bytes());
+        buf
+    }
+
+    /// Deserialize from a byte slice (must be exactly 36 bytes).
+    pub(crate) fn from_bytes(data: &[u8]) -> super::error::Result<Self> {
+        if data.len() != Self::encoded_size() {
+            return Err(super::error::Error::Corruption(format!(
+                "ValuePointer expected {} bytes, got {}",
+                Self::encoded_size(),
+                data.len()
+            )));
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&data[..32]);
+        let size = u32::from_be_bytes(data[32..36].try_into().unwrap());
+        Ok(Self { hash, size })
     }
 }
 
@@ -333,9 +385,13 @@ mod tests {
         let data = Value::Data(vec![]);
         let null = Value::Null;
         let tomb = Value::tombstone();
+        let ptr = Value::Pointer(ValuePointer::new([0xABu8; 32], 100));
         assert_ne!(data, null);
         assert_ne!(data, tomb);
+        assert_ne!(data, ptr);
         assert_ne!(null, tomb);
+        assert_ne!(null, ptr);
+        assert_ne!(tomb, ptr);
     }
 
     // --- Clone ---
@@ -441,5 +497,84 @@ mod tests {
         hash[0] = 0xFF;
         let vp = ValuePointer::new(hash, 100);
         assert_eq!(vp.fan_out_prefix(), "ff");
+    }
+
+    #[test]
+    fn value_pointer_to_bytes_roundtrip() {
+        let hash = [0xABu8; 32];
+        let vp = ValuePointer::new(hash, 12345);
+        let bytes = vp.to_bytes();
+        assert_eq!(bytes.len(), 36);
+        let vp2 = ValuePointer::from_bytes(&bytes).unwrap();
+        assert_eq!(vp, vp2);
+    }
+
+    #[test]
+    fn value_pointer_from_bytes_wrong_size() {
+        let err = ValuePointer::from_bytes(&[0u8; 10]).unwrap_err();
+        assert!(matches!(err, super::super::error::Error::Corruption(_)));
+    }
+
+    // --- Pointer variant ---
+
+    #[test]
+    fn to_tag_pointer() {
+        let vp = ValuePointer::new([0u8; 32], 100);
+        assert_eq!(Value::Pointer(vp).to_tag(), 0x03);
+    }
+
+    #[test]
+    fn from_tag_pointer() {
+        let vp = ValuePointer::new([0xABu8; 32], 512);
+        let bytes = vp.to_bytes();
+        let v = Value::from_tag(0x03, &bytes).unwrap();
+        assert_eq!(v, Value::Pointer(ValuePointer::new([0xABu8; 32], 512)));
+    }
+
+    #[test]
+    fn pointer_len_returns_original_size() {
+        let vp = ValuePointer::new([0u8; 32], 4096);
+        let v = Value::Pointer(vp);
+        assert_eq!(v.len(), 4096);
+    }
+
+    #[test]
+    fn pointer_as_bytes_returns_none() {
+        let vp = ValuePointer::new([0u8; 32], 100);
+        assert_eq!(Value::Pointer(vp).as_bytes(), None);
+    }
+
+    #[test]
+    fn pointer_into_bytes_returns_none() {
+        let vp = ValuePointer::new([0u8; 32], 100);
+        assert_eq!(Value::Pointer(vp).into_bytes(), None);
+    }
+
+    #[test]
+    fn pointer_is_not_empty() {
+        let vp = ValuePointer::new([0u8; 32], 100);
+        assert!(!Value::Pointer(vp).is_empty());
+    }
+
+    #[test]
+    fn display_pointer() {
+        let vp = ValuePointer::new([0xABu8; 32], 100);
+        let s = Value::Pointer(vp).to_string();
+        assert_eq!(s, "(object:abababab...)");
+    }
+
+    #[test]
+    fn is_pointer_check() {
+        let vp = ValuePointer::new([0u8; 32], 100);
+        assert!(Value::Pointer(vp).is_pointer());
+        assert!(!Value::Data(vec![]).is_pointer());
+    }
+
+    #[test]
+    fn as_pointer_check() {
+        let vp = ValuePointer::new([0xABu8; 32], 100);
+        let v = Value::Pointer(vp.clone());
+        assert_eq!(v.as_pointer(), Some(&vp));
+        assert_eq!(Value::Data(vec![]).as_pointer(), None);
     }
 }
