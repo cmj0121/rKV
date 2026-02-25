@@ -1206,3 +1206,203 @@ fn persist_buffered_flush_threshold_triggers() {
         assert_eq!(ns.get("c").unwrap(), Value::from("3"));
     }
 }
+
+// --- Value separation (bin objects) ---
+
+#[test]
+fn value_sep_large_value_stored_and_retrieved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 100; // small threshold for testing
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let large_value = "x".repeat(200);
+    ns.put("big", large_value.as_str(), None).unwrap();
+    let result = ns.get("big").unwrap();
+    assert_eq!(result, Value::from(large_value.as_str()));
+}
+
+#[test]
+fn value_sep_small_value_stays_inline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 1024;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("small", "hello", None).unwrap();
+    let result = ns.get("small").unwrap();
+    assert_eq!(result, Value::from("hello"));
+
+    // No object files should be created for small values
+    let objects_dir = tmp.path().join("objects");
+    let count = std::fs::read_dir(objects_dir)
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().file_type().unwrap().is_dir())
+        .count();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn value_sep_dedup_same_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 10;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let data = "x".repeat(100);
+    ns.put("k1", data.as_str(), None).unwrap();
+    ns.put("k2", data.as_str(), None).unwrap();
+
+    // Both keys return the same value
+    assert_eq!(ns.get("k1").unwrap(), ns.get("k2").unwrap());
+
+    // Count total object files: should be exactly 1 (dedup)
+    let objects_dir = tmp.path().join("objects");
+    let mut file_count = 0;
+    for entry in std::fs::read_dir(objects_dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            for f in std::fs::read_dir(entry.path()).unwrap() {
+                let f = f.unwrap();
+                if f.file_type().unwrap().is_file() {
+                    file_count += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(file_count, 1);
+}
+
+#[test]
+fn value_sep_persistence_survives_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let large_value = "y".repeat(200);
+
+    {
+        let mut config = Config::new(tmp.path());
+        config.object_size = 100;
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put("persist", large_value.as_str(), None).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let mut config = Config::new(tmp.path());
+        config.object_size = 100;
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        let result = ns.get("persist").unwrap();
+        assert_eq!(result, Value::from(large_value.as_str()));
+    }
+}
+
+#[test]
+fn value_sep_compress_disabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 10;
+    config.compress = false;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let data = "z".repeat(100);
+    ns.put("nocomp", data.as_str(), None).unwrap();
+    let result = ns.get("nocomp").unwrap();
+    assert_eq!(result, Value::from(data.as_str()));
+}
+
+#[test]
+fn value_sep_rev_get_resolves_pointers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 10;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let v1 = "a".repeat(50);
+    let v2 = "b".repeat(50);
+    ns.put("rev_key", v1.as_str(), None).unwrap();
+    ns.put("rev_key", v2.as_str(), None).unwrap();
+
+    assert_eq!(ns.rev_get("rev_key", 0).unwrap(), Value::from(v1.as_str()));
+    assert_eq!(ns.rev_get("rev_key", 1).unwrap(), Value::from(v2.as_str()));
+}
+
+#[test]
+fn value_sep_large_value_with_ttl() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 10;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let data = "t".repeat(50);
+    ns.put("ttl_key", data.as_str(), Some(Duration::from_secs(3600)))
+        .unwrap();
+    let result = ns.get("ttl_key").unwrap();
+    assert_eq!(result, Value::from(data.as_str()));
+
+    let ttl = ns.ttl("ttl_key").unwrap().unwrap();
+    assert!(ttl.as_secs() > 3500);
+}
+
+#[test]
+fn value_sep_delete_after_large_put() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 10;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let data = "d".repeat(50);
+    ns.put("del_key", data.as_str(), None).unwrap();
+    ns.delete("del_key").unwrap();
+
+    let err = ns.get("del_key").unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound));
+}
+
+#[test]
+fn value_sep_object_size_zero_forces_all_to_objects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 0;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // Even a 1-byte value exceeds threshold 0
+    ns.put("tiny", "x", None).unwrap();
+    let result = ns.get("tiny").unwrap();
+    assert_eq!(result, Value::from("x"));
+
+    // Object file should exist
+    let objects_dir = tmp.path().join("objects");
+    let mut file_count = 0;
+    for entry in std::fs::read_dir(objects_dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            for f in std::fs::read_dir(entry.path()).unwrap() {
+                if f.unwrap().file_type().unwrap().is_file() {
+                    file_count += 1;
+                }
+            }
+        }
+    }
+    assert!(file_count > 0);
+}
+
+#[test]
+fn value_sep_null_value_not_separated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 0;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("null_key", Value::Null, None).unwrap();
+    let result = ns.get("null_key").unwrap();
+    assert_eq!(result, Value::Null);
+}
