@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use rkv::{Config, Error, IoModel, Key, RevisionID, Stats, Value, DB, DEFAULT_NAMESPACE};
+use rkv::{
+    Compression, Config, Error, IoModel, Key, RevisionID, Stats, Value, DB, DEFAULT_NAMESPACE,
+};
 
 #[test]
 fn open_creates_directory() {
@@ -805,6 +807,42 @@ fn io_model_from_str() {
 #[test]
 fn io_model_from_str_invalid() {
     let err = "bad".parse::<IoModel>().unwrap_err();
+    assert!(matches!(err, Error::InvalidConfig(_)));
+}
+
+#[test]
+fn config_compression_default() {
+    let config = Config::new("/tmp/test");
+    assert_eq!(config.compression, Compression::LZ4);
+}
+
+#[test]
+fn config_compression_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.compression = Compression::Zstd;
+    let db = DB::open(config).unwrap();
+
+    assert_eq!(db.config().compression, Compression::Zstd);
+}
+
+#[test]
+fn compression_display() {
+    assert_eq!(Compression::None.to_string(), "none");
+    assert_eq!(Compression::LZ4.to_string(), "lz4");
+    assert_eq!(Compression::Zstd.to_string(), "zstd");
+}
+
+#[test]
+fn compression_from_str() {
+    assert_eq!("none".parse::<Compression>().unwrap(), Compression::None);
+    assert_eq!("lz4".parse::<Compression>().unwrap(), Compression::LZ4);
+    assert_eq!("zstd".parse::<Compression>().unwrap(), Compression::Zstd);
+}
+
+#[test]
+fn compression_from_str_invalid() {
+    let err = "bad".parse::<Compression>().unwrap_err();
     assert!(matches!(err, Error::InvalidConfig(_)));
 }
 
