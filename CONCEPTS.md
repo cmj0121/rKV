@@ -595,6 +595,19 @@ Compaction is idempotent — calling it when L0 is empty is a no-op. After compa
 new flushes continue writing to L0 and a subsequent compact merges them into L1 again.
 When `max_levels` is 1, compaction is a no-op (no merge target available).
 
+##### Bin Object GC
+
+After all level merges complete for a namespace, compaction runs a
+garbage-collection sweep over the bin object store:
+
+1. Collect all live `ValuePointer` hashes from every surviving SSTable.
+2. Walk `<db>/objects/<namespace>/` and list all object files on disk.
+3. Delete any object whose hash is not in the live set.
+
+This handles overwrites (old Pointer orphaned), tombstones (shadowed
+Pointer orphaned), and dedup safely (an object is kept as long as at
+least one SSTable entry still references it).
+
 The CLI exposes compaction via the `compact` REPL command.
 
 ### Data Integrity
