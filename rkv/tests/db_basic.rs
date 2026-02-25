@@ -2243,9 +2243,9 @@ fn flush_multiple_creates_multiple_l0_files() {
     assert_eq!(ns.get(1).unwrap(), Value::from("first"));
     assert_eq!(ns.get(2).unwrap(), Value::from("second"));
 
-    // Should have 2 SSTable files
-    let sst_dir = tmp.path().join("sst").join("_");
-    let count = std::fs::read_dir(&sst_dir).unwrap().count();
+    // Should have 2 SSTable files in L0
+    let l0_dir = tmp.path().join("sst").join("_").join("L0");
+    let count = std::fs::read_dir(&l0_dir).unwrap().count();
     assert_eq!(count, 2);
 }
 
