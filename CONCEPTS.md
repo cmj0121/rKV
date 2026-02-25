@@ -93,24 +93,26 @@ rKV uses **value separation** inspired by WiscKey and Git's object model:
 #### Object Identity
 
 Each bin object is identified by its **BLAKE3 content hash** (32 bytes / 64 hex chars). The hash
-serves as both the unique identifier and the filename. Identical values produce the same hash,
-giving **automatic deduplication** — if two keys store the same 5 MB image, only one object file
-exists on disk.
+serves as both the unique identifier and the filename. Deduplication is **per-namespace**, not
+global — identical values in the same namespace share one object file, but the same content in
+different namespaces produces separate files. This preserves namespace isolation.
 
 #### Object Store Layout
 
-Object files are stored in a Git-style **fan-out directory** structure using the first byte
-(2 hex chars) of the hash as a subdirectory:
+Object files are stored in a Git-style **fan-out directory** structure, scoped per namespace.
+The first byte (2 hex chars) of the hash is used as a subdirectory:
 
 ```text
 <db>/objects/
-  ab/cdef0123456789abcdef0123456789abcdef0123456789abcdef01234567
-  ab/ff01234567890abcdef01234567890abcdef01234567890abcdef0123456
-  cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab
+  <namespace>/
+    ab/cdef0123456789abcdef0123456789abcdef0123456789abcdef01234567
+    ab/ff01234567890abcdef01234567890abcdef01234567890abcdef0123456
+    cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab
 ```
 
-This limits the number of entries per directory, scaling to millions of objects without
-hitting filesystem performance cliffs.
+Each namespace gets its own isolated object store directory. This mirrors the per-namespace
+MemTable pattern and limits the number of entries per directory, scaling to millions of
+objects without hitting filesystem performance cliffs.
 
 #### Object File Format
 
@@ -144,7 +146,7 @@ in LSM   object file exists?
          │yes │ no
          │    ▼
          │  LZ4 compress (if enabled)
-         │  write to objects/<prefix>/<hash>
+         │  write to objects/<ns>/<prefix>/<hash>
          ▼
          store ValuePointer in LSM
 ```
@@ -154,7 +156,7 @@ is skipped and only the LSM entry is created.
 
 #### Read Path
 
-`get(key)` → read `ValuePointer` from LSM → open `objects/<prefix>/<hash>` → read flags byte
+`get(key)` → read `ValuePointer` from LSM → open `objects/<ns>/<prefix>/<hash>` → read flags byte
 → decompress if needed → return value.
 
 #### ValuePointer Format (36 bytes fixed)
