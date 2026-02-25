@@ -95,6 +95,270 @@ fn parse_key(token: &str) -> Key {
     }
 }
 
+fn print_command_help(cmd: &str) {
+    match cmd {
+        "put" => {
+            println!("put <key> <value|@file> [ttl]");
+            println!();
+            println!("  Store a key-value pair in the current namespace.");
+            println!();
+            println!("  Arguments:");
+            println!("    key     Integer or string key");
+            println!("    value   Literal value, @file to read from file, @@x for literal \"@x\"");
+            println!("    ttl     Optional expiration: 10s, 5m, 2h, 1d");
+            println!();
+            println!("  Examples:");
+            println!("    put name Alice");
+            println!("    put counter 42 10m");
+            println!("    put avatar @photo.png");
+            println!();
+            println!("  See also: get, del, ttl");
+        }
+        "get" => {
+            println!("get <key>");
+            println!();
+            println!("  Retrieve the value for a key in the current namespace.");
+            println!("  Returns an error if the key does not exist or has expired.");
+            println!();
+            println!("  Examples:");
+            println!("    get name");
+            println!("    get 42");
+            println!();
+            println!("  See also: put, has, rev");
+        }
+        "del" => {
+            println!("del <key>");
+            println!();
+            println!("  Remove a single key from the current namespace.");
+            println!("  The key is tombstoned and will no longer appear in scans.");
+            println!();
+            println!("  Examples:");
+            println!("    del name");
+            println!("    del 42");
+            println!();
+            println!("  See also: wipe, has");
+        }
+        "wipe" => {
+            println!("wipe <prefix>*           Remove keys matching prefix");
+            println!("wipe <start>..<end>      Remove keys in range [start, end)");
+            println!("wipe <start>..=<end>     Remove keys in range [start, end]");
+            println!();
+            println!("  Bulk-delete keys by prefix or range. Returns the count of");
+            println!("  keys actually deleted. Tombstoned/expired keys are excluded.");
+            println!();
+            println!("  Prefix mode (trailing *):");
+            println!("    Deletes all live keys whose string form starts with the prefix.");
+            println!("    The `*` is required and must have at least one char before it.");
+            println!();
+            println!("  Range mode (..):");
+            println!("    Deletes keys in the range. Uses BTreeMap ordering.");
+            println!("    `..` is exclusive (half-open), `..=` is inclusive (closed).");
+            println!("    Both start and end are required.");
+            println!();
+            println!("  Examples:");
+            println!("    wipe user_*          delete user_1, user_2, user_abc, ...");
+            println!("    wipe 1..10           delete keys 1..9 (exclusive end)");
+            println!("    wipe 1..=10          delete keys 1..10 (inclusive end)");
+            println!("    wipe aaa..zzz        delete string keys in [aaa, zzz)");
+            println!();
+            println!("  See also: del, scan, count");
+        }
+        "has" => {
+            println!("has <key>");
+            println!();
+            println!("  Check if a key exists (non-expired, non-tombstoned).");
+            println!("  Prints \"true\" or \"false\".");
+            println!();
+            println!("  Examples:");
+            println!("    has name");
+            println!();
+            println!("  See also: get, del");
+        }
+        "ttl" => {
+            println!("ttl <key>");
+            println!();
+            println!("  Show the remaining time-to-live for a key.");
+            println!("  Prints a duration (e.g., 4m30s) or \"none\" if no expiration.");
+            println!();
+            println!("  Examples:");
+            println!("    ttl session_token");
+            println!();
+            println!("  See also: put");
+        }
+        "scan" => {
+            println!("scan [prefix] [:n] [+offset]");
+            println!();
+            println!("  Forward-scan keys in sorted order. Shows up to n keys");
+            println!("  (default 10) starting after offset matching keys.");
+            println!();
+            println!("  Arguments:");
+            println!("    prefix   Optional key prefix filter");
+            println!("    :n       Limit results (default :10)");
+            println!("    +offset  Skip first N matches");
+            println!();
+            println!("  Examples:");
+            println!("    scan");
+            println!("    scan user :5");
+            println!("    scan user :10 +20");
+            println!();
+            println!("  See also: rscan, count");
+        }
+        "rscan" => {
+            println!("rscan [prefix] [:n] [+offset]");
+            println!();
+            println!("  Reverse-scan keys (descending order). Same arguments as scan.");
+            println!();
+            println!("  Examples:");
+            println!("    rscan");
+            println!("    rscan user :5");
+            println!();
+            println!("  See also: scan, count");
+        }
+        "count" => {
+            println!("count");
+            println!();
+            println!("  Count all live keys in the current namespace.");
+            println!("  Tombstoned and expired keys are excluded.");
+            println!();
+            println!("  See also: scan, stats");
+        }
+        "rev" => {
+            println!("rev <key>          Show total revision count");
+            println!("rev <key> <index>  Show value at revision index (0 = oldest)");
+            println!();
+            println!("  Access the revision history for a key. Each put creates a");
+            println!("  new revision. Index 0 is the oldest, last index is current.");
+            println!();
+            println!("  Examples:");
+            println!("    rev name          prints: 3");
+            println!("    rev name 0        prints: first-value");
+            println!("    rev name 2        prints: latest-value");
+            println!();
+            println!("  See also: get, put");
+        }
+        "use" => {
+            println!("use <namespace> [+]");
+            println!();
+            println!("  Switch to a different namespace. Creates the namespace if");
+            println!("  it does not exist. Append + to enable encryption (will");
+            println!("  prompt for a password).");
+            println!();
+            println!("  Examples:");
+            println!("    use logs");
+            println!("    use secrets +");
+            println!();
+            println!("  See also: namespaces, drop");
+        }
+        "namespaces" => {
+            println!("namespaces");
+            println!();
+            println!("  List all namespaces in the database.");
+            println!();
+            println!("  See also: use, drop");
+        }
+        "drop" => {
+            println!("drop <namespace>");
+            println!();
+            println!("  Drop a namespace and all its data. This is irreversible.");
+            println!();
+            println!("  Examples:");
+            println!("    drop temp_data");
+            println!();
+            println!("  See also: use, namespaces");
+        }
+        "stats" => {
+            println!("stats");
+            println!();
+            println!("  Print database statistics (storage, LSM, operations, uptime).");
+            println!("  Reads live counters without persisting. For a persistent");
+            println!("  snapshot, use `analyze`.");
+            println!();
+            println!("  See also: analyze, config");
+        }
+        "analyze" => {
+            println!("analyze");
+            println!();
+            println!("  Re-derive statistics from live state and persist operation");
+            println!("  counters to stats.meta. Same output as `stats` but ensures");
+            println!("  counters survive a restart.");
+            println!();
+            println!("  See also: stats");
+        }
+        "config" => {
+            println!("config                       Print current configuration");
+            println!("config <group.key> <value>   Set a configuration value");
+            println!();
+            println!("  View or modify runtime configuration. Changes take effect");
+            println!("  immediately but are not persisted to disk.");
+            println!();
+            println!("  Groups: storage, lsm, object, io, aol, revision");
+            println!();
+            println!("  Examples:");
+            println!("    config");
+            println!("    config lsm.write_buffer_size 8388608");
+            println!("    config object.compress false");
+            println!();
+            println!("  See also: stats");
+        }
+        "flush" => {
+            println!("flush");
+            println!();
+            println!("  Flush the write buffer (memtable) to an SSTable on disk.");
+            println!();
+            println!("  See also: sync, compact");
+        }
+        "sync" => {
+            println!("sync");
+            println!();
+            println!("  Flush and fsync to ensure data reaches durable storage.");
+            println!();
+            println!("  See also: flush, compact");
+        }
+        "compact" => {
+            println!("compact");
+            println!();
+            println!("  Trigger manual compaction to merge SSTables and reclaim space.");
+            println!();
+            println!("  See also: flush, sync");
+        }
+        "destroy" => {
+            println!("destroy <path>");
+            println!();
+            println!("  Destroy a database directory and all its data.");
+            println!("  WARNING: This is irreversible.");
+            println!();
+            println!("  Examples:");
+            println!("    destroy /tmp/test-db");
+            println!();
+            println!("  See also: repair");
+        }
+        "repair" => {
+            println!("repair <path>");
+            println!();
+            println!("  Attempt to repair a corrupted database. Reports the number");
+            println!("  of records scanned, skipped, recovered, and lost.");
+            println!();
+            println!("  Examples:");
+            println!("    repair /tmp/broken-db");
+            println!();
+            println!("  See also: destroy, dump");
+        }
+        "dump" => {
+            println!("dump <path>");
+            println!();
+            println!("  Export the database to a backup file.");
+            println!();
+            println!("  Examples:");
+            println!("    dump /tmp/backup.rkv");
+            println!();
+            println!("  See also: repair");
+        }
+        _ => {
+            eprintln!("unknown command: {cmd} (type 'help' for usage)");
+        }
+    }
+}
+
 fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     if tokens.is_empty() {
@@ -513,46 +777,50 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             }
         }
         "help" | "?" => {
-            println!("Data operations:");
-            println!(
-                "  put <key> <value|@file> [ttl]  Store a key-value pair (ttl: 10s, 5m, 2h, 1d)"
-            );
-            println!("  get <key>                Retrieve a value by key");
-            println!("  del <key>                Remove a key");
-            println!("  wipe <prefix>*           Remove keys matching prefix");
-            println!("  wipe <start>..<end>      Remove keys in range [start, end)");
-            println!("  wipe <start>..=<end>     Remove keys in range [start, end]");
-            println!("  has <key>                Check if a key exists");
-            println!("  ttl <key>                Show remaining TTL or \"none\"");
-            println!("  scan [prefix] [:n] [+offset]   Forward scan keys");
-            println!("  rscan [prefix] [:n] [+offset]  Reverse scan keys");
-            println!("  count                    Count all keys");
-            println!("  rev <key>                Show total revisions for a key");
-            println!("  rev <key> <index>        Show value at revision index (0 = oldest)");
-            println!();
-            println!("Namespace:");
-            println!(
-                "  use <namespace> [+]  Switch to namespace (+ = encrypted, prompts for password)"
-            );
-            println!("  namespaces           List all namespaces");
-            println!("  drop <namespace>     Drop a namespace and all its data");
-            println!();
-            println!("Admin:");
-            println!("  stats                Print database statistics");
-            println!("  analyze              Re-derive stats and persist counters");
-            println!("  config                    Print current configuration");
-            println!("  config <group.key> <value> Set a configuration value");
-            println!("  flush                Flush write buffer to disk");
-            println!("  sync                 Flush and fsync to durable storage");
-            println!("  compact              Trigger manual compaction");
-            println!("  destroy <path>       Destroy a database (all data deleted)");
-            println!("  repair <path>        Attempt to repair a corrupted database");
-            println!("  dump <path>          Export database to a backup file");
-            println!();
-            println!("Misc:");
-            println!("  clear                Clear the screen");
-            println!("  help                 Show this message (alias: ?)");
-            println!("  exit                 Quit the REPL (alias: quit)");
+            if let Some(cmd) = tokens.get(1) {
+                print_command_help(cmd);
+            } else {
+                println!("Data operations:");
+                println!(
+                    "  put <key> <value|@file> [ttl]  Store a key-value pair (ttl: 10s, 5m, 2h, 1d)"
+                );
+                println!("  get <key>                Retrieve a value by key");
+                println!("  del <key>                Remove a key");
+                println!("  wipe <prefix>*           Remove keys matching prefix");
+                println!("  wipe <start>..<end>      Remove keys in range [start, end)");
+                println!("  wipe <start>..=<end>     Remove keys in range [start, end]");
+                println!("  has <key>                Check if a key exists");
+                println!("  ttl <key>                Show remaining TTL or \"none\"");
+                println!("  scan [prefix] [:n] [+offset]   Forward scan keys");
+                println!("  rscan [prefix] [:n] [+offset]  Reverse scan keys");
+                println!("  count                    Count all keys");
+                println!("  rev <key>                Show total revisions for a key");
+                println!("  rev <key> <index>        Show value at revision index (0 = oldest)");
+                println!();
+                println!("Namespace:");
+                println!(
+                    "  use <namespace> [+]  Switch to namespace (+ = encrypted, prompts for password)"
+                );
+                println!("  namespaces           List all namespaces");
+                println!("  drop <namespace>     Drop a namespace and all its data");
+                println!();
+                println!("Admin:");
+                println!("  stats                Print database statistics");
+                println!("  analyze              Re-derive stats and persist counters");
+                println!("  config                    Print current configuration");
+                println!("  config <group.key> <value> Set a configuration value");
+                println!("  flush                Flush write buffer to disk");
+                println!("  sync                 Flush and fsync to durable storage");
+                println!("  compact              Trigger manual compaction");
+                println!("  destroy <path>       Destroy a database (all data deleted)");
+                println!("  repair <path>        Attempt to repair a corrupted database");
+                println!("  dump <path>          Export database to a backup file");
+                println!();
+                println!("Misc:");
+                println!("  clear                Clear the screen");
+                println!("  help [command]       Show help (alias: ?)");
+                println!("  exit                 Quit the REPL (alias: quit)");
+            }
         }
         "clear" => {
             print!("\x1B[2J\x1B[H");
