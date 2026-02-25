@@ -146,7 +146,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
         }
         "put" => {
             if tokens.len() < 3 {
-                eprintln!("usage: put <key> <value> [ttl]");
+                eprintln!("usage: put <key> <value|@file> [ttl]");
                 return Action::Continue;
             }
             let ttl = if let Some(ttl_str) = tokens.get(3) {
@@ -160,7 +160,22 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             } else {
                 None
             };
-            let result = ns.put(parse_key(tokens[1]), tokens[2].as_bytes(), ttl);
+            let value: Vec<u8> = if let Some(rest) = tokens[2].strip_prefix("@@") {
+                // Escape: @@foo → literal "@foo"
+                format!("@{rest}").into_bytes()
+            } else if let Some(path) = tokens[2].strip_prefix('@') {
+                // File read: @/path/to/file → file contents
+                match std::fs::read(path) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        eprintln!("error: cannot read file '{path}': {e}");
+                        return Action::Continue;
+                    }
+                }
+            } else {
+                tokens[2].as_bytes().to_vec()
+            };
+            let result = ns.put(parse_key(tokens[1]), value, ttl);
             match result {
                 Ok(_) => {}
                 Err(e) => eprintln!("error: {e}"),
@@ -449,7 +464,9 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
         }
         "help" | "?" => {
             println!("Data operations:");
-            println!("  put <key> <value> [ttl]  Store a key-value pair (ttl: 10s, 5m, 2h, 1d)");
+            println!(
+                "  put <key> <value|@file> [ttl]  Store a key-value pair (ttl: 10s, 5m, 2h, 1d)"
+            );
             println!("  get <key>                Retrieve a value by key");
             println!("  del <key>                Remove a key");
             println!("  has <key>                Check if a key exists");
