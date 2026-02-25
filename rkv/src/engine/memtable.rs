@@ -281,7 +281,6 @@ impl MemTable {
     ///
     /// Expired entries are skipped entirely. After draining, the MemTable's
     /// entries and bookkeeping are cleared, but `ordered_mode` is preserved.
-    #[allow(dead_code)]
     pub(crate) fn drain_latest(&mut self) -> Vec<(Key, Value)> {
         let entries = std::mem::take(&mut self.entries);
         self.last_rev.clear();

@@ -772,13 +772,13 @@ fn corruption_error_matches() {
 // --- Maintenance operation stubs ---
 
 #[test]
-fn flush_returns_not_implemented() {
+fn flush_empty_db_is_noop() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
 
-    let err = db.flush().unwrap_err();
-    assert!(matches!(err, Error::NotImplemented(_)));
+    // Flushing an empty DB should succeed without error
+    db.flush().unwrap();
 }
 
 #[test]

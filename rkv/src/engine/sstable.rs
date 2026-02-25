@@ -217,6 +217,7 @@ fn compress_block(data: &[u8], compression: &Compression) -> (u8, Vec<u8>) {
 }
 
 /// Decompress a block payload given its compression tag.
+#[allow(dead_code)]
 pub(super) fn decompress_block(tag: u8, data: &[u8]) -> Result<Vec<u8>> {
     match tag {
         COMPRESS_NONE => Ok(data.to_vec()),
@@ -233,6 +234,7 @@ pub(super) fn decompress_block(tag: u8, data: &[u8]) -> Result<Vec<u8>> {
 // --- SSTableReader ---
 
 /// Index entry parsed from an SSTable's index block.
+#[allow(dead_code)]
 struct IndexEntry {
     /// Last key in this data block (serialized bytes).
     last_key: Vec<u8>,
@@ -248,6 +250,7 @@ struct IndexEntry {
 /// via binary search on the block index.
 pub(crate) struct SSTableReader {
     /// Raw file contents (read into memory).
+    #[allow(dead_code)]
     data: Vec<u8>,
     /// Parsed index entries, sorted by last_key.
     index: Vec<IndexEntry>,
@@ -355,6 +358,7 @@ impl SSTableReader {
     /// Returns `Some(value)` if found, `None` if the key is not present.
     /// When `verify_checksums` is true, each data block is verified before
     /// decoding.
+    #[allow(dead_code)]
     pub(crate) fn get(&self, key: &Key, verify_checksums: bool) -> Result<Option<Value>> {
         if self.index.is_empty() {
             return Ok(None);
@@ -406,6 +410,7 @@ impl SSTableReader {
     }
 
     /// Linear scan through a decompressed block looking for a specific key.
+    #[allow(dead_code)]
     fn scan_block_for_key(block: &[u8], target: &[u8]) -> Result<Option<Value>> {
         let mut pos = 0;
         while pos < block.len() {

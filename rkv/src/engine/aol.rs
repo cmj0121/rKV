@@ -196,7 +196,6 @@ impl Aol {
     ///
     /// Called after a successful flush — all data is now persisted in SSTables,
     /// so the AOL can be reset to prevent unbounded growth.
-    #[allow(dead_code)]
     pub(crate) fn truncate(&mut self, db_dir: &Path) -> Result<()> {
         // Flush any pending writes before truncating
         self.writer.flush()?;
