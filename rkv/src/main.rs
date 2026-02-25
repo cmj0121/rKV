@@ -664,6 +664,26 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                     "verify on read",
                     c.verify_checksums.to_string(),
                 ),
+                (
+                    "  lsm.l0_max_count",
+                    "L0 file count trigger",
+                    c.l0_max_count.to_string(),
+                ),
+                (
+                    "  lsm.l0_max_size",
+                    "L0 total size trigger",
+                    format_bytes(c.l0_max_size),
+                ),
+                (
+                    "  lsm.l1_max_size",
+                    "L1 size cap",
+                    format_bytes(c.l1_max_size),
+                ),
+                (
+                    "  lsm.default_max_size",
+                    "L2+ default size cap",
+                    format_bytes(c.default_max_size),
+                ),
                 ("", "", String::new()),
                 ("Objects", "", String::new()),
                 (
@@ -936,6 +956,34 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
         "aol.buffer_size" => match value.parse::<usize>() {
             Ok(v) => {
                 c.aol_buffer_size = v;
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected a number"),
+        },
+        "lsm.l0_max_count" => match value.parse::<usize>() {
+            Ok(v) => {
+                c.l0_max_count = v;
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected a number"),
+        },
+        "lsm.l0_max_size" => match value.parse::<usize>() {
+            Ok(v) => {
+                c.l0_max_size = v;
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected a number"),
+        },
+        "lsm.l1_max_size" => match value.parse::<usize>() {
+            Ok(v) => {
+                c.l1_max_size = v;
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected a number"),
+        },
+        "lsm.default_max_size" => match value.parse::<usize>() {
+            Ok(v) => {
+                c.default_max_size = v;
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected a number"),

@@ -159,6 +159,14 @@ pub struct Config {
     /// AOL flush threshold in records (default: 128).
     /// Set to 0 for per-record flush (maximum durability).
     pub aol_buffer_size: usize,
+    /// Maximum number of L0 SSTable files before compaction (default: 4).
+    pub l0_max_count: usize,
+    /// Maximum total L0 size in bytes before compaction (default: 64 MB).
+    pub l0_max_size: usize,
+    /// Maximum L1 size in bytes before compaction to L2 (default: 256 MB).
+    pub l1_max_size: usize,
+    /// Default maximum size in bytes for L2+ levels (default: 2 GB).
+    pub default_max_size: usize,
 }
 
 impl Config {
@@ -178,6 +186,10 @@ impl Config {
             io_model: IoModel::default(),
             cluster_id: None,
             aol_buffer_size: 128,
+            l0_max_count: 4,
+            l0_max_size: 64 * 1024 * 1024,
+            l1_max_size: 256 * 1024 * 1024,
+            default_max_size: 2 * 1024 * 1024 * 1024,
         }
     }
 }
