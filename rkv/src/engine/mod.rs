@@ -27,7 +27,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -182,6 +182,13 @@ impl Config {
     }
 }
 
+/// Stats metadata file name within the DB directory.
+const STATS_META: &str = "stats.meta";
+/// Magic bytes for the stats metadata file.
+const STATS_MAGIC: &[u8; 4] = b"rKVT";
+/// Current stats metadata format version.
+const STATS_VERSION: u16 = 1;
+
 pub struct DB {
     config: Config,
     opened_at: Instant,
@@ -194,6 +201,10 @@ pub struct DB {
     object_stores: RwLock<HashMap<String, objects::ObjectStore>>,
     flush_stop: Arc<AtomicBool>,
     flush_thread: Option<JoinHandle<()>>,
+    // Operation counters (persistent across restarts)
+    op_puts: AtomicU64,
+    op_gets: AtomicU64,
+    op_deletes: AtomicU64,
 }
 
 impl DB {
@@ -269,6 +280,9 @@ impl DB {
             }))
         };
 
+        // Load persisted operation counters
+        let (op_puts, op_gets, op_deletes) = Self::load_stats_meta(&config.path);
+
         Ok(Self {
             config,
             opened_at: Instant::now(),
@@ -280,6 +294,9 @@ impl DB {
             object_stores,
             flush_stop,
             flush_thread,
+            op_puts: AtomicU64::new(op_puts),
+            op_gets: AtomicU64::new(op_gets),
+            op_deletes: AtomicU64::new(op_deletes),
         })
     }
 
@@ -288,6 +305,7 @@ impl DB {
         if let Some(handle) = self.flush_thread.take() {
             let _ = handle.join();
         }
+        self.save_stats_meta();
         Ok(())
     }
 
@@ -296,8 +314,25 @@ impl DB {
     }
 
     pub fn stats(&self) -> Stats {
+        let map = self.namespace_data.read().unwrap();
+        let namespace_count = map.len() as u64;
+        let mut total_keys: u64 = 0;
+        let mut write_buffer_bytes: u64 = 0;
+        for mt in map.values() {
+            let mt = mt.lock().unwrap();
+            total_keys += mt.count();
+            write_buffer_bytes += mt.approximate_size() as u64;
+        }
+
         Stats {
+            total_keys,
+            data_size_bytes: write_buffer_bytes,
+            namespace_count,
             level_count: self.config.max_levels,
+            write_buffer_bytes,
+            op_puts: self.op_puts.load(Ordering::Relaxed),
+            op_gets: self.op_gets.load(Ordering::Relaxed),
+            op_deletes: self.op_deletes.load(Ordering::Relaxed),
             uptime: self.opened_at.elapsed(),
             ..Stats::default()
         }
@@ -473,6 +508,58 @@ impl DB {
         Ok(unsafe { &*ptr })
     }
 
+    pub(crate) fn inc_op_puts(&self) {
+        self.op_puts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn inc_op_gets(&self) {
+        self.op_gets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn inc_op_deletes(&self) {
+        self.op_deletes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Load operation counters from `stats.meta`. Returns (0,0,0) if the file
+    /// is missing or malformed.
+    fn load_stats_meta(path: &Path) -> (u64, u64, u64) {
+        let meta_path = path.join(STATS_META);
+        let data = match fs::read(&meta_path) {
+            Ok(d) => d,
+            Err(_) => return (0, 0, 0),
+        };
+        // Format: [magic:4][version:2][op_puts:8][op_gets:8][op_deletes:8] = 30 bytes
+        if data.len() < 30 {
+            return (0, 0, 0);
+        }
+        if &data[0..4] != STATS_MAGIC {
+            return (0, 0, 0);
+        }
+        let version = u16::from_be_bytes([data[4], data[5]]);
+        if version != STATS_VERSION {
+            return (0, 0, 0);
+        }
+        let puts = u64::from_be_bytes(data[6..14].try_into().unwrap());
+        let gets = u64::from_be_bytes(data[14..22].try_into().unwrap());
+        let deletes = u64::from_be_bytes(data[22..30].try_into().unwrap());
+        (puts, gets, deletes)
+    }
+
+    /// Persist operation counters to `stats.meta` via atomic write-to-temp + rename.
+    fn save_stats_meta(&self) {
+        let meta_path = self.config.path.join(STATS_META);
+        let tmp_path = self.config.path.join("stats.meta.tmp");
+        let mut buf = Vec::with_capacity(30);
+        buf.extend_from_slice(STATS_MAGIC);
+        buf.extend_from_slice(&STATS_VERSION.to_be_bytes());
+        buf.extend_from_slice(&self.op_puts.load(Ordering::Relaxed).to_be_bytes());
+        buf.extend_from_slice(&self.op_gets.load(Ordering::Relaxed).to_be_bytes());
+        buf.extend_from_slice(&self.op_deletes.load(Ordering::Relaxed).to_be_bytes());
+        if fs::write(&tmp_path, &buf).is_ok() {
+            let _ = fs::rename(&tmp_path, &meta_path);
+        }
+    }
+
     pub(crate) fn get_or_create_memtable(&self, name: &str) -> &Mutex<memtable::MemTable> {
         // Fast path: read lock to check if memtable already exists
         {
@@ -501,5 +588,6 @@ impl Drop for DB {
         if let Some(handle) = self.flush_thread.take() {
             let _ = handle.join();
         }
+        self.save_stats_meta();
     }
 }

@@ -65,11 +65,13 @@ impl<'db> Namespace<'db> {
         let mt = self.db.get_or_create_memtable(&self.name);
         let mut mt = mt.lock().unwrap();
         let actual_rev = mt.put(key, value, rev, ttl);
+        self.db.inc_op_puts();
         Ok(actual_rev)
     }
 
     pub fn get(&self, key: impl Into<Key>) -> Result<Value> {
         let key = key.into();
+        self.db.inc_op_gets();
         let value = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap();
@@ -86,6 +88,7 @@ impl<'db> Namespace<'db> {
         let mt = self.db.get_or_create_memtable(&self.name);
         let mut mt = mt.lock().unwrap();
         mt.delete(key, rev);
+        self.db.inc_op_deletes();
         Ok(())
     }
 
