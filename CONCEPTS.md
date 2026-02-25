@@ -480,8 +480,63 @@ Compression is applied per block at flush time and reversed on read. The block c
 Block compression is independent of bin object compression (`compress` config field), which
 controls LZ4 compression of large values in the object store.
 
-**Stub status**: The `Compression` enum and config field are defined. Actual block-level
-compress/decompress logic will be implemented alongside the SSTable writer/reader.
+#### SSTable File Format
+
+An SSTable is a read-only file of sorted key-value entries. The file is divided into three
+regions written sequentially: data blocks, an index block, and a fixed-size footer.
+
+```text
+┌──────────────────────────────┐
+│  Data Block 0                │  ← compressed entries + checksum
+│  Data Block 1                │
+│  ...                         │
+│  Data Block N                │
+├──────────────────────────────┤
+│  Index Block                 │  ← one entry per data block
+├──────────────────────────────┤
+│  Footer (48 bytes)           │  ← magic, version, metadata, checksum
+└──────────────────────────────┘
+```
+
+**Data block on-disk layout:**
+
+```text
+[compression_tag: u8][compressed_payload][checksum: 5B CRC32C]
+```
+
+The `compression_tag` identifies the algorithm (0x00 = none, 0x01 = LZ4, 0x02 = Zstd).
+The checksum covers the tag byte plus the compressed payload.
+
+**Entry encoding (within a decompressed block):**
+
+```text
+[key_len: u16 BE][key_bytes][value_tag: u8][value_len: u32 BE][value_data]
+```
+
+Entries are stored in sorted key order. `key_bytes` uses the same memcmp-preserving
+serialization as `Key::to_bytes()`. `value_tag` encodes the Value variant (0x00 = Data,
+0x01 = Null, 0x02 = Tombstone, 0x03 = Pointer).
+
+**Index block layout:**
+
+```text
+repeated: [key_len: u16 BE][last_key_bytes][offset: u64 BE][size: u32 BE]
+```
+
+Each entry records the last key in a data block plus the block's file offset and on-disk
+size. Point lookups binary-search the index to find the candidate block, then linear-scan
+entries within that block.
+
+**Footer layout (48 bytes):**
+
+```text
+[magic: 4B "rKVS"][version: u16 BE][entry_count: u64 BE]
+[index_offset: u64 BE][index_size: u32 BE]
+[data_blocks: u32 BE][reserved: 13B][checksum: 5B CRC32C]
+```
+
+The footer checksum covers the first 43 bytes. The reader verifies magic, version, and
+checksum before parsing the index.
 
 #### WriteBuffer (MemTable)
 
