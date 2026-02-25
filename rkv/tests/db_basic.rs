@@ -826,13 +826,12 @@ fn load_returns_not_implemented() {
 }
 
 #[test]
-fn compact_returns_not_implemented() {
+fn compact_empty_db_is_noop() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
 
-    let err = db.compact().unwrap_err();
-    assert!(matches!(err, Error::NotImplemented(_)));
+    db.compact().unwrap();
 }
 
 // --- Namespace encryption ---

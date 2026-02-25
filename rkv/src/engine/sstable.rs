@@ -472,7 +472,6 @@ impl SSTableReader {
     /// Iterate all entries in sorted key order.
     ///
     /// Reads every data block, decompresses, and returns `(Key, Value)` pairs.
-    #[allow(dead_code)] // consumed by compact() in a later commit
     pub(crate) fn iter_entries(&self, verify_checksums: bool) -> Result<Vec<(Key, Value)>> {
         let mut result = Vec::with_capacity(self.entry_count as usize);
 

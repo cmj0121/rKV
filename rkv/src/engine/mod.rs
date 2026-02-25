@@ -613,9 +613,134 @@ impl DB {
 
     // --- Compaction ---
 
-    /// Trigger a manual compaction of SSTable levels.
+    /// Trigger a manual compaction.
+    ///
+    /// Merges all L0 + existing L1 SSTables for each namespace into a
+    /// single new L1 SSTable. Old files are deleted after the merge.
+    /// Tombstones are preserved (they may shadow data in deeper levels).
     pub fn compact(&self) -> Result<()> {
-        Err(Error::NotImplemented("compact".into()))
+        let namespaces: Vec<String> = {
+            let sst = self.sstables.read().unwrap();
+            sst.keys().cloned().collect()
+        };
+
+        for ns_name in &namespaces {
+            self.compact_namespace(ns_name)?;
+        }
+
+        Ok(())
+    }
+
+    /// Compact a single namespace: merge L0 + L1 into a new L1 SSTable.
+    fn compact_namespace(&self, ns: &str) -> Result<()> {
+        // Collect file paths to delete after successful merge.
+        // We need these before we replace the readers.
+        let (source_paths, merged) = {
+            let sst = self.sstables.read().unwrap();
+            let levels = match sst.get(ns) {
+                Some(l) => l,
+                None => return Ok(()),
+            };
+
+            let l0 = levels.first().map(|v| v.as_slice()).unwrap_or(&[]);
+            let l1 = levels.get(1).map(|v| v.as_slice()).unwrap_or(&[]);
+
+            // Nothing to compact if L0 is empty
+            if l0.is_empty() {
+                return Ok(());
+            }
+
+            // Merge all entries: process oldest-to-newest so newer values
+            // overwrite older ones in the BTreeMap.
+            let mut merged = std::collections::BTreeMap::<Key, Value>::new();
+
+            // L1 entries are oldest
+            for reader in l1 {
+                for (key, value) in reader.iter_entries(self.config.verify_checksums)? {
+                    merged.insert(key, value);
+                }
+            }
+
+            // L0 entries: iterate oldest-to-newest (reverse of newest-first order)
+            for reader in l0.iter().rev() {
+                for (key, value) in reader.iter_entries(self.config.verify_checksums)? {
+                    merged.insert(key, value);
+                }
+            }
+
+            // Collect source file paths for cleanup by scanning disk
+            let mut source_paths = Vec::new();
+            for level in [0, 1] {
+                let level_dir = self.sst_level_dir(ns, level);
+                if level_dir.exists() {
+                    for entry in fs::read_dir(&level_dir)? {
+                        let entry = entry?;
+                        let fname = entry.file_name().to_string_lossy().to_string();
+                        if fname.ends_with(".sst") {
+                            source_paths.push(entry.path());
+                        }
+                    }
+                }
+            }
+
+            (source_paths, merged)
+        };
+
+        if merged.is_empty() {
+            // All entries were tombstones or empty — clean up source files
+            for path in &source_paths {
+                let _ = fs::remove_file(path);
+            }
+            let mut sst = self.sstables.write().unwrap();
+            if let Some(levels) = sst.get_mut(ns) {
+                if !levels.is_empty() {
+                    levels[0].clear();
+                }
+                if levels.len() > 1 {
+                    levels[1].clear();
+                }
+            }
+            return Ok(());
+        }
+
+        // Write merged output as a new L1 SSTable
+        let seq = self.sst_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        let l1_dir = self.sst_level_dir(ns, 1);
+        fs::create_dir_all(&l1_dir)?;
+        let output_path = l1_dir.join(format!("{seq:06}.sst"));
+
+        let mut writer = sstable::SSTableWriter::new(
+            &output_path,
+            self.config.block_size,
+            self.config.compression.clone(),
+        )?;
+        for (key, value) in &merged {
+            writer.add(key, value)?;
+        }
+        writer.finish()?;
+
+        // Delete old source files
+        for path in &source_paths {
+            let _ = fs::remove_file(path);
+        }
+
+        // Open the new reader and update the in-memory level structure
+        let reader = sstable::SSTableReader::open(&output_path)?;
+        let mut sst = self.sstables.write().unwrap();
+        let levels = sst.entry(ns.to_owned()).or_insert_with(|| vec![Vec::new()]);
+
+        // Clear L0
+        if !levels.is_empty() {
+            levels[0].clear();
+        }
+
+        // Set L1 to the single merged reader
+        while levels.len() <= 1 {
+            levels.push(Vec::new());
+        }
+        levels[1] = vec![reader];
+
+        Ok(())
     }
 
     // --- Internal helpers ---
