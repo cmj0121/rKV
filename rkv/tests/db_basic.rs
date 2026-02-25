@@ -1979,3 +1979,174 @@ fn delete_range_string_keys() {
     assert!(!ns.exists("ccc").unwrap());
     assert!(ns.exists("ddd").unwrap());
 }
+
+// --- Encryption crypto ---
+
+#[test]
+fn encrypted_put_get_roundtrip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace("vault", Some("s3cret")).unwrap();
+    ns.put("key", "hello", None).unwrap();
+    assert_eq!(ns.get("key").unwrap(), Value::from("hello"));
+}
+
+#[test]
+fn encrypted_null_value_roundtrip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace("vault", Some("pw")).unwrap();
+    ns.put("k", Value::Null, None).unwrap();
+    assert_eq!(ns.get("k").unwrap(), Value::Null);
+}
+
+#[test]
+fn encrypted_data_persists_across_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("vault", Some("pw")).unwrap();
+        ns.put("key", "secret-data", None).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("vault", Some("pw")).unwrap();
+        assert_eq!(ns.get("key").unwrap(), Value::from("secret-data"));
+    }
+}
+
+#[test]
+fn encrypted_wrong_password_returns_corruption() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("vault", Some("correct")).unwrap();
+        ns.put("key", "secret", None).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        // Same namespace, wrong password — data decryption should fail
+        let ns = db.namespace("vault", Some("wrong")).unwrap();
+        let err = ns.get("key").unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)));
+    }
+}
+
+#[test]
+fn encrypted_and_plain_namespaces_coexist() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let plain = db.namespace("public", None).unwrap();
+    let secret = db.namespace("private", Some("pw")).unwrap();
+
+    plain.put("k", "plain-val", None).unwrap();
+    secret.put("k", "secret-val", None).unwrap();
+
+    assert_eq!(plain.get("k").unwrap(), Value::from("plain-val"));
+    assert_eq!(secret.get("k").unwrap(), Value::from("secret-val"));
+}
+
+#[test]
+fn encrypted_rev_get_decrypts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace("vault", Some("pw")).unwrap();
+    ns.put("k", "v1", None).unwrap();
+    ns.put("k", "v2", None).unwrap();
+
+    assert_eq!(ns.rev_get("k", 0).unwrap(), Value::from("v1"));
+    assert_eq!(ns.rev_get("k", 1).unwrap(), Value::from("v2"));
+    assert_eq!(ns.rev_count("k").unwrap(), 2);
+}
+
+#[test]
+fn encrypted_large_value_bin_object() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 10; // force value separation
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace("vault", Some("pw")).unwrap();
+    let large = "x".repeat(200);
+    ns.put("big", large.as_str(), None).unwrap();
+    assert_eq!(ns.get("big").unwrap(), Value::from(large.as_str()));
+}
+
+#[test]
+fn encrypted_large_value_persists_across_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let large = "y".repeat(200);
+    {
+        let mut config = Config::new(tmp.path());
+        config.object_size = 10;
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("vault", Some("pw")).unwrap();
+        ns.put("big", large.as_str(), None).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let mut config = Config::new(tmp.path());
+        config.object_size = 10;
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("vault", Some("pw")).unwrap();
+        assert_eq!(ns.get("big").unwrap(), Value::from(large.as_str()));
+    }
+}
+
+#[test]
+fn encrypted_delete_and_exists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace("vault", Some("pw")).unwrap();
+    ns.put("k", "v", None).unwrap();
+    assert!(ns.exists("k").unwrap());
+
+    ns.delete("k").unwrap();
+    assert!(!ns.exists("k").unwrap());
+    let err = ns.get("k").unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound));
+}
+
+#[test]
+fn encrypted_ttl_works() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace("vault", Some("pw")).unwrap();
+    ns.put("k", "v", Some(Duration::from_secs(3600))).unwrap();
+    let remaining = ns.ttl("k").unwrap().unwrap();
+    assert!(remaining.as_secs() > 3500);
+    assert_eq!(ns.get("k").unwrap(), Value::from("v"));
+}
+
+#[test]
+fn encrypted_scan_returns_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace("vault", Some("pw")).unwrap();
+    ns.put("user:1", "a", None).unwrap();
+    ns.put("user:2", "b", None).unwrap();
+    ns.put("post:1", "c", None).unwrap();
+
+    let keys = ns.scan(&Key::from("user:"), 10, 0).unwrap();
+    assert_eq!(keys.len(), 2);
+}

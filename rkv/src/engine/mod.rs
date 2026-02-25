@@ -1,6 +1,7 @@
 mod aol;
 mod bloom;
 mod checksum;
+pub(crate) mod crypto;
 mod error;
 mod io;
 mod key;
