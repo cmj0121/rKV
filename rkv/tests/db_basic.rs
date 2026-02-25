@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::time::Duration;
 
 use rkv::{
@@ -792,18 +791,35 @@ fn sync_returns_not_implemented() {
 }
 
 #[test]
-fn destroy_returns_not_implemented() {
-    let err = DB::destroy(PathBuf::from("/tmp/rkv_test_destroy")).unwrap_err();
-    assert!(matches!(err, Error::NotImplemented(_)));
+fn destroy_basic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("mydb");
+    {
+        let config = Config::new(&db_path);
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+        ns.put(Key::Int(1), "hello", None).unwrap();
+        db.close().unwrap();
+    }
+    assert!(db_path.exists());
+    DB::destroy(&db_path).unwrap();
+    assert!(!db_path.exists());
 }
 
 #[test]
-fn repair_returns_not_implemented() {
-    let result = DB::repair(PathBuf::from("/tmp/rkv_test_repair"));
-    let Err(err) = result else {
-        panic!("expected NotImplemented error");
-    };
-    assert!(matches!(err, Error::NotImplemented(_)));
+fn repair_clean_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("mydb");
+    {
+        let config = Config::new(&db_path);
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+        ns.put(Key::Int(1), "hello", None).unwrap();
+        db.close().unwrap();
+    }
+    let report = DB::repair(&db_path).unwrap();
+    assert!(report.is_clean());
+    assert!(!report.has_data_loss());
 }
 
 #[test]

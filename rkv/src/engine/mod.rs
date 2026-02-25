@@ -583,19 +583,204 @@ impl DB {
     // --- Destroy / Repair ---
 
     /// Destroy the database at the given path, deleting all data.
+    ///
+    /// Validates that the path looks like an rKV database (contains an `aol`
+    /// file or `sst/` directory) before removing the entire directory tree.
+    /// Returns `Io(NotFound)` if the path does not exist.
     pub fn destroy(path: impl Into<PathBuf>) -> Result<()> {
-        let _path = path.into();
-        Err(Error::NotImplemented("destroy".into()))
+        let path = path.into();
+
+        if !path.exists() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("database path does not exist: {}", path.display()),
+            )));
+        }
+
+        // Safety check: verify this looks like an rKV database
+        let has_aol = path.join("aol").exists();
+        let has_sst = path.join("sst").exists();
+        if !has_aol && !has_sst {
+            return Err(Error::Corruption(format!(
+                "path does not appear to be an rKV database: {}",
+                path.display()
+            )));
+        }
+
+        fs::remove_dir_all(&path)?;
+        Ok(())
     }
 
     /// Attempt to repair a corrupted database at the given path.
+    ///
+    /// Scans three data sources (AOL, SSTables, bin objects), tolerating
+    /// corruption in each. Corrupted SSTable files and bin objects are
+    /// deleted. The AOL is rewritten to contain only valid records.
     ///
     /// Returns a `RecoveryReport` describing what was scanned, recovered,
     /// and lost. Callers should inspect the report to determine whether
     /// the database is usable.
     pub fn repair(path: impl Into<PathBuf>) -> Result<RecoveryReport> {
-        let _path = path.into();
-        Err(Error::NotImplemented("repair".into()))
+        let path = path.into();
+        let mut report = RecoveryReport::default();
+
+        if !path.exists() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("database path does not exist: {}", path.display()),
+            )));
+        }
+
+        // --- Phase 1: Replay AOL with verification ---
+        let aol_file = path.join("aol");
+        let mut good_records: Vec<aol::AolRecord> = Vec::new();
+        if aol_file.exists() {
+            let (records, skipped) = aol::Aol::replay(&path, true)?;
+            report.wal_records_scanned = (records.len() as u64) + skipped;
+            report.wal_records_skipped = skipped;
+            if skipped > 0 {
+                report.warnings.push(format!(
+                    "AOL: {skipped} corrupted/truncated record(s) skipped"
+                ));
+            }
+            good_records = records;
+        }
+
+        // Rewrite AOL with only valid records
+        if report.wal_records_skipped > 0 {
+            Self::rewrite_aol(&path, &good_records)?;
+            report
+                .warnings
+                .push("AOL rewritten with valid records only".into());
+        }
+
+        // --- Phase 2: Scan SSTables ---
+        let sst_root = path.join("sst");
+        if sst_root.exists() {
+            Self::repair_sstables(&sst_root, &mut report)?;
+        }
+
+        // --- Phase 3: Scan bin objects ---
+        let obj_root = path.join("objects");
+        if obj_root.exists() {
+            Self::repair_objects(&obj_root, &mut report)?;
+        }
+
+        // Compute keys_recovered from surviving AOL records
+        report.keys_recovered = good_records.len() as u64;
+
+        Ok(report)
+    }
+
+    /// Rewrite the AOL file with only the given valid records.
+    fn rewrite_aol(db_path: &Path, records: &[aol::AolRecord]) -> Result<()> {
+        // Open the AOL (positions at end), then truncate to header-only
+        let mut aol = aol::Aol::open(db_path, 0)?;
+        aol.truncate(db_path)?;
+
+        // Re-append only valid records
+        for record in records {
+            aol.append_raw(
+                &record.namespace,
+                record.revision,
+                &record.key,
+                &record.value,
+                record.expires_at_ms,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Scan all SSTable files, removing corrupted ones.
+    fn repair_sstables(sst_root: &Path, report: &mut RecoveryReport) -> Result<()> {
+        for ns_entry in fs::read_dir(sst_root)? {
+            let ns_entry = ns_entry?;
+            if !ns_entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            for level_entry in fs::read_dir(ns_entry.path())? {
+                let level_entry = level_entry?;
+                if !level_entry.file_type()?.is_dir() {
+                    continue;
+                }
+
+                for file_entry in fs::read_dir(level_entry.path())? {
+                    let file_entry = file_entry?;
+                    let fpath = file_entry.path();
+                    if fpath.extension().and_then(|e| e.to_str()) != Some("sst") {
+                        continue;
+                    }
+
+                    report.sstable_blocks_scanned += 1;
+
+                    match sstable::SSTableReader::open(&fpath) {
+                        Ok(reader) => {
+                            // Verify block checksums
+                            if let Err(_e) = reader.iter_entries(true) {
+                                report.sstable_blocks_corrupted += 1;
+                                report.warnings.push(format!(
+                                    "SSTable corrupted, removed: {}",
+                                    fpath.display()
+                                ));
+                                fs::remove_file(&fpath)?;
+                            }
+                        }
+                        Err(_e) => {
+                            report.sstable_blocks_corrupted += 1;
+                            report
+                                .warnings
+                                .push(format!("SSTable unreadable, removed: {}", fpath.display()));
+                            fs::remove_file(&fpath)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Scan all bin objects, removing corrupted ones.
+    fn repair_objects(obj_root: &Path, report: &mut RecoveryReport) -> Result<()> {
+        for ns_entry in fs::read_dir(obj_root)? {
+            let ns_entry = ns_entry?;
+            if !ns_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let ns = ns_entry.file_name().to_string_lossy().to_string();
+            let store = objects::ObjectStore::open(obj_root.parent().unwrap_or(obj_root), &ns)?;
+
+            let hashes = store.list_object_hashes()?;
+            for hash_str in &hashes {
+                report.objects_scanned += 1;
+
+                // Reconstruct a ValuePointer from the hex hash to verify
+                let mut hash_bytes = [0u8; 32];
+                let ok = hex_decode(hash_str, &mut hash_bytes);
+                if !ok {
+                    report.objects_corrupted += 1;
+                    report
+                        .warnings
+                        .push(format!("Object invalid hash name: {hash_str}"));
+                    store.delete_object(hash_str)?;
+                    continue;
+                }
+
+                let vp = value::ValuePointer::new(hash_bytes, 0);
+                match store.read(&vp, true) {
+                    Ok(_) => {}
+                    Err(_) => {
+                        report.objects_corrupted += 1;
+                        report
+                            .warnings
+                            .push(format!("Object corrupted, removed: {hash_str}"));
+                        store.delete_object(hash_str)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     // --- Dump / Load ---
@@ -1229,5 +1414,34 @@ impl Drop for DB {
             let _ = handle.join();
         }
         self.save_stats_meta();
+    }
+}
+
+/// Decode a 64-char hex string into a 32-byte array.
+/// Returns `false` if the string is not valid hex or wrong length.
+fn hex_decode(hex: &str, out: &mut [u8; 32]) -> bool {
+    if hex.len() != 64 {
+        return false;
+    }
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = match hex_nibble(chunk[0]) {
+            Some(v) => v,
+            None => return false,
+        };
+        let lo = match hex_nibble(chunk[1]) {
+            Some(v) => v,
+            None => return false,
+        };
+        out[i] = (hi << 4) | lo;
+    }
+    true
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }

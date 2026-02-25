@@ -104,6 +104,36 @@ impl Aol {
         Ok(())
     }
 
+    /// Append a record with an already-computed absolute expiry timestamp.
+    ///
+    /// Used by `DB::repair()` to replay records without converting TTL durations.
+    pub(crate) fn append_raw(
+        &mut self,
+        ns: &str,
+        rev: u128,
+        key: &Key,
+        value: &Value,
+        expires_at_ms: u64,
+    ) -> Result<()> {
+        let payload = encode_payload(ns, rev, expires_at_ms, key, value);
+        let checksum = Checksum::compute(&payload);
+
+        self.writer
+            .write_all(&(payload.len() as u32).to_be_bytes())?;
+        self.writer.write_all(&payload)?;
+        self.writer.write_all(&checksum.to_bytes())?;
+
+        self.append_count += 1;
+        self.dirty = true;
+        if self.buffer_size == 0 || self.append_count >= self.buffer_size {
+            self.writer.flush()?;
+            self.append_count = 0;
+            self.dirty = false;
+        }
+
+        Ok(())
+    }
+
     /// Replay the AOL file and return all decoded records plus a count of
     /// skipped (corrupted/truncated) records.
     ///
