@@ -208,9 +208,34 @@ The encryption state is recorded on first access and enforced within the session
 **CLI syntax**: `use myns +` prompts for a password (hidden input). The prompt indicator shows
 `rkv [myns+]>` for encrypted namespaces and `rkv [myns]>` for non-encrypted ones.
 
-**Stub status**: The API surface, error handling, and in-memory state tracking are implemented.
-Cryptographic operations (key derivation via Argon2, AES-256-GCM encryption/decryption of
-WAL entries and SSTable blocks) are deferred to a future phase.
+#### Cryptographic Operations
+
+Encryption uses **Argon2id** for key derivation and **AES-256-GCM** for authenticated
+encryption. The encryption boundary is at the `Namespace` level — value bytes are
+encrypted before entering the write path and decrypted after retrieval.
+
+**Key derivation**: `password + salt → Argon2id → 256-bit key`. Each namespace has a
+persistent 16-byte random salt stored at `<db>/crypto/<namespace>.salt`. The salt is
+created on first encrypted access and reused on subsequent opens. The derived key is
+held in memory only (never written to disk).
+
+**Wire format** (per encrypted value):
+
+```text
+[nonce (12 bytes)] [ciphertext (variable)] [GCM tag (16 bytes)]
+```
+
+A fresh random 96-bit nonce is generated for each encryption operation, ensuring that
+identical plaintext produces different ciphertext.
+
+**Write path**: `plaintext → encrypt → maybe_separate (bin objects) → AOL + MemTable`.
+**Read path**: `MemTable → resolve_value (pointer→data) → decrypt → plaintext`.
+
+Non-Data values (`Null`, `Tombstone`, `Pointer`) pass through without encryption.
+Key names are stored in plaintext (required for BTreeMap ordering and scans).
+
+Using the wrong password to open an encrypted namespace will produce `Corruption`
+errors on `get`/`rev_get` (the GCM tag verification fails).
 
 ### Revision ID
 
