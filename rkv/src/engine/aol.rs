@@ -243,7 +243,6 @@ impl Aol {
     }
 
     /// Fsync the underlying file to durable storage.
-    #[allow(dead_code)]
     pub(crate) fn sync(&mut self) -> Result<()> {
         self.writer.flush()?;
         self.append_count = 0;

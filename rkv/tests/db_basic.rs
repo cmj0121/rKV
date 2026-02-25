@@ -781,13 +781,44 @@ fn flush_empty_db_is_noop() {
 }
 
 #[test]
-fn sync_returns_not_implemented() {
+fn sync_succeeds() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+    ns.put(Key::Int(1), "hello", None).unwrap();
+    db.sync().unwrap();
+    db.close().unwrap();
+}
 
-    let err = db.sync().unwrap_err();
-    assert!(matches!(err, Error::NotImplemented(_)));
+#[test]
+fn sync_empty_db() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    db.sync().unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+fn sync_data_survives_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("mydb");
+    {
+        let config = Config::new(&db_path);
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+        ns.put(Key::Int(1), "synced", None).unwrap();
+        db.sync().unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(&db_path);
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+        assert_eq!(ns.get(Key::Int(1)).unwrap(), Value::from("synced"));
+        db.close().unwrap();
+    }
 }
 
 #[test]

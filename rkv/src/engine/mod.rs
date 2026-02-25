@@ -576,8 +576,13 @@ impl DB {
     }
 
     /// Flush and fsync all data to durable storage.
+    ///
+    /// Flushes any buffered AOL writes and then calls `fsync` on the
+    /// underlying file descriptor, guaranteeing that all committed data
+    /// is persisted to the storage device.
     pub fn sync(&self) -> Result<()> {
-        Err(Error::NotImplemented("sync".into()))
+        let mut aol = self.aol.lock().unwrap();
+        aol.sync()
     }
 
     // --- Destroy / Repair ---
