@@ -1757,3 +1757,225 @@ fn value_sep_dedup_within_namespace_still_works() {
     }
     assert_eq!(file_count, 1);
 }
+
+// --- Bulk delete (wipe) ---
+
+#[test]
+fn delete_range_exclusive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 1..=10_i64 {
+        ns.put(i, format!("v{i}"), None).unwrap();
+    }
+
+    // Delete [3, 7) — keys 3, 4, 5, 6
+    let deleted = ns.delete_range(3_i64, 7_i64, false).unwrap();
+    assert_eq!(deleted, 4);
+    assert_eq!(ns.count().unwrap(), 6);
+
+    // Keys 3..6 gone
+    for i in 3..=6_i64 {
+        assert!(!ns.exists(i).unwrap());
+    }
+    // Key 7 still present (exclusive end)
+    assert!(ns.exists(7_i64).unwrap());
+}
+
+#[test]
+fn delete_range_inclusive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 1..=10_i64 {
+        ns.put(i, format!("v{i}"), None).unwrap();
+    }
+
+    // Delete [3, 7] — keys 3, 4, 5, 6, 7
+    let deleted = ns.delete_range(3_i64, 7_i64, true).unwrap();
+    assert_eq!(deleted, 5);
+    assert_eq!(ns.count().unwrap(), 5);
+
+    // Key 7 also gone (inclusive)
+    assert!(!ns.exists(7_i64).unwrap());
+    // Key 8 still present
+    assert!(ns.exists(8_i64).unwrap());
+}
+
+#[test]
+fn delete_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("user:1", "a", None).unwrap();
+    ns.put("user:2", "b", None).unwrap();
+    ns.put("user:3", "c", None).unwrap();
+    ns.put("post:1", "d", None).unwrap();
+    ns.put("post:2", "e", None).unwrap();
+
+    let deleted = ns.delete_prefix("user:").unwrap();
+    assert_eq!(deleted, 3);
+    assert_eq!(ns.count().unwrap(), 2);
+
+    assert!(!ns.exists("user:1").unwrap());
+    assert!(ns.exists("post:1").unwrap());
+}
+
+#[test]
+fn delete_range_empty_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put(1_i64, "a", None).unwrap();
+    ns.put(2_i64, "b", None).unwrap();
+
+    // Range [10, 20) has no keys
+    let deleted = ns.delete_range(10_i64, 20_i64, false).unwrap();
+    assert_eq!(deleted, 0);
+    assert_eq!(ns.count().unwrap(), 2);
+}
+
+#[test]
+fn delete_prefix_no_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("foo", "1", None).unwrap();
+    ns.put("bar", "2", None).unwrap();
+
+    let deleted = ns.delete_prefix("zzz").unwrap();
+    assert_eq!(deleted, 0);
+    assert_eq!(ns.count().unwrap(), 2);
+}
+
+#[test]
+fn delete_range_excludes_tombstones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 1..=5_i64 {
+        ns.put(i, format!("v{i}"), None).unwrap();
+    }
+    // Delete key 3 individually first
+    ns.delete(3_i64).unwrap();
+
+    // Range delete [1, 5] — should only delete 4 live keys (not tombstoned 3)
+    let deleted = ns.delete_range(1_i64, 5_i64, true).unwrap();
+    assert_eq!(deleted, 4);
+    assert_eq!(ns.count().unwrap(), 0);
+}
+
+#[test]
+fn delete_range_updates_op_counter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let before = db.stats().op_deletes;
+    for i in 1..=5_i64 {
+        ns.put(i, "v", None).unwrap();
+    }
+    ns.delete_range(1_i64, 5_i64, true).unwrap();
+    let after = db.stats().op_deletes;
+    assert_eq!(after - before, 5);
+}
+
+#[test]
+fn delete_prefix_updates_op_counter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let before = db.stats().op_deletes;
+    ns.put("x:1", "a", None).unwrap();
+    ns.put("x:2", "b", None).unwrap();
+    ns.put("y:1", "c", None).unwrap();
+    ns.delete_prefix("x:").unwrap();
+    let after = db.stats().op_deletes;
+    assert_eq!(after - before, 2);
+}
+
+#[test]
+fn delete_range_persists_across_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        for i in 1..=5_i64 {
+            ns.put(i, format!("v{i}"), None).unwrap();
+        }
+        ns.delete_range(2_i64, 4_i64, true).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        assert!(ns.exists(1_i64).unwrap());
+        assert!(!ns.exists(2_i64).unwrap());
+        assert!(!ns.exists(3_i64).unwrap());
+        assert!(!ns.exists(4_i64).unwrap());
+        assert!(ns.exists(5_i64).unwrap());
+        assert_eq!(ns.count().unwrap(), 2);
+    }
+}
+
+#[test]
+fn delete_prefix_persists_across_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put("user:1", "a", None).unwrap();
+        ns.put("user:2", "b", None).unwrap();
+        ns.put("post:1", "c", None).unwrap();
+        ns.delete_prefix("user:").unwrap();
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        assert!(!ns.exists("user:1").unwrap());
+        assert!(!ns.exists("user:2").unwrap());
+        assert!(ns.exists("post:1").unwrap());
+        assert_eq!(ns.count().unwrap(), 1);
+    }
+}
+
+#[test]
+fn delete_range_string_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("aaa", "1", None).unwrap();
+    ns.put("bbb", "2", None).unwrap();
+    ns.put("ccc", "3", None).unwrap();
+    ns.put("ddd", "4", None).unwrap();
+
+    // Delete [bbb, ddd) — keys bbb, ccc
+    let deleted = ns.delete_range("bbb", "ddd", false).unwrap();
+    assert_eq!(deleted, 2);
+    assert!(ns.exists("aaa").unwrap());
+    assert!(!ns.exists("bbb").unwrap());
+    assert!(!ns.exists("ccc").unwrap());
+    assert!(ns.exists("ddd").unwrap());
+}

@@ -260,6 +260,35 @@ method returns the remaining duration, or `None` if the key has no expiration.
 TTL is specified as a `std::time::Duration` in the library API. The CLI accepts human-friendly suffixes:
 `10s` (seconds), `5m` (minutes), `2h` (hours), `1d` (days). Plain numbers are treated as seconds.
 
+### Bulk Delete
+
+Two methods on `Namespace` allow deleting multiple keys in a single call:
+
+| Method          | Description                                        |
+| --------------- | -------------------------------------------------- |
+| `delete_range`  | Delete keys in `[start, end)` or `[start, end]`    |
+| `delete_prefix` | Delete keys whose string form starts with `prefix` |
+
+Signatures: `delete_range(&self, start, end, inclusive: bool) -> Result<u64>`,
+`delete_prefix(&self, prefix: &str) -> Result<u64>`.
+
+Both methods return the number of keys actually deleted. Tombstoned and expired keys are
+excluded from the count. Each deleted key is individually tombstoned in the AOL for
+crash-safe persistence, and the `op_deletes` counter is incremented by the batch count.
+
+#### CLI: wipe Command
+
+The `wipe` REPL command exposes bulk delete with three syntax forms:
+
+| Syntax                 | Mode       | Example       | Semantics                            |
+| ---------------------- | ---------- | ------------- | ------------------------------------ |
+| `wipe <prefix>*`       | prefix     | `wipe user_*` | Delete keys starting with `user_`    |
+| `wipe <start>..<end>`  | range (ex) | `wipe 1..10`  | Delete keys in `[1, 10)` (exclusive) |
+| `wipe <start>..=<end>` | range (in) | `wipe 1..=10` | Delete keys in `[1, 10]` (inclusive) |
+
+Constraints: both sides of a range are required; the prefix glob `*` must have at least
+one character before it. Use `help wipe` for detailed usage.
+
 ### Configuration
 
 The `Config` struct controls database behavior and LSM tuning parameters:
