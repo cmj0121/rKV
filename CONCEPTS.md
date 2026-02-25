@@ -440,9 +440,32 @@ maintenance methods return `Result` and are stubs (`NotImplemented`) during the 
 | `flush` | instance | `&self -> Result<()>` | Flush the in-memory write buffer to disk    |
 | `sync`  | instance | `&self -> Result<()>` | Flush and fsync all data to durable storage |
 
-`flush` writes the current write buffer to an L1 SSTable but does not guarantee durability —
-data may remain in OS page cache. `sync` calls `flush` followed by `fsync`, ensuring all data
-reaches durable storage.
+`flush` drains every non-empty namespace MemTable and writes an L0 SSTable per namespace.
+After all SSTables are written, the AOL is truncated back to a header-only state. The flush
+path is:
+
+```text
+DB::flush()
+  for each namespace with non-empty MemTable:
+    1. drain_latest() — extract latest value per key (sorted, includes tombstones)
+    2. SSTableWriter::add() each entry in key order
+    3. SSTableWriter::finish() — write index + footer
+    4. SSTableReader::open() — cache reader (newest first)
+  truncate AOL
+```
+
+L0 SSTable files are stored at `<db>/sst/<namespace>/<seq>.sst` where `<seq>` is a
+zero-padded monotonically increasing counter (e.g., `000001.sst`). On `DB::open()`, the
+engine scans these directories to recover the L0 reader cache and sequence counter.
+
+`sync` calls `flush` followed by `fsync`, ensuring all data reaches durable storage
+(currently a stub).
+
+**Limitations (V1)**:
+
+- TTL is not preserved across flush — keys with TTL become permanent once flushed
+- `scan`, `rscan`, `count`, and `exists` only check the MemTable (not SSTables)
+- Revision history is not flushed — only the latest value per key is written
 
 #### Destroy / Repair
 
@@ -536,8 +559,10 @@ and is out of scope.
 
 ### LSM-Tree Storage
 
-Data is organized in levels (L1-L3). Fresh writes land in an in-memory buffer and are periodically flushed to sorted
-SSTable files on disk. Background merge compaction keeps read amplification bounded.
+Data is organized in levels. Fresh writes land in an in-memory buffer (MemTable) and are
+flushed to sorted L0 SSTable files on disk via `DB::flush()`. The read path checks the
+MemTable first, then searches L0 SSTables from newest to oldest. Background merge
+compaction (L0 to deeper levels) is planned but not yet implemented.
 
 #### Block Compression
 
@@ -614,6 +639,29 @@ entries within that block.
 The footer checksum covers the first 43 bytes. The reader verifies magic, version, and
 checksum before parsing the index.
 
+#### SSTable Read Path
+
+Point lookups (`get`) check the MemTable first, then search L0 SSTables from newest to
+oldest. The first match wins:
+
+```text
+Namespace::get(key)
+  1. MemTable lookup — if found, return value
+  2. For each L0 SSTable (newest first):
+     a. Binary search index for candidate block
+     b. Decompress + verify checksum
+     c. Linear scan entries for key
+     d. If found:
+        - Tombstone → return KeyNotFound
+        - Pointer → resolve via ObjectStore
+        - Data/Null → return value
+  3. Not found in any SSTable → return KeyNotFound
+```
+
+On `DB::open()`, the engine scans `<db>/sst/<namespace>/` directories and opens all
+`.sst` files into an in-memory reader cache. Readers are ordered newest-first based on
+the sequence number in the filename.
+
 #### WriteBuffer (MemTable)
 
 The WriteBuffer is the first component in the write path. It is an in-memory sorted store
@@ -633,8 +681,10 @@ Each namespace has its own independent MemTable. The `DB` struct holds a
 on first access. A shared `RevisionGen` produces candidate RevisionIDs; individual MemTables
 enforce per-key monotonicity.
 
-**Current status**: The MemTable is the in-memory component of the write path. On startup,
-the AOL is replayed to reconstruct memtable state (see Append-Only Log below).
+**Current status**: The MemTable serves as the write buffer. On startup, the AOL is replayed
+to reconstruct memtable state (see Append-Only Log below). `DB::flush()` calls
+`drain_latest()` to extract the latest value per key in sorted order, writes an L0 SSTable,
+and truncates the AOL. After flush, the MemTable is empty and ready for new writes.
 
 #### Append-Only Log (AOL)
 
