@@ -510,10 +510,22 @@ reader cache and sequence counter across all levels.
 | `destroy` | static | `(path) -> Result<()>`             | Delete database and all data |
 | `repair`  | static | `(path) -> Result<RecoveryReport>` | Repair a corrupted database  |
 
-Both are static methods — they operate on a path, not a live `DB` handle. `destroy` removes the
-entire database directory. `repair` scans for structural corruption and rebuilds indices where
-possible. It returns a `RecoveryReport` describing what was scanned, recovered, and lost
-(see Data Integrity below).
+Both are static methods — they operate on a path, not a live `DB` handle.
+
+**Destroy** validates the path contains an rKV signature (`aol` file or `sst/` directory) before
+removing the entire directory tree. Returns an I/O error if the path does not exist, or a
+`Corruption` error if the directory does not look like an rKV database.
+
+**Repair** performs an offline scan of three data sources:
+
+1. **AOL**: Replays with checksum verification. Corrupted/truncated records are skipped. If any
+   records were skipped, the AOL is rewritten with only valid records.
+2. **SSTables**: Opens each `.sst` file and verifies block checksums via `iter_entries(true)`.
+   Corrupted files are deleted.
+3. **Bin objects**: Reads each object with BLAKE3 hash verification. Corrupted objects are deleted.
+
+Returns a `RecoveryReport` describing what was scanned, recovered, and lost (see Data Integrity
+below). The database is openable after repair.
 
 #### Dump / Load
 
@@ -661,10 +673,10 @@ Helper methods on `RecoveryReport`:
 - `total_corrupted()` — sum of skipped + corrupted counters.
 - `has_data_loss()` — `keys_lost > 0`.
 
-Recovery is best-effort: the engine replays WAL entries and cross-references SSTable
-levels to rebuild data where redundant copies exist. Data with no redundant copy is
-reported as lost. Silent self-healing from bit-flips is not possible without redundancy
-and is out of scope.
+Recovery is best-effort: the engine replays valid WAL entries, removes corrupted SSTable
+files, and deletes bin objects that fail BLAKE3 verification. The AOL is rewritten to
+exclude corrupted records. After repair, the database can be reopened normally. Silent
+self-healing from bit-flips is not possible without redundancy and is out of scope.
 
 ### LSM-Tree Storage
 
