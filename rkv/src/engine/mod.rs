@@ -528,6 +528,10 @@ impl DB {
         self.op_deletes.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn inc_op_deletes_by(&self, n: u64) {
+        self.op_deletes.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Load operation counters from `stats.meta`. Returns (0,0,0) if the file
     /// is missing or malformed.
     fn load_stats_meta(path: &Path) -> (u64, u64, u64) {

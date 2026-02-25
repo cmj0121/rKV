@@ -201,6 +201,47 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 Err(e) => eprintln!("error: {e}"),
             }
         }
+        "wipe" => {
+            if tokens.len() < 2 {
+                eprintln!("usage: wipe <prefix>* | <start>..<end> | <start>..=<end>");
+                return Action::Continue;
+            }
+            let arg = tokens[1];
+            if let Some((start_str, end_str)) = arg.split_once("..=") {
+                // Inclusive range: wipe 1..=10
+                if start_str.is_empty() || end_str.is_empty() {
+                    eprintln!("usage: wipe <start>..=<end> (both sides required)");
+                    return Action::Continue;
+                }
+                let start = parse_key(start_str);
+                let end = parse_key(end_str);
+                match ns.delete_range(start, end, true) {
+                    Ok(n) => println!("({n} deleted)"),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            } else if let Some((start_str, end_str)) = arg.split_once("..") {
+                // Exclusive range: wipe 1..10
+                if start_str.is_empty() || end_str.is_empty() {
+                    eprintln!("usage: wipe <start>..<end> (both sides required)");
+                    return Action::Continue;
+                }
+                let start = parse_key(start_str);
+                let end = parse_key(end_str);
+                match ns.delete_range(start, end, false) {
+                    Ok(n) => println!("({n} deleted)"),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            } else if arg.len() > 1 && arg.ends_with('*') {
+                // Prefix: wipe user_*
+                let prefix = &arg[..arg.len() - 1];
+                match ns.delete_prefix(prefix) {
+                    Ok(n) => println!("({n} deleted)"),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            } else {
+                eprintln!("usage: wipe <prefix>* | <start>..<end> | <start>..=<end>");
+            }
+        }
         "has" => {
             if tokens.len() < 2 {
                 eprintln!("usage: has <key>");
@@ -478,6 +519,9 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             );
             println!("  get <key>                Retrieve a value by key");
             println!("  del <key>                Remove a key");
+            println!("  wipe <prefix>*           Remove keys matching prefix");
+            println!("  wipe <start>..<end>      Remove keys in range [start, end)");
+            println!("  wipe <start>..=<end>     Remove keys in range [start, end]");
             println!("  has <key>                Check if a key exists");
             println!("  ttl <key>                Show remaining TTL or \"none\"");
             println!("  scan [prefix] [:n] [+offset]   Forward scan keys");

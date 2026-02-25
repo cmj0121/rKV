@@ -241,6 +241,38 @@ impl MemTable {
         }
     }
 
+    /// Collect live keys in the range `[start, end)` or `[start, end]`.
+    ///
+    /// Uses BTreeMap ordering (works for both Int and Str keys).
+    /// Tombstoned and expired keys are excluded.
+    pub(crate) fn keys_in_range(&self, start: &Key, end: &Key, inclusive: bool) -> Vec<Key> {
+        if inclusive {
+            self.entries
+                .range(start.clone()..=end.clone())
+                .filter(|(_, entries)| self.is_live(entries))
+                .map(|(k, _)| k.clone())
+                .collect()
+        } else {
+            self.entries
+                .range(start.clone()..end.clone())
+                .filter(|(_, entries)| self.is_live(entries))
+                .map(|(k, _)| k.clone())
+                .collect()
+        }
+    }
+
+    /// Collect live keys whose string representation starts with `prefix`.
+    ///
+    /// Works regardless of ordered/unordered mode — always uses string
+    /// prefix matching for consistent behavior.
+    pub(crate) fn keys_with_prefix(&self, prefix: &str) -> Vec<Key> {
+        self.entries
+            .iter()
+            .filter(|(k, entries)| k.to_string().starts_with(prefix) && self.is_live(entries))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
     /// Check if the latest entry for a key is live (non-tombstone, non-expired).
     fn is_live(&self, entries: &[MemEntry]) -> bool {
         let Some(latest) = entries.last() else {

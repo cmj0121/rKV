@@ -92,6 +92,70 @@ impl<'db> Namespace<'db> {
         Ok(())
     }
 
+    /// Delete all live keys in a range.
+    ///
+    /// When `inclusive` is false the range is `[start, end)` (half-open).
+    /// When `inclusive` is true the range is `[start, end]` (closed).
+    ///
+    /// Returns the number of keys actually deleted.
+    pub fn delete_range(
+        &self,
+        start: impl Into<Key>,
+        end: impl Into<Key>,
+        inclusive: bool,
+    ) -> Result<u64> {
+        let start = start.into();
+        let end = end.into();
+
+        // Collect keys to delete while holding the memtable lock briefly
+        let keys = {
+            let mt = self.db.get_or_create_memtable(&self.name);
+            let mt = mt.lock().unwrap();
+            mt.keys_in_range(&start, &end, inclusive)
+        };
+
+        let count = keys.len() as u64;
+        for key in keys {
+            let rev = self.db.generate_revision();
+            self.db
+                .append_to_aol(&self.name, rev.as_u128(), &key, &Value::tombstone(), None)?;
+            let mt = self.db.get_or_create_memtable(&self.name);
+            let mut mt = mt.lock().unwrap();
+            mt.delete(key, rev);
+        }
+
+        if count > 0 {
+            self.db.inc_op_deletes_by(count);
+        }
+        Ok(count)
+    }
+
+    /// Delete all live keys whose string representation starts with `prefix`.
+    ///
+    /// Returns the number of keys actually deleted.
+    pub fn delete_prefix(&self, prefix: &str) -> Result<u64> {
+        let keys = {
+            let mt = self.db.get_or_create_memtable(&self.name);
+            let mt = mt.lock().unwrap();
+            mt.keys_with_prefix(prefix)
+        };
+
+        let count = keys.len() as u64;
+        for key in keys {
+            let rev = self.db.generate_revision();
+            self.db
+                .append_to_aol(&self.name, rev.as_u128(), &key, &Value::tombstone(), None)?;
+            let mt = self.db.get_or_create_memtable(&self.name);
+            let mut mt = mt.lock().unwrap();
+            mt.delete(key, rev);
+        }
+
+        if count > 0 {
+            self.db.inc_op_deletes_by(count);
+        }
+        Ok(count)
+    }
+
     pub fn exists(&self, key: impl Into<Key>) -> Result<bool> {
         let key = key.into();
         let mt = self.db.get_or_create_memtable(&self.name);
