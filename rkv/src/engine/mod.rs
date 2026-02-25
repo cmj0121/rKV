@@ -768,6 +768,9 @@ impl DB {
             self.merge_two_levels(ns, level, target, drop)?;
         }
 
+        // Step 3: garbage-collect orphaned bin objects
+        self.gc_orphaned_objects(ns)?;
+
         Ok(())
     }
 
@@ -932,6 +935,48 @@ impl DB {
             .and_then(|levels| levels.get(level))
             .map(|readers| readers.iter().map(|r| r.size_bytes()).sum())
             .unwrap_or(0)
+    }
+
+    /// Garbage-collect orphaned bin objects for a namespace.
+    ///
+    /// Collects all live `ValuePointer` hashes from every SSTable level,
+    /// then walks the object store directory and deletes any object file
+    /// whose hash is not in the live set. Safe with dedup: an object is
+    /// kept as long as at least one SSTable entry references it.
+    fn gc_orphaned_objects(&self, ns: &str) -> Result<()> {
+        let obj_dir = self.config.path.join("objects").join(ns);
+        if !obj_dir.exists() {
+            return Ok(());
+        }
+
+        // Collect live Pointer hashes from all SSTable levels
+        let live_hashes: std::collections::HashSet<String> = {
+            let sst = self.sstables.read().unwrap();
+            let mut hashes = std::collections::HashSet::new();
+            if let Some(levels) = sst.get(ns) {
+                for level_readers in levels {
+                    for reader in level_readers {
+                        for (_key, value) in reader.iter_entries(self.config.verify_checksums)? {
+                            if let Value::Pointer(vp) = value {
+                                hashes.insert(vp.hex_hash());
+                            }
+                        }
+                    }
+                }
+            }
+            hashes
+        };
+
+        // Walk object store and delete orphans
+        let store = self.get_or_create_object_store(ns)?;
+        let on_disk = store.list_object_hashes()?;
+        for hash in &on_disk {
+            if !live_hashes.contains(hash) {
+                store.delete_object(hash)?;
+            }
+        }
+
+        Ok(())
     }
 
     // --- Internal helpers ---

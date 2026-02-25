@@ -119,6 +119,42 @@ impl ObjectStore {
         self.object_path(vp).exists()
     }
 
+    /// List all object hex hashes present on disk.
+    ///
+    /// Walks the fan-out directories and returns the set of 64-char hex
+    /// hash strings for every object file found.
+    pub(crate) fn list_object_hashes(&self) -> Result<std::collections::HashSet<String>> {
+        let mut hashes = std::collections::HashSet::new();
+        if !self.base.exists() {
+            return Ok(hashes);
+        }
+        for fan_entry in fs::read_dir(&self.base)? {
+            let fan_entry = fan_entry?;
+            if !fan_entry.file_type()?.is_dir() {
+                continue;
+            }
+            for obj_entry in fs::read_dir(fan_entry.path())? {
+                let obj_entry = obj_entry?;
+                let name = obj_entry.file_name().to_string_lossy().to_string();
+                // Object files are 64-char hex hashes (no extension)
+                if name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()) {
+                    hashes.insert(name);
+                }
+            }
+        }
+        Ok(hashes)
+    }
+
+    /// Delete an object file by its hex hash string.
+    pub(crate) fn delete_object(&self, hex_hash: &str) -> Result<()> {
+        let fan_out = &hex_hash[..2];
+        let path = self.base.join(fan_out).join(hex_hash);
+        if path.exists() {
+            fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
     /// Compute the file path for an object: `<base>/<fan_out>/<hex_hash>`.
     fn object_path(&self, vp: &ValuePointer) -> PathBuf {
         self.base.join(vp.fan_out_prefix()).join(vp.hex_hash())

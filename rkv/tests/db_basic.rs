@@ -2922,6 +2922,171 @@ fn compact_max_levels_one_is_noop() {
     assert_eq!(ns.get(1).unwrap(), Value::from("val"));
 }
 
+// --- Bin Object GC tests ---
+
+/// Helper: count object files under `<db>/objects/<ns>/`.
+fn count_object_files(db_path: &std::path::Path, ns: &str) -> usize {
+    let obj_dir = db_path.join("objects").join(ns);
+    if !obj_dir.exists() {
+        return 0;
+    }
+    let mut count = 0;
+    for fan_entry in std::fs::read_dir(&obj_dir).unwrap() {
+        let fan_entry = fan_entry.unwrap();
+        if fan_entry.file_type().unwrap().is_dir() {
+            for obj_entry in std::fs::read_dir(fan_entry.path()).unwrap() {
+                let name = obj_entry.unwrap().file_name().to_string_lossy().to_string();
+                if name.len() == 64 {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
+#[test]
+fn gc_overwrite_removes_orphaned_object() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 16; // force value separation
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    // Write a large value, then overwrite with a different large value
+    ns.put(1, "a".repeat(100).as_str(), None).unwrap();
+    db.flush().unwrap();
+    assert_eq!(count_object_files(tmp.path(), "_"), 1);
+
+    ns.put(1, "b".repeat(100).as_str(), None).unwrap();
+    db.flush().unwrap();
+    assert_eq!(count_object_files(tmp.path(), "_"), 2); // both objects exist
+
+    db.compact().unwrap();
+
+    // Only the new object should survive
+    assert_eq!(count_object_files(tmp.path(), "_"), 1);
+    assert_eq!(ns.get(1).unwrap(), Value::from("b".repeat(100).as_str()));
+}
+
+#[test]
+fn gc_tombstone_removes_orphaned_object() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 16;
+    config.max_levels = 2; // L1 is bottom — tombstones dropped
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "x".repeat(100).as_str(), None).unwrap();
+    db.flush().unwrap();
+    assert_eq!(count_object_files(tmp.path(), "_"), 1);
+
+    ns.delete(1).unwrap();
+    db.flush().unwrap();
+
+    db.compact().unwrap();
+
+    // Object should be garbage-collected
+    assert_eq!(count_object_files(tmp.path(), "_"), 0);
+    let err = ns.get(1).unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound));
+}
+
+#[test]
+fn gc_dedup_preserved_when_one_ref_deleted_another_alive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 16;
+    config.max_levels = 2; // bottom level — tombstones dropped
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    // Two keys reference the exact same large content (dedup)
+    let shared_content = "d".repeat(100);
+    ns.put(1, shared_content.as_str(), None).unwrap();
+    ns.put(2, shared_content.as_str(), None).unwrap();
+    db.flush().unwrap();
+
+    // Only 1 object file due to dedup
+    assert_eq!(count_object_files(tmp.path(), "_"), 1);
+
+    // Delete key 1 but keep key 2
+    ns.delete(1).unwrap();
+    db.flush().unwrap();
+
+    db.compact().unwrap();
+
+    // Object must survive — key 2 still references it
+    assert_eq!(count_object_files(tmp.path(), "_"), 1);
+    assert_eq!(ns.get(2).unwrap(), Value::from(shared_content.as_str()));
+    let err = ns.get(1).unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound));
+}
+
+#[test]
+fn gc_no_objects_is_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    // Small values — no bin objects
+    ns.put(1, "small", None).unwrap();
+    db.flush().unwrap();
+    ns.put(2, "tiny", None).unwrap();
+    db.flush().unwrap();
+
+    db.compact().unwrap();
+
+    assert_eq!(ns.get(1).unwrap(), Value::from("small"));
+    assert_eq!(ns.get(2).unwrap(), Value::from("tiny"));
+    assert_eq!(count_object_files(tmp.path(), "_"), 0);
+}
+
+#[test]
+fn gc_after_cascade_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 16;
+    config.max_levels = 3;
+    config.l1_max_size = 1; // force cascade to L2
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "old".repeat(50).as_str(), None).unwrap();
+    db.flush().unwrap();
+    ns.put(1, "new".repeat(50).as_str(), None).unwrap();
+    db.flush().unwrap();
+
+    db.compact().unwrap();
+
+    // After cascade + GC, only the new object survives
+    assert_eq!(count_object_files(tmp.path(), "_"), 1);
+    assert_eq!(ns.get(1).unwrap(), Value::from("new".repeat(50).as_str()));
+}
+
+#[test]
+fn gc_dedup_both_keys_alive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 16;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let shared = "s".repeat(100);
+    ns.put(1, shared.as_str(), None).unwrap();
+    ns.put(2, shared.as_str(), None).unwrap();
+    db.flush().unwrap();
+
+    db.compact().unwrap();
+
+    // Deduped object survives — both keys reference it
+    assert_eq!(count_object_files(tmp.path(), "_"), 1);
+    assert_eq!(ns.get(1).unwrap(), Value::from(shared.as_str()));
+    assert_eq!(ns.get(2).unwrap(), Value::from(shared.as_str()));
+}
+
 // --- Namespace management tests ---
 
 #[test]
