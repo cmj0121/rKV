@@ -1236,12 +1236,15 @@ fn value_sep_small_value_stays_inline() {
     assert_eq!(result, Value::from("hello"));
 
     // No object files should be created for small values
-    let objects_dir = tmp.path().join("objects");
-    let count = std::fs::read_dir(objects_dir)
-        .unwrap()
-        .filter(|e| e.as_ref().unwrap().file_type().unwrap().is_dir())
-        .count();
-    assert_eq!(count, 0);
+    let objects_dir = tmp.path().join("objects").join("_");
+    if objects_dir.exists() {
+        let count = std::fs::read_dir(objects_dir)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_type().unwrap().is_dir())
+            .count();
+        assert_eq!(count, 0);
+    }
+    // If objects/_/ doesn't exist at all, that's fine — no objects were created
 }
 
 #[test]
@@ -1260,14 +1263,13 @@ fn value_sep_dedup_same_content() {
     assert_eq!(ns.get("k1").unwrap(), ns.get("k2").unwrap());
 
     // Count total object files: should be exactly 1 (dedup)
-    let objects_dir = tmp.path().join("objects");
+    let ns_objects_dir = tmp.path().join("objects").join("_");
     let mut file_count = 0;
-    for entry in std::fs::read_dir(objects_dir).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_dir() {
-            for f in std::fs::read_dir(entry.path()).unwrap() {
-                let f = f.unwrap();
-                if f.file_type().unwrap().is_file() {
+    for fan_out in std::fs::read_dir(ns_objects_dir).unwrap() {
+        let fan_out = fan_out.unwrap();
+        if fan_out.file_type().unwrap().is_dir() {
+            for f in std::fs::read_dir(fan_out.path()).unwrap() {
+                if f.unwrap().file_type().unwrap().is_file() {
                     file_count += 1;
                 }
             }
@@ -1379,12 +1381,12 @@ fn value_sep_object_size_zero_forces_all_to_objects() {
     assert_eq!(result, Value::from("x"));
 
     // Object file should exist
-    let objects_dir = tmp.path().join("objects");
+    let ns_objects_dir = tmp.path().join("objects").join("_");
     let mut file_count = 0;
-    for entry in std::fs::read_dir(objects_dir).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_dir() {
-            for f in std::fs::read_dir(entry.path()).unwrap() {
+    for fan_out in std::fs::read_dir(ns_objects_dir).unwrap() {
+        let fan_out = fan_out.unwrap();
+        if fan_out.file_type().unwrap().is_dir() {
+            for f in std::fs::read_dir(fan_out.path()).unwrap() {
                 if f.unwrap().file_type().unwrap().is_file() {
                     file_count += 1;
                 }
@@ -1463,4 +1465,105 @@ fn value_sep_many_distinct_survive_reopen() {
             assert_eq!(result.as_bytes().unwrap(), expected.as_slice());
         }
     }
+}
+
+#[test]
+fn value_sep_cross_namespace_isolation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 10;
+    let db = DB::open(config).unwrap();
+
+    let data = "x".repeat(100);
+
+    let ns1 = db.namespace("ns1", None).unwrap();
+    ns1.put("key", data.as_str(), None).unwrap();
+
+    let ns2 = db.namespace("ns2", None).unwrap();
+    ns2.put("key", data.as_str(), None).unwrap();
+
+    // Both namespaces return the correct value
+    assert_eq!(ns1.get("key").unwrap(), Value::from(data.as_str()));
+    assert_eq!(ns2.get("key").unwrap(), Value::from(data.as_str()));
+
+    // Each namespace has its own object directory with separate files
+    let ns1_objects = tmp.path().join("objects").join("ns1");
+    let ns2_objects = tmp.path().join("objects").join("ns2");
+    assert!(ns1_objects.is_dir());
+    assert!(ns2_objects.is_dir());
+
+    // Count object files in each namespace — should be 1 each (separate stores)
+    let count_files = |dir: &std::path::Path| -> usize {
+        let mut count = 0;
+        for fan_out in std::fs::read_dir(dir).unwrap() {
+            let fan_out = fan_out.unwrap();
+            if fan_out.file_type().unwrap().is_dir() {
+                for f in std::fs::read_dir(fan_out.path()).unwrap() {
+                    if f.unwrap().file_type().unwrap().is_file() {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    };
+    assert_eq!(count_files(&ns1_objects), 1);
+    assert_eq!(count_files(&ns2_objects), 1);
+}
+
+#[test]
+fn value_sep_cross_namespace_isolation_survives_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = "y".repeat(200);
+
+    {
+        let mut config = Config::new(tmp.path());
+        config.object_size = 10;
+        let db = DB::open(config).unwrap();
+        let ns1 = db.namespace("ns1", None).unwrap();
+        ns1.put("key", data.as_str(), None).unwrap();
+        let ns2 = db.namespace("ns2", None).unwrap();
+        ns2.put("key", data.as_str(), None).unwrap();
+        db.close().unwrap();
+    }
+    {
+        let mut config = Config::new(tmp.path());
+        config.object_size = 10;
+        let db = DB::open(config).unwrap();
+        let ns1 = db.namespace("ns1", None).unwrap();
+        let ns2 = db.namespace("ns2", None).unwrap();
+        assert_eq!(ns1.get("key").unwrap(), Value::from(data.as_str()));
+        assert_eq!(ns2.get("key").unwrap(), Value::from(data.as_str()));
+    }
+}
+
+#[test]
+fn value_sep_dedup_within_namespace_still_works() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 10;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("myns", None).unwrap();
+
+    let data = "z".repeat(100);
+    ns.put("k1", data.as_str(), None).unwrap();
+    ns.put("k2", data.as_str(), None).unwrap();
+
+    assert_eq!(ns.get("k1").unwrap(), Value::from(data.as_str()));
+    assert_eq!(ns.get("k2").unwrap(), Value::from(data.as_str()));
+
+    // Only 1 object file — dedup still works within a namespace
+    let ns_objects = tmp.path().join("objects").join("myns");
+    let mut file_count = 0;
+    for fan_out in std::fs::read_dir(ns_objects).unwrap() {
+        let fan_out = fan_out.unwrap();
+        if fan_out.file_type().unwrap().is_dir() {
+            for f in std::fs::read_dir(fan_out.path()).unwrap() {
+                if f.unwrap().file_type().unwrap().is_file() {
+                    file_count += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(file_count, 1);
 }

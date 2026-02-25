@@ -141,7 +141,7 @@ pub struct DB {
     revision_gen: revision::RevisionGen,
     namespace_data: RwLock<HashMap<String, Mutex<memtable::MemTable>>>,
     aol: Arc<Mutex<aol::Aol>>,
-    object_store: objects::ObjectStore,
+    object_stores: RwLock<HashMap<String, objects::ObjectStore>>,
     flush_stop: Arc<AtomicBool>,
     flush_thread: Option<JoinHandle<()>>,
 }
@@ -189,8 +189,8 @@ impl DB {
             }
         }
 
-        // Open object store
-        let object_store = objects::ObjectStore::open(&config.path)?;
+        // Per-namespace object stores (created lazily on first access)
+        let object_stores = RwLock::new(HashMap::new());
 
         // Open AOL for appending
         let aol = Arc::new(Mutex::new(aol::Aol::open(
@@ -227,7 +227,7 @@ impl DB {
             revision_gen,
             namespace_data,
             aol,
-            object_store,
+            object_stores,
             flush_stop,
             flush_thread,
         })
@@ -361,22 +361,24 @@ impl DB {
     // --- Internal helpers ---
 
     /// If the value exceeds the configured `object_size`, write it to the
-    /// object store and return a `Value::Pointer`. Otherwise pass through.
-    pub(crate) fn maybe_separate_value(&self, value: Value) -> Result<Value> {
+    /// namespace's object store and return a `Value::Pointer`. Otherwise pass through.
+    pub(crate) fn maybe_separate_value(&self, ns: &str, value: Value) -> Result<Value> {
         if let Value::Data(ref data) = value {
             if data.len() > self.config.object_size {
-                let vp = self.object_store.write(data, self.config.compress)?;
+                let store = self.get_or_create_object_store(ns)?;
+                let vp = store.write(data, self.config.compress)?;
                 return Ok(Value::Pointer(vp));
             }
         }
         Ok(value)
     }
 
-    /// If the value is a `Pointer`, read the data from the object store.
+    /// If the value is a `Pointer`, read the data from the namespace's object store.
     /// Otherwise clone the value through.
-    pub(crate) fn resolve_value(&self, value: &Value) -> Result<Value> {
+    pub(crate) fn resolve_value(&self, ns: &str, value: &Value) -> Result<Value> {
         if let Value::Pointer(vp) = value {
-            let data = self.object_store.read(vp, self.config.verify_checksums)?;
+            let store = self.get_or_create_object_store(ns)?;
+            let data = store.read(vp, self.config.verify_checksums)?;
             return Ok(Value::Data(data));
         }
         Ok(value.clone())
@@ -396,6 +398,29 @@ impl DB {
     ) -> Result<()> {
         let mut aol = self.aol.lock().unwrap();
         aol.append(ns, rev, key, value, ttl)
+    }
+
+    pub(crate) fn get_or_create_object_store(&self, ns: &str) -> Result<&objects::ObjectStore> {
+        // Fast path: read lock to check if store already exists
+        {
+            let map = self.object_stores.read().unwrap();
+            if map.contains_key(ns) {
+                // SAFETY: The RwLock<HashMap> only grows (we never remove entries),
+                // so a reference obtained under the read lock remains valid.
+                let ptr = map.get(ns).unwrap() as *const objects::ObjectStore;
+                return Ok(unsafe { &*ptr });
+            }
+        }
+
+        // Slow path: write lock to insert
+        let mut map = self.object_stores.write().unwrap();
+        if !map.contains_key(ns) {
+            let store = objects::ObjectStore::open(&self.config.path, ns)?;
+            map.insert(ns.to_owned(), store);
+        }
+        let ptr = map.get(ns).unwrap() as *const objects::ObjectStore;
+        // SAFETY: Same as above — the HashMap only grows, so the reference is stable.
+        Ok(unsafe { &*ptr })
     }
 
     pub(crate) fn get_or_create_memtable(&self, name: &str) -> &Mutex<memtable::MemTable> {
