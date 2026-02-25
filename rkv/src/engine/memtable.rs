@@ -259,12 +259,18 @@ impl MemTable {
 
     /// Estimate the memory footprint of a single entry.
     fn entry_size(key: &Key, value: &Value) -> usize {
+        use super::value::ValuePointer;
+
         let key_size = match key {
             Key::Int(_) => 8,
             Key::Str(s) => s.len(),
         };
+        let value_size = match value {
+            Value::Pointer(_) => ValuePointer::encoded_size(),
+            _ => value.len(),
+        };
         // key + value bytes + RevisionID (16) + Option<Instant> (16) + overhead
-        key_size + value.len() + 16 + 16 + 32
+        key_size + value_size + 16 + 16 + 32
     }
 
     /// Widen all Int keys to Str and rebuild internal maps.

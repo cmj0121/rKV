@@ -265,7 +265,7 @@ The `Config` struct controls database behavior and LSM tuning parameters:
 | Field               | Type          | Default    | Description                                |
 | ------------------- | ------------- | ---------- | ------------------------------------------ |
 | `path`              | `PathBuf`     | (required) | Database directory path                    |
-| `create_if_missing` | `bool`        | `true`     | Create the directory if it does not exist  |
+| `create_if_missing` | `bool`        | `true`     | Create the directory if it doesn't exist   |
 | `write_buffer_size` | `usize`       | 4 MB       | In-memory write buffer size before flush   |
 | `max_levels`        | `usize`       | 3          | Maximum number of LSM levels               |
 | `block_size`        | `usize`       | 4 KB       | SSTable block size                         |
@@ -277,6 +277,24 @@ The `Config` struct controls database behavior and LSM tuning parameters:
 | `io_model`          | `IoModel`     | `Mmap`     | File I/O strategy (see I/O Modes below)    |
 | `cluster_id`        | `Option<u16>` | `None`     | Cluster ID for RevisionID (random if None) |
 | `aol_buffer_size`   | `usize`       | 128        | AOL flush threshold in records (0 = every) |
+
+The CLI uses dot-notation keys for `config <key> <value>`:
+
+| Config field        | CLI key                     |
+| ------------------- | --------------------------- |
+| `path`              | `storage.path` (read-only)  |
+| `create_if_missing` | `storage.create_if_missing` |
+| `write_buffer_size` | `lsm.write_buffer_size`     |
+| `max_levels`        | `lsm.max_levels`            |
+| `block_size`        | `lsm.block_size`            |
+| `cache_size`        | `lsm.cache_size`            |
+| `bloom_bits`        | `lsm.bloom_bits`            |
+| `verify_checksums`  | `lsm.verify_checksums`      |
+| `object_size`       | `object.size`               |
+| `compress`          | `object.compress`           |
+| `io_model`          | `io.model`                  |
+| `cluster_id`        | `revision.cluster_id`       |
+| `aol_buffer_size`   | `aol.buffer_size`           |
 
 `Config::new(path)` initializes all fields to their defaults. Fields can be overridden before
 passing the config to `DB::open`.
@@ -504,8 +522,8 @@ followed by a sequence of variable-length records.
 
 - `revision`: candidate RevisionID from `RevisionGen` (MemTable enforces per-key monotonicity on replay)
 - `expires_at_ms`: absolute expiry as ms since Unix epoch (0 = no expiry)
-- `value_tag`: `0x00` = Data, `0x01` = Null, `0x02` = Tombstone
-- `value_data`: present only for Data variant
+- `value_tag`: `0x00` = Data, `0x01` = Null, `0x02` = Tombstone, `0x03` = Pointer
+- `value_data`: present for Data (raw bytes) and Pointer (36-byte `ValuePointer`); empty for Null/Tombstone
 
 ##### TTL Encoding
 
@@ -545,6 +563,13 @@ to C, Python, and Go consumers.
 ### CLI Tool
 
 A REPL binary built on top of the library provides interactive access for debugging, exploration, and scripting.
+
+#### File Input Syntax
+
+The `put` command supports loading values from files:
+
+- `put mykey @/path/to/file` — reads the file contents as the value (binary-safe)
+- `put mykey @@literal` — escape: stores the literal string `@literal`
 
 ## Design Decisions
 

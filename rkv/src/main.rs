@@ -146,7 +146,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
         }
         "put" => {
             if tokens.len() < 3 {
-                eprintln!("usage: put <key> <value> [ttl]");
+                eprintln!("usage: put <key> <value|@file> [ttl]");
                 return Action::Continue;
             }
             let ttl = if let Some(ttl_str) = tokens.get(3) {
@@ -160,7 +160,22 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             } else {
                 None
             };
-            let result = ns.put(parse_key(tokens[1]), tokens[2].as_bytes(), ttl);
+            let value: Vec<u8> = if let Some(rest) = tokens[2].strip_prefix("@@") {
+                // Escape: @@foo → literal "@foo"
+                format!("@{rest}").into_bytes()
+            } else if let Some(path) = tokens[2].strip_prefix('@') {
+                // File read: @/path/to/file → file contents
+                match std::fs::read(path) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        eprintln!("error: cannot read file '{path}': {e}");
+                        return Action::Continue;
+                    }
+                }
+            } else {
+                tokens[2].as_bytes().to_vec()
+            };
+            let result = ns.put(parse_key(tokens[1]), value, ttl);
             match result {
                 Ok(_) => {}
                 Err(e) => eprintln!("error: {e}"),
@@ -290,70 +305,74 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             let c = db.config();
             let items: &[(&str, &str, String)] = &[
                 ("Storage", "", String::new()),
-                ("  path", "", c.path.display().to_string()),
+                ("  storage.path", "", c.path.display().to_string()),
                 (
-                    "  create_if_missing",
+                    "  storage.create_if_missing",
                     "create dir if absent",
                     c.create_if_missing.to_string(),
                 ),
                 ("", "", String::new()),
                 ("LSM", "", String::new()),
                 (
-                    "  write_buffer_size",
+                    "  lsm.write_buffer_size",
                     "memtable flush threshold",
                     format_bytes(c.write_buffer_size),
                 ),
-                ("  max_levels", "SSTable levels", c.max_levels.to_string()),
                 (
-                    "  block_size",
+                    "  lsm.max_levels",
+                    "SSTable levels",
+                    c.max_levels.to_string(),
+                ),
+                (
+                    "  lsm.block_size",
                     "SSTable block size",
                     format_bytes(c.block_size),
                 ),
                 (
-                    "  cache_size",
+                    "  lsm.cache_size",
                     "block cache size",
                     format_bytes(c.cache_size),
                 ),
                 (
-                    "  bloom_bits",
+                    "  lsm.bloom_bits",
                     "bits per key (0 = disabled)",
                     c.bloom_bits.to_string(),
                 ),
                 (
-                    "  verify_checksums",
+                    "  lsm.verify_checksums",
                     "verify on read",
                     c.verify_checksums.to_string(),
                 ),
                 ("", "", String::new()),
                 ("Objects", "", String::new()),
                 (
-                    "  object_size",
+                    "  object.size",
                     "value separation threshold",
                     format_bytes(c.object_size),
                 ),
                 (
-                    "  compress",
+                    "  object.compress",
                     "LZ4-compress bin objects",
                     c.compress.to_string(),
                 ),
                 ("", "", String::new()),
                 ("I/O", "", String::new()),
                 (
-                    "  io_model",
+                    "  io.model",
                     "file I/O strategy (none, directio, mmap)",
                     c.io_model.to_string(),
                 ),
                 ("", "", String::new()),
                 ("AOL", "", String::new()),
                 (
-                    "  aol_buffer_size",
+                    "  aol.buffer_size",
                     "flush threshold (0 = per-record)",
                     c.aol_buffer_size.to_string(),
                 ),
                 ("", "", String::new()),
                 ("Revision", "", String::new()),
                 (
-                    "  cluster_id",
+                    "  revision.cluster_id",
                     "RevisionID cluster (none = random)",
                     c.cluster_id
                         .map(|id| format!("{id}"))
@@ -366,9 +385,9 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 } else if desc.is_empty() && !key.starts_with(' ') {
                     println!("{key}:");
                 } else if desc.is_empty() {
-                    println!("  {:<18} {}", &key[2..], val);
+                    println!("  {:<24} {}", &key[2..], val);
                 } else {
-                    println!("  {:<18} {:<7} # {}", &key[2..], val, desc);
+                    println!("  {:<24} {:<7} # {}", &key[2..], val, desc);
                 }
             }
         }
@@ -445,7 +464,9 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
         }
         "help" | "?" => {
             println!("Data operations:");
-            println!("  put <key> <value> [ttl]  Store a key-value pair (ttl: 10s, 5m, 2h, 1d)");
+            println!(
+                "  put <key> <value|@file> [ttl]  Store a key-value pair (ttl: 10s, 5m, 2h, 1d)"
+            );
             println!("  get <key>                Retrieve a value by key");
             println!("  del <key>                Remove a key");
             println!("  has <key>                Check if a key exists");
@@ -465,8 +486,8 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!();
             println!("Admin:");
             println!("  stats                Print database statistics");
-            println!("  config               Print current configuration");
-            println!("  config <key> <value> Set a configuration value");
+            println!("  config                    Print current configuration");
+            println!("  config <group.key> <value> Set a configuration value");
             println!("  flush                Flush write buffer to disk");
             println!("  sync                 Flush and fsync to durable storage");
             println!("  compact              Trigger manual compaction");
@@ -493,77 +514,77 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
 fn set_config(db: &mut DB, key: &str, value: &str) {
     let c = db.config_mut();
     match key {
-        "create_if_missing" => match value.parse::<bool>() {
+        "storage.create_if_missing" => match value.parse::<bool>() {
             Ok(v) => {
                 c.create_if_missing = v;
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected true or false"),
         },
-        "write_buffer_size" => match value.parse::<usize>() {
+        "lsm.write_buffer_size" => match value.parse::<usize>() {
             Ok(v) => {
                 c.write_buffer_size = v;
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected a number"),
         },
-        "max_levels" => match value.parse::<usize>() {
+        "lsm.max_levels" => match value.parse::<usize>() {
             Ok(v) => {
                 c.max_levels = v;
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected a number"),
         },
-        "block_size" => match value.parse::<usize>() {
+        "lsm.block_size" => match value.parse::<usize>() {
             Ok(v) => {
                 c.block_size = v;
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected a number"),
         },
-        "cache_size" => match value.parse::<usize>() {
+        "lsm.cache_size" => match value.parse::<usize>() {
             Ok(v) => {
                 c.cache_size = v;
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected a number"),
         },
-        "object_size" => match value.parse::<usize>() {
+        "object.size" => match value.parse::<usize>() {
             Ok(v) => {
                 c.object_size = v;
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected a number"),
         },
-        "compress" => match value.parse::<bool>() {
+        "object.compress" => match value.parse::<bool>() {
             Ok(v) => {
                 c.compress = v;
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected true or false"),
         },
-        "verify_checksums" => match value.parse::<bool>() {
+        "lsm.verify_checksums" => match value.parse::<bool>() {
             Ok(v) => {
                 c.verify_checksums = v;
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected true or false"),
         },
-        "bloom_bits" => match value.parse::<usize>() {
+        "lsm.bloom_bits" => match value.parse::<usize>() {
             Ok(v) => {
                 c.bloom_bits = v;
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected a number"),
         },
-        "io_model" => match value.parse::<rkv::IoModel>() {
+        "io.model" => match value.parse::<rkv::IoModel>() {
             Ok(v) => {
                 c.io_model = v;
                 println!("OK");
             }
             Err(e) => eprintln!("error: {e}"),
         },
-        "cluster_id" => match value {
+        "revision.cluster_id" => match value {
             "none" => {
                 c.cluster_id = None;
                 println!("OK");
@@ -576,14 +597,14 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
                 Err(_) => eprintln!("error: expected a number or 'none'"),
             },
         },
-        "aol_buffer_size" => match value.parse::<usize>() {
+        "aol.buffer_size" => match value.parse::<usize>() {
             Ok(v) => {
                 c.aol_buffer_size = v;
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected a number"),
         },
-        "path" => eprintln!("error: path cannot be changed at runtime"),
+        "storage.path" => eprintln!("error: path cannot be changed at runtime"),
         _ => eprintln!("error: unknown config key '{key}'"),
     }
 }
