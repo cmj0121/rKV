@@ -494,8 +494,8 @@ the LSM level (0, 1, ...) and `<seq>` is a zero-padded monotonically increasing 
 (e.g., `000001.sst`). On `DB::open()`, the engine scans these directories to recover the
 reader cache and sequence counter across all levels.
 
-`sync` calls `flush` followed by `fsync`, ensuring all data reaches durable storage
-(currently a stub).
+`sync` flushes any buffered AOL writes and calls `fsync` on the AOL file descriptor,
+guaranteeing that all committed data is persisted to the storage device.
 
 **Limitations (V1)**:
 
