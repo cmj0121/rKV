@@ -9,6 +9,8 @@ mod namespace;
 mod objects;
 mod recovery;
 mod revision;
+#[allow(dead_code)]
+mod sstable;
 mod stats;
 mod value;
 
@@ -78,6 +80,51 @@ impl FromStr for IoModel {
     }
 }
 
+/// SSTable block compression algorithm.
+///
+/// Controls how data blocks are compressed when flushed to SSTable files.
+/// Bin objects use their own compression setting (`compress`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Compression {
+    /// No compression — blocks are stored as-is.
+    None,
+    /// LZ4 block compression — fast with moderate ratio (default).
+    LZ4,
+    /// Zstandard compression — better ratio, higher CPU cost.
+    Zstd,
+}
+
+impl Default for Compression {
+    fn default() -> Self {
+        Self::LZ4
+    }
+}
+
+impl fmt::Display for Compression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => write!(f, "none"),
+            Self::LZ4 => write!(f, "lz4"),
+            Self::Zstd => write!(f, "zstd"),
+        }
+    }
+}
+
+impl FromStr for Compression {
+    type Err = Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "none" => Ok(Self::None),
+            "lz4" => Ok(Self::LZ4),
+            "zstd" => Ok(Self::Zstd),
+            _ => Err(Error::InvalidConfig(format!(
+                "unknown compression '{s}' (expected: none, lz4, zstd)"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub path: PathBuf,
@@ -103,6 +150,8 @@ pub struct Config {
     /// When enabled, every WAL entry and SSTable block is verified against
     /// its stored checksum during reads. Disabling trades safety for speed.
     pub verify_checksums: bool,
+    /// SSTable block compression algorithm (default: LZ4).
+    pub compression: Compression,
     /// I/O model for file access (default: Mmap).
     pub io_model: IoModel,
     /// Cluster ID for RevisionID generation (default: None = random at startup).
@@ -125,6 +174,7 @@ impl Config {
             compress: true,
             bloom_bits: 10,
             verify_checksums: true,
+            compression: Compression::default(),
             io_model: IoModel::default(),
             cluster_id: None,
             aol_buffer_size: 128,

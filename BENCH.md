@@ -31,12 +31,12 @@ Wall-clock time is measured via `std::time::Instant`.
 
 | Operation | 1K        | 8K        | 16K       | 1M        |
 | --------- | --------- | --------- | --------- | --------- |
-| put       | 454 µs    | 4.75 ms   | 6.76 ms   | 774.73 ms |
-| get       | 129 µs    | 2.44 ms   | 6.13 ms   | 718.19 ms |
-| delete    | 250 µs    | 4.47 ms   | 4.59 ms   | 476.48 ms |
-| scan      | 41 µs     | 161 µs    | 309 µs    | 26.51 ms  |
-| put_obj   | 169.83 ms | 1.53 s    | 2.78 s    | 454.84 s  |
-| get_obj   | 21.73 ms  | 181.40 ms | 917.89 ms | 392.21 s  |
+| put       | 460 µs    | 6.53 ms   | 14.72 ms  | 918.81 ms |
+| get       | 141 µs    | 4.91 ms   | 7.21 ms   | 723.60 ms |
+| delete    | 238 µs    | 2.22 ms   | 4.10 ms   | 727.89 ms |
+| scan      | 16 µs     | 138 µs    | 343 µs    | 28.27 ms  |
+| put_obj   | 176.85 ms | 1.32 s    | 2.97 s    | 441.35 s  |
+| get_obj   | 21.59 ms  | 180.89 ms | 516.36 ms | 352.86 s  |
 
 ## Reproduce
 

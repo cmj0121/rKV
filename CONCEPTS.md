@@ -276,6 +276,7 @@ The `Config` struct controls database behavior and LSM tuning parameters:
 | `compress`          | `bool`        | `true`     | LZ4-compress bin objects on disk           |
 | `bloom_bits`        | `usize`       | 10         | Bloom filter bits per key (0 = disabled)   |
 | `verify_checksums`  | `bool`        | `true`     | Verify checksums on read (see below)       |
+| `compression`       | `Compression` | `LZ4`      | SSTable block compression (see above)      |
 | `io_model`          | `IoModel`     | `Mmap`     | File I/O strategy (see I/O Modes below)    |
 | `cluster_id`        | `Option<u16>` | `None`     | Cluster ID for RevisionID (random if None) |
 | `aol_buffer_size`   | `usize`       | 128        | AOL flush threshold in records (0 = every) |
@@ -292,6 +293,7 @@ The CLI uses dot-notation keys for `config <key> <value>`:
 | `cache_size`        | `lsm.cache_size`            |
 | `bloom_bits`        | `lsm.bloom_bits`            |
 | `verify_checksums`  | `lsm.verify_checksums`      |
+| `compression`       | `lsm.compression`           |
 | `object_size`       | `object.size`               |
 | `compress`          | `object.compress`           |
 | `io_model`          | `io.model`                  |
@@ -460,6 +462,81 @@ and is out of scope.
 
 Data is organized in levels (L1-L3). Fresh writes land in an in-memory buffer and are periodically flushed to sorted
 SSTable files on disk. Background merge compaction keeps read amplification bounded.
+
+#### Block Compression
+
+SSTable data blocks can be compressed to reduce disk usage and I/O bandwidth. The `compression`
+config field selects the algorithm applied when blocks are flushed to disk:
+
+| Algorithm | Enum variant        | Characteristics                            |
+| --------- | ------------------- | ------------------------------------------ |
+| `none`    | `Compression::None` | No compression — lowest CPU, largest files |
+| `lz4`     | `Compression::LZ4`  | Fast with moderate ratio **(default)**     |
+| `zstd`    | `Compression::Zstd` | Better ratio, higher CPU cost              |
+
+Compression is applied per block at flush time and reversed on read. The block cache stores
+**decompressed** blocks, so the CPU cost is paid once per cache miss, not per read.
+
+Block compression is independent of bin object compression (`compress` config field), which
+controls LZ4 compression of large values in the object store.
+
+#### SSTable File Format
+
+An SSTable is a read-only file of sorted key-value entries. The file is divided into three
+regions written sequentially: data blocks, an index block, and a fixed-size footer.
+
+```text
+┌──────────────────────────────┐
+│  Data Block 0                │  ← compressed entries + checksum
+│  Data Block 1                │
+│  ...                         │
+│  Data Block N                │
+├──────────────────────────────┤
+│  Index Block                 │  ← one entry per data block
+├──────────────────────────────┤
+│  Footer (48 bytes)           │  ← magic, version, metadata, checksum
+└──────────────────────────────┘
+```
+
+**Data block on-disk layout:**
+
+```text
+[compression_tag: u8][compressed_payload][checksum: 5B CRC32C]
+```
+
+The `compression_tag` identifies the algorithm (0x00 = none, 0x01 = LZ4, 0x02 = Zstd).
+The checksum covers the tag byte plus the compressed payload.
+
+**Entry encoding (within a decompressed block):**
+
+```text
+[key_len: u16 BE][key_bytes][value_tag: u8][value_len: u32 BE][value_data]
+```
+
+Entries are stored in sorted key order. `key_bytes` uses the same memcmp-preserving
+serialization as `Key::to_bytes()`. `value_tag` encodes the Value variant (0x00 = Data,
+0x01 = Null, 0x02 = Tombstone, 0x03 = Pointer).
+
+**Index block layout:**
+
+```text
+repeated: [key_len: u16 BE][last_key_bytes][offset: u64 BE][size: u32 BE]
+```
+
+Each entry records the last key in a data block plus the block's file offset and on-disk
+size. Point lookups binary-search the index to find the candidate block, then linear-scan
+entries within that block.
+
+**Footer layout (48 bytes):**
+
+```text
+[magic: 4B "rKVS"][version: u16 BE][entry_count: u64 BE]
+[index_offset: u64 BE][index_size: u32 BE]
+[data_blocks: u32 BE][reserved: 13B][checksum: 5B CRC32C]
+```
+
+The footer checksum covers the first 43 bytes. The reader verifies magic, version, and
+checksum before parsing the index.
 
 #### WriteBuffer (MemTable)
 
