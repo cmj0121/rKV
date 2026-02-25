@@ -823,6 +823,161 @@ fn repair_clean_database() {
 }
 
 #[test]
+fn destroy_nonexistent_path_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let err = DB::destroy(tmp.path().join("does_not_exist")).unwrap_err();
+    assert!(matches!(err, Error::Io(_)));
+}
+
+#[test]
+fn destroy_non_rkv_directory_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Create a plain directory with no aol or sst — should be rejected
+    let dir = tmp.path().join("not_a_db");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("random.txt"), b"data").unwrap();
+    let err = DB::destroy(&dir).unwrap_err();
+    assert!(matches!(err, Error::Corruption(_)));
+}
+
+#[test]
+fn destroy_after_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("mydb");
+    {
+        let config = Config::new(&db_path);
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+        ns.put(Key::Int(1), "hello", None).unwrap();
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+    assert!(db_path.join("sst").exists());
+    DB::destroy(&db_path).unwrap();
+    assert!(!db_path.exists());
+}
+
+#[test]
+fn repair_nonexistent_path_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let err = DB::repair(tmp.path().join("does_not_exist")).unwrap_err();
+    assert!(matches!(err, Error::Io(_)));
+}
+
+#[test]
+fn repair_corrupted_aol() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("mydb");
+    {
+        let config = Config::new(&db_path);
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+        ns.put(Key::Int(1), "v1", None).unwrap();
+        ns.put(Key::Int(2), "v2", None).unwrap();
+        db.close().unwrap();
+    }
+
+    // Corrupt the last byte of the AOL (damages the last record's checksum)
+    let aol_path = db_path.join("aol");
+    let mut aol_data = std::fs::read(&aol_path).unwrap();
+    let last = aol_data.len() - 1;
+    aol_data[last] ^= 0xFF;
+    std::fs::write(&aol_path, &aol_data).unwrap();
+
+    let report = DB::repair(&db_path).unwrap();
+    assert!(!report.is_clean());
+    assert!(report.wal_records_skipped > 0);
+    assert!(report.wal_records_scanned >= 2);
+
+    // Database should still be openable after repair
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+    // At least the first record should survive
+    assert_eq!(ns.get(Key::Int(1)).unwrap(), Value::from("v1"));
+    db.close().unwrap();
+}
+
+#[test]
+fn repair_corrupted_sstable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("mydb");
+    {
+        let config = Config::new(&db_path);
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+        ns.put(Key::Int(1), "hello", None).unwrap();
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+
+    // Find and corrupt an SSTable file
+    let sst_dir = db_path.join("sst").join("_").join("L0");
+    let entries: Vec<_> = std::fs::read_dir(&sst_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(!entries.is_empty());
+    let sst_path = entries[0].path();
+    let mut sst_data = std::fs::read(&sst_path).unwrap();
+    sst_data[10] ^= 0xFF;
+    std::fs::write(&sst_path, &sst_data).unwrap();
+
+    let report = DB::repair(&db_path).unwrap();
+    assert!(!report.is_clean());
+    assert!(report.sstable_blocks_corrupted > 0);
+
+    // Corrupted SSTable file should be removed
+    assert!(!sst_path.exists());
+}
+
+#[test]
+fn repair_with_objects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("mydb");
+    {
+        let mut config = Config::new(&db_path);
+        config.object_size = 10; // force bin objects for small values
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+        ns.put(Key::Int(1), "a]".repeat(100).as_str(), None)
+            .unwrap();
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+
+    let report = DB::repair(&db_path).unwrap();
+    assert!(report.is_clean());
+    assert!(report.objects_scanned > 0);
+    assert_eq!(report.objects_corrupted, 0);
+}
+
+#[test]
+fn repair_data_readable_after_repair() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("mydb");
+    {
+        let config = Config::new(&db_path);
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+        ns.put(Key::Int(1), "alpha", None).unwrap();
+        ns.put(Key::Int(2), "beta", None).unwrap();
+        db.close().unwrap();
+    }
+
+    let report = DB::repair(&db_path).unwrap();
+    assert!(report.is_clean());
+
+    // Reopen and verify data is intact
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+    assert_eq!(ns.get(Key::Int(1)).unwrap(), Value::from("alpha"));
+    assert_eq!(ns.get(Key::Int(2)).unwrap(), Value::from("beta"));
+    db.close().unwrap();
+}
+
+#[test]
 fn dump_basic_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path().join("source"));
