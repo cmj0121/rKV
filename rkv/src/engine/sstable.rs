@@ -230,6 +230,246 @@ pub(super) fn decompress_block(tag: u8, data: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+// --- SSTableReader ---
+
+/// Index entry parsed from an SSTable's index block.
+struct IndexEntry {
+    /// Last key in this data block (serialized bytes).
+    last_key: Vec<u8>,
+    /// Byte offset of the data block in the file.
+    offset: u64,
+    /// Size of the data block on disk (including compression tag + checksum).
+    size: u32,
+}
+
+/// Reads key-value entries from an SSTable file.
+///
+/// Opens a file, parses the footer and index, then serves point lookups
+/// via binary search on the block index.
+pub(crate) struct SSTableReader {
+    /// Raw file contents (read into memory).
+    data: Vec<u8>,
+    /// Parsed index entries, sorted by last_key.
+    index: Vec<IndexEntry>,
+    /// Total entry count from the footer.
+    entry_count: u64,
+}
+
+impl SSTableReader {
+    /// Open an SSTable file and parse its footer and index.
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        let data = fs::read(path)?;
+        if data.len() < FOOTER_SIZE {
+            return Err(Error::Corruption(format!(
+                "SSTable too small: {} bytes (minimum {FOOTER_SIZE})",
+                data.len()
+            )));
+        }
+
+        // Parse footer (last 48 bytes)
+        let footer_start = data.len() - FOOTER_SIZE;
+        let footer = &data[footer_start..];
+
+        // Verify magic
+        if footer[..4] != MAGIC {
+            return Err(Error::Corruption(format!(
+                "SSTable bad magic: expected {MAGIC:?}, got {:?}",
+                &footer[..4]
+            )));
+        }
+
+        // Verify footer checksum (covers first 43 bytes)
+        let cksum_offset = FOOTER_SIZE - Checksum::encoded_size();
+        let footer_checksum = Checksum::from_bytes(&footer[cksum_offset..])?;
+        footer_checksum.verify(&footer[..cksum_offset])?;
+
+        // Parse footer fields
+        let version = u16::from_be_bytes(footer[4..6].try_into().unwrap());
+        if version != VERSION {
+            return Err(Error::Corruption(format!(
+                "SSTable unsupported version: {version}"
+            )));
+        }
+
+        let entry_count = u64::from_be_bytes(footer[6..14].try_into().unwrap());
+        let index_offset = u64::from_be_bytes(footer[14..22].try_into().unwrap()) as usize;
+        let index_size = u32::from_be_bytes(footer[22..26].try_into().unwrap()) as usize;
+
+        // Bounds-check the index block
+        if index_offset + index_size > footer_start {
+            return Err(Error::Corruption(format!(
+                "SSTable index out of bounds: offset={index_offset}, size={index_size}, data_end={footer_start}"
+            )));
+        }
+
+        let index_data = &data[index_offset..index_offset + index_size];
+        let index = Self::parse_index(index_data)?;
+
+        Ok(Self {
+            data,
+            index,
+            entry_count,
+        })
+    }
+
+    /// Parse the index block into entries.
+    fn parse_index(data: &[u8]) -> Result<Vec<IndexEntry>> {
+        let mut entries = Vec::new();
+        let mut pos = 0;
+        while pos < data.len() {
+            if pos + 2 > data.len() {
+                return Err(Error::Corruption(
+                    "SSTable index truncated at key_len".into(),
+                ));
+            }
+            let key_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+
+            if pos + key_len > data.len() {
+                return Err(Error::Corruption("SSTable index truncated at key".into()));
+            }
+            let last_key = data[pos..pos + key_len].to_vec();
+            pos += key_len;
+
+            if pos + 12 > data.len() {
+                return Err(Error::Corruption(
+                    "SSTable index truncated at offset/size".into(),
+                ));
+            }
+            let offset = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let size = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+
+            entries.push(IndexEntry {
+                last_key,
+                offset,
+                size,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Look up a key in the SSTable.
+    ///
+    /// Returns `Some(value)` if found, `None` if the key is not present.
+    /// When `verify_checksums` is true, each data block is verified before
+    /// decoding.
+    pub(crate) fn get(&self, key: &Key, verify_checksums: bool) -> Result<Option<Value>> {
+        if self.index.is_empty() {
+            return Ok(None);
+        }
+
+        let key_bytes = key.to_bytes();
+
+        // Binary search: find the first block whose last_key >= target
+        let block_idx = match self
+            .index
+            .binary_search_by(|e| e.last_key.as_slice().cmp(&key_bytes))
+        {
+            Ok(i) => i,
+            Err(i) => {
+                if i >= self.index.len() {
+                    return Ok(None); // key beyond all blocks
+                }
+                i
+            }
+        };
+
+        let ie = &self.index[block_idx];
+        let block_start = ie.offset as usize;
+        let block_end = block_start + ie.size as usize;
+
+        if block_end > self.data.len() {
+            return Err(Error::Corruption(format!(
+                "SSTable block out of bounds: {block_start}..{block_end} (file size {})",
+                self.data.len()
+            )));
+        }
+
+        let block_on_disk = &self.data[block_start..block_end];
+
+        // Verify block checksum
+        let cksum_start = block_on_disk.len() - Checksum::encoded_size();
+        if verify_checksums {
+            let checksum = Checksum::from_bytes(&block_on_disk[cksum_start..])?;
+            checksum.verify(&block_on_disk[..cksum_start])?;
+        }
+
+        // Decompress
+        let compression_tag = block_on_disk[0];
+        let compressed_payload = &block_on_disk[1..cksum_start];
+        let block_data = decompress_block(compression_tag, compressed_payload)?;
+
+        // Linear scan entries within the block
+        Self::scan_block_for_key(&block_data, &key_bytes)
+    }
+
+    /// Linear scan through a decompressed block looking for a specific key.
+    fn scan_block_for_key(block: &[u8], target: &[u8]) -> Result<Option<Value>> {
+        let mut pos = 0;
+        while pos < block.len() {
+            // [key_len: u16 BE][key_bytes][value_tag: u8][value_len: u32 BE][value_data]
+            if pos + 2 > block.len() {
+                return Err(Error::Corruption(
+                    "SSTable entry truncated at key_len".into(),
+                ));
+            }
+            let kl = u16::from_be_bytes(block[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+
+            if pos + kl > block.len() {
+                return Err(Error::Corruption(
+                    "SSTable entry truncated at key_bytes".into(),
+                ));
+            }
+            let entry_key = &block[pos..pos + kl];
+            pos += kl;
+
+            if pos + 1 > block.len() {
+                return Err(Error::Corruption(
+                    "SSTable entry truncated at value_tag".into(),
+                ));
+            }
+            let value_tag = block[pos];
+            pos += 1;
+
+            if pos + 4 > block.len() {
+                return Err(Error::Corruption(
+                    "SSTable entry truncated at value_len".into(),
+                ));
+            }
+            let vl = u32::from_be_bytes(block[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+
+            if pos + vl > block.len() {
+                return Err(Error::Corruption(
+                    "SSTable entry truncated at value_data".into(),
+                ));
+            }
+            let value_data = &block[pos..pos + vl];
+            pos += vl;
+
+            if entry_key == target {
+                return Ok(Some(Value::from_tag(value_tag, value_data)?));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Return the total number of entries in this SSTable.
+    #[allow(dead_code)]
+    pub(crate) fn entry_count(&self) -> u64 {
+        self.entry_count
+    }
+
+    /// Return the number of data blocks in this SSTable.
+    #[allow(dead_code)]
+    pub(crate) fn block_count(&self) -> usize {
+        self.index.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
