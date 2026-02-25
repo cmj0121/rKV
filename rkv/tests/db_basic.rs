@@ -60,13 +60,13 @@ fn namespace_empty_name_rejected() {
 }
 
 #[test]
-fn list_namespaces_returns_not_implemented() {
+fn list_namespaces_empty_db() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
 
-    let err = db.list_namespaces().unwrap_err();
-    assert!(matches!(err, Error::NotImplemented(_)));
+    let names = db.list_namespaces().unwrap();
+    assert!(names.is_empty());
 }
 
 #[test]
@@ -80,13 +80,13 @@ fn drop_default_namespace_rejected() {
 }
 
 #[test]
-fn drop_namespace_returns_not_implemented() {
+fn drop_nonexistent_namespace_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
 
     let err = db.drop_namespace("users").unwrap_err();
-    assert!(matches!(err, Error::NotImplemented(_)));
+    assert!(matches!(err, Error::InvalidNamespace(_)));
 }
 
 // --- Data operations (memtable-backed) ---
