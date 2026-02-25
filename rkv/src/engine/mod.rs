@@ -476,7 +476,14 @@ impl DB {
 
         // 3. Flush remaining namespaces + truncate AOL so the dropped
         //    namespace's records don't resurrect on restart.
+        //    flush() only truncates when it actually writes SSTables, so we
+        //    force-truncate afterwards to cover the case where no other
+        //    namespaces have pending data.
         self.flush()?;
+        {
+            let mut aol = self.aol.lock().unwrap();
+            aol.truncate(&self.config.path)?;
+        }
 
         Ok(())
     }

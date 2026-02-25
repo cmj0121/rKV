@@ -2359,3 +2359,187 @@ fn flush_aol_truncated() {
     let size_after = std::fs::metadata(&aol_path).unwrap().len();
     assert_eq!(size_after, 8); // Header only (magic + version + reserved)
 }
+
+// --- Namespace management tests ---
+
+#[test]
+fn list_namespaces_after_put() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace("users", None).unwrap();
+    ns.put("alice", "1", None).unwrap();
+    let ns2 = db.namespace("orders", None).unwrap();
+    ns2.put("order1", "x", None).unwrap();
+
+    let names = db.list_namespaces().unwrap();
+    assert_eq!(names, vec!["orders", "users"]);
+}
+
+#[test]
+fn list_namespaces_includes_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns.put("k", "v", None).unwrap();
+
+    let names = db.list_namespaces().unwrap();
+    assert_eq!(names, vec!["_"]);
+}
+
+#[test]
+fn list_namespaces_includes_flushed_sstable_namespaces() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace("data", None).unwrap();
+    ns.put("k", "v", None).unwrap();
+    db.flush().unwrap();
+
+    // After flush, memtable is empty but L0 SSTable exists
+    let names = db.list_namespaces().unwrap();
+    assert!(names.contains(&"data".to_owned()));
+}
+
+#[test]
+fn drop_namespace_removes_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace("users", None).unwrap();
+    ns.put("alice", "1", None).unwrap();
+    drop(ns);
+
+    db.drop_namespace("users").unwrap();
+
+    let names = db.list_namespaces().unwrap();
+    assert!(!names.contains(&"users".to_owned()));
+}
+
+#[test]
+fn drop_namespace_removes_sstable_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace("logs", None).unwrap();
+    ns.put("entry1", "data", None).unwrap();
+    drop(ns);
+    db.flush().unwrap();
+
+    // Verify SSTable dir exists
+    let sst_dir = tmp.path().join("sst").join("logs");
+    assert!(sst_dir.exists());
+
+    db.drop_namespace("logs").unwrap();
+    assert!(!sst_dir.exists());
+}
+
+#[test]
+fn drop_namespace_removes_object_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.object_size = 0; // Force all values to bin objects
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace("blobs", None).unwrap();
+    ns.put("big", "some data", None).unwrap();
+    drop(ns);
+
+    let obj_dir = tmp.path().join("objects").join("blobs");
+    assert!(obj_dir.exists());
+
+    db.drop_namespace("blobs").unwrap();
+    assert!(!obj_dir.exists());
+}
+
+#[test]
+fn drop_namespace_removes_crypto_salt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace("secret", Some("pass123")).unwrap();
+    ns.put("k", "v", None).unwrap();
+    drop(ns);
+
+    let salt_path = tmp.path().join("crypto").join("secret.salt");
+    assert!(salt_path.exists());
+
+    db.drop_namespace("secret").unwrap();
+    assert!(!salt_path.exists());
+}
+
+#[test]
+fn drop_namespace_does_not_affect_other_namespaces() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let ns1 = db.namespace("keep", None).unwrap();
+    ns1.put("k1", "v1", None).unwrap();
+    let ns2 = db.namespace("remove", None).unwrap();
+    ns2.put("k2", "v2", None).unwrap();
+    drop(ns1);
+    drop(ns2);
+
+    db.drop_namespace("remove").unwrap();
+
+    let ns1 = db.namespace("keep", None).unwrap();
+    assert_eq!(ns1.get("k1").unwrap(), Value::from("v1"));
+}
+
+#[test]
+fn drop_namespace_survives_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().to_path_buf();
+
+    {
+        let config = Config::new(&db_path);
+        let db = DB::open(config).unwrap();
+
+        let ns = db.namespace("ephemeral", None).unwrap();
+        ns.put("k", "v", None).unwrap();
+        drop(ns);
+
+        db.drop_namespace("ephemeral").unwrap();
+        db.close().unwrap();
+    }
+
+    // Reopen — dropped namespace should not reappear
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+
+    let names = db.list_namespaces().unwrap();
+    assert!(!names.contains(&"ephemeral".to_owned()));
+}
+
+#[test]
+fn drop_empty_name_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    let err = db.drop_namespace("").unwrap_err();
+    assert!(matches!(err, Error::InvalidNamespace(_)));
+}
+
+#[test]
+fn list_namespaces_sorted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+
+    for name in &["zeta", "alpha", "mid"] {
+        let ns = db.namespace(name, None).unwrap();
+        ns.put("k", "v", None).unwrap();
+    }
+
+    let names = db.list_namespaces().unwrap();
+    assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+}
