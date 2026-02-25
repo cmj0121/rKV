@@ -17,9 +17,9 @@ pub(crate) struct ObjectStore {
 }
 
 impl ObjectStore {
-    /// Open (or create) the object store directory under `db_dir`.
-    pub(crate) fn open(db_dir: &Path) -> Result<Self> {
-        let base = db_dir.join("objects");
+    /// Open (or create) the object store directory for a namespace under `db_dir`.
+    pub(crate) fn open(db_dir: &Path, ns: &str) -> Result<Self> {
+        let base = db_dir.join("objects").join(ns);
         fs::create_dir_all(&base)?;
         Ok(Self { base })
     }
@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn write_read_roundtrip_raw() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_").unwrap();
 
         let data = b"hello world, this is a test value";
         let vp = store.write(data, false).unwrap();
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn write_read_roundtrip_compressed() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_").unwrap();
 
         let data = b"hello world, this is a test value for compression";
         let vp = store.write(data, true).unwrap();
@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn dedup_same_content() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_").unwrap();
 
         let data = b"same content";
         let vp1 = store.write(data, true).unwrap();
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn exists_after_write() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_").unwrap();
 
         let data = b"some data";
         let vp = store.write(data, false).unwrap();
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn exists_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_").unwrap();
 
         let vp = ValuePointer::new([0xFFu8; 32], 100);
         assert!(!store.exists(&vp));
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn read_missing_file_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_").unwrap();
 
         let vp = ValuePointer::new([0xFFu8; 32], 100);
         let err = store.read(&vp, false).unwrap_err();
@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn read_empty_file_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_").unwrap();
 
         // Create an empty file at the object path
         let vp = ValuePointer::new([0xAAu8; 32], 100);
@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn blake3_verification_catches_corruption() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_").unwrap();
 
         let data = b"test data for verification";
         let vp = store.write(data, false).unwrap();
@@ -233,19 +233,23 @@ mod tests {
     #[test]
     fn fan_out_directory_created() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_").unwrap();
 
         let data = b"test data";
         let vp = store.write(data, false).unwrap();
 
-        let fan_out_dir = tmp.path().join("objects").join(vp.fan_out_prefix());
+        let fan_out_dir = tmp
+            .path()
+            .join("objects")
+            .join("_")
+            .join(vp.fan_out_prefix());
         assert!(fan_out_dir.is_dir());
     }
 
     #[test]
     fn large_value_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_").unwrap();
 
         // 64 KB of data
         let data: Vec<u8> = (0..65536).map(|i| (i % 256) as u8).collect();

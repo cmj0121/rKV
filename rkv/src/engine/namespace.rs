@@ -58,7 +58,7 @@ impl<'db> Namespace<'db> {
         ttl: Option<Duration>,
     ) -> Result<RevisionID> {
         let key = key.into();
-        let value = self.db.maybe_separate_value(value.into())?;
+        let value = self.db.maybe_separate_value(&self.name, value.into())?;
         let rev = self.db.generate_revision();
         self.db
             .append_to_aol(&self.name, rev.as_u128(), &key, &value, ttl)?;
@@ -75,7 +75,7 @@ impl<'db> Namespace<'db> {
             let mt = mt.lock().unwrap();
             mt.get(&key).cloned().ok_or(Error::KeyNotFound)?
         };
-        self.db.resolve_value(&value)
+        self.db.resolve_value(&self.name, &value)
     }
 
     pub fn delete(&self, key: impl Into<Key>) -> Result<()> {
@@ -130,7 +130,7 @@ impl<'db> Namespace<'db> {
             let mt = mt.lock().unwrap();
             mt.rev_get(&key, index).cloned().ok_or(Error::KeyNotFound)?
         };
-        self.db.resolve_value(&value)
+        self.db.resolve_value(&self.name, &value)
     }
 
     /// Returns the remaining TTL for a key, or `None` if the key has no expiration.
