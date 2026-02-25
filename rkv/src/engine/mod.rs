@@ -572,7 +572,29 @@ impl DB {
             aol.truncate(&self.config.path)?;
         }
 
+        // Auto-compact if any namespace's L0 exceeds thresholds
+        if flushed_any && self.should_compact() {
+            self.compact()?;
+        }
+
         Ok(())
+    }
+
+    /// Check if any namespace's L0 level exceeds the compaction thresholds.
+    fn should_compact(&self) -> bool {
+        let sst = self.sstables.read().unwrap();
+        for (_ns, levels) in sst.iter() {
+            if let Some(l0_readers) = levels.first() {
+                if l0_readers.len() >= self.config.l0_max_count {
+                    return true;
+                }
+                let l0_size: usize = l0_readers.iter().map(|r| r.size_bytes()).sum();
+                if l0_size >= self.config.l0_max_size {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Flush and fsync all data to durable storage.
