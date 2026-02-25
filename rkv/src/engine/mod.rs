@@ -633,44 +633,94 @@ impl DB {
 
     /// Compact a single namespace: merge L0 + L1 into a new L1 SSTable.
     fn compact_namespace(&self, ns: &str) -> Result<()> {
-        // Collect file paths to delete after successful merge.
-        // We need these before we replace the readers.
+        // Nothing to compact if L0 is empty
+        {
+            let sst = self.sstables.read().unwrap();
+            let has_l0 = sst
+                .get(ns)
+                .and_then(|levels| levels.first())
+                .is_some_and(|l0| !l0.is_empty());
+            if !has_l0 {
+                return Ok(());
+            }
+        }
+
+        self.merge_two_levels(ns, 0, 1, false)?;
+        Ok(())
+    }
+
+    /// Merge all SSTables from `source_level` into `target_level`.
+    ///
+    /// Target entries are loaded first (oldest), then source entries
+    /// (newer wins via BTreeMap). For L0 source, readers are iterated
+    /// in reverse (oldest-to-newest); for L1+ source, natural order.
+    ///
+    /// If `drop_tombstones` is true, tombstones are filtered from the
+    /// output (safe only when target is the bottommost level).
+    ///
+    /// Returns the output SSTable size in bytes (0 if nothing to merge).
+    fn merge_two_levels(
+        &self,
+        ns: &str,
+        source_level: usize,
+        target_level: usize,
+        drop_tombstones: bool,
+    ) -> Result<usize> {
         let (source_paths, merged) = {
             let sst = self.sstables.read().unwrap();
             let levels = match sst.get(ns) {
                 Some(l) => l,
-                None => return Ok(()),
+                None => return Ok(0),
             };
 
-            let l0 = levels.first().map(|v| v.as_slice()).unwrap_or(&[]);
-            let l1 = levels.get(1).map(|v| v.as_slice()).unwrap_or(&[]);
+            let source = levels
+                .get(source_level)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let target = levels
+                .get(target_level)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
 
-            // Nothing to compact if L0 is empty
-            if l0.is_empty() {
-                return Ok(());
+            if source.is_empty() {
+                return Ok(0);
             }
 
             // Merge all entries: process oldest-to-newest so newer values
             // overwrite older ones in the BTreeMap.
             let mut merged = std::collections::BTreeMap::<Key, Value>::new();
 
-            // L1 entries are oldest
-            for reader in l1 {
+            // Target entries are oldest
+            for reader in target {
                 for (key, value) in reader.iter_entries(self.config.verify_checksums)? {
                     merged.insert(key, value);
                 }
             }
 
-            // L0 entries: iterate oldest-to-newest (reverse of newest-first order)
-            for reader in l0.iter().rev() {
-                for (key, value) in reader.iter_entries(self.config.verify_checksums)? {
-                    merged.insert(key, value);
+            // Source entries: L0 iterate oldest-to-newest (reverse of newest-first);
+            // L1+ iterate in natural order.
+            if source_level == 0 {
+                for reader in source.iter().rev() {
+                    for (key, value) in reader.iter_entries(self.config.verify_checksums)? {
+                        merged.insert(key, value);
+                    }
                 }
+            } else {
+                for reader in source {
+                    for (key, value) in reader.iter_entries(self.config.verify_checksums)? {
+                        merged.insert(key, value);
+                    }
+                }
+            }
+
+            // Filter tombstones if requested
+            if drop_tombstones {
+                merged.retain(|_, v| !v.is_tombstone());
             }
 
             // Collect source file paths for cleanup by scanning disk
             let mut source_paths = Vec::new();
-            for level in [0, 1] {
+            for level in [source_level, target_level] {
                 let level_dir = self.sst_level_dir(ns, level);
                 if level_dir.exists() {
                     for entry in fs::read_dir(&level_dir)? {
@@ -693,21 +743,21 @@ impl DB {
             }
             let mut sst = self.sstables.write().unwrap();
             if let Some(levels) = sst.get_mut(ns) {
-                if !levels.is_empty() {
-                    levels[0].clear();
+                if let Some(s) = levels.get_mut(source_level) {
+                    s.clear();
                 }
-                if levels.len() > 1 {
-                    levels[1].clear();
+                if let Some(t) = levels.get_mut(target_level) {
+                    t.clear();
                 }
             }
-            return Ok(());
+            return Ok(0);
         }
 
-        // Write merged output as a new L1 SSTable
+        // Write merged output as a new SSTable in target level
         let seq = self.sst_sequence.fetch_add(1, Ordering::Relaxed) + 1;
-        let l1_dir = self.sst_level_dir(ns, 1);
-        fs::create_dir_all(&l1_dir)?;
-        let output_path = l1_dir.join(format!("{seq:06}.sst"));
+        let target_dir = self.sst_level_dir(ns, target_level);
+        fs::create_dir_all(&target_dir)?;
+        let output_path = target_dir.join(format!("{seq:06}.sst"));
 
         let mut writer = sstable::SSTableWriter::new(
             &output_path,
@@ -726,21 +776,32 @@ impl DB {
 
         // Open the new reader and update the in-memory level structure
         let reader = sstable::SSTableReader::open(&output_path)?;
+        let output_size = reader.size_bytes();
         let mut sst = self.sstables.write().unwrap();
         let levels = sst.entry(ns.to_owned()).or_insert_with(|| vec![Vec::new()]);
 
-        // Clear L0
-        if !levels.is_empty() {
-            levels[0].clear();
+        // Clear source level
+        if let Some(s) = levels.get_mut(source_level) {
+            s.clear();
         }
 
-        // Set L1 to the single merged reader
-        while levels.len() <= 1 {
+        // Set target level to the single merged reader
+        while levels.len() <= target_level {
             levels.push(Vec::new());
         }
-        levels[1] = vec![reader];
+        levels[target_level] = vec![reader];
 
-        Ok(())
+        Ok(output_size)
+    }
+
+    /// Maximum size in bytes for a given level before it should be compacted.
+    #[allow(dead_code)] // consumed by cascade compaction in a later commit
+    fn level_max_size(&self, level: usize) -> usize {
+        match level {
+            0 => usize::MAX, // L0 uses count/size triggers, not a cap
+            1 => self.config.l1_max_size,
+            _ => self.config.default_max_size,
+        }
     }
 
     // --- Internal helpers ---
