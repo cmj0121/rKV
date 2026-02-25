@@ -807,22 +807,23 @@ fn repair_returns_not_implemented() {
 }
 
 #[test]
-fn dump_returns_not_implemented() {
+fn dump_basic_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
-    let config = Config::new(tmp.path());
+    let config = Config::new(tmp.path().join("source"));
     let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+    ns.put(1, "hello", None).unwrap();
+    drop(ns);
 
-    let err = db.dump("/tmp/rkv_test_dump.bak").unwrap_err();
-    assert!(matches!(err, Error::NotImplemented(_)));
-}
+    let dump_path = tmp.path().join("backup.rkv");
+    db.dump(&dump_path).unwrap();
+    db.close().unwrap();
 
-#[test]
-fn load_returns_not_implemented() {
-    let result = DB::load(PathBuf::from("/tmp/rkv_test_load.bak"));
-    let Err(err) = result else {
-        panic!("expected NotImplemented error");
-    };
-    assert!(matches!(err, Error::NotImplemented(_)));
+    // Load into a fresh location (remove old DB first)
+    std::fs::remove_dir_all(tmp.path().join("source")).unwrap();
+    let db2 = DB::load(&dump_path).unwrap();
+    let ns2 = db2.namespace("_", None).unwrap();
+    assert_eq!(ns2.get(1).unwrap(), Value::from("hello"));
 }
 
 #[test]
