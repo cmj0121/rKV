@@ -522,11 +522,40 @@ possible. It returns a `RecoveryReport` describing what was scanned, recovered, 
 | `dump` | instance | `&self, path: impl Into<PathBuf> -> Result<()>` | Export database to a portable backup file |
 | `load` | static   | `(path: impl Into<PathBuf>) -> Result<DB>`      | Import database from a backup file        |
 
-`dump` serializes the entire database (all namespaces, keys, values, and metadata) into a
-self-contained backup file. `load` is static and returns a new `DB` — the backup file encodes
-its own configuration, so no separate `Config` is needed.
+`dump` flushes all in-memory write buffers, merges SSTable levels per namespace
+(same strategy as compaction), filters tombstones, resolves `Pointer` values to
+inline `Data`, and writes each entry to the dump file with a CRC32C checksum.
+Encrypted namespaces are skipped (v1 limitation).
 
-`load` is not exposed in the CLI because it would require replacing the live DB handle mid-session.
+`load` reads the dump file, creates a fresh DB at the stored path, replays all
+records via `namespace.put()`, and flushes. Returns `InvalidConfig` if the target
+path already contains data.
+
+`load` is not exposed in the CLI because it would require replacing the live DB
+handle mid-session.
+
+##### Dump File Format
+
+```text
+Header:
+  [magic: 4B "rKVD"]  [version: 2B BE]
+  [path_len: 2B BE]   [path: UTF-8 bytes]
+
+Records (repeating):
+  [payload_len: 4B BE] [payload] [checksum: 5B CRC32C]
+
+Payload:
+  [ns_len: 2B BE]  [namespace]
+  [key_len: 2B BE] [key_bytes]
+  [value_tag: 1B]  [value_data_len: 4B BE] [value_data]
+  [expires_at_ms: 8B BE]
+
+EOF sentinel:
+  [payload_len: 4B = 0x00000000]
+```
+
+The format mirrors the AOL record layout for consistency. Each record is
+self-describing and independently verifiable via its checksum.
 
 #### Compaction
 
