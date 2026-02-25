@@ -607,6 +607,13 @@ Compaction is idempotent — calling it when L0 is empty is a no-op. After compa
 new flushes continue writing to L0 and a subsequent compact merges them into L1 again.
 When `max_levels` is 1, compaction is a no-op (no merge target available).
 
+##### Auto-Compaction
+
+After each `flush()`, the engine checks whether any namespace's L0 level exceeds
+the configured thresholds (`l0_max_count` or `l0_max_size`). If either threshold
+is met, `compact()` is called automatically. This eliminates the need for manual
+compaction in typical workloads while still allowing explicit `compact()` calls.
+
 ##### Bin Object GC
 
 After all level merges complete for a namespace, compaction runs a
