@@ -1,6 +1,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use super::crypto;
 use super::error::{Error, Result};
 use super::key::Key;
 use super::revision::RevisionID;
@@ -15,6 +16,7 @@ pub struct Namespace<'db> {
     db: &'db DB,
     name: String,
     encrypted: bool,
+    encryption_key: Option<[u8; 32]>,
 }
 
 impl fmt::Debug for Namespace<'_> {
@@ -34,10 +36,17 @@ impl<'db> Namespace<'db> {
                 "namespace name must not be empty".into(),
             ));
         }
+        let encryption_key = if let Some(pw) = password {
+            let salt = crypto::load_or_create_salt(&db.config().path, name)?;
+            Some(crypto::derive_key(pw, &salt))
+        } else {
+            None
+        };
         Ok(Self {
             db,
             name: name.to_owned(),
             encrypted: password.is_some(),
+            encryption_key,
         })
     }
 
@@ -51,6 +60,29 @@ impl<'db> Namespace<'db> {
         self.encrypted
     }
 
+    /// Encrypt a value's data bytes if this namespace is encrypted.
+    /// Non-Data variants (Null, Tombstone, Pointer) pass through unchanged.
+    fn encrypt_value(&self, value: Value) -> Value {
+        if let Some(ref key) = self.encryption_key {
+            if let Value::Data(ref plaintext) = value {
+                return Value::Data(crypto::encrypt(key, plaintext));
+            }
+        }
+        value
+    }
+
+    /// Decrypt a value's data bytes if this namespace is encrypted.
+    /// Non-Data variants pass through unchanged.
+    fn decrypt_value(&self, value: Value) -> Result<Value> {
+        if let Some(ref key) = self.encryption_key {
+            if let Value::Data(ref ciphertext) = value {
+                let plaintext = crypto::decrypt(key, ciphertext)?;
+                return Ok(Value::Data(plaintext));
+            }
+        }
+        Ok(value)
+    }
+
     pub fn put(
         &self,
         key: impl Into<Key>,
@@ -58,7 +90,8 @@ impl<'db> Namespace<'db> {
         ttl: Option<Duration>,
     ) -> Result<RevisionID> {
         let key = key.into();
-        let value = self.db.maybe_separate_value(&self.name, value.into())?;
+        let value = self.encrypt_value(value.into());
+        let value = self.db.maybe_separate_value(&self.name, value)?;
         let rev = self.db.generate_revision();
         self.db
             .append_to_aol(&self.name, rev.as_u128(), &key, &value, ttl)?;
@@ -77,7 +110,8 @@ impl<'db> Namespace<'db> {
             let mt = mt.lock().unwrap();
             mt.get(&key).cloned().ok_or(Error::KeyNotFound)?
         };
-        self.db.resolve_value(&self.name, &value)
+        let value = self.db.resolve_value(&self.name, &value)?;
+        self.decrypt_value(value)
     }
 
     pub fn delete(&self, key: impl Into<Key>) -> Result<()> {
@@ -197,7 +231,8 @@ impl<'db> Namespace<'db> {
             let mt = mt.lock().unwrap();
             mt.rev_get(&key, index).cloned().ok_or(Error::KeyNotFound)?
         };
-        self.db.resolve_value(&self.name, &value)
+        let value = self.db.resolve_value(&self.name, &value)?;
+        self.decrypt_value(value)
     }
 
     /// Returns the remaining TTL for a key, or `None` if the key has no expiration.

@@ -1,7 +1,6 @@
 mod aol;
 mod bloom;
 mod checksum;
-#[allow(dead_code)]
 pub(crate) mod crypto;
 mod error;
 mod io;
