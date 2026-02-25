@@ -2,6 +2,7 @@ mod aol;
 mod bloom;
 mod checksum;
 pub(crate) mod crypto;
+mod dump;
 mod error;
 mod io;
 mod key;
@@ -600,15 +601,111 @@ impl DB {
     // --- Dump / Load ---
 
     /// Export the database to a portable backup file.
+    ///
+    /// Flushes all in-memory write buffers, then iterates every namespace's
+    /// SSTables to produce a self-contained dump. Tombstones are filtered,
+    /// `Pointer` values are resolved to inline `Data`, and expired entries
+    /// are skipped. Encrypted namespaces are skipped (no password available
+    /// for decryption during raw iteration).
     pub fn dump(&self, path: impl Into<PathBuf>) -> Result<()> {
-        let _path = path.into();
-        Err(Error::NotImplemented("dump".into()))
+        let dump_path = path.into();
+
+        // Flush memtables so all data is in SSTables
+        self.flush()?;
+
+        let mut writer = dump::DumpWriter::new(&dump_path)?;
+        writer.write_header(&self.config.path)?;
+
+        let namespaces = self.list_namespaces()?;
+
+        for ns_name in &namespaces {
+            // Skip encrypted namespaces
+            {
+                let enc = self.encrypted_namespaces.lock().unwrap();
+                if enc.get(ns_name).copied().unwrap_or(false) {
+                    continue;
+                }
+            }
+
+            // Merge all SSTable levels into a single sorted map (bottom-up,
+            // newest wins) — same merge strategy as compaction.
+            let merged = {
+                let sst = self.sstables.read().unwrap();
+                let levels = match sst.get(ns_name) {
+                    Some(l) => l,
+                    None => continue,
+                };
+
+                let mut merged = std::collections::BTreeMap::<Key, Value>::new();
+
+                // Process levels from bottom (oldest) to top (newest)
+                for (level_idx, level_readers) in levels.iter().enumerate().rev() {
+                    if level_idx == 0 {
+                        // L0: reverse (oldest-to-newest within L0)
+                        for reader in level_readers.iter().rev() {
+                            for (key, value) in reader.iter_entries(self.config.verify_checksums)? {
+                                merged.insert(key, value);
+                            }
+                        }
+                    } else {
+                        for reader in level_readers {
+                            for (key, value) in reader.iter_entries(self.config.verify_checksums)? {
+                                merged.insert(key, value);
+                            }
+                        }
+                    }
+                }
+
+                // Filter tombstones
+                merged.retain(|_, v| !v.is_tombstone());
+                merged
+            };
+
+            for (key, value) in &merged {
+                // Resolve Pointer → inline Data
+                let resolved = self.resolve_value(ns_name, value)?;
+                // TTL is not preserved — SSTables don't store expiry.
+                writer.write_record(ns_name, key, &resolved, 0)?;
+            }
+        }
+
+        writer.finish()?;
+        Ok(())
     }
 
     /// Import a database from a portable backup file.
+    ///
+    /// Reads the dump file header to recover the original DB path, creates
+    /// a fresh database at that path, and replays all records. Returns the
+    /// populated `DB` handle. Expired entries are skipped during import.
+    ///
+    /// Returns `InvalidConfig` if the target path already contains data.
     pub fn load(path: impl Into<PathBuf>) -> Result<DB> {
-        let _path = path.into();
-        Err(Error::NotImplemented("load".into()))
+        let dump_path = path.into();
+
+        let mut reader = dump::DumpReader::open(&dump_path)?;
+        let header = reader.read_header()?;
+
+        let db_path = PathBuf::from(&header.db_path);
+
+        // Refuse to overwrite an existing database
+        if db_path.exists() && fs::read_dir(&db_path)?.next().is_some() {
+            return Err(Error::InvalidConfig(format!(
+                "target path '{}' is not empty",
+                db_path.display()
+            )));
+        }
+
+        let config = Config::new(&db_path);
+        let db = DB::open(config)?;
+
+        while let Some(record) = reader.read_record(true)? {
+            let ns = db.namespace(&record.namespace, None)?;
+            ns.put(record.key, record.value, None)?;
+        }
+
+        db.flush()?;
+        Ok(db)
     }
 
     // --- Compaction ---
