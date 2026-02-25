@@ -4,14 +4,14 @@
 
 ## Environment
 
-| Field  | Value                                    |
-| ------ | ---------------------------------------- |
-| OS     | macos aarch64                            |
-| CPU    | Apple M2 Pro                             |
-| Cores  | 10                                       |
-| Memory | 16 GB                                    |
-| Rust   | 1.90.0 (1159e78c4 2025-09-14) (Homebrew) |
-| Date   | 2026-02-25                               |
+| Field  | Value                           |
+| ------ | ------------------------------- |
+| OS     | linux x86_64                    |
+| CPU    | AMD EPYC 7763 64-Core Processor |
+| Cores  | 2                               |
+| Memory | 7 GB                            |
+| Rust   | 1.93.1 (01f6ddf75 2026-02-11)   |
+| Date   | 2026-02-25                      |
 
 ## Methodology
 
@@ -29,14 +29,14 @@ Wall-clock time is measured via `std::time::Instant`.
 
 ## Results
 
-| Operation | 1K        | 8K        | 16K       | 1M        |
-| --------- | --------- | --------- | --------- | --------- |
-| put       | 460 µs    | 6.53 ms   | 14.72 ms  | 918.81 ms |
-| get       | 141 µs    | 4.91 ms   | 7.21 ms   | 723.60 ms |
-| delete    | 238 µs    | 2.22 ms   | 4.10 ms   | 727.89 ms |
-| scan      | 16 µs     | 138 µs    | 343 µs    | 28.27 ms  |
-| put_obj   | 176.85 ms | 1.32 s    | 2.97 s    | 441.35 s  |
-| get_obj   | 21.59 ms  | 180.89 ms | 516.36 ms | 352.86 s  |
+| Operation | 1K       | 8K        | 16K       | 1M        |
+| --------- | -------- | --------- | --------- | --------- |
+| put       | 664 µs   | 6.51 ms   | 12.41 ms  | 837.29 ms |
+| get       | 158 µs   | 1.96 ms   | 3.44 ms   | 663.95 ms |
+| delete    | 381 µs   | 2.83 ms   | 5.67 ms   | 518.17 ms |
+| scan      | 11 µs    | 199 µs    | 201 µs    | 37.11 ms  |
+| put_obj   | 56.82 ms | 410.45 ms | 857.89 ms | 147.13 s  |
+| get_obj   | 11.31 ms | 93.35 ms  | 189.17 ms | 169.13 s  |
 
 ## Reproduce
 
