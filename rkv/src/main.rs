@@ -329,6 +329,11 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                     format_bytes(c.block_size),
                 ),
                 (
+                    "  lsm.compression",
+                    "SSTable block compression",
+                    c.compression.to_string(),
+                ),
+                (
                     "  lsm.cache_size",
                     "block cache size",
                     format_bytes(c.cache_size),
@@ -541,6 +546,13 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected a number"),
+        },
+        "lsm.compression" => match value.parse::<rkv::Compression>() {
+            Ok(v) => {
+                c.compression = v;
+                println!("OK");
+            }
+            Err(e) => eprintln!("error: {e}"),
         },
         "lsm.cache_size" => match value.parse::<usize>() {
             Ok(v) => {
