@@ -77,7 +77,7 @@ impl Aol {
             Some(d) => {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_millis() as u64;
                 now + d.as_millis() as u64
             }
