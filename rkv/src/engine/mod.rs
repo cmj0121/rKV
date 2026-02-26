@@ -838,12 +838,13 @@ impl DB {
         let mut good_records: Vec<aol::AolRecord> = Vec::new();
         if aol_file.exists() {
             let (records, skipped) = aol::Aol::replay(&path, true)?;
-            report.wal_records_scanned = (records.len() as u64) + skipped;
-            report.wal_records_skipped = skipped;
-            if skipped > 0 {
-                report.warnings.push(format!(
-                    "AOL: {skipped} corrupted/truncated record(s) skipped"
-                ));
+            let skipped_count = skipped.len() as u64;
+            report.wal_records_scanned = (records.len() as u64) + skipped_count;
+            report.wal_records_skipped = skipped_count;
+            if !skipped.is_empty() {
+                for detail in &skipped {
+                    report.warnings.push(format!("AOL: {detail}"));
+                }
             }
             good_records = records;
         }

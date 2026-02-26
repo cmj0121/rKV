@@ -138,15 +138,15 @@ impl Aol {
     /// skipped (corrupted/truncated) records.
     ///
     /// This is a static method — it reads the file independently of `Aol`.
-    pub(crate) fn replay(db_dir: &Path, verify: bool) -> Result<(Vec<AolRecord>, u64)> {
+    pub(crate) fn replay(db_dir: &Path, verify: bool) -> Result<(Vec<AolRecord>, Vec<String>)> {
         let path = aol_path(db_dir);
         if !path.exists() {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), Vec::new()));
         }
 
         let data = std::fs::read(&path)?;
         if data.len() < HEADER_SIZE {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), Vec::new()));
         }
 
         // Validate header
@@ -163,12 +163,14 @@ impl Aol {
 
         let mut pos = HEADER_SIZE;
         let mut records = Vec::new();
-        let mut skipped = 0u64;
+        let mut skipped: Vec<String> = Vec::new();
 
         while pos < data.len() {
+            let record_offset = pos;
+
             // Need at least 4 bytes for payload_len
             if pos + 4 > data.len() {
-                skipped += 1;
+                skipped.push(format!("offset {record_offset}: truncated payload_len"));
                 break;
             }
             // SAFETY: bounds checked above — slice is exactly 4 bytes
@@ -177,7 +179,11 @@ impl Aol {
 
             // Need payload + 5 checksum bytes
             if pos + payload_len + Checksum::encoded_size() > data.len() {
-                skipped += 1;
+                skipped.push(format!(
+                    "offset {record_offset}: truncated record (need {}, have {})",
+                    payload_len + Checksum::encoded_size(),
+                    data.len() - pos
+                ));
                 break;
             }
 
@@ -191,21 +197,23 @@ impl Aol {
             if verify {
                 let cs = match Checksum::from_bytes(checksum_bytes) {
                     Ok(cs) => cs,
-                    Err(_) => {
-                        skipped += 1;
+                    Err(e) => {
+                        skipped.push(format!("offset {record_offset}: checksum parse error: {e}"));
                         continue;
                     }
                 };
-                if cs.verify(payload).is_err() {
-                    skipped += 1;
+                if let Err(e) = cs.verify(payload) {
+                    skipped.push(format!(
+                        "offset {record_offset}: checksum verification failed: {e}"
+                    ));
                     continue;
                 }
             }
 
             match decode_payload(payload) {
                 Ok(record) => records.push(record),
-                Err(_) => {
-                    skipped += 1;
+                Err(e) => {
+                    skipped.push(format!("offset {record_offset}: decode error: {e}"));
                 }
             }
         }
@@ -502,7 +510,7 @@ mod tests {
 
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert_eq!(records.len(), 2);
-        assert_eq!(skipped, 0);
+        assert!(skipped.is_empty());
         assert_eq!(records[0].key, Key::Int(1));
         assert_eq!(records[0].value, Value::from("v1"));
         assert_eq!(records[1].key, Key::Int(2));
@@ -514,7 +522,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert!(records.is_empty());
-        assert_eq!(skipped, 0);
+        assert!(skipped.is_empty());
     }
 
     #[test]
@@ -570,7 +578,7 @@ mod tests {
 
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert!(records.is_empty());
-        assert_eq!(skipped, 1);
+        assert_eq!(skipped.len(), 1);
     }
 
     #[test]
@@ -590,7 +598,7 @@ mod tests {
 
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert!(records.is_empty());
-        assert_eq!(skipped, 1);
+        assert_eq!(skipped.len(), 1);
     }
 
     #[test]
@@ -613,7 +621,7 @@ mod tests {
         // Without verification, the record should still be decoded
         let (records, skipped) = Aol::replay(tmp.path(), false).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(skipped, 0);
+        assert!(skipped.is_empty());
     }
 
     #[test]
@@ -661,7 +669,7 @@ mod tests {
 
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert_eq!(records.len(), 2);
-        assert_eq!(skipped, 0);
+        assert!(skipped.is_empty());
     }
 
     // --- Buffered flush ---
@@ -741,7 +749,7 @@ mod tests {
         // After truncate, replay should return zero records
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert!(records.is_empty());
-        assert_eq!(skipped, 0);
+        assert!(skipped.is_empty());
 
         // File should be exactly the header size
         let data = std::fs::read(aol_path(tmp.path())).unwrap();
@@ -765,7 +773,7 @@ mod tests {
 
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(skipped, 0);
+        assert!(skipped.is_empty());
         assert_eq!(records[0].key, Key::Int(2));
         assert_eq!(records[0].value, Value::from("new"));
     }
@@ -870,7 +878,7 @@ mod tests {
 
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert_eq!(records.len(), 1); // first record OK
-        assert_eq!(skipped, 1); // truncated tail
+        assert_eq!(skipped.len(), 1); // truncated tail
     }
 
     #[test]
@@ -892,7 +900,7 @@ mod tests {
 
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert!(records.is_empty());
-        assert_eq!(skipped, 1);
+        assert_eq!(skipped.len(), 1);
     }
 
     #[test]
@@ -916,7 +924,7 @@ mod tests {
         // With verify=false, checksum passes but decode_payload may fail
         let (records, skipped) = Aol::replay(tmp.path(), false).unwrap();
         // Either way, records+skipped should account for the entry
-        assert_eq!(records.len() + skipped as usize, 1);
+        assert_eq!(records.len() + skipped.len(), 1);
     }
 
     #[test]
