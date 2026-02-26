@@ -423,21 +423,28 @@ I/O logic will be implemented when the storage layer is built.
 
 `db.stats()` returns a `Stats` snapshot with counters and metadata:
 
-| Field                 | Type       | Source                 | Description                           |
-| --------------------- | ---------- | ---------------------- | ------------------------------------- |
-| `total_keys`          | `u64`      | MemTable (live)        | Total number of live keys             |
-| `data_size_bytes`     | `u64`      | MemTable (live)        | Approximate data size in bytes        |
-| `namespace_count`     | `u64`      | MemTable map (live)    | Number of namespaces                  |
-| `level_count`         | `usize`    | Config                 | Number of LSM levels (from config)    |
-| `sstable_count`       | `u64`      | Stub (0)               | Total SSTable files across all levels |
-| `write_buffer_bytes`  | `u64`      | MemTable (live)        | Current write buffer usage            |
-| `pending_compactions` | `u64`      | Stub (0)               | Pending compaction tasks              |
-| `op_puts`             | `u64`      | AtomicU64 (persistent) | Cumulative put operations             |
-| `op_gets`             | `u64`      | AtomicU64 (persistent) | Cumulative get operations             |
-| `op_deletes`          | `u64`      | AtomicU64 (persistent) | Cumulative delete operations          |
-| `cache_hits`          | `u64`      | Stub (0)               | Block cache hits                      |
-| `cache_misses`        | `u64`      | Stub (0)               | Block cache misses                    |
-| `uptime`              | `Duration` | Instant (live)         | Time since `DB::open`                 |
+| Field                 | Type             | Source                 | Description                             |
+| --------------------- | ---------------- | ---------------------- | --------------------------------------- |
+| `total_keys`          | `u64`            | MemTable (live)        | Total number of live keys               |
+| `data_size_bytes`     | `u64`            | MemTable (live)        | Approximate data size in bytes          |
+| `namespace_count`     | `u64`            | MemTable map (live)    | Number of namespaces                    |
+| `level_count`         | `usize`          | Config                 | Number of LSM levels (from config)      |
+| `sstable_count`       | `u64`            | SSTables (live)        | Total SSTable files across all levels   |
+| `write_buffer_bytes`  | `u64`            | MemTable (live)        | Current write buffer usage              |
+| `pending_compactions` | `u64`            | SSTables (live)        | Levels exceeding compaction thresholds  |
+| `level_stats`         | `Vec<LevelStat>` | SSTables (live)        | Per-level file count and size breakdown |
+| `op_puts`             | `u64`            | AtomicU64 (persistent) | Cumulative put operations               |
+| `op_gets`             | `u64`            | AtomicU64 (persistent) | Cumulative get operations               |
+| `op_deletes`          | `u64`            | AtomicU64 (persistent) | Cumulative delete operations            |
+| `cache_hits`          | `u64`            | BlockCache (live)      | Block cache hits                        |
+| `cache_misses`        | `u64`            | BlockCache (live)      | Block cache misses                      |
+| `uptime`              | `Duration`       | Instant (live)         | Time since `DB::open`                   |
+
+`LevelStat` contains `file_count: u64` and `size_bytes: u64`. The `level_stats` vector has
+`max_levels` entries; `level_stats[i]` aggregates all namespaces at level `i`.
+
+`pending_compactions` counts L0 levels where file count >= `l0_max_count` or total size >=
+`l0_max_size`, plus L1+ levels where total size >= the level's max size threshold.
 
 `stats()` returns `Stats` directly (not `Result<Stats>`) — it cannot fail. Live fields are derived
 from MemTable state on each call. Operation counters are tracked via `AtomicU64` (Relaxed ordering)
