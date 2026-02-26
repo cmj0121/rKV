@@ -547,6 +547,7 @@ impl DB {
                 &sst_path,
                 self.config.block_size,
                 self.config.compression.clone(),
+                self.config.bloom_bits,
             )?;
             for (key, value) in &entries {
                 writer.add(key, value)?;
@@ -1100,6 +1101,7 @@ impl DB {
             &output_path,
             self.config.block_size,
             self.config.compression.clone(),
+            self.config.bloom_bits,
         )?;
         for (key, value) in &merged {
             writer.add(key, value)?;
