@@ -203,6 +203,9 @@ fn encode_payload(namespace: &str, key: &Key, value: &Value, expires_at_ms: u64)
     buf
 }
 
+/// Maximum namespace name length in bytes (sanity limit for untrusted data).
+const MAX_NAMESPACE_LEN: usize = 256;
+
 /// Decode a record payload into a DumpRecord.
 fn decode_payload(data: &[u8]) -> Result<DumpRecord> {
     let mut pos = 0;
@@ -218,6 +221,13 @@ fn decode_payload(data: &[u8]) -> Result<DumpRecord> {
             .map_err(|_| Error::Corruption("dump record truncated at ns_len bytes".into()))?,
     ) as usize;
     pos += 2;
+
+    if ns_len > MAX_NAMESPACE_LEN {
+        return Err(Error::Corruption(format!(
+            "dump record namespace length {ns_len} exceeds maximum {MAX_NAMESPACE_LEN}"
+        )));
+    }
+
     if pos + ns_len > data.len() {
         return Err(Error::Corruption(
             "dump record truncated at namespace".into(),
