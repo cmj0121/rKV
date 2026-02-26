@@ -1,7 +1,6 @@
 use super::error::Result;
 
 /// LevelDB-compatible hash function for bloom filter probe generation.
-#[allow(dead_code)]
 fn bloom_hash(data: &[u8]) -> u32 {
     let m: u32 = 0xc6a4_a793;
     let mut h: u32 = 0xbc9f_1d34_u32 ^ (data.len() as u32).wrapping_mul(m);
@@ -38,7 +37,6 @@ fn bloom_hash(data: &[u8]) -> u32 {
 /// serialize the filter. **Query phase**: call `from_bytes()` to
 /// deserialize, then `may_contain()` to test membership.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct BloomFilter {
     /// Bit array (populated after `build()` or `from_bytes()`).
     bits: Vec<u8>,
@@ -52,7 +50,6 @@ pub(crate) struct BloomFilter {
     key_hashes: Vec<u32>,
 }
 
-#[allow(dead_code)]
 impl BloomFilter {
     /// Create a new Bloom filter with the given bits-per-key setting.
     ///
@@ -109,6 +106,7 @@ impl BloomFilter {
     }
 
     /// Reset the filter to empty.
+    #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {
         self.bits.clear();
         self.key_hashes.clear();
@@ -116,16 +114,19 @@ impl BloomFilter {
     }
 
     /// Number of keys inserted.
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.num_keys as usize
     }
 
     /// Returns `true` if no keys have been inserted.
+    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.num_keys == 0
     }
 
     /// Returns the configured bits-per-key.
+    #[allow(dead_code)]
     pub(crate) fn bits_per_key(&self) -> usize {
         self.bits_per_key
     }
@@ -133,6 +134,7 @@ impl BloomFilter {
     /// Estimated false-positive rate based on filter parameters.
     ///
     /// Uses the formula: FPR ~ (1 - e^(-k*n/m))^k
+    #[allow(dead_code)]
     pub(crate) fn estimated_fpr(&self) -> f64 {
         if self.bits.is_empty() || self.num_keys == 0 {
             return 1.0;
