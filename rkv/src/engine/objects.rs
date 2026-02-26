@@ -114,7 +114,7 @@ impl ObjectStore {
     }
 
     /// Check if an object file exists.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn exists(&self, vp: &ValuePointer) -> bool {
         self.object_path(vp).exists()
     }

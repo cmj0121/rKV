@@ -48,13 +48,13 @@ impl Checksum {
     }
 
     /// Return the algorithm used for this checksum.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn algo(&self) -> ChecksumAlgo {
         self.algo
     }
 
     /// Return the raw checksum value.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn value(&self) -> u32 {
         self.value
     }
@@ -100,7 +100,7 @@ impl Checksum {
     }
 
     /// Construct a checksum directly from an algorithm and value.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn from_raw(algo: ChecksumAlgo, value: u32) -> Self {
         Self { algo, value }
     }

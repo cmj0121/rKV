@@ -345,6 +345,7 @@ pub(crate) struct SSTableReader {
     /// Prefix length used to build the prefix bloom (0 = none).
     bloom_prefix_len: usize,
     /// First key in the SSTable (serialized bytes), for range filtering.
+    #[allow(dead_code)] // accessed via #[cfg(test)] first_key() method
     first_key: Option<Vec<u8>>,
     /// Unique SSTable identifier (sequence number from file naming).
     sst_id: u64,
@@ -793,7 +794,7 @@ impl SSTableReader {
     }
 
     /// Return the first key in this SSTable (serialized bytes), if any.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn first_key(&self) -> Option<&[u8]> {
         self.first_key.as_deref()
     }
@@ -880,13 +881,13 @@ impl SSTableReader {
     }
 
     /// Return the total number of entries in this SSTable.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn entry_count(&self) -> u64 {
         self.entry_count
     }
 
     /// Return the number of data blocks in this SSTable.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn block_count(&self) -> usize {
         self.index.len()
     }

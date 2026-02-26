@@ -148,7 +148,6 @@ impl MemTable {
     }
 
     /// Returns the approximate memory usage in bytes.
-    #[allow(dead_code)]
     pub(crate) fn approximate_size(&self) -> usize {
         self.approximate_size
     }
@@ -159,19 +158,18 @@ impl MemTable {
     }
 
     /// Returns true if the approximate size meets or exceeds the limit.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn is_full(&self, limit: usize) -> bool {
         self.approximate_size >= limit
     }
 
     /// Total number of keys in the table (including tombstoned/expired).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Returns true if the table contains no keys.
-    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -182,7 +180,7 @@ impl MemTable {
     /// - **Unordered mode** (Str keys): prefix matching on string representation.
     ///
     /// Tombstoned and expired keys are excluded.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn scan(&self, prefix: &Key, limit: usize, offset: usize) -> Vec<Key> {
         if self.ordered_mode {
             self.entries
@@ -212,7 +210,7 @@ impl MemTable {
     /// - **Unordered mode**: prefix matching, reverse iteration order.
     ///
     /// Tombstoned and expired keys are excluded.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn rscan(&self, prefix: &Key, limit: usize, offset: usize) -> Vec<Key> {
         if self.ordered_mode {
             self.entries
@@ -289,7 +287,7 @@ impl MemTable {
     ///
     /// Like `scan()` but includes tombstones (needed to shadow SSTable entries
     /// during merge). Expired entries are still skipped.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn scan_raw(&self, prefix: &Key, limit: usize, offset: usize) -> Vec<(Key, Value)> {
         if self.ordered_mode {
             self.entries
@@ -316,7 +314,7 @@ impl MemTable {
     /// Reverse scan keys starting from `prefix`, returning raw `(Key, Value)` pairs.
     ///
     /// Like `rscan()` but includes tombstones. Expired entries are skipped.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn rscan_raw(&self, prefix: &Key, limit: usize, offset: usize) -> Vec<(Key, Value)> {
         if self.ordered_mode {
             self.entries

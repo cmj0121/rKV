@@ -22,7 +22,6 @@ pub enum Value {
 
 impl Value {
     /// Create a tombstone value (crate-internal only).
-    #[allow(dead_code)]
     pub(crate) fn tombstone() -> Self {
         Value::Tombstone
     }
@@ -51,7 +50,6 @@ impl Value {
     }
 
     /// Check whether this value is a tombstone (crate-internal only).
-    #[allow(dead_code)]
     pub(crate) fn is_tombstone(&self) -> bool {
         matches!(self, Value::Tombstone)
     }
@@ -67,13 +65,13 @@ impl Value {
     }
 
     /// Returns `true` if this value is a `Pointer` (crate-internal only).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn is_pointer(&self) -> bool {
         matches!(self, Value::Pointer(_))
     }
 
     /// Returns the inner `ValuePointer`, or `None` if not a `Pointer`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn as_pointer(&self) -> Option<&ValuePointer> {
         match self {
             Value::Pointer(vp) => Some(vp),

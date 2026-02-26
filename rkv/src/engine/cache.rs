@@ -155,13 +155,13 @@ impl BlockCache {
     }
 
     /// Number of cached blocks.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.map.len()
     }
 
     /// Whether the cache is empty.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
