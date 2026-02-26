@@ -1281,7 +1281,14 @@ impl DB {
         prefix: &Key,
         ordered_mode: bool,
     ) -> Result<std::collections::BTreeMap<Key, Value>> {
-        let prefix_bytes = prefix.to_bytes();
+        // For ordered mode (range scan), use full serialized key bytes.
+        // For unordered mode (prefix match), use prefix bytes without
+        // the Str null terminator so starts_with works correctly.
+        let prefix_bytes = if ordered_mode {
+            prefix.to_bytes()
+        } else {
+            prefix.to_prefix_bytes()
+        };
         let sst = self.sstables.read().unwrap();
         let mut merged = std::collections::BTreeMap::<Key, Value>::new();
 
@@ -1327,7 +1334,11 @@ impl DB {
         prefix: &Key,
         ordered_mode: bool,
     ) -> Result<std::collections::BTreeMap<Key, Value>> {
-        let prefix_bytes = prefix.to_bytes();
+        let prefix_bytes = if ordered_mode {
+            prefix.to_bytes()
+        } else {
+            prefix.to_prefix_bytes()
+        };
         let sst = self.sstables.read().unwrap();
         let mut merged = std::collections::BTreeMap::<Key, Value>::new();
 

@@ -150,9 +150,12 @@ impl SSTableWriter {
         let filter_offset = self.offset;
         let has_prefix = !prefix_bloom_data.is_empty();
         let filter_data = if has_prefix {
+            // Compound format:
+            // [key_bloom_len: u32 LE][key_bloom_data][prefix_len: u8][prefix_bloom_data]
             let mut buf = Vec::new();
             buf.extend_from_slice(&(key_bloom_data.len() as u32).to_le_bytes());
             buf.extend_from_slice(&key_bloom_data);
+            buf.push(self.bloom_prefix_len as u8);
             buf.extend_from_slice(&prefix_bloom_data);
             buf
         } else {
@@ -337,6 +340,8 @@ pub(crate) struct SSTableReader {
     bloom: BloomFilter,
     /// Prefix bloom filter for scan optimization.
     prefix_bloom: Option<BloomFilter>,
+    /// Prefix length used to build the prefix bloom (0 = none).
+    bloom_prefix_len: usize,
     /// First key in the SSTable (serialized bytes), for range filtering.
     first_key: Option<Vec<u8>>,
 }
@@ -396,41 +401,45 @@ impl SSTableReader {
         let filter_size = u32::from_be_bytes(footer[38..42].try_into().unwrap()) as usize;
         let filter_format = footer[42];
 
-        let (bloom, prefix_bloom) =
-            if filter_size > 0 && filter_offset + filter_size <= footer_start {
-                let filter_data = &data[filter_offset..filter_offset + filter_size];
+        let (bloom, prefix_bloom, bloom_prefix_len) = if filter_size > 0
+            && filter_offset + filter_size <= footer_start
+        {
+            let filter_data = &data[filter_offset..filter_offset + filter_size];
 
-                match filter_format {
-                    0x01 => {
-                        // Compound: [key_bloom_len: u32 LE][key_bloom_data][prefix_bloom_data]
-                        if filter_data.len() < 4 {
-                            (BloomFilter::new(0), None)
+            match filter_format {
+                0x01 => {
+                    // Compound: [key_bloom_len: u32 LE][key_bloom_data]
+                    //           [prefix_len: u8][prefix_bloom_data]
+                    if filter_data.len() < 4 {
+                        (BloomFilter::new(0), None, 0)
+                    } else {
+                        let key_bloom_len =
+                            u32::from_le_bytes(filter_data[0..4].try_into().unwrap()) as usize;
+                        let key_bloom_end = 4 + key_bloom_len;
+                        if key_bloom_end >= filter_data.len() {
+                            (BloomFilter::new(0), None, 0)
                         } else {
-                            let key_bloom_len =
-                                u32::from_le_bytes(filter_data[0..4].try_into().unwrap()) as usize;
-                            let key_bloom_end = 4 + key_bloom_len;
-                            if key_bloom_end > filter_data.len() {
-                                (BloomFilter::new(0), None)
+                            let key_bloom =
+                                BloomFilter::from_bytes(&filter_data[4..key_bloom_end])?;
+                            let prefix_len = filter_data[key_bloom_end] as usize;
+                            let prefix_bloom_start = key_bloom_end + 1;
+                            let prefix_bloom = if prefix_bloom_start < filter_data.len() {
+                                Some(BloomFilter::from_bytes(&filter_data[prefix_bloom_start..])?)
                             } else {
-                                let key_bloom =
-                                    BloomFilter::from_bytes(&filter_data[4..key_bloom_end])?;
-                                let prefix_bloom = if key_bloom_end < filter_data.len() {
-                                    Some(BloomFilter::from_bytes(&filter_data[key_bloom_end..])?)
-                                } else {
-                                    None
-                                };
-                                (key_bloom, prefix_bloom)
-                            }
+                                None
+                            };
+                            (key_bloom, prefix_bloom, prefix_len)
                         }
                     }
-                    _ => {
-                        // Legacy (0x00): filter block = key bloom only
-                        (BloomFilter::from_bytes(filter_data)?, None)
-                    }
                 }
-            } else {
-                (BloomFilter::new(0), None) // no filter
-            };
+                _ => {
+                    // Legacy (0x00): filter block = key bloom only
+                    (BloomFilter::from_bytes(filter_data)?, None, 0)
+                }
+            }
+        } else {
+            (BloomFilter::new(0), None, 0) // no filter
+        };
 
         // Extract first key from the first block for range filtering
         let first_key = if let Some(first_ie) = index.first() {
@@ -469,6 +478,7 @@ impl SSTableReader {
             entry_count,
             bloom,
             prefix_bloom,
+            bloom_prefix_len,
             first_key,
         })
     }
@@ -743,11 +753,21 @@ impl SSTableReader {
 
     /// Test whether the prefix bloom filter may contain the given prefix.
     ///
-    /// Returns `true` if the prefix might be present (or no prefix bloom exists),
-    /// `false` if the prefix is definitely absent.
+    /// Truncates the query prefix to `bloom_prefix_len` (the length used at
+    /// write time) before checking the bloom filter. Returns `true` if the
+    /// prefix might be present (or no prefix bloom exists), `false` if it
+    /// is definitely absent.
     pub(crate) fn may_contain_prefix(&self, prefix_bytes: &[u8]) -> bool {
         match &self.prefix_bloom {
-            Some(pf) => pf.may_contain(prefix_bytes),
+            Some(pf) => {
+                let query =
+                    if self.bloom_prefix_len > 0 && prefix_bytes.len() >= self.bloom_prefix_len {
+                        &prefix_bytes[..self.bloom_prefix_len]
+                    } else {
+                        prefix_bytes
+                    };
+                pf.may_contain(query)
+            }
             None => true, // no prefix bloom — conservative
         }
     }

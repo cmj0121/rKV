@@ -94,6 +94,30 @@ impl Key {
         }
     }
 
+    /// Serialize the key for prefix matching.
+    ///
+    /// Like `to_bytes()`, but omits the trailing null terminator for Str keys
+    /// so that `other.to_bytes().starts_with(prefix.to_prefix_bytes())` works
+    /// correctly.
+    pub fn to_prefix_bytes(&self) -> Vec<u8> {
+        match self {
+            Key::Int(v) => {
+                let flipped = (*v as u64) ^ SIGN_FLIP;
+                let mut buf = Vec::with_capacity(9);
+                buf.push(TAG_INT);
+                buf.extend_from_slice(&flipped.to_be_bytes());
+                buf
+            }
+            Key::Str(s) => {
+                let mut buf = Vec::with_capacity(1 + s.len());
+                buf.push(TAG_STR);
+                buf.extend_from_slice(s.as_bytes());
+                // No null terminator — this is a prefix
+                buf
+            }
+        }
+    }
+
     /// Widen this key to Str. `Int(v)` becomes `Str(v.to_string())`, Str unchanged.
     pub fn widen(&self) -> Key {
         match self {
