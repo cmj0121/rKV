@@ -7,6 +7,7 @@ fn bloom_hash(data: &[u8]) -> u32 {
 
     let mut i = 0;
     while i + 4 <= data.len() {
+        // SAFETY: i + 4 <= data.len() ensured by while condition
         h = h.wrapping_add(u32::from_le_bytes(data[i..i + 4].try_into().unwrap()));
         h = h.wrapping_mul(m);
         h ^= h >> 16;
@@ -106,7 +107,7 @@ impl BloomFilter {
     }
 
     /// Reset the filter to empty.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.bits.clear();
         self.key_hashes.clear();
@@ -114,19 +115,19 @@ impl BloomFilter {
     }
 
     /// Number of keys inserted.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.num_keys as usize
     }
 
     /// Returns `true` if no keys have been inserted.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.num_keys == 0
     }
 
     /// Returns the configured bits-per-key.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn bits_per_key(&self) -> usize {
         self.bits_per_key
     }
@@ -134,7 +135,7 @@ impl BloomFilter {
     /// Estimated false-positive rate based on filter parameters.
     ///
     /// Uses the formula: FPR ~ (1 - e^(-k*n/m))^k
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn estimated_fpr(&self) -> f64 {
         if self.bits.is_empty() || self.num_keys == 0 {
             return 1.0;

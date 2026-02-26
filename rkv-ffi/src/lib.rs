@@ -15,18 +15,19 @@ pub struct RkvDb {
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 fn set_last_error(msg: String) {
-    *LAST_ERROR.lock().unwrap() = Some(msg);
+    *LAST_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
 }
 
 /// Helper: extract a namespace name from a C string pointer.
 /// If `ns` is null, returns the default namespace.
-unsafe fn ns_str(ns: *const c_char) -> Result<&'static str, String> {
+unsafe fn ns_str(ns: *const c_char) -> Result<String, String> {
     if ns.is_null() {
-        return Ok(DEFAULT_NAMESPACE);
+        return Ok(DEFAULT_NAMESPACE.to_owned());
     }
     let c_str = unsafe { CStr::from_ptr(ns) };
     c_str
         .to_str()
+        .map(|s| s.to_owned())
         .map_err(|e| format!("invalid utf-8 namespace: {e}"))
 }
 
@@ -37,7 +38,15 @@ fn parse_key(key: *const u8, key_len: usize) -> Result<Key, String> {
 }
 
 /// Helper: write value bytes to output pointers. Returns 0 on success.
+///
+/// # Safety
+/// `out` and `out_len` must be valid, non-null writable pointers.
+/// The caller must free the returned buffer with `rkv_free`.
 unsafe fn write_value_out(val: Value, out: *mut *mut u8, out_len: *mut usize) -> i32 {
+    if out.is_null() || out_len.is_null() {
+        set_last_error("null output pointer".into());
+        return -1;
+    }
     match val.into_bytes() {
         Some(bytes) => {
             let mut boxed = bytes.into_boxed_slice();
@@ -187,7 +196,7 @@ pub unsafe extern "C" fn rkv_put_ns(
         }
     };
     let db = unsafe { &*db };
-    let namespace = match db.inner.namespace(ns_name, None) {
+    let namespace = match db.inner.namespace(&ns_name, None) {
         Ok(ns) => ns,
         Err(e) => {
             set_last_error(e.to_string());
@@ -246,7 +255,7 @@ pub unsafe extern "C" fn rkv_get_ns(
         }
     };
     let db = unsafe { &*db };
-    let namespace = match db.inner.namespace(ns_name, None) {
+    let namespace = match db.inner.namespace(&ns_name, None) {
         Ok(ns) => ns,
         Err(e) => {
             set_last_error(e.to_string());
@@ -294,7 +303,7 @@ pub unsafe extern "C" fn rkv_delete_ns(
         }
     };
     let db = unsafe { &*db };
-    let namespace = match db.inner.namespace(ns_name, None) {
+    let namespace = match db.inner.namespace(&ns_name, None) {
         Ok(ns) => ns,
         Err(e) => {
             set_last_error(e.to_string());
@@ -346,7 +355,7 @@ pub unsafe extern "C" fn rkv_exists(
         }
     };
     let db = unsafe { &*db };
-    let namespace = match db.inner.namespace(ns_name, None) {
+    let namespace = match db.inner.namespace(&ns_name, None) {
         Ok(ns) => ns,
         Err(e) => {
             set_last_error(e.to_string());
@@ -395,7 +404,7 @@ pub unsafe extern "C" fn rkv_ttl(
         }
     };
     let db = unsafe { &*db };
-    let namespace = match db.inner.namespace(ns_name, None) {
+    let namespace = match db.inner.namespace(&ns_name, None) {
         Ok(ns) => ns,
         Err(e) => {
             set_last_error(e.to_string());
@@ -488,7 +497,7 @@ unsafe fn rkv_scan_inner(
         }
     };
     let db = unsafe { &*db };
-    let namespace = match db.inner.namespace(ns_name, None) {
+    let namespace = match db.inner.namespace(&ns_name, None) {
         Ok(ns) => ns,
         Err(e) => {
             set_last_error(e.to_string());
@@ -572,7 +581,7 @@ pub unsafe extern "C" fn rkv_rev_count(
         }
     };
     let db = unsafe { &*db };
-    let namespace = match db.inner.namespace(ns_name, None) {
+    let namespace = match db.inner.namespace(&ns_name, None) {
         Ok(ns) => ns,
         Err(e) => {
             set_last_error(e.to_string());
@@ -625,7 +634,7 @@ pub unsafe extern "C" fn rkv_rev_get(
         }
     };
     let db = unsafe { &*db };
-    let namespace = match db.inner.namespace(ns_name, None) {
+    let namespace = match db.inner.namespace(&ns_name, None) {
         Ok(ns) => ns,
         Err(e) => {
             set_last_error(e.to_string());
@@ -810,7 +819,7 @@ pub unsafe extern "C" fn rkv_last_error(buf: *mut c_char, buf_len: usize) -> i32
     if buf.is_null() || buf_len == 0 {
         return -1;
     }
-    let guard = LAST_ERROR.lock().unwrap();
+    let guard = LAST_ERROR.lock().unwrap_or_else(|e| e.into_inner());
     match guard.as_deref() {
         Some(msg) => {
             let bytes = msg.as_bytes();

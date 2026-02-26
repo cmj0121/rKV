@@ -345,6 +345,7 @@ pub(crate) struct SSTableReader {
     /// Prefix length used to build the prefix bloom (0 = none).
     bloom_prefix_len: usize,
     /// First key in the SSTable (serialized bytes), for range filtering.
+    #[allow(dead_code)] // accessed via #[cfg(test)] first_key() method
     first_key: Option<Vec<u8>>,
     /// Unique SSTable identifier (sequence number from file naming).
     sst_id: u64,
@@ -385,6 +386,7 @@ impl SSTableReader {
         footer_checksum.verify(&footer[..cksum_offset])?;
 
         // Parse footer fields
+        // SAFETY: footer is exactly FOOTER_SIZE (48) bytes — all slices are within bounds
         let version = u16::from_be_bytes(footer[4..6].try_into().unwrap());
         if version != VERSION {
             return Err(Error::Corruption(format!(
@@ -407,6 +409,7 @@ impl SSTableReader {
         let index = Self::parse_index(index_data)?;
 
         // Parse filter metadata from footer (bytes 30-42)
+        // SAFETY: footer is FOOTER_SIZE bytes — slices within bounds
         let filter_offset = u64::from_be_bytes(footer[30..38].try_into().unwrap()) as usize;
         let filter_size = u32::from_be_bytes(footer[38..42].try_into().unwrap()) as usize;
         let filter_format = footer[42];
@@ -423,6 +426,7 @@ impl SSTableReader {
                     if filter_data.len() < 4 {
                         (BloomFilter::new(0), None, 0)
                     } else {
+                        // SAFETY: filter_data.len() >= 4 checked above
                         let key_bloom_len =
                             u32::from_le_bytes(filter_data[0..4].try_into().unwrap()) as usize;
                         let key_bloom_end = 4 + key_bloom_len;
@@ -463,6 +467,7 @@ impl SSTableReader {
                 if let Ok(block_data) = decompress_block(compression_tag, compressed_payload) {
                     // Parse just the first entry's key
                     if block_data.len() >= 2 {
+                        // SAFETY: block_data.len() >= 2 checked above
                         let kl = u16::from_be_bytes(block_data[0..2].try_into().unwrap()) as usize;
                         if 2 + kl <= block_data.len() {
                             Some(block_data[2..2 + kl].to_vec())
@@ -505,6 +510,7 @@ impl SSTableReader {
                     "SSTable index truncated at key_len".into(),
                 ));
             }
+            // SAFETY: bounds checked above — slice is exactly 2 bytes
             let key_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
             pos += 2;
 
@@ -519,6 +525,7 @@ impl SSTableReader {
                     "SSTable index truncated at offset/size".into(),
                 ));
             }
+            // SAFETY: bounds checked above — slices are exactly 8 and 4 bytes
             let offset = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
             pos += 8;
             let size = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
@@ -587,6 +594,7 @@ impl SSTableReader {
                     "SSTable entry truncated at key_len".into(),
                 ));
             }
+            // SAFETY: bounds checked above — slice is exactly 2 bytes
             let kl = u16::from_be_bytes(block[pos..pos + 2].try_into().unwrap()) as usize;
             pos += 2;
 
@@ -611,6 +619,7 @@ impl SSTableReader {
                     "SSTable entry truncated at value_len".into(),
                 ));
             }
+            // SAFETY: bounds checked above — slice is exactly 4 bytes
             let vl = u32::from_be_bytes(block[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
 
@@ -785,7 +794,7 @@ impl SSTableReader {
     }
 
     /// Return the first key in this SSTable (serialized bytes), if any.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn first_key(&self) -> Option<&[u8]> {
         self.first_key.as_deref()
     }
@@ -872,13 +881,13 @@ impl SSTableReader {
     }
 
     /// Return the total number of entries in this SSTable.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn entry_count(&self) -> u64 {
         self.entry_count
     }
 
     /// Return the number of data blocks in this SSTable.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn block_count(&self) -> usize {
         self.index.len()
     }

@@ -82,7 +82,7 @@ impl RevisionGen {
     pub(crate) fn generate(&self) -> RevisionID {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
         let seq: u64 = fastrand::u64(..);
         let raw: u128 = ((ts as u128 & 0xFFFF_FFFF_FFFF) << 80)

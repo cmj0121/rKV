@@ -436,6 +436,14 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 format!("@{rest}").into_bytes()
             } else if let Some(path) = tokens[2].strip_prefix('@') {
                 // File read: @/path/to/file → file contents
+                let file_path = std::path::Path::new(path);
+                if file_path
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+                {
+                    eprintln!("error: path traversal ('..') not allowed in @path");
+                    return Action::Continue;
+                }
                 match std::fs::read(path) {
                     Ok(data) => data,
                     Err(e) => {

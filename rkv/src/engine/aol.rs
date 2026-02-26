@@ -77,7 +77,7 @@ impl Aol {
             Some(d) => {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_millis() as u64;
                 now + d.as_millis() as u64
             }
@@ -138,21 +138,22 @@ impl Aol {
     /// skipped (corrupted/truncated) records.
     ///
     /// This is a static method — it reads the file independently of `Aol`.
-    pub(crate) fn replay(db_dir: &Path, verify: bool) -> Result<(Vec<AolRecord>, u64)> {
+    pub(crate) fn replay(db_dir: &Path, verify: bool) -> Result<(Vec<AolRecord>, Vec<String>)> {
         let path = aol_path(db_dir);
         if !path.exists() {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), Vec::new()));
         }
 
         let data = std::fs::read(&path)?;
         if data.len() < HEADER_SIZE {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), Vec::new()));
         }
 
         // Validate header
         if data[0..4] != MAGIC {
             return Err(Error::Corruption("AOL magic mismatch".into()));
         }
+        // SAFETY: data.len() >= HEADER_SIZE (8) checked above — slice is exactly 2 bytes
         let version = u16::from_be_bytes(data[4..6].try_into().unwrap());
         if version != VERSION {
             return Err(Error::Corruption(format!(
@@ -162,20 +163,27 @@ impl Aol {
 
         let mut pos = HEADER_SIZE;
         let mut records = Vec::new();
-        let mut skipped = 0u64;
+        let mut skipped: Vec<String> = Vec::new();
 
         while pos < data.len() {
+            let record_offset = pos;
+
             // Need at least 4 bytes for payload_len
             if pos + 4 > data.len() {
-                skipped += 1;
+                skipped.push(format!("offset {record_offset}: truncated payload_len"));
                 break;
             }
+            // SAFETY: bounds checked above — slice is exactly 4 bytes
             let payload_len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
 
             // Need payload + 5 checksum bytes
             if pos + payload_len + Checksum::encoded_size() > data.len() {
-                skipped += 1;
+                skipped.push(format!(
+                    "offset {record_offset}: truncated record (need {}, have {})",
+                    payload_len + Checksum::encoded_size(),
+                    data.len() - pos
+                ));
                 break;
             }
 
@@ -189,21 +197,23 @@ impl Aol {
             if verify {
                 let cs = match Checksum::from_bytes(checksum_bytes) {
                     Ok(cs) => cs,
-                    Err(_) => {
-                        skipped += 1;
+                    Err(e) => {
+                        skipped.push(format!("offset {record_offset}: checksum parse error: {e}"));
                         continue;
                     }
                 };
-                if cs.verify(payload).is_err() {
-                    skipped += 1;
+                if let Err(e) = cs.verify(payload) {
+                    skipped.push(format!(
+                        "offset {record_offset}: checksum verification failed: {e}"
+                    ));
                     continue;
                 }
             }
 
             match decode_payload(payload) {
                 Ok(record) => records.push(record),
-                Err(_) => {
-                    skipped += 1;
+                Err(e) => {
+                    skipped.push(format!("offset {record_offset}: decode error: {e}"));
                 }
             }
         }
@@ -310,6 +320,9 @@ fn encode_payload(ns: &str, rev: u128, expires_at_ms: u64, key: &Key, value: &Va
     buf
 }
 
+/// Maximum namespace name length in bytes (sanity limit for untrusted data).
+const MAX_NAMESPACE_LEN: usize = 256;
+
 /// Decode a record payload.
 fn decode_payload(data: &[u8]) -> Result<AolRecord> {
     let mut pos = 0;
@@ -318,8 +331,19 @@ fn decode_payload(data: &[u8]) -> Result<AolRecord> {
     if pos + 2 > data.len() {
         return Err(Error::Corruption("truncated ns_len".into()));
     }
-    let ns_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+    // SAFETY: bounds checked above — slice is exactly 2 bytes
+    let ns_len = u16::from_be_bytes(
+        data[pos..pos + 2]
+            .try_into()
+            .map_err(|_| Error::Corruption("truncated ns_len bytes".into()))?,
+    ) as usize;
     pos += 2;
+
+    if ns_len > MAX_NAMESPACE_LEN {
+        return Err(Error::Corruption(format!(
+            "namespace length {ns_len} exceeds maximum {MAX_NAMESPACE_LEN}"
+        )));
+    }
 
     if pos + ns_len > data.len() {
         return Err(Error::Corruption("truncated namespace".into()));
@@ -333,21 +357,36 @@ fn decode_payload(data: &[u8]) -> Result<AolRecord> {
     if pos + 16 > data.len() {
         return Err(Error::Corruption("truncated revision".into()));
     }
-    let revision = u128::from_be_bytes(data[pos..pos + 16].try_into().unwrap());
+    // SAFETY: bounds checked above — slice is exactly 16 bytes
+    let revision = u128::from_be_bytes(
+        data[pos..pos + 16]
+            .try_into()
+            .map_err(|_| Error::Corruption("truncated revision bytes".into()))?,
+    );
     pos += 16;
 
     // expires_at_ms
     if pos + 8 > data.len() {
         return Err(Error::Corruption("truncated expires_at_ms".into()));
     }
-    let expires_at_ms = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+    // SAFETY: bounds checked above — slice is exactly 8 bytes
+    let expires_at_ms = u64::from_be_bytes(
+        data[pos..pos + 8]
+            .try_into()
+            .map_err(|_| Error::Corruption("truncated expires_at_ms bytes".into()))?,
+    );
     pos += 8;
 
     // key
     if pos + 2 > data.len() {
         return Err(Error::Corruption("truncated key_len".into()));
     }
-    let key_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+    // SAFETY: bounds checked above — slice is exactly 2 bytes
+    let key_len = u16::from_be_bytes(
+        data[pos..pos + 2]
+            .try_into()
+            .map_err(|_| Error::Corruption("truncated key_len bytes".into()))?,
+    ) as usize;
     pos += 2;
 
     if pos + key_len > data.len() {
@@ -471,7 +510,7 @@ mod tests {
 
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert_eq!(records.len(), 2);
-        assert_eq!(skipped, 0);
+        assert!(skipped.is_empty());
         assert_eq!(records[0].key, Key::Int(1));
         assert_eq!(records[0].value, Value::from("v1"));
         assert_eq!(records[1].key, Key::Int(2));
@@ -483,7 +522,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert!(records.is_empty());
-        assert_eq!(skipped, 0);
+        assert!(skipped.is_empty());
     }
 
     #[test]
@@ -539,7 +578,7 @@ mod tests {
 
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert!(records.is_empty());
-        assert_eq!(skipped, 1);
+        assert_eq!(skipped.len(), 1);
     }
 
     #[test]
@@ -559,7 +598,7 @@ mod tests {
 
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert!(records.is_empty());
-        assert_eq!(skipped, 1);
+        assert_eq!(skipped.len(), 1);
     }
 
     #[test]
@@ -582,7 +621,7 @@ mod tests {
         // Without verification, the record should still be decoded
         let (records, skipped) = Aol::replay(tmp.path(), false).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(skipped, 0);
+        assert!(skipped.is_empty());
     }
 
     #[test]
@@ -630,7 +669,7 @@ mod tests {
 
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert_eq!(records.len(), 2);
-        assert_eq!(skipped, 0);
+        assert!(skipped.is_empty());
     }
 
     // --- Buffered flush ---
@@ -710,7 +749,7 @@ mod tests {
         // After truncate, replay should return zero records
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert!(records.is_empty());
-        assert_eq!(skipped, 0);
+        assert!(skipped.is_empty());
 
         // File should be exactly the header size
         let data = std::fs::read(aol_path(tmp.path())).unwrap();
@@ -734,7 +773,7 @@ mod tests {
 
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(skipped, 0);
+        assert!(skipped.is_empty());
         assert_eq!(records[0].key, Key::Int(2));
         assert_eq!(records[0].value, Value::from("new"));
     }
@@ -839,7 +878,7 @@ mod tests {
 
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert_eq!(records.len(), 1); // first record OK
-        assert_eq!(skipped, 1); // truncated tail
+        assert_eq!(skipped.len(), 1); // truncated tail
     }
 
     #[test]
@@ -861,7 +900,7 @@ mod tests {
 
         let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
         assert!(records.is_empty());
-        assert_eq!(skipped, 1);
+        assert_eq!(skipped.len(), 1);
     }
 
     #[test]
@@ -885,7 +924,7 @@ mod tests {
         // With verify=false, checksum passes but decode_payload may fail
         let (records, skipped) = Aol::replay(tmp.path(), false).unwrap();
         // Either way, records+skipped should account for the entry
-        assert_eq!(records.len() + skipped as usize, 1);
+        assert_eq!(records.len() + skipped.len(), 1);
     }
 
     #[test]

@@ -13,6 +13,17 @@ pub(crate) struct MemEntry {
     pub expires_at: Option<Instant>,
 }
 
+/// Result of a memtable key lookup — distinguishes "key is tombstoned"
+/// from "key was never written".
+pub(crate) enum MemLookup<'a> {
+    /// Key exists with a live (non-expired) value.
+    Found(&'a Value),
+    /// Key exists but is tombstoned or expired — do NOT fall through to SSTables.
+    Tombstone,
+    /// Key was never written to this memtable — caller should check SSTables.
+    NotFound,
+}
+
 /// In-memory sorted write buffer (memtable).
 ///
 /// Holds all active writes for a namespace before they are flushed to disk.
@@ -104,13 +115,39 @@ impl MemTable {
         Some(&latest.value)
     }
 
+    /// Three-state lookup: Found / Tombstone / NotFound.
+    ///
+    /// Unlike `get()`, this distinguishes "key is tombstoned" from "key was
+    /// never written". `Namespace::get()` uses this to avoid falling through
+    /// to stale SSTable data when the memtable holds a tombstone.
+    pub(crate) fn lookup(&self, key: &Key) -> MemLookup<'_> {
+        let Some(entries) = self.entries.get(key) else {
+            return MemLookup::NotFound;
+        };
+        let Some(latest) = entries.last() else {
+            return MemLookup::NotFound;
+        };
+
+        // Expired → treat as tombstone (do not fall through)
+        if let Some(expires_at) = latest.expires_at {
+            if Instant::now() > expires_at {
+                return MemLookup::Tombstone;
+            }
+        }
+
+        if latest.value.is_tombstone() {
+            return MemLookup::Tombstone;
+        }
+
+        MemLookup::Found(&latest.value)
+    }
+
     /// Check if a key exists (non-expired, non-tombstone).
     pub(crate) fn exists(&self, key: &Key) -> bool {
         self.get(key).is_some()
     }
 
     /// Returns the approximate memory usage in bytes.
-    #[allow(dead_code)]
     pub(crate) fn approximate_size(&self) -> usize {
         self.approximate_size
     }
@@ -121,19 +158,18 @@ impl MemTable {
     }
 
     /// Returns true if the approximate size meets or exceeds the limit.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn is_full(&self, limit: usize) -> bool {
         self.approximate_size >= limit
     }
 
     /// Total number of keys in the table (including tombstoned/expired).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Returns true if the table contains no keys.
-    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -144,7 +180,7 @@ impl MemTable {
     /// - **Unordered mode** (Str keys): prefix matching on string representation.
     ///
     /// Tombstoned and expired keys are excluded.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn scan(&self, prefix: &Key, limit: usize, offset: usize) -> Vec<Key> {
         if self.ordered_mode {
             self.entries
@@ -174,7 +210,7 @@ impl MemTable {
     /// - **Unordered mode**: prefix matching, reverse iteration order.
     ///
     /// Tombstoned and expired keys are excluded.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn rscan(&self, prefix: &Key, limit: usize, offset: usize) -> Vec<Key> {
         if self.ordered_mode {
             self.entries
@@ -251,7 +287,7 @@ impl MemTable {
     ///
     /// Like `scan()` but includes tombstones (needed to shadow SSTable entries
     /// during merge). Expired entries are still skipped.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn scan_raw(&self, prefix: &Key, limit: usize, offset: usize) -> Vec<(Key, Value)> {
         if self.ordered_mode {
             self.entries
@@ -278,7 +314,7 @@ impl MemTable {
     /// Reverse scan keys starting from `prefix`, returning raw `(Key, Value)` pairs.
     ///
     /// Like `rscan()` but includes tombstones. Expired entries are skipped.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn rscan_raw(&self, prefix: &Key, limit: usize, offset: usize) -> Vec<(Key, Value)> {
         if self.ordered_mode {
             self.entries

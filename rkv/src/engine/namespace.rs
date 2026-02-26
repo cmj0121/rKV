@@ -4,6 +4,7 @@ use std::time::Duration;
 use super::crypto;
 use super::error::{Error, Result};
 use super::key::Key;
+use super::memtable::MemLookup;
 use super::revision::RevisionID;
 use super::value::Value;
 use super::DB;
@@ -96,7 +97,7 @@ impl<'db> Namespace<'db> {
         self.db
             .append_to_aol(&self.name, rev.as_u128(), &key, &value, ttl)?;
         let mt = self.db.get_or_create_memtable(&self.name);
-        let mut mt = mt.lock().unwrap();
+        let mut mt = mt.lock().unwrap_or_else(|e| e.into_inner());
         let actual_rev = mt.put(key, value, rev, ttl);
         self.db.inc_op_puts();
         Ok(actual_rev)
@@ -106,21 +107,22 @@ impl<'db> Namespace<'db> {
         let key = key.into();
         self.db.inc_op_gets();
 
-        // 1. Check MemTable first
-        let mt_value = {
+        // 1. Check MemTable first (3-state lookup)
+        let value = {
             let mt = self.db.get_or_create_memtable(&self.name);
-            let mt = mt.lock().unwrap();
-            mt.get(&key).cloned()
-        };
-
-        let value = if let Some(v) = mt_value {
-            v
-        } else {
-            // 2. Fall through to L0 SSTables (newest first)
-            match self.db.get_from_sstables(&self.name, &key)? {
-                Some(v) if v.is_tombstone() => return Err(Error::KeyNotFound),
-                Some(v) => v,
-                None => return Err(Error::KeyNotFound),
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            match mt.lookup(&key) {
+                MemLookup::Found(v) => v.clone(),
+                MemLookup::Tombstone => return Err(Error::KeyNotFound),
+                MemLookup::NotFound => {
+                    // 2. Fall through to SSTables only when key was never in memtable
+                    drop(mt);
+                    match self.db.get_from_sstables(&self.name, &key)? {
+                        Some(v) if v.is_tombstone() => return Err(Error::KeyNotFound),
+                        Some(v) => v,
+                        None => return Err(Error::KeyNotFound),
+                    }
+                }
             }
         };
 
@@ -134,7 +136,7 @@ impl<'db> Namespace<'db> {
         self.db
             .append_to_aol(&self.name, rev.as_u128(), &key, &Value::tombstone(), None)?;
         let mt = self.db.get_or_create_memtable(&self.name);
-        let mut mt = mt.lock().unwrap();
+        let mut mt = mt.lock().unwrap_or_else(|e| e.into_inner());
         mt.delete(key, rev);
         self.db.inc_op_deletes();
         Ok(())
@@ -158,7 +160,7 @@ impl<'db> Namespace<'db> {
         // Collect keys to delete while holding the memtable lock briefly
         let keys = {
             let mt = self.db.get_or_create_memtable(&self.name);
-            let mt = mt.lock().unwrap();
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
             mt.keys_in_range(&start, &end, inclusive)
         };
 
@@ -168,7 +170,7 @@ impl<'db> Namespace<'db> {
             self.db
                 .append_to_aol(&self.name, rev.as_u128(), &key, &Value::tombstone(), None)?;
             let mt = self.db.get_or_create_memtable(&self.name);
-            let mut mt = mt.lock().unwrap();
+            let mut mt = mt.lock().unwrap_or_else(|e| e.into_inner());
             mt.delete(key, rev);
         }
 
@@ -184,7 +186,7 @@ impl<'db> Namespace<'db> {
     pub fn delete_prefix(&self, prefix: &str) -> Result<u64> {
         let keys = {
             let mt = self.db.get_or_create_memtable(&self.name);
-            let mt = mt.lock().unwrap();
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
             mt.keys_with_prefix(prefix)
         };
 
@@ -194,7 +196,7 @@ impl<'db> Namespace<'db> {
             self.db
                 .append_to_aol(&self.name, rev.as_u128(), &key, &Value::tombstone(), None)?;
             let mt = self.db.get_or_create_memtable(&self.name);
-            let mut mt = mt.lock().unwrap();
+            let mut mt = mt.lock().unwrap_or_else(|e| e.into_inner());
             mt.delete(key, rev);
         }
 
@@ -207,14 +209,14 @@ impl<'db> Namespace<'db> {
     pub fn exists(&self, key: impl Into<Key>) -> Result<bool> {
         let key = key.into();
         let mt = self.db.get_or_create_memtable(&self.name);
-        let mt = mt.lock().unwrap();
+        let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
         Ok(mt.exists(&key))
     }
 
     pub fn scan(&self, prefix: &Key, limit: usize, offset: usize) -> Result<Vec<Key>> {
         let (mt_entries, ordered_mode) = {
             let mt = self.db.get_or_create_memtable(&self.name);
-            let mt = mt.lock().unwrap();
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
             (mt.scan_all_raw(prefix), mt.is_ordered())
         };
 
@@ -238,7 +240,7 @@ impl<'db> Namespace<'db> {
     pub fn rscan(&self, prefix: &Key, limit: usize, offset: usize) -> Result<Vec<Key>> {
         let (mt_entries, ordered_mode) = {
             let mt = self.db.get_or_create_memtable(&self.name);
-            let mt = mt.lock().unwrap();
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
             (mt.rscan_all_raw(prefix), mt.is_ordered())
         };
 
@@ -262,7 +264,7 @@ impl<'db> Namespace<'db> {
 
     pub fn count(&self) -> Result<u64> {
         let mt = self.db.get_or_create_memtable(&self.name);
-        let mt = mt.lock().unwrap();
+        let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
         Ok(mt.count())
     }
 
@@ -270,7 +272,7 @@ impl<'db> Namespace<'db> {
     pub fn rev_count(&self, key: impl Into<Key>) -> Result<u64> {
         let key = key.into();
         let mt = self.db.get_or_create_memtable(&self.name);
-        let mt = mt.lock().unwrap();
+        let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
         mt.rev_count(&key).ok_or(Error::KeyNotFound)
     }
 
@@ -279,7 +281,7 @@ impl<'db> Namespace<'db> {
         let key = key.into();
         let value = {
             let mt = self.db.get_or_create_memtable(&self.name);
-            let mt = mt.lock().unwrap();
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
             mt.rev_get(&key, index).cloned().ok_or(Error::KeyNotFound)?
         };
         let value = self.db.resolve_value(&self.name, &value)?;
@@ -290,7 +292,7 @@ impl<'db> Namespace<'db> {
     pub fn ttl(&self, key: impl Into<Key>) -> Result<Option<Duration>> {
         let key = key.into();
         let mt = self.db.get_or_create_memtable(&self.name);
-        let mt = mt.lock().unwrap();
+        let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
         mt.ttl(&key).ok_or(Error::KeyNotFound)
     }
 }
