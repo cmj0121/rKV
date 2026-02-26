@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use rkv::{
-    Compression, Config, Error, IoModel, Key, RevisionID, Stats, Value, DB, DEFAULT_NAMESPACE,
+    Compression, Config, Error, IoModel, Key, LevelStat, RevisionID, Stats, Value, DB,
+    DEFAULT_NAMESPACE,
 };
 
 #[test]
@@ -4131,4 +4132,106 @@ fn cache_survives_restart() {
             assert_eq!(v, Value::from(format!("data_{i}").as_str()));
         }
     }
+}
+
+// --- Stats counters tests ---
+
+#[test]
+fn stats_sstable_count_after_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    assert_eq!(db.stats().sstable_count, 0);
+
+    ns.put(1, "a", None).unwrap();
+    db.flush().unwrap();
+
+    let s = db.stats();
+    assert!(
+        s.sstable_count >= 1,
+        "expected at least 1 SSTable after flush"
+    );
+}
+
+#[test]
+fn stats_level_stats_populated_after_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let s = db.stats();
+    assert_eq!(s.level_stats.len(), s.level_count);
+    for ls in &s.level_stats {
+        assert_eq!(ls.file_count, 0);
+        assert_eq!(ls.size_bytes, 0);
+    }
+
+    ns.put(1, "a", None).unwrap();
+    db.flush().unwrap();
+
+    let s = db.stats();
+    let total_files: u64 = s.level_stats.iter().map(|ls| ls.file_count).sum();
+    assert_eq!(total_files, s.sstable_count);
+    assert!(total_files >= 1);
+    // At least one level should have nonzero size
+    assert!(s.level_stats.iter().any(|ls| ls.size_bytes > 0));
+}
+
+#[test]
+fn stats_cache_hits_misses_after_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.cache_size = 8 * 1024 * 1024; // ensure cache is enabled
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put(1, "a", None).unwrap();
+    db.flush().unwrap();
+
+    // First read: cache miss (block not yet cached)
+    let _ = ns.get(1).unwrap();
+    let s = db.stats();
+    assert!(
+        s.cache_misses >= 1,
+        "expected cache miss on first SSTable read"
+    );
+
+    // Second read of same key: cache hit
+    let hits_before = db.stats().cache_hits;
+    let _ = ns.get(1).unwrap();
+    let s = db.stats();
+    assert!(
+        s.cache_hits > hits_before,
+        "expected cache hit on repeated read"
+    );
+}
+
+#[test]
+fn stats_cache_disabled_reports_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.cache_size = 0; // disable cache
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put(1, "a", None).unwrap();
+    db.flush().unwrap();
+    let _ = ns.get(1).unwrap();
+
+    let s = db.stats();
+    assert_eq!(s.cache_hits, 0);
+    assert_eq!(s.cache_misses, 0);
+}
+
+#[test]
+fn stats_default_includes_level_stats() {
+    let s = Stats::default();
+    assert!(s.level_stats.is_empty());
+
+    let ls = LevelStat::default();
+    assert_eq!(ls.file_count, 0);
+    assert_eq!(ls.size_bytes, 0);
 }

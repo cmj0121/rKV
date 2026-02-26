@@ -607,6 +607,18 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("  sstable_count:     {}", s.sstable_count);
             println!("  write_buffer_bytes:{}", s.write_buffer_bytes);
             println!("  pending_compactions:{}", s.pending_compactions);
+            if s.sstable_count > 0 {
+                for (i, ls) in s.level_stats.iter().enumerate() {
+                    if ls.file_count > 0 {
+                        println!(
+                            "  L{}:                {} files, {}",
+                            i,
+                            ls.file_count,
+                            format_bytes(ls.size_bytes as usize)
+                        );
+                    }
+                }
+            }
             println!("Operations:");
             println!("  op_puts:           {}", s.op_puts);
             println!("  op_gets:           {}", s.op_gets);
