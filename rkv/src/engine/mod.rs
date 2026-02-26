@@ -263,7 +263,7 @@ impl DB {
             .as_millis() as u64;
 
         {
-            let mut map = namespace_data.write().unwrap();
+            let mut map = namespace_data.write().unwrap_or_else(|e| e.into_inner());
             for record in records {
                 // Skip expired records
                 if record.expires_at_ms > 0 && record.expires_at_ms <= now_ms {
@@ -323,12 +323,12 @@ impl DB {
                     tick += 1;
                     if tick >= 60 {
                         tick = 0;
-                        let mut aol = aol.lock().unwrap();
+                        let mut aol = aol.lock().unwrap_or_else(|e| e.into_inner());
                         let _ = aol.flush_if_dirty();
                     }
                 }
                 // Final flush on shutdown
-                let mut aol = aol.lock().unwrap();
+                let mut aol = aol.lock().unwrap_or_else(|e| e.into_inner());
                 let _ = aol.flush_if_dirty();
             }))
         };
@@ -353,7 +353,7 @@ impl DB {
                     // Wait for notification or 30s safety-net poll
                     {
                         let (lock, cvar) = &*notify;
-                        let mut pending = lock.lock().unwrap();
+                        let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
                         if !*pending && !stop.load(Ordering::Relaxed) {
                             let result =
                                 cvar.wait_timeout(pending, Duration::from_secs(30)).unwrap();
@@ -364,7 +364,7 @@ impl DB {
 
                     if stop.load(Ordering::Relaxed) {
                         let (lock, cvar) = &*done;
-                        let mut d = lock.lock().unwrap();
+                        let mut d = lock.lock().unwrap_or_else(|e| e.into_inner());
                         *d = true;
                         cvar.notify_all();
                         break;
@@ -379,7 +379,7 @@ impl DB {
                             break;
                         }
 
-                        let _guard = c_mutex.lock().unwrap();
+                        let _guard = c_mutex.lock().unwrap_or_else(|e| e.into_inner());
                         // Re-check after acquiring mutex (another thread may have compacted)
                         if !DB::check_should_compact(&sstables, &config) {
                             break;
@@ -390,7 +390,7 @@ impl DB {
                     // Signal wait_for_compaction() callers
                     {
                         let (lock, cvar) = &*done;
-                        let mut d = lock.lock().unwrap();
+                        let mut d = lock.lock().unwrap_or_else(|e| e.into_inner());
                         *d = true;
                         cvar.notify_all();
                     }
@@ -434,7 +434,7 @@ impl DB {
         self.compaction_stop.store(true, Ordering::Relaxed);
         {
             let (lock, cvar) = &*self.compaction_notify;
-            let mut pending = lock.lock().unwrap();
+            let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
             *pending = true;
             cvar.notify_one();
         }
@@ -450,18 +450,21 @@ impl DB {
     }
 
     pub fn stats(&self) -> Stats {
-        let map = self.namespace_data.read().unwrap();
+        let map = self
+            .namespace_data
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let namespace_count = map.len() as u64;
         let mut total_keys: u64 = 0;
         let mut write_buffer_bytes: u64 = 0;
         for mt in map.values() {
-            let mt = mt.lock().unwrap();
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
             total_keys += mt.count();
             write_buffer_bytes += mt.approximate_size() as u64;
         }
 
         // SSTable stats from self.sstables
-        let sst = self.sstables.read().unwrap();
+        let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
         let max_levels = self.config.max_levels;
         let mut sstable_count: u64 = 0;
         let mut pending_compactions: u64 = 0;
@@ -505,7 +508,7 @@ impl DB {
 
         // Cache hit/miss counters
         let (cache_hits, cache_misses) = if let Some(ref bc) = self.block_cache {
-            let cache = bc.lock().unwrap();
+            let cache = bc.lock().unwrap_or_else(|e| e.into_inner());
             (cache.hits(), cache.misses())
         } else {
             (0, 0)
@@ -552,7 +555,10 @@ impl DB {
     /// access and enforced on subsequent calls within the same session.
     pub fn namespace(&self, name: &str, password: Option<&str>) -> Result<Namespace<'_>> {
         let encrypted = password.is_some();
-        let mut map = self.encrypted_namespaces.lock().unwrap();
+        let mut map = self
+            .encrypted_namespaces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(&was_encrypted) = map.get(name) {
             if was_encrypted && !encrypted {
                 return Err(Error::EncryptionRequired(format!(
@@ -579,13 +585,16 @@ impl DB {
         let mut names = std::collections::BTreeSet::new();
 
         {
-            let map = self.namespace_data.read().unwrap();
+            let map = self
+                .namespace_data
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             for key in map.keys() {
                 names.insert(key.clone());
             }
         }
         {
-            let sst = self.sstables.read().unwrap();
+            let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
             for key in sst.keys() {
                 names.insert(key.clone());
             }
@@ -614,8 +623,11 @@ impl DB {
 
         // Check the namespace actually exists
         let exists = {
-            let nd = self.namespace_data.read().unwrap();
-            let sst = self.sstables.read().unwrap();
+            let nd = self
+                .namespace_data
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
             nd.contains_key(name) || sst.contains_key(name)
         };
         if !exists {
@@ -626,19 +638,28 @@ impl DB {
 
         // 1. Remove from in-memory maps
         {
-            let mut map = self.namespace_data.write().unwrap();
+            let mut map = self
+                .namespace_data
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             map.remove(name);
         }
         {
-            let mut map = self.sstables.write().unwrap();
+            let mut map = self.sstables.write().unwrap_or_else(|e| e.into_inner());
             map.remove(name);
         }
         {
-            let mut map = self.object_stores.write().unwrap();
+            let mut map = self
+                .object_stores
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             map.remove(name);
         }
         {
-            let mut map = self.encrypted_namespaces.lock().unwrap();
+            let mut map = self
+                .encrypted_namespaces
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             map.remove(name);
         }
 
@@ -663,7 +684,7 @@ impl DB {
         //    namespaces have pending data.
         self.flush()?;
         {
-            let mut aol = self.aol.lock().unwrap();
+            let mut aol = self.aol.lock().unwrap_or_else(|e| e.into_inner());
             aol.truncate(&self.config.path)?;
         }
 
@@ -680,7 +701,10 @@ impl DB {
     /// flushed, the AOL is truncated.
     pub fn flush(&self) -> Result<()> {
         let namespaces: Vec<String> = {
-            let map = self.namespace_data.read().unwrap();
+            let map = self
+                .namespace_data
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             map.keys().cloned().collect()
         };
 
@@ -689,7 +713,7 @@ impl DB {
         for ns_name in &namespaces {
             let entries = {
                 let mt = self.get_or_create_memtable(ns_name);
-                let mut mt = mt.lock().unwrap();
+                let mut mt = mt.lock().unwrap_or_else(|e| e.into_inner());
                 if mt.is_empty() {
                     continue;
                 }
@@ -720,7 +744,7 @@ impl DB {
 
             // Open the reader and prepend to L0 cache (newest first)
             let reader = sstable::SSTableReader::open(&sst_path, seq, self.block_cache.clone())?;
-            let mut sst = self.sstables.write().unwrap();
+            let mut sst = self.sstables.write().unwrap_or_else(|e| e.into_inner());
             let levels = sst
                 .entry(ns_name.clone())
                 .or_insert_with(|| vec![Vec::new()]);
@@ -733,14 +757,14 @@ impl DB {
         }
 
         if flushed_any {
-            let mut aol = self.aol.lock().unwrap();
+            let mut aol = self.aol.lock().unwrap_or_else(|e| e.into_inner());
             aol.truncate(&self.config.path)?;
         }
 
         // Signal background compaction thread
         if flushed_any {
             let (lock, cvar) = &*self.compaction_notify;
-            let mut pending = lock.lock().unwrap();
+            let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
             *pending = true;
             cvar.notify_one();
         }
@@ -754,7 +778,7 @@ impl DB {
     /// underlying file descriptor, guaranteeing that all committed data
     /// is persisted to the storage device.
     pub fn sync(&self) -> Result<()> {
-        let mut aol = self.aol.lock().unwrap();
+        let mut aol = self.aol.lock().unwrap_or_else(|e| e.into_inner());
         aol.sync()
     }
 
@@ -984,7 +1008,10 @@ impl DB {
         for ns_name in &namespaces {
             // Skip encrypted namespaces
             {
-                let enc = self.encrypted_namespaces.lock().unwrap();
+                let enc = self
+                    .encrypted_namespaces
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if enc.get(ns_name).copied().unwrap_or(false) {
                     continue;
                 }
@@ -993,7 +1020,7 @@ impl DB {
             // Merge all SSTable levels into a single sorted map (bottom-up,
             // newest wins) — same merge strategy as compaction.
             let merged = {
-                let sst = self.sstables.read().unwrap();
+                let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
                 let levels = match sst.get(ns_name) {
                     Some(l) => l,
                     None => continue,
@@ -1080,7 +1107,10 @@ impl DB {
     /// deeper levels when a level exceeds its size threshold. Tombstones
     /// are dropped only at the bottommost level (`max_levels - 1`).
     pub fn compact(&self) -> Result<()> {
-        let _guard = self.compaction_mutex.lock().unwrap();
+        let _guard = self
+            .compaction_mutex
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         Self::do_compact(
             &self.config,
             &self.sstables,
@@ -1098,19 +1128,19 @@ impl DB {
         // Clear done flag to ensure we wait for the NEXT cycle, not a stale one
         {
             let (lock, _cvar) = &*self.compaction_done;
-            let mut done = lock.lock().unwrap();
+            let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
             *done = false;
         }
         // Signal the compaction thread
         {
             let (lock, cvar) = &*self.compaction_notify;
-            let mut pending = lock.lock().unwrap();
+            let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
             *pending = true;
             cvar.notify_one();
         }
         // Wait for the compaction thread to signal done
         let (lock, cvar) = &*self.compaction_done;
-        let mut done = lock.lock().unwrap();
+        let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
         while !*done {
             done = cvar.wait(done).unwrap();
         }
@@ -1119,7 +1149,7 @@ impl DB {
 
     /// Check if any namespace's L0 level exceeds the compaction thresholds.
     fn check_should_compact(sstables: &RwLock<LeveledSSTables>, config: &Config) -> bool {
-        let sst = sstables.read().unwrap();
+        let sst = sstables.read().unwrap_or_else(|e| e.into_inner());
         for (_ns, levels) in sst.iter() {
             if let Some(l0_readers) = levels.first() {
                 if l0_readers.len() >= config.l0_max_count {
@@ -1142,7 +1172,7 @@ impl DB {
         block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
     ) -> Result<()> {
         let namespaces: Vec<String> = {
-            let sst = sstables.read().unwrap();
+            let sst = sstables.read().unwrap_or_else(|e| e.into_inner());
             sst.keys().cloned().collect()
         };
 
@@ -1168,7 +1198,7 @@ impl DB {
         }
 
         {
-            let sst = sstables.read().unwrap();
+            let sst = sstables.read().unwrap_or_else(|e| e.into_inner());
             let has_l0 = sst
                 .get(ns)
                 .and_then(|levels| levels.first())
@@ -1240,7 +1270,7 @@ impl DB {
         block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
     ) -> Result<usize> {
         let (source_paths, merged) = {
-            let sst = sstables.read().unwrap();
+            let sst = sstables.read().unwrap_or_else(|e| e.into_inner());
             let levels = match sst.get(ns) {
                 Some(l) => l,
                 None => return Ok(0),
@@ -1313,10 +1343,10 @@ impl DB {
             for path in &source_paths {
                 let _ = fs::remove_file(path);
             }
-            let mut sst = sstables.write().unwrap();
+            let mut sst = sstables.write().unwrap_or_else(|e| e.into_inner());
             if let Some(levels) = sst.get_mut(ns) {
                 if let Some(ref bc) = block_cache {
-                    let mut cache = bc.lock().unwrap();
+                    let mut cache = bc.lock().unwrap_or_else(|e| e.into_inner());
                     for level in [source_level, target_level] {
                         if let Some(readers) = levels.get(level) {
                             for r in readers {
@@ -1361,12 +1391,12 @@ impl DB {
         // Open the new reader and update the in-memory level structure
         let reader = sstable::SSTableReader::open(&output_path, seq, block_cache.clone())?;
         let output_size = reader.size_bytes();
-        let mut sst = sstables.write().unwrap();
+        let mut sst = sstables.write().unwrap_or_else(|e| e.into_inner());
         let levels = sst.entry(ns.to_owned()).or_insert_with(|| vec![Vec::new()]);
 
         // Evict old SSTable blocks from the cache before dropping readers
         if let Some(ref bc) = block_cache {
-            let mut cache = bc.lock().unwrap();
+            let mut cache = bc.lock().unwrap_or_else(|e| e.into_inner());
             for level in [source_level, target_level] {
                 if let Some(readers) = levels.get(level) {
                     for r in readers {
@@ -1397,7 +1427,7 @@ impl DB {
     }
 
     fn do_level_total_size(sstables: &RwLock<LeveledSSTables>, ns: &str, level: usize) -> usize {
-        let sst = sstables.read().unwrap();
+        let sst = sstables.read().unwrap_or_else(|e| e.into_inner());
         sst.get(ns)
             .and_then(|levels| levels.get(level))
             .map(|readers| readers.iter().map(|r| r.size_bytes()).sum())
@@ -1416,7 +1446,7 @@ impl DB {
         }
 
         let live_hashes: std::collections::HashSet<String> = {
-            let sst = sstables.read().unwrap();
+            let sst = sstables.read().unwrap_or_else(|e| e.into_inner());
             let mut hashes = std::collections::HashSet::new();
             if let Some(levels) = sst.get(ns) {
                 for level_readers in levels {
@@ -1481,14 +1511,14 @@ impl DB {
         value: &Value,
         ttl: Option<Duration>,
     ) -> Result<()> {
-        let mut aol = self.aol.lock().unwrap();
+        let mut aol = self.aol.lock().unwrap_or_else(|e| e.into_inner());
         aol.append(ns, rev, key, value, ttl)
     }
 
     pub(crate) fn get_or_create_object_store(&self, ns: &str) -> Result<&objects::ObjectStore> {
         // Fast path: read lock to check if store already exists
         {
-            let map = self.object_stores.read().unwrap();
+            let map = self.object_stores.read().unwrap_or_else(|e| e.into_inner());
             if map.contains_key(ns) {
                 // SAFETY: The RwLock<HashMap> only grows (we never remove entries),
                 // so a reference obtained under the read lock remains valid.
@@ -1498,7 +1528,10 @@ impl DB {
         }
 
         // Slow path: write lock to insert
-        let mut map = self.object_stores.write().unwrap();
+        let mut map = self
+            .object_stores
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         if !map.contains_key(ns) {
             let store = objects::ObjectStore::open(&self.config.path, ns)?;
             map.insert(ns.to_owned(), store);
@@ -1530,7 +1563,7 @@ impl DB {
         } else {
             prefix.to_prefix_bytes()
         };
-        let sst = self.sstables.read().unwrap();
+        let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
         let mut merged = std::collections::BTreeMap::<Key, Value>::new();
 
         if let Some(levels) = sst.get(ns) {
@@ -1580,7 +1613,7 @@ impl DB {
         } else {
             prefix.to_prefix_bytes()
         };
-        let sst = self.sstables.read().unwrap();
+        let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
         let mut merged = std::collections::BTreeMap::<Key, Value>::new();
 
         if let Some(levels) = sst.get(ns) {
@@ -1618,7 +1651,7 @@ impl DB {
     /// - `Ok(Some(value))` if found (may be `Tombstone`)
     /// - `Ok(None)` if not found in any SSTable
     pub(crate) fn get_from_sstables(&self, ns: &str, key: &Key) -> Result<Option<Value>> {
-        let sst = self.sstables.read().unwrap();
+        let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
         if let Some(levels) = sst.get(ns) {
             for level_readers in levels {
                 for reader in level_readers {
@@ -1780,7 +1813,10 @@ impl DB {
     pub(crate) fn get_or_create_memtable(&self, name: &str) -> &Mutex<memtable::MemTable> {
         // Fast path: read lock to check if memtable already exists
         {
-            let map = self.namespace_data.read().unwrap();
+            let map = self
+                .namespace_data
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             if map.contains_key(name) {
                 // SAFETY: The RwLock<HashMap> only grows (we never remove entries),
                 // so a reference obtained under the read lock remains valid.
@@ -1790,7 +1826,10 @@ impl DB {
         }
 
         // Slow path: write lock to insert
-        let mut map = self.namespace_data.write().unwrap();
+        let mut map = self
+            .namespace_data
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         map.entry(name.to_owned())
             .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
         let ptr = map.get(name).unwrap() as *const Mutex<memtable::MemTable>;
@@ -1808,7 +1847,7 @@ impl Drop for DB {
         self.compaction_stop.store(true, Ordering::Relaxed);
         {
             let (lock, cvar) = &*self.compaction_notify;
-            let mut pending = lock.lock().unwrap();
+            let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
             *pending = true;
             cvar.notify_one();
         }
