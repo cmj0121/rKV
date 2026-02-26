@@ -891,8 +891,36 @@ skip counter). This handles partial writes from crashes during append.
 
 ### Embeddable Library
 
-The engine is a Rust library crate (`rkv`) that can be linked into any Rust program. FFI bindings expose the same API
-to C, Python, and Go consumers.
+The engine is a Rust library crate (`rkv`) that can be linked into any Rust program. The `rkv-ffi`
+crate builds a C-compatible shared library (`cdylib`) with the following exported functions:
+
+| Function          | Signature                                         | Description                   |
+| ----------------- | ------------------------------------------------- | ----------------------------- |
+| `rkv_open`        | `(path) -> *RkvDb`                                | Open database                 |
+| `rkv_close`       | `(*RkvDb)`                                        | Close and free handle         |
+| `rkv_put`         | `(*RkvDb, key, val) -> u128`                      | Put in default namespace      |
+| `rkv_get`         | `(*RkvDb, key, out) -> i32`                       | Get from default namespace    |
+| `rkv_delete`      | `(*RkvDb, key) -> i32`                            | Delete from default namespace |
+| `rkv_put_ns`      | `(*RkvDb, ns, key, val, ttl) -> u128`             | Put with namespace and TTL    |
+| `rkv_get_ns`      | `(*RkvDb, ns, key, out) -> i32`                   | Get with namespace            |
+| `rkv_delete_ns`   | `(*RkvDb, ns, key) -> i32`                        | Delete with namespace         |
+| `rkv_exists`      | `(*RkvDb, ns, key) -> i32`                        | Check key existence (1/0/-1)  |
+| `rkv_ttl`         | `(*RkvDb, ns, key) -> i64`                        | Remaining TTL in ms           |
+| `rkv_scan`        | `(*RkvDb, ns, prefix, limit, offset, out) -> i32` | Forward key scan              |
+| `rkv_rscan`       | `(*RkvDb, ns, prefix, limit, offset, out) -> i32` | Reverse key scan              |
+| `rkv_rev_count`   | `(*RkvDb, ns, key) -> i64`                        | Revision count                |
+| `rkv_rev_get`     | `(*RkvDb, ns, key, index, out) -> i32`            | Get revision by index         |
+| `rkv_flush`       | `(*RkvDb) -> i32`                                 | Flush memtables               |
+| `rkv_compact`     | `(*RkvDb) -> i32`                                 | Trigger compaction            |
+| `rkv_sync`        | `(*RkvDb) -> i32`                                 | Durable sync                  |
+| `rkv_stats`       | `(*RkvDb) -> *char`                               | Stats as JSON string          |
+| `rkv_free`        | `(*u8, len)`                                      | Free byte buffer              |
+| `rkv_free_string` | `(*char)`                                         | Free CString buffer           |
+| `rkv_last_error`  | `(buf, len) -> i32`                               | Copy last error message       |
+
+All functions use `ns = NULL` for the default namespace. Errors are reported via
+`rkv_last_error`. Scan results are encoded as length-prefixed key entries
+(`[key_len: 4B LE][key_bytes]...`).
 
 ### CLI Tool
 
