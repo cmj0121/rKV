@@ -1369,4 +1369,142 @@ mod tests {
         let r = SSTableReader::open(&path, 1, None).unwrap();
         assert!(r.size_bytes() > FOOTER_SIZE);
     }
+
+    // --- parse_index truncation ---
+
+    #[test]
+    fn parse_index_truncated_at_key_len() {
+        // Only 1 byte when 2 are needed for key_len
+        let data = vec![0x00];
+        assert!(SSTableReader::parse_index(&data).is_err());
+    }
+
+    #[test]
+    fn parse_index_truncated_at_key() {
+        // key_len = 5, but only 3 bytes follow
+        let mut data = vec![];
+        data.extend_from_slice(&5u16.to_be_bytes());
+        data.extend_from_slice(&[0x01, 0x02, 0x03]);
+        assert!(SSTableReader::parse_index(&data).is_err());
+    }
+
+    #[test]
+    fn parse_index_truncated_at_offset_size() {
+        // Valid key_len + key, but missing offset/size (needs 12 bytes, only 4 given)
+        let key = Key::Int(1).to_bytes();
+        let mut data = vec![];
+        data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        data.extend_from_slice(&key);
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // only 4 bytes, need 12
+        assert!(SSTableReader::parse_index(&data).is_err());
+    }
+
+    #[test]
+    fn parse_index_valid_entry() {
+        let key = Key::Int(1).to_bytes();
+        let mut data = vec![];
+        data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        data.extend_from_slice(&key);
+        data.extend_from_slice(&100u64.to_be_bytes()); // offset
+        data.extend_from_slice(&200u32.to_be_bytes()); // size
+        let entries = SSTableReader::parse_index(&data).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].offset, 100);
+        assert_eq!(entries[0].size, 200);
+    }
+
+    // --- parse_block_entries truncation ---
+
+    #[test]
+    fn parse_block_truncated_key_len() {
+        let data = vec![0x00]; // only 1 byte, need 2
+        let err = SSTableReader::parse_block_entries(&data).unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)));
+    }
+
+    #[test]
+    fn parse_block_truncated_key() {
+        let mut data = vec![];
+        data.extend_from_slice(&5u16.to_be_bytes()); // key_len = 5
+        data.extend_from_slice(&[0x01, 0x02]); // only 2 bytes of key
+        let err = SSTableReader::parse_block_entries(&data).unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)));
+    }
+
+    #[test]
+    fn parse_block_truncated_value_tag() {
+        let key = Key::Int(1).to_bytes();
+        let mut data = vec![];
+        data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        data.extend_from_slice(&key);
+        // No value_tag byte
+        let err = SSTableReader::parse_block_entries(&data).unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)));
+    }
+
+    #[test]
+    fn parse_block_truncated_value_len() {
+        let key = Key::Int(1).to_bytes();
+        let mut data = vec![];
+        data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        data.extend_from_slice(&key);
+        data.push(0x00); // value_tag
+        data.extend_from_slice(&[0x00, 0x00]); // only 2 bytes, need 4 for value_len
+        let err = SSTableReader::parse_block_entries(&data).unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)));
+    }
+
+    #[test]
+    fn parse_block_truncated_value_data() {
+        let key = Key::Int(1).to_bytes();
+        let mut data = vec![];
+        data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        data.extend_from_slice(&key);
+        data.push(0x00); // value_tag
+        data.extend_from_slice(&10u32.to_be_bytes()); // value_len = 10
+        data.extend_from_slice(&[0x01, 0x02]); // only 2 bytes of data
+        let err = SSTableReader::parse_block_entries(&data).unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)));
+    }
+
+    // --- scan_entries edge cases ---
+
+    #[test]
+    fn scan_entries_empty_sstable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("empty_scan.sst");
+        let w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0).unwrap();
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path, 1, None).unwrap();
+        let entries = r
+            .scan_entries(&Key::Int(1).to_bytes(), true, false)
+            .unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn scan_with_prefix_bloom_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bloom_scan.sst");
+        // bloom_bits=10, bloom_prefix_len=3
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 10, 3).unwrap();
+        w.add(&Key::from("aaa:1"), &Value::from("v")).unwrap();
+        w.add(&Key::from("aaa:2"), &Value::from("v")).unwrap();
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path, 1, None).unwrap();
+
+        // Prefix that exists
+        let entries = r
+            .scan_entries(&Key::from("aaa:").to_prefix_bytes(), false, false)
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // Prefix that doesn't exist — bloom filter should reject
+        let entries = r
+            .scan_entries(&Key::from("zzz:").to_prefix_bytes(), false, false)
+            .unwrap();
+        assert!(entries.is_empty());
+    }
 }
