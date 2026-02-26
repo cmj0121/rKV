@@ -736,6 +736,131 @@ fn config_bloom_bits_override() {
     assert_eq!(db.config().bloom_bits, 20);
 }
 
+// --- Bloom filter integration ---
+
+#[test]
+fn bloom_filter_no_false_negatives_after_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.bloom_bits = 10;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // Write keys, flush to SSTable (builds bloom filter)
+    for i in 0..100 {
+        ns.put(Key::Int(i), format!("val{i}"), None).unwrap();
+    }
+    db.flush().unwrap();
+
+    // Every inserted key must be found (no false negatives)
+    for i in 0..100 {
+        let val = ns.get(Key::Int(i)).unwrap();
+        assert_eq!(val, Value::from(format!("val{i}").as_str()));
+    }
+}
+
+#[test]
+fn bloom_filter_rejects_missing_keys_after_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.bloom_bits = 10;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 0..100 {
+        ns.put(Key::Int(i), format!("val{i}"), None).unwrap();
+    }
+    db.flush().unwrap();
+
+    // Non-existent keys should return KeyNotFound
+    for i in 100..200 {
+        let err = ns.get(Key::Int(i)).unwrap_err();
+        assert!(matches!(err, Error::KeyNotFound));
+    }
+}
+
+#[test]
+fn bloom_filter_works_after_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.bloom_bits = 10;
+    config.write_buffer_size = 256;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // Multiple flushes to create multiple L0 SSTables
+    for batch in 0..3 {
+        for i in 0..10 {
+            let key = batch * 10 + i;
+            ns.put(Key::Int(key), format!("v{key}"), None).unwrap();
+        }
+        db.flush().unwrap();
+    }
+    db.compact().unwrap();
+
+    // All keys readable after compaction (bloom filter rebuilt in output SSTable)
+    for i in 0..30 {
+        let val = ns.get(Key::Int(i)).unwrap();
+        assert_eq!(val, Value::from(format!("v{i}").as_str()));
+    }
+}
+
+#[test]
+fn bloom_filter_survives_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db");
+
+    {
+        let mut config = Config::new(&db_path);
+        config.bloom_bits = 10;
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        for i in 0..50 {
+            ns.put(Key::Int(i), format!("val{i}"), None).unwrap();
+        }
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+
+    {
+        let mut config = Config::new(&db_path);
+        config.bloom_bits = 10;
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        // Data readable via SSTable with bloom filter
+        for i in 0..50 {
+            let val = ns.get(Key::Int(i)).unwrap();
+            assert_eq!(val, Value::from(format!("val{i}").as_str()));
+        }
+        // Missing keys correctly rejected
+        let err = ns.get(Key::Int(999)).unwrap_err();
+        assert!(matches!(err, Error::KeyNotFound));
+    }
+}
+
+#[test]
+fn bloom_filter_disabled_with_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.bloom_bits = 0; // disabled
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 0..20 {
+        ns.put(Key::Int(i), format!("val{i}"), None).unwrap();
+    }
+    db.flush().unwrap();
+
+    // Still works correctly — just without bloom optimization
+    for i in 0..20 {
+        let val = ns.get(Key::Int(i)).unwrap();
+        assert_eq!(val, Value::from(format!("val{i}").as_str()));
+    }
+    let err = ns.get(Key::Int(999)).unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound));
+}
+
 // --- Verify checksums config ---
 
 #[test]
