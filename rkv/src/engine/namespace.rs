@@ -96,10 +96,17 @@ impl<'db> Namespace<'db> {
         let rev = self.db.generate_revision();
         self.db
             .append_to_aol(&self.name, rev.as_u128(), &key, &value, ttl)?;
-        let mt = self.db.get_or_create_memtable(&self.name);
-        let mut mt = mt.lock().unwrap_or_else(|e| e.into_inner());
-        let actual_rev = mt.put(key, value, rev, ttl);
-        self.db.inc_op_puts();
+        let (actual_rev, should_flush) = {
+            let mt = self.db.get_or_create_memtable(&self.name);
+            let mut mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let actual_rev = mt.put(key, value, rev, ttl);
+            self.db.inc_op_puts();
+            let size = mt.approximate_size();
+            (actual_rev, size >= self.db.config().write_buffer_size)
+        };
+        if should_flush {
+            let _ = self.db.flush(); // best-effort; data is safe in AOL
+        }
         Ok(actual_rev)
     }
 
