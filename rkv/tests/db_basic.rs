@@ -3972,3 +3972,160 @@ fn scan_cross_namespace_isolation_after_flush() {
     assert_eq!(ns1.get("shared_key").unwrap(), Value::from("from_ns1"));
     assert_eq!(ns2.get("shared_key").unwrap(), Value::from("from_ns2"));
 }
+
+// --- Block Cache ---
+
+#[test]
+fn cache_hit_after_repeated_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.cache_size = 8 * 1024 * 1024; // 8 MB
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    for i in 0..10 {
+        ns.put(Key::Int(i), format!("value_{i}"), None).unwrap();
+    }
+    db.flush().unwrap();
+
+    // First read populates the cache
+    for i in 0..10 {
+        let v = ns.get(Key::Int(i)).unwrap();
+        assert_eq!(v, Value::from(format!("value_{i}").as_str()));
+    }
+
+    // Second read should hit the cache (same results expected)
+    for i in 0..10 {
+        let v = ns.get(Key::Int(i)).unwrap();
+        assert_eq!(v, Value::from(format!("value_{i}").as_str()));
+    }
+}
+
+#[test]
+fn cache_works_after_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.cache_size = 8 * 1024 * 1024;
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns.put("a", "alpha", None).unwrap();
+    ns.put("b", "beta", None).unwrap();
+    db.flush().unwrap();
+
+    // Read from SSTable (populates cache)
+    assert_eq!(ns.get("a").unwrap(), Value::from("alpha"));
+    assert_eq!(ns.get("b").unwrap(), Value::from("beta"));
+
+    // Second flush adds more data
+    ns.put("c", "gamma", None).unwrap();
+    db.flush().unwrap();
+
+    // All keys still readable (mix of cached and new reads)
+    assert_eq!(ns.get("a").unwrap(), Value::from("alpha"));
+    assert_eq!(ns.get("b").unwrap(), Value::from("beta"));
+    assert_eq!(ns.get("c").unwrap(), Value::from("gamma"));
+}
+
+#[test]
+fn cache_disabled_with_zero_size() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.cache_size = 0; // disabled
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    for i in 0..10 {
+        ns.put(Key::Int(i), format!("val_{i}"), None).unwrap();
+    }
+    db.flush().unwrap();
+
+    // Should still work correctly without cache
+    for i in 0..10 {
+        let v = ns.get(Key::Int(i)).unwrap();
+        assert_eq!(v, Value::from(format!("val_{i}").as_str()));
+    }
+
+    // Scans should also work
+    let results = ns.scan(&Key::Int(0), 100, 0).unwrap();
+    assert_eq!(results.len(), 10);
+}
+
+#[test]
+fn cache_compaction_evicts_old_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.cache_size = 8 * 1024 * 1024;
+    config.l0_max_count = 100; // prevent auto-compaction
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // Create multiple L0 SSTables
+    for batch in 0..3 {
+        for i in 0..5 {
+            let key = Key::Int(batch * 10 + i);
+            ns.put(key, format!("v{batch}_{i}"), None).unwrap();
+        }
+        db.flush().unwrap();
+    }
+
+    // Read all keys to populate cache
+    for batch in 0..3 {
+        for i in 0..5 {
+            let key = Key::Int(batch * 10 + i);
+            let _ = ns.get(key).unwrap();
+        }
+    }
+
+    // Compact — old SSTables are merged and cache entries evicted
+    db.compact().unwrap();
+
+    // Data should still be accessible (reads go through new SSTables)
+    for batch in 0..3 {
+        for i in 0..5 {
+            let key = Key::Int(batch * 10 + i);
+            let v = ns.get(key).unwrap();
+            assert_eq!(v, Value::from(format!("v{batch}_{i}").as_str()));
+        }
+    }
+}
+
+#[test]
+fn cache_survives_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().to_path_buf();
+
+    // Session 1: write data and flush
+    {
+        let mut config = Config::new(&db_path);
+        config.cache_size = 8 * 1024 * 1024;
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        for i in 0..10 {
+            ns.put(Key::Int(i), format!("data_{i}"), None).unwrap();
+        }
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+
+    // Session 2: reopen (fresh cache) and verify reads work
+    {
+        let mut config = Config::new(&db_path);
+        config.cache_size = 8 * 1024 * 1024;
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        // First read populates cache from new SSTable readers
+        for i in 0..10 {
+            let v = ns.get(Key::Int(i)).unwrap();
+            assert_eq!(v, Value::from(format!("data_{i}").as_str()));
+        }
+
+        // Second read should hit cache
+        for i in 0..10 {
+            let v = ns.get(Key::Int(i)).unwrap();
+            assert_eq!(v, Value::from(format!("data_{i}").as_str()));
+        }
+    }
+}

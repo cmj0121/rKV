@@ -1,8 +1,10 @@
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use super::bloom::BloomFilter;
+use super::cache::{self, BlockCache};
 use super::checksum::Checksum;
 use super::error::{Error, Result};
 use super::key::Key;
@@ -313,7 +315,7 @@ pub(super) fn decompress_block(tag: u8, data: &[u8]) -> Result<Vec<u8>> {
 // --- SSTableReader ---
 
 /// Raw entry parsed from a data block: (key_bytes, value_tag, value_data).
-type RawEntry = (Vec<u8>, u8, Vec<u8>);
+use cache::RawEntry;
 
 /// Index entry parsed from an SSTable's index block.
 struct IndexEntry {
@@ -344,11 +346,19 @@ pub(crate) struct SSTableReader {
     bloom_prefix_len: usize,
     /// First key in the SSTable (serialized bytes), for range filtering.
     first_key: Option<Vec<u8>>,
+    /// Unique SSTable identifier (sequence number from file naming).
+    sst_id: u64,
+    /// Shared LRU block cache for decompressed data blocks.
+    cache: Option<Arc<Mutex<BlockCache>>>,
 }
 
 impl SSTableReader {
     /// Open an SSTable file and parse its footer and index.
-    pub(crate) fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(
+        path: &Path,
+        sst_id: u64,
+        cache: Option<Arc<Mutex<BlockCache>>>,
+    ) -> Result<Self> {
         let data = fs::read(path)?;
         if data.len() < FOOTER_SIZE {
             return Err(Error::Corruption(format!(
@@ -480,6 +490,8 @@ impl SSTableReader {
             prefix_bloom,
             bloom_prefix_len,
             first_key,
+            sst_id,
+            cache,
         })
     }
 
@@ -553,7 +565,7 @@ impl SSTableReader {
         };
 
         let ie = &self.index[block_idx];
-        let entries = self.read_block(ie, verify_checksums)?;
+        let entries = self.read_block(ie, block_idx, verify_checksums)?;
 
         // Linear scan entries within the block
         for (kb, value_tag, value_data) in entries {
@@ -657,8 +669,8 @@ impl SSTableReader {
                 }
             };
 
-            for ie in &self.index[start_block..] {
-                let entries = self.read_block(ie, verify_checksums)?;
+            for (bi, ie) in self.index[start_block..].iter().enumerate() {
+                let entries = self.read_block(ie, start_block + bi, verify_checksums)?;
                 for (key_bytes, value_tag, value_data) in entries {
                     if key_bytes.as_slice() >= prefix_bytes {
                         let key = Key::from_bytes(&key_bytes)?;
@@ -669,8 +681,8 @@ impl SSTableReader {
             }
         } else {
             // Prefix matching: scan all blocks, filter by prefix.
-            for ie in &self.index {
-                let entries = self.read_block(ie, verify_checksums)?;
+            for (bi, ie) in self.index.iter().enumerate() {
+                let entries = self.read_block(ie, bi, verify_checksums)?;
                 for (key_bytes, value_tag, value_data) in entries {
                     if key_bytes.starts_with(prefix_bytes) {
                         let key = Key::from_bytes(&key_bytes)?;
@@ -733,8 +745,8 @@ impl SSTableReader {
             };
 
             // Read from block 0 up to end_block inclusive
-            for ie in &self.index[..=end_block] {
-                let entries = self.read_block(ie, verify_checksums)?;
+            for (bi, ie) in self.index[..=end_block].iter().enumerate() {
+                let entries = self.read_block(ie, bi, verify_checksums)?;
                 for (key_bytes, value_tag, value_data) in entries {
                     if key_bytes.as_slice() <= prefix_bytes {
                         let key = Key::from_bytes(&key_bytes)?;
@@ -779,7 +791,24 @@ impl SSTableReader {
     }
 
     /// Read and decompress a single block, returning raw entries.
-    fn read_block(&self, ie: &IndexEntry, verify_checksums: bool) -> Result<Vec<RawEntry>> {
+    ///
+    /// When a block cache is present, checks for a cached copy first and
+    /// inserts newly parsed blocks into the cache for future lookups.
+    fn read_block(
+        &self,
+        ie: &IndexEntry,
+        block_index: usize,
+        verify_checksums: bool,
+    ) -> Result<Vec<RawEntry>> {
+        // 1. Cache lookup (brief lock)
+        if let Some(ref c) = self.cache {
+            let mut cache = c.lock().unwrap();
+            if let Some(entries) = cache.get(self.sst_id, block_index as u32) {
+                return Ok(entries);
+            }
+        }
+
+        // 2. Decompress + parse (no lock held)
         let block_start = ie.offset as usize;
         let block_end = block_start + ie.size as usize;
 
@@ -802,7 +831,17 @@ impl SSTableReader {
         let compressed_payload = &block_on_disk[1..cksum_start];
         let block_data = decompress_block(compression_tag, compressed_payload)?;
 
-        Self::parse_block_entries(&block_data)
+        let entries = Self::parse_block_entries(&block_data)?;
+
+        // 3. Cache insert (brief lock)
+        if let Some(ref c) = self.cache {
+            let size = cache::estimate_block_size(&entries);
+            c.lock()
+                .unwrap()
+                .insert(self.sst_id, block_index as u32, entries.clone(), size);
+        }
+
+        Ok(entries)
     }
 
     /// Iterate all entries in sorted key order.
@@ -811,8 +850,8 @@ impl SSTableReader {
     pub(crate) fn iter_entries(&self, verify_checksums: bool) -> Result<Vec<(Key, Value)>> {
         let mut result = Vec::with_capacity(self.entry_count as usize);
 
-        for ie in &self.index {
-            for (key_bytes, value_tag, value_data) in self.read_block(ie, verify_checksums)? {
+        for (bi, ie) in self.index.iter().enumerate() {
+            for (key_bytes, value_tag, value_data) in self.read_block(ie, bi, verify_checksums)? {
                 let key = Key::from_bytes(&key_bytes)?;
                 let value = Value::from_tag(value_tag, &value_data)?;
                 result.push((key, value));
@@ -820,6 +859,11 @@ impl SSTableReader {
         }
 
         Ok(result)
+    }
+
+    /// Return the SSTable identifier.
+    pub(crate) fn sst_id(&self) -> u64 {
+        self.sst_id
     }
 
     /// Return the total size of the SSTable data in bytes.
@@ -937,7 +981,7 @@ mod tests {
         w.add(&Key::Int(2), &Value::from("b")).unwrap();
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         assert_eq!(r.entry_count(), 2);
         assert_eq!(r.block_count(), 1);
     }
@@ -953,7 +997,7 @@ mod tests {
         }
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         assert_eq!(r.entry_count(), 20);
         assert!(r.block_count() > 1);
     }
@@ -968,7 +1012,7 @@ mod tests {
         w.add(&Key::Int(42), &Value::from("hello")).unwrap();
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         let val = r.get(&Key::Int(42), true).unwrap();
         assert_eq!(val, Some(Value::from("hello")));
     }
@@ -984,7 +1028,7 @@ mod tests {
         }
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         for i in 0..10 {
             let val = r.get(&Key::Int(i), true).unwrap();
             assert_eq!(val, Some(Value::from(format!("val{i}").as_str())));
@@ -1003,7 +1047,7 @@ mod tests {
         }
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         assert!(r.block_count() > 1);
         for i in 0..50 {
             let val = r.get(&Key::Int(i), true).unwrap();
@@ -1022,7 +1066,7 @@ mod tests {
         }
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         for i in 0..10 {
             assert_eq!(
                 r.get(&Key::Int(i), true).unwrap(),
@@ -1042,7 +1086,7 @@ mod tests {
         }
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         for i in 0..10 {
             assert_eq!(
                 r.get(&Key::Int(i), true).unwrap(),
@@ -1062,7 +1106,7 @@ mod tests {
         w.add(&Key::from("ccc"), &Value::from("third")).unwrap();
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         assert_eq!(
             r.get(&Key::from("aaa"), true).unwrap(),
             Some(Value::from("first"))
@@ -1087,7 +1131,7 @@ mod tests {
         w.add(&Key::Int(3), &Value::from("data")).unwrap();
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         assert_eq!(r.get(&Key::Int(1), true).unwrap(), Some(Value::Null));
         assert_eq!(r.get(&Key::Int(2), true).unwrap(), Some(Value::tombstone()));
         assert_eq!(
@@ -1107,7 +1151,7 @@ mod tests {
         w.add(&Key::Int(3), &Value::from("c")).unwrap();
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         assert_eq!(r.get(&Key::Int(2), true).unwrap(), None);
     }
 
@@ -1119,7 +1163,7 @@ mod tests {
         w.add(&Key::Int(1), &Value::from("a")).unwrap();
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         assert_eq!(r.get(&Key::Int(999), true).unwrap(), None);
     }
 
@@ -1131,7 +1175,7 @@ mod tests {
         w.add(&Key::Int(10), &Value::from("a")).unwrap();
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         assert_eq!(r.get(&Key::Int(1), true).unwrap(), None);
     }
 
@@ -1143,7 +1187,7 @@ mod tests {
         let path = tmp.path().join("tiny.sst");
         fs::write(&path, b"too small").unwrap();
 
-        let Err(err) = SSTableReader::open(&path) else {
+        let Err(err) = SSTableReader::open(&path, 1, None) else {
             panic!("expected error for too-small file");
         };
         assert!(matches!(err, Error::Corruption(_)));
@@ -1157,7 +1201,7 @@ mod tests {
         data[..4].copy_from_slice(b"XXXX");
         fs::write(&path, &data).unwrap();
 
-        let Err(err) = SSTableReader::open(&path) else {
+        let Err(err) = SSTableReader::open(&path, 1, None) else {
             panic!("expected error for bad magic");
         };
         assert!(matches!(err, Error::Corruption(_)));
@@ -1176,7 +1220,7 @@ mod tests {
         data[1] ^= 0xFF;
         fs::write(&path, &data).unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         let err = r.get(&Key::Int(1), true).unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
     }
@@ -1194,7 +1238,7 @@ mod tests {
         data[1] ^= 0xFF;
         fs::write(&path, &data).unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         // With verify_checksums=false, corruption is not detected
         // (read may return garbage or decompression error, but not a checksum error)
         let result = r.get(&Key::Int(1), false);
@@ -1218,7 +1262,7 @@ mod tests {
         }
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         assert_eq!(r.get(&Key::Int(0), true).unwrap(), Some(Value::from("v0")));
         assert_eq!(
             r.get(&Key::Int(99), true).unwrap(),
@@ -1239,7 +1283,7 @@ mod tests {
         w.add(&Key::Int(3), &Value::from("c")).unwrap();
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         let entries = r.iter_entries(true).unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0], (Key::Int(1), Value::from("a")));
@@ -1258,7 +1302,7 @@ mod tests {
         }
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         let entries = r.iter_entries(true).unwrap();
         assert_eq!(entries.len(), 20);
         for (i, (key, value)) in entries.iter().enumerate() {
@@ -1277,7 +1321,7 @@ mod tests {
         w.add(&Key::Int(3), &Value::Null).unwrap();
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         let entries = r.iter_entries(true).unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[1].1, Value::tombstone());
@@ -1291,7 +1335,7 @@ mod tests {
         let w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0).unwrap();
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         let entries = r.iter_entries(true).unwrap();
         assert!(entries.is_empty());
     }
@@ -1307,7 +1351,7 @@ mod tests {
         }
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         let entries = r.iter_entries(true).unwrap();
         assert_eq!(entries.len(), 10);
         assert_eq!(entries[0], (Key::Int(0), Value::from("val0")));
@@ -1322,7 +1366,7 @@ mod tests {
         w.add(&Key::Int(1), &Value::from("data")).unwrap();
         w.finish().unwrap();
 
-        let r = SSTableReader::open(&path).unwrap();
+        let r = SSTableReader::open(&path, 1, None).unwrap();
         assert!(r.size_bytes() > FOOTER_SIZE);
     }
 }
