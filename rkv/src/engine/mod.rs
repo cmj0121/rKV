@@ -147,6 +147,12 @@ pub struct Config {
     /// Bloom filter bits per key (default: 10, ~1% false-positive rate).
     /// Set to 0 to disable bloom filters.
     pub bloom_bits: usize,
+    /// Bloom filter prefix length for scan optimization (default: 0 = disabled).
+    /// When > 0, the first `bloom_prefix_len` bytes of each key's serialized
+    /// form are hashed into a prefix bloom filter per SSTable. Scans check
+    /// this filter to skip SSTables that definitely don't contain matching
+    /// prefixes.
+    pub bloom_prefix_len: usize,
     /// Verify checksums on read (default: true).
     /// When enabled, every WAL entry and SSTable block is verified against
     /// its stored checksum during reads. Disabling trades safety for speed.
@@ -182,6 +188,7 @@ impl Config {
             object_size: 1024,
             compress: true,
             bloom_bits: 10,
+            bloom_prefix_len: 0,
             verify_checksums: true,
             compression: Compression::default(),
             io_model: IoModel::default(),
@@ -548,6 +555,7 @@ impl DB {
                 self.config.block_size,
                 self.config.compression.clone(),
                 self.config.bloom_bits,
+                self.config.bloom_prefix_len,
             )?;
             for (key, value) in &entries {
                 writer.add(key, value)?;
@@ -1102,6 +1110,7 @@ impl DB {
             self.config.block_size,
             self.config.compression.clone(),
             self.config.bloom_bits,
+            self.config.bloom_prefix_len,
         )?;
         for (key, value) in &merged {
             writer.add(key, value)?;
@@ -1256,6 +1265,110 @@ impl DB {
         let ptr = map.get(ns).unwrap() as *const objects::ObjectStore;
         // SAFETY: Same as above — the HashMap only grows, so the reference is stable.
         Ok(unsafe { &*ptr })
+    }
+
+    /// Scan entries matching a prefix across all SSTable levels.
+    ///
+    /// Merges results from oldest-to-newest so newer entries overwrite older
+    /// ones. Returns raw `(Key, Value)` pairs including tombstones.
+    ///
+    /// Merge order (oldest-to-newest, so newest wins):
+    /// - L_max, L_max-1, ..., L1 (ascending key order within each level)
+    /// - L0: reverse order (oldest reader → newest reader)
+    pub(crate) fn scan_from_sstables(
+        &self,
+        ns: &str,
+        prefix: &Key,
+        ordered_mode: bool,
+    ) -> Result<std::collections::BTreeMap<Key, Value>> {
+        // For ordered mode (range scan), use full serialized key bytes.
+        // For unordered mode (prefix match), use prefix bytes without
+        // the Str null terminator so starts_with works correctly.
+        let prefix_bytes = if ordered_mode {
+            prefix.to_bytes()
+        } else {
+            prefix.to_prefix_bytes()
+        };
+        let sst = self.sstables.read().unwrap();
+        let mut merged = std::collections::BTreeMap::<Key, Value>::new();
+
+        if let Some(levels) = sst.get(ns) {
+            // Process levels from bottom (oldest) to top (newest)
+            for (level_idx, level_readers) in levels.iter().enumerate().rev() {
+                if level_idx == 0 {
+                    // L0: reverse (oldest-to-newest within L0)
+                    for reader in level_readers.iter().rev() {
+                        for (key, value) in reader.scan_entries(
+                            &prefix_bytes,
+                            ordered_mode,
+                            self.config.verify_checksums,
+                        )? {
+                            merged.insert(key, value);
+                        }
+                    }
+                } else {
+                    for reader in level_readers {
+                        for (key, value) in reader.scan_entries(
+                            &prefix_bytes,
+                            ordered_mode,
+                            self.config.verify_checksums,
+                        )? {
+                            merged.insert(key, value);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(merged)
+    }
+
+    /// Reverse-scan entries matching a prefix across all SSTable levels.
+    ///
+    /// For ordered mode: returns entries with keys <= prefix. For unordered
+    /// mode: same as scan_from_sstables (prefix matching). Same merge order
+    /// as scan_from_sstables.
+    pub(crate) fn rscan_from_sstables(
+        &self,
+        ns: &str,
+        prefix: &Key,
+        ordered_mode: bool,
+    ) -> Result<std::collections::BTreeMap<Key, Value>> {
+        let prefix_bytes = if ordered_mode {
+            prefix.to_bytes()
+        } else {
+            prefix.to_prefix_bytes()
+        };
+        let sst = self.sstables.read().unwrap();
+        let mut merged = std::collections::BTreeMap::<Key, Value>::new();
+
+        if let Some(levels) = sst.get(ns) {
+            for (level_idx, level_readers) in levels.iter().enumerate().rev() {
+                if level_idx == 0 {
+                    for reader in level_readers.iter().rev() {
+                        for (key, value) in reader.rscan_entries(
+                            &prefix_bytes,
+                            ordered_mode,
+                            self.config.verify_checksums,
+                        )? {
+                            merged.insert(key, value);
+                        }
+                    }
+                } else {
+                    for reader in level_readers {
+                        for (key, value) in reader.rscan_entries(
+                            &prefix_bytes,
+                            ordered_mode,
+                            self.config.verify_checksums,
+                        )? {
+                            merged.insert(key, value);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(merged)
     }
 
     /// Look up a key across all SSTable levels for a namespace.

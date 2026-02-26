@@ -54,19 +54,30 @@ pub(crate) struct SSTableWriter {
     entry_count: u64,
     /// Bloom filter builder (collects key hashes during writes).
     bloom: BloomFilter,
+    /// Prefix bloom filter builder (collects prefix hashes during writes).
+    prefix_bloom: Option<BloomFilter>,
+    /// Prefix length for prefix bloom (0 = disabled).
+    bloom_prefix_len: usize,
 }
 
 impl SSTableWriter {
     /// Create a new SSTable writer at the given path.
     ///
     /// `bloom_bits` controls the bloom filter: 10 = ~1% FPR, 0 = disabled.
+    /// `bloom_prefix_len` controls the prefix bloom (0 = disabled).
     pub(crate) fn new(
         path: &Path,
         block_size: usize,
         compression: Compression,
         bloom_bits: usize,
+        bloom_prefix_len: usize,
     ) -> Result<Self> {
         let file = fs::File::create(path)?;
+        let prefix_bloom = if bloom_prefix_len > 0 && bloom_bits > 0 {
+            Some(BloomFilter::new(bloom_bits))
+        } else {
+            None
+        };
         Ok(Self {
             file,
             block_size,
@@ -78,6 +89,8 @@ impl SSTableWriter {
             index: Vec::new(),
             entry_count: 0,
             bloom: BloomFilter::new(bloom_bits),
+            prefix_bloom,
+            bloom_prefix_len,
         })
     }
 
@@ -85,6 +98,13 @@ impl SSTableWriter {
     pub(crate) fn add(&mut self, key: &Key, value: &Value) -> Result<()> {
         let key_bytes = key.to_bytes();
         self.bloom.insert(&key_bytes);
+
+        // Insert prefix into prefix bloom if enabled
+        if let Some(ref mut pf) = self.prefix_bloom {
+            let prefix_len = self.bloom_prefix_len.min(key_bytes.len());
+            pf.insert(&key_bytes[..prefix_len]);
+        }
+
         let value_data = value_to_data(value);
         let value_tag = value.to_tag();
 
@@ -116,9 +136,31 @@ impl SSTableWriter {
             self.flush_block()?;
         }
 
-        // Write filter block (bloom filter)
-        let filter_data = self.bloom.build();
+        // Build filter block
+        let key_bloom_data = self.bloom.build();
+        let prefix_bloom_data = self
+            .prefix_bloom
+            .as_mut()
+            .map(|pf| pf.build())
+            .unwrap_or_default();
+
+        // Write filter block:
+        //   Legacy (0x00): filter block = key bloom only
+        //   Compound (0x01): [key_bloom_len: u32 LE][key_bloom_data][prefix_bloom_data]
         let filter_offset = self.offset;
+        let has_prefix = !prefix_bloom_data.is_empty();
+        let filter_data = if has_prefix {
+            // Compound format:
+            // [key_bloom_len: u32 LE][key_bloom_data][prefix_len: u8][prefix_bloom_data]
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&(key_bloom_data.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&key_bloom_data);
+            buf.push(self.bloom_prefix_len as u8);
+            buf.extend_from_slice(&prefix_bloom_data);
+            buf
+        } else {
+            key_bloom_data
+        };
         let filter_size = filter_data.len() as u32;
         if !filter_data.is_empty() {
             self.file.write_all(&filter_data)?;
@@ -133,7 +175,14 @@ impl SSTableWriter {
         self.offset += index_data.len() as u64;
 
         // Write footer
-        let footer = self.encode_footer(index_offset, index_size, filter_offset, filter_size);
+        let filter_format = if has_prefix { 0x01 } else { 0x00 };
+        let footer = self.encode_footer(
+            index_offset,
+            index_size,
+            filter_offset,
+            filter_size,
+            filter_format,
+        );
         self.file.write_all(&footer)?;
 
         self.file.flush()?;
@@ -200,6 +249,7 @@ impl SSTableWriter {
         index_size: u32,
         filter_offset: u64,
         filter_size: u32,
+        filter_format: u8,
     ) -> Vec<u8> {
         let mut buf = Vec::with_capacity(FOOTER_SIZE);
         buf.extend_from_slice(&MAGIC);
@@ -210,8 +260,8 @@ impl SSTableWriter {
         buf.extend_from_slice(&(self.index.len() as u32).to_be_bytes());
         buf.extend_from_slice(&filter_offset.to_be_bytes());
         buf.extend_from_slice(&filter_size.to_be_bytes());
-        // Reserved padding (1 byte)
-        buf.push(0);
+        // Filter format byte (0x00 = legacy key-only, 0x01 = compound)
+        buf.push(filter_format);
         // Checksum over the preceding 43 bytes
         let checksum = Checksum::compute(&buf);
         buf.extend_from_slice(&checksum.to_bytes());
@@ -288,6 +338,12 @@ pub(crate) struct SSTableReader {
     entry_count: u64,
     /// Bloom filter for probabilistic key membership testing.
     bloom: BloomFilter,
+    /// Prefix bloom filter for scan optimization.
+    prefix_bloom: Option<BloomFilter>,
+    /// Prefix length used to build the prefix bloom (0 = none).
+    bloom_prefix_len: usize,
+    /// First key in the SSTable (serialized bytes), for range filtering.
+    first_key: Option<Vec<u8>>,
 }
 
 impl SSTableReader {
@@ -340,14 +396,80 @@ impl SSTableReader {
         let index_data = &data[index_offset..index_offset + index_size];
         let index = Self::parse_index(index_data)?;
 
-        // Parse filter metadata from footer (bytes 30-41, formerly reserved)
+        // Parse filter metadata from footer (bytes 30-42)
         let filter_offset = u64::from_be_bytes(footer[30..38].try_into().unwrap()) as usize;
         let filter_size = u32::from_be_bytes(footer[38..42].try_into().unwrap()) as usize;
+        let filter_format = footer[42];
 
-        let bloom = if filter_size > 0 && filter_offset + filter_size <= footer_start {
-            BloomFilter::from_bytes(&data[filter_offset..filter_offset + filter_size])?
+        let (bloom, prefix_bloom, bloom_prefix_len) = if filter_size > 0
+            && filter_offset + filter_size <= footer_start
+        {
+            let filter_data = &data[filter_offset..filter_offset + filter_size];
+
+            match filter_format {
+                0x01 => {
+                    // Compound: [key_bloom_len: u32 LE][key_bloom_data]
+                    //           [prefix_len: u8][prefix_bloom_data]
+                    if filter_data.len() < 4 {
+                        (BloomFilter::new(0), None, 0)
+                    } else {
+                        let key_bloom_len =
+                            u32::from_le_bytes(filter_data[0..4].try_into().unwrap()) as usize;
+                        let key_bloom_end = 4 + key_bloom_len;
+                        if key_bloom_end >= filter_data.len() {
+                            (BloomFilter::new(0), None, 0)
+                        } else {
+                            let key_bloom =
+                                BloomFilter::from_bytes(&filter_data[4..key_bloom_end])?;
+                            let prefix_len = filter_data[key_bloom_end] as usize;
+                            let prefix_bloom_start = key_bloom_end + 1;
+                            let prefix_bloom = if prefix_bloom_start < filter_data.len() {
+                                Some(BloomFilter::from_bytes(&filter_data[prefix_bloom_start..])?)
+                            } else {
+                                None
+                            };
+                            (key_bloom, prefix_bloom, prefix_len)
+                        }
+                    }
+                }
+                _ => {
+                    // Legacy (0x00): filter block = key bloom only
+                    (BloomFilter::from_bytes(filter_data)?, None, 0)
+                }
+            }
         } else {
-            BloomFilter::new(0) // no filter — may_contain always returns true
+            (BloomFilter::new(0), None, 0) // no filter
+        };
+
+        // Extract first key from the first block for range filtering
+        let first_key = if let Some(first_ie) = index.first() {
+            let block_start = first_ie.offset as usize;
+            let block_end = block_start + first_ie.size as usize;
+            if block_end <= data.len() {
+                let block_on_disk = &data[block_start..block_end];
+                let cksum_start = block_on_disk.len() - Checksum::encoded_size();
+                let compression_tag = block_on_disk[0];
+                let compressed_payload = &block_on_disk[1..cksum_start];
+                if let Ok(block_data) = decompress_block(compression_tag, compressed_payload) {
+                    // Parse just the first entry's key
+                    if block_data.len() >= 2 {
+                        let kl = u16::from_be_bytes(block_data[0..2].try_into().unwrap()) as usize;
+                        if 2 + kl <= block_data.len() {
+                            Some(block_data[2..2 + kl].to_vec())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
         Ok(Self {
@@ -355,6 +477,9 @@ impl SSTableReader {
             index,
             entry_count,
             bloom,
+            prefix_bloom,
+            bloom_prefix_len,
+            first_key,
         })
     }
 
@@ -428,32 +553,15 @@ impl SSTableReader {
         };
 
         let ie = &self.index[block_idx];
-        let block_start = ie.offset as usize;
-        let block_end = block_start + ie.size as usize;
-
-        if block_end > self.data.len() {
-            return Err(Error::Corruption(format!(
-                "SSTable block out of bounds: {block_start}..{block_end} (file size {})",
-                self.data.len()
-            )));
-        }
-
-        let block_on_disk = &self.data[block_start..block_end];
-
-        // Verify block checksum
-        let cksum_start = block_on_disk.len() - Checksum::encoded_size();
-        if verify_checksums {
-            let checksum = Checksum::from_bytes(&block_on_disk[cksum_start..])?;
-            checksum.verify(&block_on_disk[..cksum_start])?;
-        }
-
-        // Decompress
-        let compression_tag = block_on_disk[0];
-        let compressed_payload = &block_on_disk[1..cksum_start];
-        let block_data = decompress_block(compression_tag, compressed_payload)?;
+        let entries = self.read_block(ie, verify_checksums)?;
 
         // Linear scan entries within the block
-        Self::scan_block_for_key(&block_data, &key_bytes)
+        for (kb, value_tag, value_data) in entries {
+            if kb == key_bytes {
+                return Ok(Some(Value::from_tag(value_tag, &value_data)?));
+            }
+        }
+        Ok(None)
     }
 
     /// Parse all entries from a decompressed block.
@@ -507,14 +615,194 @@ impl SSTableReader {
         Ok(entries)
     }
 
-    /// Linear scan through a decompressed block looking for a specific key.
-    fn scan_block_for_key(block: &[u8], target: &[u8]) -> Result<Option<Value>> {
-        for (key_bytes, value_tag, value_data) in Self::parse_block_entries(block)? {
-            if key_bytes == target {
-                return Ok(Some(Value::from_tag(value_tag, &value_data)?));
+    /// Scan entries matching a prefix/range.
+    ///
+    /// Uses the block index to skip blocks that cannot contain matching keys.
+    /// Returns `(Key, Value)` pairs in sorted order, including tombstones.
+    ///
+    /// - `prefix_bytes`: serialized key prefix to match against.
+    /// - `ordered_mode`: if true, scan from prefix forward (range scan);
+    ///   if false, check all blocks for string prefix matching.
+    pub(crate) fn scan_entries(
+        &self,
+        prefix_bytes: &[u8],
+        ordered_mode: bool,
+        verify_checksums: bool,
+    ) -> Result<Vec<(Key, Value)>> {
+        if self.index.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Prefix bloom check: skip this SSTable if it definitely doesn't
+        // contain keys with this prefix.
+        if !self.may_contain_prefix(prefix_bytes) {
+            return Ok(Vec::new());
+        }
+
+        let mut result = Vec::new();
+
+        if ordered_mode {
+            // Range scan: find the first block whose last_key >= prefix_bytes,
+            // then read blocks forward until keys no longer match.
+            let start_block = match self
+                .index
+                .binary_search_by(|e| e.last_key.as_slice().cmp(prefix_bytes))
+            {
+                Ok(i) => i,
+                Err(i) => {
+                    if i >= self.index.len() {
+                        return Ok(Vec::new());
+                    }
+                    i
+                }
+            };
+
+            for ie in &self.index[start_block..] {
+                let entries = self.read_block(ie, verify_checksums)?;
+                for (key_bytes, value_tag, value_data) in entries {
+                    if key_bytes.as_slice() >= prefix_bytes {
+                        let key = Key::from_bytes(&key_bytes)?;
+                        let value = Value::from_tag(value_tag, &value_data)?;
+                        result.push((key, value));
+                    }
+                }
+            }
+        } else {
+            // Prefix matching: scan all blocks, filter by prefix.
+            for ie in &self.index {
+                let entries = self.read_block(ie, verify_checksums)?;
+                for (key_bytes, value_tag, value_data) in entries {
+                    if key_bytes.starts_with(prefix_bytes) {
+                        let key = Key::from_bytes(&key_bytes)?;
+                        let value = Value::from_tag(value_tag, &value_data)?;
+                        result.push((key, value));
+                    }
+                }
             }
         }
-        Ok(None)
+
+        Ok(result)
+    }
+
+    /// Reverse-scan entries matching a prefix/range.
+    ///
+    /// For ordered mode: returns entries with keys <= prefix_bytes.
+    /// For unordered mode: same as scan_entries (prefix matching).
+    pub(crate) fn rscan_entries(
+        &self,
+        prefix_bytes: &[u8],
+        ordered_mode: bool,
+        verify_checksums: bool,
+    ) -> Result<Vec<(Key, Value)>> {
+        if self.index.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Prefix bloom check for unordered mode (prefix matching).
+        // For ordered mode, prefix_bytes is a range bound, not a prefix.
+        if !ordered_mode && !self.may_contain_prefix(prefix_bytes) {
+            return Ok(Vec::new());
+        }
+
+        let mut result = Vec::new();
+
+        if ordered_mode {
+            // Range scan: find blocks that may contain keys <= prefix_bytes.
+            // We need all blocks from the beginning up to the block whose
+            // last_key >= prefix_bytes.
+            let end_block = match self
+                .index
+                .binary_search_by(|e| e.last_key.as_slice().cmp(prefix_bytes))
+            {
+                Ok(i) => i,
+                Err(i) => {
+                    if i == 0 {
+                        // All blocks have last_key < prefix, so check if
+                        // any keys exist <= prefix. Process all blocks.
+                        // Actually, if i == 0, the first block's last_key < prefix,
+                        // meaning all keys in block 0 could be <= prefix.
+                        // We need to read up to block i (exclusive would miss keys).
+                        // Let's just include block 0 if it has any keys <= prefix.
+                    }
+                    if i > 0 {
+                        i - 1
+                    } else {
+                        0
+                    }
+                }
+            };
+
+            // Read from block 0 up to end_block inclusive
+            for ie in &self.index[..=end_block] {
+                let entries = self.read_block(ie, verify_checksums)?;
+                for (key_bytes, value_tag, value_data) in entries {
+                    if key_bytes.as_slice() <= prefix_bytes {
+                        let key = Key::from_bytes(&key_bytes)?;
+                        let value = Value::from_tag(value_tag, &value_data)?;
+                        result.push((key, value));
+                    }
+                }
+            }
+        } else {
+            // Prefix matching: same as forward scan
+            return self.scan_entries(prefix_bytes, ordered_mode, verify_checksums);
+        }
+
+        Ok(result)
+    }
+
+    /// Test whether the prefix bloom filter may contain the given prefix.
+    ///
+    /// Truncates the query prefix to `bloom_prefix_len` (the length used at
+    /// write time) before checking the bloom filter. Returns `true` if the
+    /// prefix might be present (or no prefix bloom exists), `false` if it
+    /// is definitely absent.
+    pub(crate) fn may_contain_prefix(&self, prefix_bytes: &[u8]) -> bool {
+        match &self.prefix_bloom {
+            Some(pf) => {
+                let query =
+                    if self.bloom_prefix_len > 0 && prefix_bytes.len() >= self.bloom_prefix_len {
+                        &prefix_bytes[..self.bloom_prefix_len]
+                    } else {
+                        prefix_bytes
+                    };
+                pf.may_contain(query)
+            }
+            None => true, // no prefix bloom — conservative
+        }
+    }
+
+    /// Return the first key in this SSTable (serialized bytes), if any.
+    #[allow(dead_code)]
+    pub(crate) fn first_key(&self) -> Option<&[u8]> {
+        self.first_key.as_deref()
+    }
+
+    /// Read and decompress a single block, returning raw entries.
+    fn read_block(&self, ie: &IndexEntry, verify_checksums: bool) -> Result<Vec<RawEntry>> {
+        let block_start = ie.offset as usize;
+        let block_end = block_start + ie.size as usize;
+
+        if block_end > self.data.len() {
+            return Err(Error::Corruption(format!(
+                "SSTable block out of bounds: {block_start}..{block_end} (file size {})",
+                self.data.len()
+            )));
+        }
+
+        let block_on_disk = &self.data[block_start..block_end];
+        let cksum_start = block_on_disk.len() - Checksum::encoded_size();
+
+        if verify_checksums {
+            let checksum = Checksum::from_bytes(&block_on_disk[cksum_start..])?;
+            checksum.verify(&block_on_disk[..cksum_start])?;
+        }
+
+        let compression_tag = block_on_disk[0];
+        let compressed_payload = &block_on_disk[1..cksum_start];
+        let block_data = decompress_block(compression_tag, compressed_payload)?;
+
+        Self::parse_block_entries(&block_data)
     }
 
     /// Iterate all entries in sorted key order.
@@ -524,29 +812,7 @@ impl SSTableReader {
         let mut result = Vec::with_capacity(self.entry_count as usize);
 
         for ie in &self.index {
-            let block_start = ie.offset as usize;
-            let block_end = block_start + ie.size as usize;
-
-            if block_end > self.data.len() {
-                return Err(Error::Corruption(format!(
-                    "SSTable block out of bounds: {block_start}..{block_end} (file size {})",
-                    self.data.len()
-                )));
-            }
-
-            let block_on_disk = &self.data[block_start..block_end];
-            let cksum_start = block_on_disk.len() - Checksum::encoded_size();
-
-            if verify_checksums {
-                let checksum = Checksum::from_bytes(&block_on_disk[cksum_start..])?;
-                checksum.verify(&block_on_disk[..cksum_start])?;
-            }
-
-            let compression_tag = block_on_disk[0];
-            let compressed_payload = &block_on_disk[1..cksum_start];
-            let block_data = decompress_block(compression_tag, compressed_payload)?;
-
-            for (key_bytes, value_tag, value_data) in Self::parse_block_entries(&block_data)? {
+            for (key_bytes, value_tag, value_data) in self.read_block(ie, verify_checksums)? {
                 let key = Key::from_bytes(&key_bytes)?;
                 let value = Value::from_tag(value_tag, &value_data)?;
                 result.push((key, value));
@@ -615,7 +881,7 @@ mod tests {
     fn footer_is_fixed_size() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.sst");
-        let mut writer = SSTableWriter::new(&path, 4096, Compression::None, 0).unwrap();
+        let mut writer = SSTableWriter::new(&path, 4096, Compression::None, 0, 0).unwrap();
         writer.add(&Key::Int(1), &Value::from("a")).unwrap();
         writer.finish().unwrap();
 
@@ -631,7 +897,7 @@ mod tests {
     fn writer_creates_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.sst");
-        let mut writer = SSTableWriter::new(&path, 4096, Compression::None, 0).unwrap();
+        let mut writer = SSTableWriter::new(&path, 4096, Compression::None, 0, 0).unwrap();
         writer.add(&Key::Int(1), &Value::from("hello")).unwrap();
         writer.add(&Key::Int(2), &Value::from("world")).unwrap();
         writer.finish().unwrap();
@@ -646,7 +912,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("multi.sst");
         // Very small block size to force multiple blocks
-        let mut writer = SSTableWriter::new(&path, 32, Compression::None, 0).unwrap();
+        let mut writer = SSTableWriter::new(&path, 32, Compression::None, 0, 0).unwrap();
         for i in 0..20 {
             writer
                 .add(&Key::Int(i), &Value::from(format!("val{i}").as_str()))
@@ -666,7 +932,7 @@ mod tests {
     fn reader_open_single_block() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0).unwrap();
         w.add(&Key::Int(1), &Value::from("a")).unwrap();
         w.add(&Key::Int(2), &Value::from("b")).unwrap();
         w.finish().unwrap();
@@ -680,7 +946,7 @@ mod tests {
     fn reader_open_multi_block() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("multi.sst");
-        let mut w = SSTableWriter::new(&path, 32, Compression::None, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 32, Compression::None, 0, 0).unwrap();
         for i in 0..20 {
             w.add(&Key::Int(i), &Value::from(format!("v{i}").as_str()))
                 .unwrap();
@@ -698,7 +964,7 @@ mod tests {
     fn roundtrip_single_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("rt.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0).unwrap();
         w.add(&Key::Int(42), &Value::from("hello")).unwrap();
         w.finish().unwrap();
 
@@ -711,7 +977,7 @@ mod tests {
     fn roundtrip_multiple_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("rt.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0).unwrap();
         for i in 0..10 {
             w.add(&Key::Int(i), &Value::from(format!("val{i}").as_str()))
                 .unwrap();
@@ -730,7 +996,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("rt.sst");
         // Small block size forces multiple blocks
-        let mut w = SSTableWriter::new(&path, 32, Compression::None, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 32, Compression::None, 0, 0).unwrap();
         for i in 0..50 {
             w.add(&Key::Int(i), &Value::from(format!("v{i}").as_str()))
                 .unwrap();
@@ -749,7 +1015,7 @@ mod tests {
     fn roundtrip_with_lz4() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("lz4.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::LZ4, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 4096, Compression::LZ4, 0, 0).unwrap();
         for i in 0..10 {
             w.add(&Key::Int(i), &Value::from(format!("val{i}").as_str()))
                 .unwrap();
@@ -769,7 +1035,7 @@ mod tests {
     fn roundtrip_with_zstd() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("zstd.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::Zstd, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 4096, Compression::Zstd, 0, 0).unwrap();
         for i in 0..10 {
             w.add(&Key::Int(i), &Value::from(format!("val{i}").as_str()))
                 .unwrap();
@@ -789,7 +1055,7 @@ mod tests {
     fn roundtrip_str_keys() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("str.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0).unwrap();
         // Str keys must be added in sorted order
         w.add(&Key::from("aaa"), &Value::from("first")).unwrap();
         w.add(&Key::from("bbb"), &Value::from("second")).unwrap();
@@ -815,7 +1081,7 @@ mod tests {
     fn roundtrip_null_and_tombstone() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("special.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0).unwrap();
         w.add(&Key::Int(1), &Value::Null).unwrap();
         w.add(&Key::Int(2), &Value::tombstone()).unwrap();
         w.add(&Key::Int(3), &Value::from("data")).unwrap();
@@ -836,7 +1102,7 @@ mod tests {
     fn get_missing_key_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0).unwrap();
         w.add(&Key::Int(1), &Value::from("a")).unwrap();
         w.add(&Key::Int(3), &Value::from("c")).unwrap();
         w.finish().unwrap();
@@ -849,7 +1115,7 @@ mod tests {
     fn get_key_beyond_last_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0).unwrap();
         w.add(&Key::Int(1), &Value::from("a")).unwrap();
         w.finish().unwrap();
 
@@ -861,7 +1127,7 @@ mod tests {
     fn get_key_before_first_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0).unwrap();
         w.add(&Key::Int(10), &Value::from("a")).unwrap();
         w.finish().unwrap();
 
@@ -901,7 +1167,7 @@ mod tests {
     fn reader_detects_corrupt_block() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("corrupt.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0).unwrap();
         w.add(&Key::Int(1), &Value::from("hello")).unwrap();
         w.finish().unwrap();
 
@@ -919,7 +1185,7 @@ mod tests {
     fn reader_skips_checksum_when_disabled() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("skip.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0).unwrap();
         w.add(&Key::Int(1), &Value::from("hello")).unwrap();
         w.finish().unwrap();
 
@@ -945,7 +1211,7 @@ mod tests {
     fn get_first_and_last_key_multi_block() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("boundary.sst");
-        let mut w = SSTableWriter::new(&path, 32, Compression::None, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 32, Compression::None, 0, 0).unwrap();
         for i in 0..100 {
             w.add(&Key::Int(i), &Value::from(format!("v{i}").as_str()))
                 .unwrap();
@@ -967,7 +1233,7 @@ mod tests {
     fn iter_entries_single_block() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("iter.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0).unwrap();
         w.add(&Key::Int(1), &Value::from("a")).unwrap();
         w.add(&Key::Int(2), &Value::from("b")).unwrap();
         w.add(&Key::Int(3), &Value::from("c")).unwrap();
@@ -985,7 +1251,7 @@ mod tests {
     fn iter_entries_multi_block() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("iter_multi.sst");
-        let mut w = SSTableWriter::new(&path, 32, Compression::None, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 32, Compression::None, 0, 0).unwrap();
         for i in 0..20 {
             w.add(&Key::Int(i), &Value::from(format!("v{i}").as_str()))
                 .unwrap();
@@ -1005,7 +1271,7 @@ mod tests {
     fn iter_entries_with_tombstones() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("iter_tomb.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0).unwrap();
         w.add(&Key::Int(1), &Value::from("live")).unwrap();
         w.add(&Key::Int(2), &Value::tombstone()).unwrap();
         w.add(&Key::Int(3), &Value::Null).unwrap();
@@ -1022,7 +1288,7 @@ mod tests {
     fn iter_entries_empty_sstable() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("empty.sst");
-        let w = SSTableWriter::new(&path, 4096, Compression::None, 0).unwrap();
+        let w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0).unwrap();
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path).unwrap();
@@ -1034,7 +1300,7 @@ mod tests {
     fn iter_entries_with_compression() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("iter_lz4.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::LZ4, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 4096, Compression::LZ4, 0, 0).unwrap();
         for i in 0..10 {
             w.add(&Key::Int(i), &Value::from(format!("val{i}").as_str()))
                 .unwrap();
@@ -1052,7 +1318,7 @@ mod tests {
     fn size_bytes_nonzero() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("size.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0).unwrap();
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0).unwrap();
         w.add(&Key::Int(1), &Value::from("data")).unwrap();
         w.finish().unwrap();
 

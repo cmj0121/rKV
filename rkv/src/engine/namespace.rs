@@ -212,15 +212,52 @@ impl<'db> Namespace<'db> {
     }
 
     pub fn scan(&self, prefix: &Key, limit: usize, offset: usize) -> Result<Vec<Key>> {
-        let mt = self.db.get_or_create_memtable(&self.name);
-        let mt = mt.lock().unwrap();
-        Ok(mt.scan(prefix, limit, offset))
+        let (mt_entries, ordered_mode) = {
+            let mt = self.db.get_or_create_memtable(&self.name);
+            let mt = mt.lock().unwrap();
+            (mt.scan_all_raw(prefix), mt.is_ordered())
+        };
+
+        let mut merged = self
+            .db
+            .scan_from_sstables(&self.name, prefix, ordered_mode)?;
+
+        for (key, value) in mt_entries {
+            merged.insert(key, value);
+        }
+
+        Ok(merged
+            .into_iter()
+            .filter(|(_, v)| !v.is_tombstone())
+            .map(|(k, _)| k)
+            .skip(offset)
+            .take(limit)
+            .collect())
     }
 
     pub fn rscan(&self, prefix: &Key, limit: usize, offset: usize) -> Result<Vec<Key>> {
-        let mt = self.db.get_or_create_memtable(&self.name);
-        let mt = mt.lock().unwrap();
-        Ok(mt.rscan(prefix, limit, offset))
+        let (mt_entries, ordered_mode) = {
+            let mt = self.db.get_or_create_memtable(&self.name);
+            let mt = mt.lock().unwrap();
+            (mt.rscan_all_raw(prefix), mt.is_ordered())
+        };
+
+        let mut merged = self
+            .db
+            .rscan_from_sstables(&self.name, prefix, ordered_mode)?;
+
+        for (key, value) in mt_entries {
+            merged.insert(key, value);
+        }
+
+        // Collect and reverse for rscan
+        let all: Vec<Key> = merged
+            .into_iter()
+            .filter(|(_, v)| !v.is_tombstone())
+            .map(|(k, _)| k)
+            .collect();
+
+        Ok(all.into_iter().rev().skip(offset).take(limit).collect())
     }
 
     pub fn count(&self) -> Result<u64> {

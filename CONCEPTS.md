@@ -30,8 +30,8 @@ external coordination.
 
 - **Write path**: Client -> AOL (append-only log, fsync for durability) -> WriteBuffer (in-memory) -> respond to
   caller. Background flush moves WriteBuffer to L1 SSTable; merge compacts L1->L2->L3.
-- **Read path**: WriteBuffer -> frozen buffer -> SSTable files (newest first), with a block cache for decompressed
-  blocks.
+- **Read path**: WriteBuffer -> SSTable files (newest first), with a block cache for decompressed blocks.
+  Both point lookups (`get`) and range/prefix queries (`scan`, `rscan`) merge results across all sources.
 - **Revisions**: Each key-value pair carries a monotonically increasing revision ID. Reads return the latest revision
   by default; history queries retrieve older revisions.
 
@@ -364,6 +364,7 @@ The `Config` struct controls database behavior and LSM tuning parameters:
 | `l0_max_size`       | `usize`       | 64 MB      | Max total L0 size before compaction        |
 | `l1_max_size`       | `usize`       | 256 MB     | Max L1 size before merge to L2             |
 | `default_max_size`  | `usize`       | 2 GB       | Default max size for L2+ levels            |
+| `bloom_prefix_len`  | `usize`       | 0          | Prefix bloom filter length (0 = disabled)  |
 
 The CLI uses dot-notation keys for `config <key> <value>`:
 
@@ -387,6 +388,7 @@ The CLI uses dot-notation keys for `config <key> <value>`:
 | `l0_max_size`       | `lsm.l0_max_size`           |
 | `l1_max_size`       | `lsm.l1_max_size`           |
 | `default_max_size`  | `lsm.default_max_size`      |
+| `bloom_prefix_len`  | `lsm.bloom_prefix_len`      |
 
 `Config::new(path)` initializes all fields to their defaults. Fields can be overridden before
 passing the config to `DB::open`.
@@ -788,6 +790,43 @@ Namespace::get(key)
   3. Not found in any SSTable → return KeyNotFound
 ```
 
+#### Merged Scan
+
+`scan` and `rscan` query across both the MemTable and all SSTable levels to produce
+a unified, deduplicated result. This ensures that data remains visible after `flush()`
+and `compact()` — not just for point lookups, but for prefix/range iteration too.
+
+**Merge strategy** (oldest-to-newest, newest wins):
+
+```text
+Namespace::scan(prefix, limit, offset)
+  1. Collect SSTable entries matching prefix (merge order below)
+  2. Collect MemTable raw entries matching prefix (includes tombstones)
+  3. Insert all into BTreeMap<Key, Value> — newer entries overwrite older
+  4. Filter out tombstones from merged result
+  5. Apply offset, then limit
+  6. For rscan: reverse iteration order before offset/limit
+```
+
+**SSTable merge order** ensures newer values shadow older ones:
+
+1. Deepest level first (L_max, L_max-1, ..., L1) — ascending key order within each
+2. L0: oldest SSTable first → newest SSTable last (so newest overwrites oldest)
+3. MemTable entries inserted last (always win over any SSTable)
+
+**Scan modes**:
+
+- **Ordered mode** (Int keys): Uses the block index to find the starting block, then
+  reads forward (scan) or backward (rscan) from the prefix key. Stops when keys move
+  out of range.
+- **Unordered mode** (Str keys): Serializes the prefix using `Key::to_prefix_bytes()`
+  (omitting the trailing null terminator), then checks each SSTable entry with
+  `starts_with`. All matching blocks must be read.
+
+**Tombstone shadowing**: MemTable raw entries include tombstones. When a MemTable
+tombstone overwrites an SSTable value in the merge map, the tombstone is filtered out
+in step 4 — correctly hiding the deleted key from the final result.
+
 #### Bloom Filters
 
 Each SSTable embeds a bloom filter that enables skipping SSTables during point lookups.
@@ -808,6 +847,38 @@ the false-positive rate is approximately 1%. Set to 0 to disable bloom filters e
 On `DB::open()`, the engine scans `<db>/sst/<namespace>/L<n>/` directories and opens all
 `.sst` files into an in-memory reader cache. L0 readers are ordered newest-first; L1+
 readers are ordered by ascending sequence number.
+
+#### Prefix Bloom Filter
+
+In addition to the per-key bloom filter used for point lookups, each SSTable can embed
+a **prefix bloom filter** that accelerates scan operations. During scan, the prefix bloom
+allows skipping SSTables that definitely contain no keys matching the query prefix.
+
+**Configuration**: `bloom_prefix_len` (default 0 = disabled). When > 0, the first
+`bloom_prefix_len` bytes of each key's serialized form (`Key::to_bytes()`) are hashed into
+a second bloom filter at flush/compaction time. On scan, the query prefix is truncated to
+`bloom_prefix_len` bytes before checking the filter.
+
+**Key prefix semantics**:
+
+- Str keys: prefix bytes are `[0x02][first N-1 chars]` (the tag byte plus string bytes)
+- Int keys: all share the same tag byte `0x01`, so the prefix bloom is less selective for
+  Int-heavy workloads but still harmless
+
+**Compound filter format**: To store both blooms in a single filter block, the SSTable uses
+a compound format identified by a footer byte:
+
+| Format byte | Layout                                                                     |
+| ----------- | -------------------------------------------------------------------------- |
+| `0x00`      | Legacy — filter block contains key bloom only                              |
+| `0x01`      | Compound — `[key_bloom_len: u32 LE][key_bloom][prefix_len: u8][pfx_bloom]` |
+
+Old SSTables with format byte `0x00` are backwards compatible — `may_contain_prefix()`
+returns `true` (no prefix bloom available, so no skipping).
+
+**Sizing**: The prefix bloom uses the same `bloom_bits` (bits-per-key) setting as the key
+bloom. For workloads with many distinct prefixes, 10 bits/key provides ~1% false-positive
+rate on prefix checks.
 
 #### WriteBuffer (MemTable)
 

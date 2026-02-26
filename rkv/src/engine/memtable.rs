@@ -115,6 +115,11 @@ impl MemTable {
         self.approximate_size
     }
 
+    /// Returns true if the memtable is in ordered mode (Int keys only).
+    pub(crate) fn is_ordered(&self) -> bool {
+        self.ordered_mode
+    }
+
     /// Returns true if the approximate size meets or exceeds the limit.
     #[allow(dead_code)]
     pub(crate) fn is_full(&self, limit: usize) -> bool {
@@ -139,6 +144,7 @@ impl MemTable {
     /// - **Unordered mode** (Str keys): prefix matching on string representation.
     ///
     /// Tombstoned and expired keys are excluded.
+    #[allow(dead_code)]
     pub(crate) fn scan(&self, prefix: &Key, limit: usize, offset: usize) -> Vec<Key> {
         if self.ordered_mode {
             self.entries
@@ -168,6 +174,7 @@ impl MemTable {
     /// - **Unordered mode**: prefix matching, reverse iteration order.
     ///
     /// Tombstoned and expired keys are excluded.
+    #[allow(dead_code)]
     pub(crate) fn rscan(&self, prefix: &Key, limit: usize, offset: usize) -> Vec<Key> {
         if self.ordered_mode {
             self.entries
@@ -187,6 +194,110 @@ impl MemTable {
                     k.to_string().starts_with(&prefix_str) && self.is_live(entries)
                 })
                 .map(|(k, _)| k.clone())
+                .skip(offset)
+                .take(limit)
+                .collect()
+        }
+    }
+
+    /// Return all raw `(Key, Value)` pairs matching a prefix, including tombstones.
+    ///
+    /// No limit/offset — returns everything. Used by the merged scan to
+    /// overlay MemTable entries on top of SSTable results.
+    pub(crate) fn scan_all_raw(&self, prefix: &Key) -> Vec<(Key, Value)> {
+        if self.ordered_mode {
+            self.entries
+                .range(prefix..)
+                .filter(|(_, entries)| self.is_not_expired(entries))
+                .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
+                .collect()
+        } else {
+            let prefix_str = prefix.to_string();
+            self.entries
+                .iter()
+                .filter(|(k, entries)| {
+                    k.to_string().starts_with(&prefix_str) && self.is_not_expired(entries)
+                })
+                .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
+                .collect()
+        }
+    }
+
+    /// Return all raw `(Key, Value)` pairs matching a prefix in reverse,
+    /// including tombstones.
+    ///
+    /// For ordered mode: returns keys <= prefix. For unordered mode: prefix
+    /// matching (same as forward). Used by merged rscan.
+    pub(crate) fn rscan_all_raw(&self, prefix: &Key) -> Vec<(Key, Value)> {
+        if self.ordered_mode {
+            self.entries
+                .range(..=prefix.clone())
+                .filter(|(_, entries)| self.is_not_expired(entries))
+                .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
+                .collect()
+        } else {
+            let prefix_str = prefix.to_string();
+            self.entries
+                .iter()
+                .filter(|(k, entries)| {
+                    k.to_string().starts_with(&prefix_str) && self.is_not_expired(entries)
+                })
+                .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
+                .collect()
+        }
+    }
+
+    /// Forward scan keys starting from `prefix`, returning raw `(Key, Value)` pairs.
+    ///
+    /// Like `scan()` but includes tombstones (needed to shadow SSTable entries
+    /// during merge). Expired entries are still skipped.
+    #[allow(dead_code)]
+    pub(crate) fn scan_raw(&self, prefix: &Key, limit: usize, offset: usize) -> Vec<(Key, Value)> {
+        if self.ordered_mode {
+            self.entries
+                .range(prefix..)
+                .filter(|(_, entries)| self.is_not_expired(entries))
+                .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
+                .skip(offset)
+                .take(limit)
+                .collect()
+        } else {
+            let prefix_str = prefix.to_string();
+            self.entries
+                .iter()
+                .filter(|(k, entries)| {
+                    k.to_string().starts_with(&prefix_str) && self.is_not_expired(entries)
+                })
+                .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
+                .skip(offset)
+                .take(limit)
+                .collect()
+        }
+    }
+
+    /// Reverse scan keys starting from `prefix`, returning raw `(Key, Value)` pairs.
+    ///
+    /// Like `rscan()` but includes tombstones. Expired entries are skipped.
+    #[allow(dead_code)]
+    pub(crate) fn rscan_raw(&self, prefix: &Key, limit: usize, offset: usize) -> Vec<(Key, Value)> {
+        if self.ordered_mode {
+            self.entries
+                .range(..=prefix.clone())
+                .rev()
+                .filter(|(_, entries)| self.is_not_expired(entries))
+                .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
+                .skip(offset)
+                .take(limit)
+                .collect()
+        } else {
+            let prefix_str = prefix.to_string();
+            self.entries
+                .iter()
+                .rev()
+                .filter(|(k, entries)| {
+                    k.to_string().starts_with(&prefix_str) && self.is_not_expired(entries)
+                })
+                .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
                 .skip(offset)
                 .take(limit)
                 .collect()
@@ -299,6 +410,19 @@ impl MemTable {
             }
         }
         result
+    }
+
+    /// Check if the latest entry for a key is not expired (may be a tombstone).
+    fn is_not_expired(&self, entries: &[MemEntry]) -> bool {
+        let Some(latest) = entries.last() else {
+            return false;
+        };
+        if let Some(expires_at) = latest.expires_at {
+            if Instant::now() > expires_at {
+                return false;
+            }
+        }
+        true
     }
 
     /// Check if the latest entry for a key is live (non-tombstone, non-expired).
