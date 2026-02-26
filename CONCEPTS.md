@@ -777,15 +777,33 @@ Namespace::get(key)
   1. MemTable lookup — if found, return value
   2. For each level (L0, L1, L2, ...):
      For each SSTable in the level (L0: newest first; L1+: ascending):
-       a. Binary search index for candidate block
-       b. Decompress + verify checksum
-       c. Linear scan entries for key
-       d. If found:
+       a. Bloom filter check — if key is definitely absent, skip SSTable
+       b. Binary search index for candidate block
+       c. Decompress + verify checksum
+       d. Linear scan entries for key
+       e. If found:
           - Tombstone → return KeyNotFound
           - Pointer → resolve via ObjectStore
           - Data/Null → return value
   3. Not found in any SSTable → return KeyNotFound
 ```
+
+#### Bloom Filters
+
+Each SSTable embeds a bloom filter that enables skipping SSTables during point lookups.
+The filter is built from all keys at flush/compaction time and serialized into the SSTable
+file between the data blocks and the index block.
+
+**Hash function**: LevelDB-compatible murmur-inspired 32-bit hash with double-hashing
+probe strategy (`h.rotate_left(15)` per probe). The number of hash probes is computed as
+`k = ln(2) * bits_per_key`, clamped to `[1, 30]`.
+
+**Serialization**: `[num_hashes: u8][bit_array...]`. Stored in the SSTable footer via
+`filter_offset` and `filter_size` fields (formerly reserved bytes). Old SSTables with
+`filter_size = 0` are backwards compatible — `may_contain()` returns `true`.
+
+**Configuration**: `bloom_bits` (default 10) controls the bits-per-key. At 10 bits/key,
+the false-positive rate is approximately 1%. Set to 0 to disable bloom filters entirely.
 
 On `DB::open()`, the engine scans `<db>/sst/<namespace>/L<n>/` directories and opens all
 `.sst` files into an in-memory reader cache. L0 readers are ordered newest-first; L1+
