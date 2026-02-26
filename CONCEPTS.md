@@ -711,6 +711,31 @@ Compression is applied per block at flush time and reversed on read. The block c
 Block compression is independent of bin object compression (`compress` config field), which
 controls LZ4 compression of large values in the object store.
 
+#### LRU Block Cache
+
+An LRU (Least Recently Used) block cache stores decompressed and parsed SSTable data blocks
+in memory, keyed by `(sst_id, block_index)`. This avoids redundant decompression and parsing
+when the same block is read repeatedly (e.g., hot keys, repeated scans).
+
+The `cache_size` config field controls the total byte budget (default 8 MB). Set to `0` to
+disable the cache entirely — all operations remain functionally correct but may be slower
+for workloads with repeated block access.
+
+**Behavior:**
+
+- **Lookup**: On each `read_block()` call, the cache is checked first. A hit returns a clone
+  of the parsed entries and promotes the block to MRU (most recently used) position.
+- **Insert**: On a cache miss, after decompression and parsing, the block is inserted into the
+  cache. If the cache exceeds its capacity, LRU entries are evicted until the budget is met.
+  Blocks larger than the total capacity are silently skipped to prevent thrashing.
+- **Compaction eviction**: When SSTables are merged during compaction, all cached blocks for
+  the old (replaced) SSTables are evicted, freeing memory for the new merged SSTable's blocks.
+- **Restart**: The cache is in-memory only. On `DB::open()`, the cache starts empty and warms
+  up naturally through reads.
+
+**Size estimation** per cached block: `64 + Σ(key_bytes.len() + 1 + value_data.len() + 48)`
+bytes, where the sum runs over all entries in the block.
+
 #### SSTable File Format
 
 An SSTable is a read-only file of sorted key-value entries. The file is divided into three
