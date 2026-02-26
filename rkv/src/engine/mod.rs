@@ -217,8 +217,7 @@ pub struct DB {
     config: Config,
     opened_at: Instant,
     encrypted_namespaces: Mutex<HashMap<String, bool>>,
-    #[allow(dead_code)]
-    io_backend: Box<dyn io::IoBackend>,
+    io_backend: Arc<dyn io::IoBackend>,
     revision_gen: revision::RevisionGen,
     namespace_data: RwLock<HashMap<String, Mutex<memtable::MemTable>>>,
     aol: Arc<Mutex<aol::Aol>>,
@@ -255,7 +254,8 @@ impl DB {
 
         // Replay AOL to reconstruct memtables
         let namespace_data = RwLock::new(HashMap::new());
-        let (records, _skipped) = aol::Aol::replay(&config.path, config.verify_checksums)?;
+        let (records, _skipped) =
+            aol::Aol::replay(&config.path, config.verify_checksums, &*io_backend)?;
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -302,7 +302,7 @@ impl DB {
 
         // Scan existing SSTable files across all levels and recover sequence counter
         let (sstables, sst_sequence) =
-            Self::scan_sstables(&config.path, config.max_levels, &block_cache)?;
+            Self::scan_sstables(&config.path, config.max_levels, &block_cache, &*io_backend)?;
         let sstables = Arc::new(RwLock::new(sstables));
         let sst_sequence = Arc::new(AtomicU64::new(sst_sequence));
 
@@ -347,6 +347,7 @@ impl DB {
             let sstables = Arc::clone(&sstables);
             let sst_sequence = Arc::clone(&sst_sequence);
             let block_cache = block_cache.clone();
+            let io = Arc::clone(&io_backend);
 
             Some(thread::spawn(move || {
                 loop {
@@ -384,7 +385,8 @@ impl DB {
                         if !DB::check_should_compact(&sstables, &config) {
                             break;
                         }
-                        let _ = DB::do_compact(&config, &sstables, &sst_sequence, &block_cache);
+                        let _ =
+                            DB::do_compact(&config, &sstables, &sst_sequence, &block_cache, &io);
                     }
 
                     // Signal wait_for_compaction() callers
@@ -736,6 +738,7 @@ impl DB {
                 self.config.compression.clone(),
                 self.config.bloom_bits,
                 self.config.bloom_prefix_len,
+                &*self.io_backend,
             )?;
             for (key, value) in &entries {
                 writer.add(key, value)?;
@@ -743,7 +746,12 @@ impl DB {
             writer.finish()?;
 
             // Open the reader and prepend to L0 cache (newest first)
-            let reader = sstable::SSTableReader::open(&sst_path, seq, self.block_cache.clone())?;
+            let reader = sstable::SSTableReader::open(
+                &sst_path,
+                seq,
+                self.block_cache.clone(),
+                &*self.io_backend,
+            )?;
             let mut sst = self.sstables.write().unwrap_or_else(|e| e.into_inner());
             let levels = sst
                 .entry(ns_name.clone())
@@ -837,7 +845,8 @@ impl DB {
         let aol_file = path.join("aol");
         let mut good_records: Vec<aol::AolRecord> = Vec::new();
         if aol_file.exists() {
-            let (records, skipped) = aol::Aol::replay(&path, true)?;
+            let repair_aol_io = io::BufferedIo;
+            let (records, skipped) = aol::Aol::replay(&path, true, &repair_aol_io)?;
             let skipped_count = skipped.len() as u64;
             report.wal_records_scanned = (records.len() as u64) + skipped_count;
             report.wal_records_skipped = skipped_count;
@@ -918,7 +927,8 @@ impl DB {
 
                     report.sstable_blocks_scanned += 1;
 
-                    match sstable::SSTableReader::open(&fpath, 0, None) {
+                    let repair_io = io::BufferedIo;
+                    match sstable::SSTableReader::open(&fpath, 0, None, &repair_io) {
                         Ok(reader) => {
                             // Verify block checksums
                             if let Err(_e) = reader.iter_entries(true) {
@@ -952,7 +962,9 @@ impl DB {
                 continue;
             }
             let ns = ns_entry.file_name().to_string_lossy().to_string();
-            let store = objects::ObjectStore::open(obj_root.parent().unwrap_or(obj_root), &ns)?;
+            let repair_io: Arc<dyn io::IoBackend> = Arc::new(io::BufferedIo);
+            let store =
+                objects::ObjectStore::open(obj_root.parent().unwrap_or(obj_root), &ns, repair_io)?;
 
             let hashes = store.list_object_hashes()?;
             for hash_str in &hashes {
@@ -1001,7 +1013,7 @@ impl DB {
         // Flush memtables so all data is in SSTables
         self.flush()?;
 
-        let mut writer = dump::DumpWriter::new(&dump_path)?;
+        let mut writer = dump::DumpWriter::new(&dump_path, &*self.io_backend)?;
         writer.write_header(&self.config.path)?;
 
         let namespaces = self.list_namespaces()?;
@@ -1074,7 +1086,8 @@ impl DB {
     pub fn load(path: impl Into<PathBuf>) -> Result<DB> {
         let dump_path = path.into();
 
-        let mut reader = dump::DumpReader::open(&dump_path)?;
+        let load_io = io::BufferedIo;
+        let mut reader = dump::DumpReader::open(&dump_path, &load_io)?;
         let header = reader.read_header()?;
 
         let db_path = PathBuf::from(&header.db_path);
@@ -1117,6 +1130,7 @@ impl DB {
             &self.sstables,
             &self.sst_sequence,
             &self.block_cache,
+            &self.io_backend,
         )
     }
 
@@ -1171,6 +1185,7 @@ impl DB {
         sstables: &RwLock<LeveledSSTables>,
         sst_sequence: &AtomicU64,
         block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
+        io: &Arc<dyn io::IoBackend>,
     ) -> Result<()> {
         let namespaces: Vec<String> = {
             let sst = sstables.read().unwrap_or_else(|e| e.into_inner());
@@ -1178,7 +1193,7 @@ impl DB {
         };
 
         for ns_name in &namespaces {
-            Self::do_compact_namespace(ns_name, config, sstables, sst_sequence, block_cache)?;
+            Self::do_compact_namespace(ns_name, config, sstables, sst_sequence, block_cache, io)?;
         }
 
         Ok(())
@@ -1191,6 +1206,7 @@ impl DB {
         sstables: &RwLock<LeveledSSTables>,
         sst_sequence: &AtomicU64,
         block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
+        io: &Arc<dyn io::IoBackend>,
     ) -> Result<()> {
         let max_levels = config.max_levels;
 
@@ -1220,6 +1236,7 @@ impl DB {
             sstables,
             sst_sequence,
             block_cache,
+            io,
         )?;
 
         // Step 2: cascade through deeper levels
@@ -1240,11 +1257,12 @@ impl DB {
                 sstables,
                 sst_sequence,
                 block_cache,
+                io,
             )?;
         }
 
         // Step 3: garbage-collect orphaned bin objects
-        Self::do_gc_orphaned_objects(ns, config, sstables)?;
+        Self::do_gc_orphaned_objects(ns, config, sstables, io)?;
 
         Ok(())
     }
@@ -1269,6 +1287,7 @@ impl DB {
         sstables: &RwLock<LeveledSSTables>,
         sst_sequence: &AtomicU64,
         block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
+        io: &Arc<dyn io::IoBackend>,
     ) -> Result<usize> {
         let (source_paths, merged) = {
             let sst = sstables.read().unwrap_or_else(|e| e.into_inner());
@@ -1378,6 +1397,7 @@ impl DB {
             config.compression.clone(),
             config.bloom_bits,
             config.bloom_prefix_len,
+            &**io,
         )?;
         for (key, value) in &merged {
             writer.add(key, value)?;
@@ -1390,7 +1410,7 @@ impl DB {
         }
 
         // Open the new reader and update the in-memory level structure
-        let reader = sstable::SSTableReader::open(&output_path, seq, block_cache.clone())?;
+        let reader = sstable::SSTableReader::open(&output_path, seq, block_cache.clone(), &**io)?;
         let output_size = reader.size_bytes();
         let mut sst = sstables.write().unwrap_or_else(|e| e.into_inner());
         let levels = sst.entry(ns.to_owned()).or_insert_with(|| vec![Vec::new()]);
@@ -1440,6 +1460,7 @@ impl DB {
         ns: &str,
         config: &Config,
         sstables: &RwLock<LeveledSSTables>,
+        io: &Arc<dyn io::IoBackend>,
     ) -> Result<()> {
         let obj_dir = config.path.join("objects").join(ns);
         if !obj_dir.exists() {
@@ -1463,7 +1484,7 @@ impl DB {
             hashes
         };
 
-        let store = objects::ObjectStore::open(&config.path, ns)?;
+        let store = objects::ObjectStore::open(&config.path, ns, Arc::clone(io))?;
         let on_disk = store.list_object_hashes()?;
         for hash in &on_disk {
             if !live_hashes.contains(hash) {
@@ -1534,7 +1555,8 @@ impl DB {
             .write()
             .unwrap_or_else(|e| e.into_inner());
         if !map.contains_key(ns) {
-            let store = objects::ObjectStore::open(&self.config.path, ns)?;
+            let store =
+                objects::ObjectStore::open(&self.config.path, ns, Arc::clone(&self.io_backend))?;
             map.insert(ns.to_owned(), store);
         }
         let ptr = map.get(ns).unwrap() as *const objects::ObjectStore;
@@ -1689,6 +1711,7 @@ impl DB {
         db_path: &Path,
         max_levels: usize,
         block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
+        io: &dyn io::IoBackend,
     ) -> Result<(LeveledSSTables, u64)> {
         let sst_root = db_path.join("sst");
         let mut result: LeveledSSTables = HashMap::new();
@@ -1741,6 +1764,7 @@ impl DB {
                         path,
                         *seq,
                         block_cache.clone(),
+                        io,
                     )?);
                 }
                 levels.push(readers);

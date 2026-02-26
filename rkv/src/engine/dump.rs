@@ -4,6 +4,7 @@ use std::path::Path;
 
 use super::checksum::Checksum;
 use super::error::{Error, Result};
+use super::io::{IoBackend, IoBytes};
 use super::key::Key;
 use super::value::Value;
 
@@ -25,8 +26,8 @@ pub(crate) struct DumpWriter {
 
 impl DumpWriter {
     /// Create a new dump writer at the given path.
-    pub(crate) fn new(path: &Path) -> Result<Self> {
-        let file = fs::File::create(path)?;
+    pub(crate) fn new(path: &Path, io: &dyn IoBackend) -> Result<Self> {
+        let file = io.create_file(path)?;
         Ok(Self { file })
     }
 
@@ -87,14 +88,14 @@ pub(crate) struct DumpHeader {
 
 /// Reads database records from a dump file.
 pub(crate) struct DumpReader {
-    data: Vec<u8>,
+    data: IoBytes,
     pos: usize,
 }
 
 impl DumpReader {
     /// Open a dump file for reading.
-    pub(crate) fn open(path: &Path) -> Result<Self> {
-        let data = fs::read(path)?;
+    pub(crate) fn open(path: &Path, io: &dyn IoBackend) -> Result<Self> {
+        let data = io.read_file(path)?;
         Ok(Self { data, pos: 0 })
     }
 
@@ -316,6 +317,10 @@ fn value_to_data(value: &Value) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    fn io() -> super::super::io::BufferedIo {
+        super::super::io::BufferedIo
+    }
+
     #[test]
     fn roundtrip_record_encoding() {
         let payload = encode_payload("myns", &Key::Int(42), &Value::from("hello"), 0);
@@ -342,7 +347,7 @@ mod tests {
         let dump_path = tmp.path().join("test.rkv");
 
         {
-            let mut w = DumpWriter::new(&dump_path).unwrap();
+            let mut w = DumpWriter::new(&dump_path, &io()).unwrap();
             w.write_header(Path::new("/tmp/mydb")).unwrap();
             w.write_record("_", &Key::Int(1), &Value::from("a"), 0)
                 .unwrap();
@@ -351,7 +356,7 @@ mod tests {
             w.finish().unwrap();
         }
 
-        let mut r = DumpReader::open(&dump_path).unwrap();
+        let mut r = DumpReader::open(&dump_path, &io()).unwrap();
         let header = r.read_header().unwrap();
         assert_eq!(header.db_path, "/tmp/mydb");
 
@@ -376,7 +381,7 @@ mod tests {
         let path = tmp.path().join("bad.rkv");
         fs::write(&path, b"XXXXrest").unwrap();
 
-        let mut r = DumpReader::open(&path).unwrap();
+        let mut r = DumpReader::open(&path, &io()).unwrap();
         let err = r.read_header().unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
     }
@@ -387,7 +392,7 @@ mod tests {
         let path = tmp.path().join("tiny.rkv");
         fs::write(&path, b"rKV").unwrap(); // too small
 
-        let mut r = DumpReader::open(&path).unwrap();
+        let mut r = DumpReader::open(&path, &io()).unwrap();
         let err = r.read_header().unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
     }
@@ -463,7 +468,7 @@ mod tests {
         data.extend_from_slice(&0u16.to_be_bytes()); // path_len = 0
         fs::write(&path, &data).unwrap();
 
-        let mut r = DumpReader::open(&path).unwrap();
+        let mut r = DumpReader::open(&path, &io()).unwrap();
         let err = r.read_header().unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
     }
@@ -478,7 +483,7 @@ mod tests {
         data.extend_from_slice(&100u16.to_be_bytes()); // path_len = 100 (but no data follows)
         fs::write(&path, &data).unwrap();
 
-        let mut r = DumpReader::open(&path).unwrap();
+        let mut r = DumpReader::open(&path, &io()).unwrap();
         let err = r.read_header().unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
     }
@@ -489,7 +494,7 @@ mod tests {
         let path = tmp.path().join("trunc_rec.rkv");
 
         {
-            let mut w = DumpWriter::new(&path).unwrap();
+            let mut w = DumpWriter::new(&path, &io()).unwrap();
             w.write_header(Path::new("/tmp/db")).unwrap();
             w.write_record("_", &Key::Int(1), &Value::from("a"), 0)
                 .unwrap();
@@ -501,7 +506,7 @@ mod tests {
         // Remove last 2 bytes from EOF sentinel area
         fs::write(&path, &data[..data.len() - 2]).unwrap();
 
-        let mut r = DumpReader::open(&path).unwrap();
+        let mut r = DumpReader::open(&path, &io()).unwrap();
         r.read_header().unwrap();
         r.read_record(true).unwrap().unwrap(); // first record OK
         assert!(r.read_record(true).is_err()); // truncated
@@ -513,7 +518,7 @@ mod tests {
         let path = tmp.path().join("trunc_pay.rkv");
 
         {
-            let mut w = DumpWriter::new(&path).unwrap();
+            let mut w = DumpWriter::new(&path, &io()).unwrap();
             w.write_header(Path::new("/tmp/db")).unwrap();
             w.write_record("_", &Key::Int(1), &Value::from("a"), 0)
                 .unwrap();
@@ -526,7 +531,7 @@ mod tests {
         // Truncate 10 bytes before EOF to cut into the record's payload
         fs::write(&path, &data[..data.len() - 10]).unwrap();
 
-        let mut r = DumpReader::open(&path).unwrap();
+        let mut r = DumpReader::open(&path, &io()).unwrap();
         r.read_header().unwrap();
         // The first record's payload + checksum may be partially cut
         let result = r.read_record(true);

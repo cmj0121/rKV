@@ -138,13 +138,17 @@ impl Aol {
     /// skipped (corrupted/truncated) records.
     ///
     /// This is a static method — it reads the file independently of `Aol`.
-    pub(crate) fn replay(db_dir: &Path, verify: bool) -> Result<(Vec<AolRecord>, Vec<String>)> {
+    pub(crate) fn replay(
+        db_dir: &Path,
+        verify: bool,
+        io: &dyn super::io::IoBackend,
+    ) -> Result<(Vec<AolRecord>, Vec<String>)> {
         let path = aol_path(db_dir);
         if !path.exists() {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        let data = std::fs::read(&path)?;
+        let data = io.read_file(&path)?;
         if data.len() < HEADER_SIZE {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -418,6 +422,10 @@ fn decode_payload(data: &[u8]) -> Result<AolRecord> {
 mod tests {
     use super::*;
 
+    fn io() -> super::super::io::BufferedIo {
+        super::super::io::BufferedIo
+    }
+
     // --- Header ---
 
     #[test]
@@ -508,7 +516,7 @@ mod tests {
                 .unwrap();
         }
 
-        let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
+        let (records, skipped) = Aol::replay(tmp.path(), true, &io()).unwrap();
         assert_eq!(records.len(), 2);
         assert!(skipped.is_empty());
         assert_eq!(records[0].key, Key::Int(1));
@@ -520,7 +528,7 @@ mod tests {
     #[test]
     fn replay_empty_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
+        let (records, skipped) = Aol::replay(tmp.path(), true, &io()).unwrap();
         assert!(records.is_empty());
         assert!(skipped.is_empty());
     }
@@ -540,7 +548,7 @@ mod tests {
             .unwrap();
         }
 
-        let (records, _) = Aol::replay(tmp.path(), true).unwrap();
+        let (records, _) = Aol::replay(tmp.path(), true, &io()).unwrap();
         assert_eq!(records.len(), 1);
         assert!(records[0].expires_at_ms > 0);
     }
@@ -556,7 +564,7 @@ mod tests {
                 .unwrap();
         }
 
-        let (records, _) = Aol::replay(tmp.path(), true).unwrap();
+        let (records, _) = Aol::replay(tmp.path(), true, &io()).unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].namespace, "ns1");
         assert_eq!(records[1].namespace, "ns2");
@@ -576,7 +584,7 @@ mod tests {
         let data = std::fs::read(&path).unwrap();
         std::fs::write(&path, &data[..data.len() - 1]).unwrap();
 
-        let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
+        let (records, skipped) = Aol::replay(tmp.path(), true, &io()).unwrap();
         assert!(records.is_empty());
         assert_eq!(skipped.len(), 1);
     }
@@ -596,7 +604,7 @@ mod tests {
         data[HEADER_SIZE + 5] ^= 0xFF; // flip a byte in the payload
         std::fs::write(&path, &data).unwrap();
 
-        let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
+        let (records, skipped) = Aol::replay(tmp.path(), true, &io()).unwrap();
         assert!(records.is_empty());
         assert_eq!(skipped.len(), 1);
     }
@@ -619,7 +627,7 @@ mod tests {
         std::fs::write(&path, &data).unwrap();
 
         // Without verification, the record should still be decoded
-        let (records, skipped) = Aol::replay(tmp.path(), false).unwrap();
+        let (records, skipped) = Aol::replay(tmp.path(), false, &io()).unwrap();
         assert_eq!(records.len(), 1);
         assert!(skipped.is_empty());
     }
@@ -636,7 +644,7 @@ mod tests {
         data[0] = 0x00; // corrupt magic
         std::fs::write(&path, &data).unwrap();
 
-        let err = Aol::replay(tmp.path(), true).unwrap_err();
+        let err = Aol::replay(tmp.path(), true, &io()).unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
     }
 
@@ -667,7 +675,7 @@ mod tests {
                 .unwrap();
         }
 
-        let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
+        let (records, skipped) = Aol::replay(tmp.path(), true, &io()).unwrap();
         assert_eq!(records.len(), 2);
         assert!(skipped.is_empty());
     }
@@ -693,7 +701,7 @@ mod tests {
             assert_eq!(aol.append_count, 0);
         }
 
-        let (records, _) = Aol::replay(tmp.path(), true).unwrap();
+        let (records, _) = Aol::replay(tmp.path(), true, &io()).unwrap();
         assert_eq!(records.len(), 3);
     }
 
@@ -709,7 +717,7 @@ mod tests {
             assert_eq!(aol.append_count, 0);
         }
 
-        let (records, _) = Aol::replay(tmp.path(), true).unwrap();
+        let (records, _) = Aol::replay(tmp.path(), true, &io()).unwrap();
         assert_eq!(records.len(), 1);
     }
 
@@ -727,7 +735,7 @@ mod tests {
             assert_eq!(aol.append_count, 0);
         }
 
-        let (records, _) = Aol::replay(tmp.path(), true).unwrap();
+        let (records, _) = Aol::replay(tmp.path(), true, &io()).unwrap();
         assert_eq!(records.len(), 1);
     }
 
@@ -747,7 +755,7 @@ mod tests {
         }
 
         // After truncate, replay should return zero records
-        let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
+        let (records, skipped) = Aol::replay(tmp.path(), true, &io()).unwrap();
         assert!(records.is_empty());
         assert!(skipped.is_empty());
 
@@ -771,7 +779,7 @@ mod tests {
                 .unwrap();
         }
 
-        let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
+        let (records, skipped) = Aol::replay(tmp.path(), true, &io()).unwrap();
         assert_eq!(records.len(), 1);
         assert!(skipped.is_empty());
         assert_eq!(records[0].key, Key::Int(2));
@@ -854,7 +862,7 @@ mod tests {
         data[5] = 99;
         std::fs::write(&path, &data).unwrap();
 
-        let err = Aol::replay(tmp.path(), true).unwrap_err();
+        let err = Aol::replay(tmp.path(), true, &io()).unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
     }
 
@@ -876,7 +884,7 @@ mod tests {
         truncated.push(0xFF);
         std::fs::write(&path, &truncated).unwrap();
 
-        let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
+        let (records, skipped) = Aol::replay(tmp.path(), true, &io()).unwrap();
         assert_eq!(records.len(), 1); // first record OK
         assert_eq!(skipped.len(), 1); // truncated tail
     }
@@ -898,7 +906,7 @@ mod tests {
         data[cksum_tag_pos] = 0xFF; // invalid algo tag
         std::fs::write(&path, &data).unwrap();
 
-        let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
+        let (records, skipped) = Aol::replay(tmp.path(), true, &io()).unwrap();
         assert!(records.is_empty());
         assert_eq!(skipped.len(), 1);
     }
@@ -922,7 +930,7 @@ mod tests {
         std::fs::write(&path, &data).unwrap();
 
         // With verify=false, checksum passes but decode_payload may fail
-        let (records, skipped) = Aol::replay(tmp.path(), false).unwrap();
+        let (records, skipped) = Aol::replay(tmp.path(), false, &io()).unwrap();
         // Either way, records+skipped should account for the entry
         assert_eq!(records.len() + skipped.len(), 1);
     }
@@ -937,7 +945,7 @@ mod tests {
             // Drop without flush — buffered data may be lost
         }
 
-        let (records, _) = Aol::replay(tmp.path(), true).unwrap();
+        let (records, _) = Aol::replay(tmp.path(), true, &io()).unwrap();
         // BufWriter may or may not flush on drop depending on implementation,
         // but with a large buffer_size the data is likely unflushed.
         // The important thing is that replay doesn't crash.

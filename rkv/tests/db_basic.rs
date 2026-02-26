@@ -785,7 +785,7 @@ fn bloom_filter_works_after_compaction() {
     let tmp = tempfile::tempdir().unwrap();
     let mut config = Config::new(tmp.path());
     config.bloom_bits = 10;
-    config.write_buffer_size = 256;
+    config.block_size = 256;
     let db = DB::open(config).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
@@ -4343,5 +4343,161 @@ fn stats_pending_compactions_l0_count() {
         s.pending_compactions > 0,
         "expected pending compactions > 0"
     );
+    db.close().unwrap();
+}
+
+// --- write_buffer_size auto-flush ---
+
+#[test]
+fn auto_flush_triggers_when_write_buffer_size_exceeded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    // Small write buffer to trigger auto-flush quickly
+    config.write_buffer_size = 512;
+    // Disable compaction so background merges don't race with auto-flush
+    config.l0_max_count = 1000;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // Write enough data to exceed the 512-byte write buffer
+    for i in 0..100 {
+        ns.put(Key::Int(i), format!("value-{i:050}"), None).unwrap();
+    }
+
+    // Auto-flush should have created SSTables without manual flush()
+    let stats = db.stats();
+    assert!(
+        stats.sstable_count > 0,
+        "expected auto-flush to create SSTables, got sstable_count={}",
+        stats.sstable_count,
+    );
+
+    // All data should still be readable
+    for i in 0..100 {
+        let val = ns.get(Key::Int(i)).unwrap();
+        assert_eq!(val, Value::from(format!("value-{i:050}").as_str()));
+    }
+
+    db.close().unwrap();
+}
+
+#[test]
+fn auto_flush_data_survives_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db");
+
+    {
+        let mut config = Config::new(&db_path);
+        config.write_buffer_size = 256;
+        // Disable compaction so background merges don't race with auto-flush
+        config.l0_max_count = 1000;
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        for i in 0..50 {
+            ns.put(Key::Int(i), format!("val-{i:040}"), None).unwrap();
+        }
+        // Don't call flush() — rely on auto-flush + AOL for persistence
+        db.close().unwrap();
+    }
+
+    {
+        let config = Config::new(&db_path);
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        for i in 0..50 {
+            let val = ns.get(Key::Int(i)).unwrap();
+            assert_eq!(val, Value::from(format!("val-{i:040}").as_str()));
+        }
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn no_auto_flush_when_buffer_not_exceeded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    // Large write buffer — auto-flush should not trigger
+    config.write_buffer_size = 64 * 1024 * 1024;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // Write a small amount of data
+    for i in 0..10 {
+        ns.put(Key::Int(i), format!("v{i}"), None).unwrap();
+    }
+
+    let stats = db.stats();
+    assert_eq!(
+        stats.sstable_count, 0,
+        "expected no auto-flush with large write_buffer_size",
+    );
+
+    db.close().unwrap();
+}
+
+// --- IoModel integration ---
+
+#[test]
+fn io_model_mmap_read_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.io_model = IoModel::Mmap;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 0..20 {
+        ns.put(Key::Int(i), format!("mmap-{i}"), None).unwrap();
+    }
+    db.flush().unwrap();
+
+    for i in 0..20 {
+        let val = ns.get(Key::Int(i)).unwrap();
+        assert_eq!(val, Value::from(format!("mmap-{i}").as_str()));
+    }
+
+    db.close().unwrap();
+}
+
+#[test]
+fn io_model_none_read_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.io_model = IoModel::None;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 0..20 {
+        ns.put(Key::Int(i), format!("buf-{i}"), None).unwrap();
+    }
+    db.flush().unwrap();
+
+    for i in 0..20 {
+        let val = ns.get(Key::Int(i)).unwrap();
+        assert_eq!(val, Value::from(format!("buf-{i}").as_str()));
+    }
+
+    db.close().unwrap();
+}
+
+#[test]
+fn io_model_directio_read_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.io_model = IoModel::DirectIO;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 0..20 {
+        ns.put(Key::Int(i), format!("direct-{i}"), None).unwrap();
+    }
+    db.flush().unwrap();
+
+    for i in 0..20 {
+        let val = ns.get(Key::Int(i)).unwrap();
+        assert_eq!(val, Value::from(format!("direct-{i}").as_str()));
+    }
+
     db.close().unwrap();
 }
