@@ -1579,4 +1579,170 @@ mod tests {
             .unwrap();
         assert!(entries.is_empty());
     }
+
+    // --- Format versioning ---
+
+    #[test]
+    fn v2_footer_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("v2.sst");
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        w.add(&Key::Int(1), &Value::from("a")).unwrap();
+        w.finish().unwrap();
+
+        let data = fs::read(&path).unwrap();
+        let footer = &data[data.len() - V2_FOOTER_SIZE..];
+        assert_eq!(&footer[..4], &MAGIC);
+        let version = u16::from_be_bytes(footer[4..6].try_into().unwrap());
+        assert_eq!(version, 2);
+    }
+
+    #[test]
+    fn v2_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("v2rt.sst");
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 10, 0, &io()).unwrap();
+        for i in 0..10 {
+            w.add(&Key::Int(i), &Value::from(format!("v{i}").as_str()))
+                .unwrap();
+        }
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
+        assert_eq!(r.features(), 0);
+        for i in 0..10 {
+            assert_eq!(
+                r.get(&Key::Int(i), true).unwrap(),
+                Some(Value::from(format!("v{i}").as_str()))
+            );
+        }
+    }
+
+    #[test]
+    fn v1_file_readable() {
+        // Construct a minimal V1 SSTable by hand: one data block + V1 footer (48 bytes).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("v1.sst");
+
+        let mut file_data = Vec::new();
+
+        // Build a data block with a single entry: Key::Int(1) => "hello"
+        let key_bytes = Key::Int(1).to_bytes();
+        let value_data = b"hello";
+        let mut block_buf = Vec::new();
+        block_buf.extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
+        block_buf.extend_from_slice(&key_bytes);
+        block_buf.push(0x00); // value tag = Data
+        block_buf.extend_from_slice(&(value_data.len() as u32).to_be_bytes());
+        block_buf.extend_from_slice(value_data);
+
+        // On-disk block: [compression_tag=0x00][payload][checksum: 5B]
+        let mut block_on_disk = Vec::new();
+        block_on_disk.push(0x00); // no compression
+        block_on_disk.extend_from_slice(&block_buf);
+        let block_cksum = Checksum::compute(&block_on_disk);
+        block_on_disk.extend_from_slice(&block_cksum.to_bytes());
+
+        let block_offset = 0u64;
+        let block_size = block_on_disk.len() as u32;
+        file_data.extend_from_slice(&block_on_disk);
+
+        // Filter block: empty (size=0)
+        let filter_offset = file_data.len() as u64;
+        let filter_size = 0u32;
+
+        // Index block: one entry
+        let index_offset = file_data.len() as u64;
+        let mut index_data = Vec::new();
+        index_data.extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
+        index_data.extend_from_slice(&key_bytes);
+        index_data.extend_from_slice(&block_offset.to_be_bytes());
+        index_data.extend_from_slice(&block_size.to_be_bytes());
+        let index_size = index_data.len() as u32;
+        file_data.extend_from_slice(&index_data);
+
+        // V1 footer (48 bytes)
+        let mut footer = Vec::with_capacity(V1_FOOTER_SIZE);
+        footer.extend_from_slice(&MAGIC);
+        footer.extend_from_slice(&1u16.to_be_bytes()); // version = 1
+        footer.extend_from_slice(&1u64.to_be_bytes()); // entry_count = 1
+        footer.extend_from_slice(&index_offset.to_be_bytes());
+        footer.extend_from_slice(&index_size.to_be_bytes());
+        footer.extend_from_slice(&1u32.to_be_bytes()); // num_blocks = 1
+        footer.extend_from_slice(&filter_offset.to_be_bytes());
+        footer.extend_from_slice(&filter_size.to_be_bytes());
+        footer.push(0x00); // filter_format = legacy
+        let footer_cksum = Checksum::compute(&footer);
+        footer.extend_from_slice(&footer_cksum.to_bytes());
+        assert_eq!(footer.len(), V1_FOOTER_SIZE);
+        file_data.extend_from_slice(&footer);
+
+        fs::write(&path, &file_data).unwrap();
+
+        // V2 reader should open V1 file transparently
+        let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
+        assert_eq!(r.entry_count(), 1);
+        assert_eq!(r.features(), 0);
+        assert_eq!(
+            r.get(&Key::Int(1), true).unwrap(),
+            Some(Value::from("hello"))
+        );
+    }
+
+    #[test]
+    fn unknown_features_rejected() {
+        // Write a valid V2 SSTable, then patch the features field with unknown bits
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("feat.sst");
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        w.add(&Key::Int(1), &Value::from("a")).unwrap();
+        w.finish().unwrap();
+
+        let mut data = fs::read(&path).unwrap();
+        let footer_start = data.len() - V2_FOOTER_SIZE;
+
+        // Patch features at footer[43..47] to 0x0000_0001 (unknown bit)
+        data[footer_start + 43..footer_start + 47].copy_from_slice(&1u32.to_be_bytes());
+
+        // Recompute checksum over first 51 bytes of footer
+        let cksum = Checksum::compute(&data[footer_start..footer_start + 51]);
+        data[footer_start + 51..footer_start + 56].copy_from_slice(&cksum.to_bytes());
+        fs::write(&path, &data).unwrap();
+
+        let Err(err) = SSTableReader::open(&path, 1, None, &io()) else {
+            panic!("expected error for unknown features");
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not supported by this version of rKV"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn unsupported_version_rejected() {
+        // Write a valid V2 SSTable, then patch the version to 99
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ver99.sst");
+        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        w.add(&Key::Int(1), &Value::from("a")).unwrap();
+        w.finish().unwrap();
+
+        let mut data = fs::read(&path).unwrap();
+        let footer_start = data.len() - V2_FOOTER_SIZE;
+
+        // Patch version at footer[4..6] to 99
+        data[footer_start + 4..footer_start + 6].copy_from_slice(&99u16.to_be_bytes());
+
+        // Recompute checksum over first 51 bytes of footer
+        let cksum = Checksum::compute(&data[footer_start..footer_start + 51]);
+        data[footer_start + 51..footer_start + 56].copy_from_slice(&cksum.to_bytes());
+        fs::write(&path, &data).unwrap();
+
+        let Err(err) = SSTableReader::open(&path, 1, None, &io()) else {
+            panic!("expected error for unsupported version");
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("unsupported version"), "{msg}");
+    }
 }
