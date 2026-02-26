@@ -288,6 +288,8 @@ pub(crate) struct SSTableReader {
     entry_count: u64,
     /// Bloom filter for probabilistic key membership testing.
     bloom: BloomFilter,
+    /// First key in the SSTable (serialized bytes), for range filtering.
+    first_key: Option<Vec<u8>>,
 }
 
 impl SSTableReader {
@@ -350,11 +352,43 @@ impl SSTableReader {
             BloomFilter::new(0) // no filter — may_contain always returns true
         };
 
+        // Extract first key from the first block for range filtering
+        let first_key = if let Some(first_ie) = index.first() {
+            let block_start = first_ie.offset as usize;
+            let block_end = block_start + first_ie.size as usize;
+            if block_end <= data.len() {
+                let block_on_disk = &data[block_start..block_end];
+                let cksum_start = block_on_disk.len() - Checksum::encoded_size();
+                let compression_tag = block_on_disk[0];
+                let compressed_payload = &block_on_disk[1..cksum_start];
+                if let Ok(block_data) = decompress_block(compression_tag, compressed_payload) {
+                    // Parse just the first entry's key
+                    if block_data.len() >= 2 {
+                        let kl = u16::from_be_bytes(block_data[0..2].try_into().unwrap()) as usize;
+                        if 2 + kl <= block_data.len() {
+                            Some(block_data[2..2 + kl].to_vec())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             data,
             index,
             entry_count,
             bloom,
+            first_key,
         })
     }
 
@@ -428,32 +462,15 @@ impl SSTableReader {
         };
 
         let ie = &self.index[block_idx];
-        let block_start = ie.offset as usize;
-        let block_end = block_start + ie.size as usize;
-
-        if block_end > self.data.len() {
-            return Err(Error::Corruption(format!(
-                "SSTable block out of bounds: {block_start}..{block_end} (file size {})",
-                self.data.len()
-            )));
-        }
-
-        let block_on_disk = &self.data[block_start..block_end];
-
-        // Verify block checksum
-        let cksum_start = block_on_disk.len() - Checksum::encoded_size();
-        if verify_checksums {
-            let checksum = Checksum::from_bytes(&block_on_disk[cksum_start..])?;
-            checksum.verify(&block_on_disk[..cksum_start])?;
-        }
-
-        // Decompress
-        let compression_tag = block_on_disk[0];
-        let compressed_payload = &block_on_disk[1..cksum_start];
-        let block_data = decompress_block(compression_tag, compressed_payload)?;
+        let entries = self.read_block(ie, verify_checksums)?;
 
         // Linear scan entries within the block
-        Self::scan_block_for_key(&block_data, &key_bytes)
+        for (kb, value_tag, value_data) in entries {
+            if kb == key_bytes {
+                return Ok(Some(Value::from_tag(value_tag, &value_data)?));
+            }
+        }
+        Ok(None)
     }
 
     /// Parse all entries from a decompressed block.
@@ -507,14 +524,101 @@ impl SSTableReader {
         Ok(entries)
     }
 
-    /// Linear scan through a decompressed block looking for a specific key.
-    fn scan_block_for_key(block: &[u8], target: &[u8]) -> Result<Option<Value>> {
-        for (key_bytes, value_tag, value_data) in Self::parse_block_entries(block)? {
-            if key_bytes == target {
-                return Ok(Some(Value::from_tag(value_tag, &value_data)?));
+    /// Scan entries matching a prefix/range.
+    ///
+    /// Uses the block index to skip blocks that cannot contain matching keys.
+    /// Returns `(Key, Value)` pairs in sorted order, including tombstones.
+    ///
+    /// - `prefix_bytes`: serialized key prefix to match against.
+    /// - `ordered_mode`: if true, scan from prefix forward (range scan);
+    ///   if false, check all blocks for string prefix matching.
+    #[allow(dead_code)]
+    pub(crate) fn scan_entries(
+        &self,
+        prefix_bytes: &[u8],
+        ordered_mode: bool,
+        verify_checksums: bool,
+    ) -> Result<Vec<(Key, Value)>> {
+        if self.index.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut result = Vec::new();
+
+        if ordered_mode {
+            // Range scan: find the first block whose last_key >= prefix_bytes,
+            // then read blocks forward until keys no longer match.
+            let start_block = match self
+                .index
+                .binary_search_by(|e| e.last_key.as_slice().cmp(prefix_bytes))
+            {
+                Ok(i) => i,
+                Err(i) => {
+                    if i >= self.index.len() {
+                        return Ok(Vec::new());
+                    }
+                    i
+                }
+            };
+
+            for ie in &self.index[start_block..] {
+                let entries = self.read_block(ie, verify_checksums)?;
+                for (key_bytes, value_tag, value_data) in entries {
+                    if key_bytes.as_slice() >= prefix_bytes {
+                        let key = Key::from_bytes(&key_bytes)?;
+                        let value = Value::from_tag(value_tag, &value_data)?;
+                        result.push((key, value));
+                    }
+                }
+            }
+        } else {
+            // Prefix matching: scan all blocks, filter by prefix.
+            for ie in &self.index {
+                let entries = self.read_block(ie, verify_checksums)?;
+                for (key_bytes, value_tag, value_data) in entries {
+                    if key_bytes.starts_with(prefix_bytes) {
+                        let key = Key::from_bytes(&key_bytes)?;
+                        let value = Value::from_tag(value_tag, &value_data)?;
+                        result.push((key, value));
+                    }
+                }
             }
         }
-        Ok(None)
+
+        Ok(result)
+    }
+
+    /// Return the first key in this SSTable (serialized bytes), if any.
+    #[allow(dead_code)]
+    pub(crate) fn first_key(&self) -> Option<&[u8]> {
+        self.first_key.as_deref()
+    }
+
+    /// Read and decompress a single block, returning raw entries.
+    fn read_block(&self, ie: &IndexEntry, verify_checksums: bool) -> Result<Vec<RawEntry>> {
+        let block_start = ie.offset as usize;
+        let block_end = block_start + ie.size as usize;
+
+        if block_end > self.data.len() {
+            return Err(Error::Corruption(format!(
+                "SSTable block out of bounds: {block_start}..{block_end} (file size {})",
+                self.data.len()
+            )));
+        }
+
+        let block_on_disk = &self.data[block_start..block_end];
+        let cksum_start = block_on_disk.len() - Checksum::encoded_size();
+
+        if verify_checksums {
+            let checksum = Checksum::from_bytes(&block_on_disk[cksum_start..])?;
+            checksum.verify(&block_on_disk[..cksum_start])?;
+        }
+
+        let compression_tag = block_on_disk[0];
+        let compressed_payload = &block_on_disk[1..cksum_start];
+        let block_data = decompress_block(compression_tag, compressed_payload)?;
+
+        Self::parse_block_entries(&block_data)
     }
 
     /// Iterate all entries in sorted key order.
@@ -524,29 +628,7 @@ impl SSTableReader {
         let mut result = Vec::with_capacity(self.entry_count as usize);
 
         for ie in &self.index {
-            let block_start = ie.offset as usize;
-            let block_end = block_start + ie.size as usize;
-
-            if block_end > self.data.len() {
-                return Err(Error::Corruption(format!(
-                    "SSTable block out of bounds: {block_start}..{block_end} (file size {})",
-                    self.data.len()
-                )));
-            }
-
-            let block_on_disk = &self.data[block_start..block_end];
-            let cksum_start = block_on_disk.len() - Checksum::encoded_size();
-
-            if verify_checksums {
-                let checksum = Checksum::from_bytes(&block_on_disk[cksum_start..])?;
-                checksum.verify(&block_on_disk[..cksum_start])?;
-            }
-
-            let compression_tag = block_on_disk[0];
-            let compressed_payload = &block_on_disk[1..cksum_start];
-            let block_data = decompress_block(compression_tag, compressed_payload)?;
-
-            for (key_bytes, value_tag, value_data) in Self::parse_block_entries(&block_data)? {
+            for (key_bytes, value_tag, value_data) in self.read_block(ie, verify_checksums)? {
                 let key = Key::from_bytes(&key_bytes)?;
                 let value = Value::from_tag(value_tag, &value_data)?;
                 result.push((key, value));
