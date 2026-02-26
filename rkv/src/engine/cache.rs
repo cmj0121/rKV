@@ -33,6 +33,8 @@ pub(crate) struct BlockCache {
     tail: usize, // LRU end (evict from here)
     current_size: usize,
     capacity: usize,
+    hits: u64,
+    misses: u64,
 }
 
 impl BlockCache {
@@ -48,6 +50,8 @@ impl BlockCache {
             tail: SENTINEL,
             current_size: 0,
             capacity,
+            hits: 0,
+            misses: 0,
         }
     }
 
@@ -59,10 +63,25 @@ impl BlockCache {
             return None;
         }
 
-        let &idx = self.map.get(&(sst_id, block_index))?;
-        self.detach(idx);
-        self.push_front(idx);
-        Some(self.nodes[idx].entries.clone())
+        if let Some(&idx) = self.map.get(&(sst_id, block_index)) {
+            self.hits += 1;
+            self.detach(idx);
+            self.push_front(idx);
+            Some(self.nodes[idx].entries.clone())
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn misses(&self) -> u64 {
+        self.misses
     }
 
     /// Insert a block into the cache, evicting LRU entries if needed.
@@ -351,5 +370,41 @@ mod tests {
         let size = estimate_block_size(&entries);
         // 64 + 2 * (1 + 1 + 10 + 48) = 64 + 120 = 184
         assert_eq!(size, 184);
+    }
+
+    #[test]
+    fn hit_miss_counters() {
+        let mut cache = BlockCache::new(4096);
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(cache.misses(), 0);
+
+        // Miss on empty cache
+        cache.get(1, 0);
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(cache.misses(), 1);
+
+        // Insert and hit
+        cache.insert(1, 0, make_entries(1), 100);
+        cache.get(1, 0);
+        assert_eq!(cache.hits(), 1);
+        assert_eq!(cache.misses(), 1);
+
+        // Miss on different key
+        cache.get(2, 0);
+        assert_eq!(cache.hits(), 1);
+        assert_eq!(cache.misses(), 2);
+
+        // Another hit
+        cache.get(1, 0);
+        assert_eq!(cache.hits(), 2);
+        assert_eq!(cache.misses(), 2);
+    }
+
+    #[test]
+    fn disabled_cache_no_hit_miss_tracking() {
+        let mut cache = BlockCache::new(0);
+        cache.get(1, 0);
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(cache.misses(), 0);
     }
 }
