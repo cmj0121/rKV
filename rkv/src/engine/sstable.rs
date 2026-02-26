@@ -17,11 +17,20 @@ use super::Compression;
 /// SSTable file magic bytes: "rKVS".
 const MAGIC: [u8; 4] = *b"rKVS";
 
-/// SSTable format version.
-const VERSION: u16 = 1;
+/// Current SSTable format version (V2 adds feature flags).
+const FORMAT_VERSION: u16 = 2;
 
-/// Fixed footer size in bytes.
-pub(crate) const FOOTER_SIZE: usize = 48;
+/// Minimum format version this reader can handle.
+const MIN_SUPPORTED_VERSION: u16 = 1;
+
+/// V1 footer size in bytes (original format).
+const V1_FOOTER_SIZE: usize = 48;
+
+/// V2 footer size in bytes (adds features bitmask + reserved).
+pub(crate) const V2_FOOTER_SIZE: usize = 56;
+
+/// Known feature flags bitmask. Unknown bits trigger a reject.
+const KNOWN_FEATURES: u32 = 0;
 
 /// Compression tag stored per block on disk.
 const COMPRESS_NONE: u8 = 0x00;
@@ -238,14 +247,15 @@ impl SSTableWriter {
         buf
     }
 
-    /// Encode the fixed-size footer (48 bytes).
+    /// Encode the V2 footer (56 bytes).
     ///
     /// Layout:
     /// ```text
     /// [magic: 4B][version: u16 BE][entry_count: u64 BE]
     /// [index_offset: u64 BE][index_size: u32 BE]
     /// [data_blocks: u32 BE][filter_offset: u64 BE][filter_size: u32 BE]
-    /// [reserved: 1B][checksum: 5B CRC32C]
+    /// [filter_format: 1B][features: u32 BE][reserved: 4B]
+    /// [checksum: 5B CRC32C]
     /// ```
     fn encode_footer(
         &self,
@@ -255,21 +265,23 @@ impl SSTableWriter {
         filter_size: u32,
         filter_format: u8,
     ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(FOOTER_SIZE);
+        let mut buf = Vec::with_capacity(V2_FOOTER_SIZE);
         buf.extend_from_slice(&MAGIC);
-        buf.extend_from_slice(&VERSION.to_be_bytes());
+        buf.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
         buf.extend_from_slice(&self.entry_count.to_be_bytes());
         buf.extend_from_slice(&index_offset.to_be_bytes());
         buf.extend_from_slice(&index_size.to_be_bytes());
         buf.extend_from_slice(&(self.index.len() as u32).to_be_bytes());
         buf.extend_from_slice(&filter_offset.to_be_bytes());
         buf.extend_from_slice(&filter_size.to_be_bytes());
-        // Filter format byte (0x00 = legacy key-only, 0x01 = compound)
         buf.push(filter_format);
-        // Checksum over the preceding 43 bytes
+        // V2 fields: features bitmask + 4 reserved bytes
+        buf.extend_from_slice(&0u32.to_be_bytes()); // features = 0
+        buf.extend_from_slice(&[0u8; 4]); // reserved
+                                          // Checksum covers first 51 bytes (56 − 5)
         let checksum = Checksum::compute(&buf);
         buf.extend_from_slice(&checksum.to_bytes());
-        debug_assert_eq!(buf.len(), FOOTER_SIZE);
+        debug_assert_eq!(buf.len(), V2_FOOTER_SIZE);
         buf
     }
 }
@@ -353,6 +365,9 @@ pub(crate) struct SSTableReader {
     sst_id: u64,
     /// Shared LRU block cache for decompressed data blocks.
     cache: Option<Arc<Mutex<BlockCache>>>,
+    /// Feature flags bitmask from the footer (0 for V1 files).
+    #[allow(dead_code)] // accessed via #[cfg(test)] features() method
+    features: u32,
 }
 
 impl SSTableReader {
@@ -364,38 +379,73 @@ impl SSTableReader {
         io: &dyn IoBackend,
     ) -> Result<Self> {
         let data = io.read_file(path)?;
-        if data.len() < FOOTER_SIZE {
+
+        // Detect footer version by probing: try V2 (56 bytes) first, then V1 (48 bytes).
+        let (footer_start, footer_size) = if data.len() >= V2_FOOTER_SIZE {
+            let candidate = data.len() - V2_FOOTER_SIZE;
+            if data[candidate..candidate + 4] == MAGIC {
+                (candidate, V2_FOOTER_SIZE)
+            } else if data.len() >= V1_FOOTER_SIZE {
+                let candidate = data.len() - V1_FOOTER_SIZE;
+                if data[candidate..candidate + 4] == MAGIC {
+                    (candidate, V1_FOOTER_SIZE)
+                } else {
+                    return Err(Error::Corruption(format!(
+                        "SSTable bad magic: expected {MAGIC:?}, got {:?}",
+                        &data[candidate..candidate + 4]
+                    )));
+                }
+            } else {
+                return Err(Error::Corruption(format!(
+                    "SSTable too small: {} bytes (minimum {V1_FOOTER_SIZE})",
+                    data.len()
+                )));
+            }
+        } else if data.len() >= V1_FOOTER_SIZE {
+            let candidate = data.len() - V1_FOOTER_SIZE;
+            if data[candidate..candidate + 4] == MAGIC {
+                (candidate, V1_FOOTER_SIZE)
+            } else {
+                return Err(Error::Corruption(format!(
+                    "SSTable bad magic: expected {MAGIC:?}, got {:?}",
+                    &data[candidate..candidate + 4]
+                )));
+            }
+        } else {
             return Err(Error::Corruption(format!(
-                "SSTable too small: {} bytes (minimum {FOOTER_SIZE})",
+                "SSTable too small: {} bytes (minimum {V1_FOOTER_SIZE})",
                 data.len()
             )));
-        }
+        };
 
-        // Parse footer (last 48 bytes)
-        let footer_start = data.len() - FOOTER_SIZE;
-        let footer = &data[footer_start..];
+        let footer = &data[footer_start..footer_start + footer_size];
 
-        // Verify magic
-        if footer[..4] != MAGIC {
-            return Err(Error::Corruption(format!(
-                "SSTable bad magic: expected {MAGIC:?}, got {:?}",
-                &footer[..4]
-            )));
-        }
-
-        // Verify footer checksum (covers first 43 bytes)
-        let cksum_offset = FOOTER_SIZE - Checksum::encoded_size();
+        // Verify footer checksum (last 5 bytes)
+        let cksum_offset = footer_size - Checksum::encoded_size();
         let footer_checksum = Checksum::from_bytes(&footer[cksum_offset..])?;
         footer_checksum.verify(&footer[..cksum_offset])?;
 
-        // Parse footer fields
-        // SAFETY: footer is exactly FOOTER_SIZE (48) bytes — all slices are within bounds
+        // Parse version
         let version = u16::from_be_bytes(footer[4..6].try_into().unwrap());
-        if version != VERSION {
+        if !(MIN_SUPPORTED_VERSION..=FORMAT_VERSION).contains(&version) {
             return Err(Error::Corruption(format!(
-                "SSTable unsupported version: {version}"
+                "SSTable unsupported version: {version} (supported: {MIN_SUPPORTED_VERSION}..{FORMAT_VERSION})"
             )));
         }
+
+        // Parse features (V2+), reject unknown bits
+        let features = if footer_size == V2_FOOTER_SIZE {
+            let f = u32::from_be_bytes(footer[43..47].try_into().unwrap());
+            let unknown = f & !KNOWN_FEATURES;
+            if unknown != 0 {
+                return Err(Error::Corruption(format!(
+                    "SSTable requires features 0x{unknown:08x} not supported by this version of rKV"
+                )));
+            }
+            f
+        } else {
+            0
+        };
 
         let entry_count = u64::from_be_bytes(footer[6..14].try_into().unwrap());
         let index_offset = u64::from_be_bytes(footer[14..22].try_into().unwrap()) as usize;
@@ -411,8 +461,7 @@ impl SSTableReader {
         let index_data = &data[index_offset..index_offset + index_size];
         let index = Self::parse_index(index_data)?;
 
-        // Parse filter metadata from footer (bytes 30-42)
-        // SAFETY: footer is FOOTER_SIZE bytes — slices within bounds
+        // Parse filter metadata (bytes 30..43 — same layout in V1 and V2)
         let filter_offset = u64::from_be_bytes(footer[30..38].try_into().unwrap()) as usize;
         let filter_size = u32::from_be_bytes(footer[38..42].try_into().unwrap()) as usize;
         let filter_format = footer[42];
@@ -500,6 +549,7 @@ impl SSTableReader {
             first_key,
             sst_id,
             cache,
+            features,
         })
     }
 
@@ -878,6 +928,12 @@ impl SSTableReader {
         self.sst_id
     }
 
+    /// Return the feature flags bitmask (0 for V1 files).
+    #[cfg(test)]
+    pub(crate) fn features(&self) -> u32 {
+        self.features
+    }
+
     /// Return the total size of the SSTable data in bytes.
     pub(crate) fn size_bytes(&self) -> usize {
         self.data.len()
@@ -946,10 +1002,10 @@ mod tests {
         writer.finish().unwrap();
 
         let data = fs::read(&path).unwrap();
-        assert!(data.len() >= FOOTER_SIZE);
+        assert!(data.len() >= V2_FOOTER_SIZE);
 
-        // Last 48 bytes are the footer
-        let footer = &data[data.len() - FOOTER_SIZE..];
+        // Last 56 bytes are the V2 footer
+        let footer = &data[data.len() - V2_FOOTER_SIZE..];
         assert_eq!(&footer[..4], &MAGIC);
     }
 
@@ -964,7 +1020,7 @@ mod tests {
 
         assert!(path.exists());
         let data = fs::read(&path).unwrap();
-        assert!(data.len() > FOOTER_SIZE);
+        assert!(data.len() > V2_FOOTER_SIZE);
     }
 
     #[test]
@@ -982,7 +1038,7 @@ mod tests {
 
         let data = fs::read(&path).unwrap();
         // Footer should have magic
-        let footer = &data[data.len() - FOOTER_SIZE..];
+        let footer = &data[data.len() - V2_FOOTER_SIZE..];
         assert_eq!(&footer[..4], &MAGIC);
     }
 
@@ -1213,7 +1269,7 @@ mod tests {
     fn reader_rejects_bad_magic() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("bad.sst");
-        let mut data = vec![0u8; FOOTER_SIZE];
+        let mut data = vec![0u8; V2_FOOTER_SIZE];
         data[..4].copy_from_slice(b"XXXX");
         fs::write(&path, &data).unwrap();
 
@@ -1383,7 +1439,7 @@ mod tests {
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
-        assert!(r.size_bytes() > FOOTER_SIZE);
+        assert!(r.size_bytes() > V2_FOOTER_SIZE);
     }
 
     // --- parse_index truncation ---
