@@ -3124,6 +3124,113 @@ fn compact_max_levels_one_is_noop() {
     assert_eq!(ns.get(1).unwrap(), Value::from("val"));
 }
 
+// --- Auto-Compaction tests ---
+
+#[test]
+fn auto_compact_triggers_on_l0_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.l0_max_count = 3; // trigger after 3 L0 files
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    // Flush 1 and 2: no auto-compact yet
+    ns.put(1, "a", None).unwrap();
+    db.flush().unwrap();
+    ns.put(2, "b", None).unwrap();
+    db.flush().unwrap();
+
+    let l0_dir = tmp.path().join("sst").join("_").join("L0");
+    assert_eq!(std::fs::read_dir(&l0_dir).unwrap().count(), 2);
+
+    // Flush 3: hits l0_max_count=3, triggers auto-compact
+    ns.put(3, "c", None).unwrap();
+    db.flush().unwrap();
+
+    // After auto-compact, L0 should be empty (merged into L1)
+    let l0_count = std::fs::read_dir(&l0_dir).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(l0_count, 0);
+
+    // L1 should have data
+    let l1_dir = tmp.path().join("sst").join("_").join("L1");
+    assert!(l1_dir.exists());
+    assert!(std::fs::read_dir(&l1_dir).unwrap().count() > 0);
+
+    // All values readable
+    assert_eq!(ns.get(1).unwrap(), Value::from("a"));
+    assert_eq!(ns.get(2).unwrap(), Value::from("b"));
+    assert_eq!(ns.get(3).unwrap(), Value::from("c"));
+}
+
+#[test]
+fn auto_compact_does_not_trigger_below_threshold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.l0_max_count = 10; // high threshold
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "a", None).unwrap();
+    db.flush().unwrap();
+    ns.put(2, "b", None).unwrap();
+    db.flush().unwrap();
+
+    // L0 should still have 2 files (no auto-compact)
+    let l0_dir = tmp.path().join("sst").join("_").join("L0");
+    assert_eq!(std::fs::read_dir(&l0_dir).unwrap().count(), 2);
+
+    // No L1 created
+    let l1_dir = tmp.path().join("sst").join("_").join("L1");
+    assert!(!l1_dir.exists());
+}
+
+#[test]
+fn auto_compact_data_survives_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("mydb");
+    {
+        let mut config = Config::new(&db_path);
+        config.l0_max_count = 2;
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+
+        ns.put(1, "first", None).unwrap();
+        db.flush().unwrap();
+        ns.put(2, "second", None).unwrap();
+        db.flush().unwrap(); // triggers auto-compact
+
+        db.close().unwrap();
+    }
+    {
+        let config = Config::new(&db_path);
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+        assert_eq!(ns.get(1).unwrap(), Value::from("first"));
+        assert_eq!(ns.get(2).unwrap(), Value::from("second"));
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn auto_compact_triggers_on_l0_size() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.l0_max_count = 100; // high count threshold
+    config.l0_max_size = 1; // 1 byte — any L0 file triggers
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1, "value", None).unwrap();
+    db.flush().unwrap();
+
+    // L0 should be empty after auto-compact
+    let l0_dir = tmp.path().join("sst").join("_").join("L0");
+    let l0_count = std::fs::read_dir(&l0_dir).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(l0_count, 0);
+
+    assert_eq!(ns.get(1).unwrap(), Value::from("value"));
+}
+
 // --- Bin Object GC tests ---
 
 /// Helper: count object files under `<db>/objects/<ns>/`.
