@@ -1,5 +1,6 @@
 mod aol;
 mod bloom;
+mod cache;
 mod checksum;
 pub(crate) mod crypto;
 mod dump;
@@ -229,6 +230,8 @@ pub struct DB {
     sstables: RwLock<LeveledSSTables>,
     /// Monotonically increasing counter for SSTable file naming.
     sst_sequence: AtomicU64,
+    /// Shared LRU block cache for decompressed SSTable blocks.
+    block_cache: Option<Arc<Mutex<cache::BlockCache>>>,
     flush_stop: Arc<AtomicBool>,
     flush_thread: Option<JoinHandle<()>>,
     // Operation counters (persistent across restarts)
@@ -283,8 +286,18 @@ impl DB {
         // Per-namespace object stores (created lazily on first access)
         let object_stores = RwLock::new(HashMap::new());
 
+        // Block cache for decompressed SSTable blocks
+        let block_cache = if config.cache_size > 0 {
+            Some(Arc::new(Mutex::new(cache::BlockCache::new(
+                config.cache_size,
+            ))))
+        } else {
+            None
+        };
+
         // Scan existing SSTable files across all levels and recover sequence counter
-        let (sstables, sst_sequence) = Self::scan_sstables(&config.path, config.max_levels)?;
+        let (sstables, sst_sequence) =
+            Self::scan_sstables(&config.path, config.max_levels, &block_cache)?;
 
         // Open AOL for appending
         let aol = Arc::new(Mutex::new(aol::Aol::open(
@@ -327,6 +340,7 @@ impl DB {
             object_stores,
             sstables: RwLock::new(sstables),
             sst_sequence: AtomicU64::new(sst_sequence),
+            block_cache,
             flush_stop,
             flush_thread,
             op_puts: AtomicU64::new(op_puts),
@@ -563,7 +577,7 @@ impl DB {
             writer.finish()?;
 
             // Open the reader and prepend to L0 cache (newest first)
-            let reader = sstable::SSTableReader::open(&sst_path)?;
+            let reader = sstable::SSTableReader::open(&sst_path, seq, self.block_cache.clone())?;
             let mut sst = self.sstables.write().unwrap();
             let levels = sst
                 .entry(ns_name.clone())
@@ -751,7 +765,7 @@ impl DB {
 
                     report.sstable_blocks_scanned += 1;
 
-                    match sstable::SSTableReader::open(&fpath) {
+                    match sstable::SSTableReader::open(&fpath, 0, None) {
                         Ok(reader) => {
                             // Verify block checksums
                             if let Err(_e) = reader.iter_entries(true) {
@@ -1089,6 +1103,17 @@ impl DB {
             }
             let mut sst = self.sstables.write().unwrap();
             if let Some(levels) = sst.get_mut(ns) {
+                // Evict old SSTable blocks from the cache
+                if let Some(ref bc) = self.block_cache {
+                    let mut cache = bc.lock().unwrap();
+                    for level in [source_level, target_level] {
+                        if let Some(readers) = levels.get(level) {
+                            for r in readers {
+                                cache.evict_sst(r.sst_id());
+                            }
+                        }
+                    }
+                }
                 if let Some(s) = levels.get_mut(source_level) {
                     s.clear();
                 }
@@ -1123,10 +1148,22 @@ impl DB {
         }
 
         // Open the new reader and update the in-memory level structure
-        let reader = sstable::SSTableReader::open(&output_path)?;
+        let reader = sstable::SSTableReader::open(&output_path, seq, self.block_cache.clone())?;
         let output_size = reader.size_bytes();
         let mut sst = self.sstables.write().unwrap();
         let levels = sst.entry(ns.to_owned()).or_insert_with(|| vec![Vec::new()]);
+
+        // Evict old SSTable blocks from the cache before dropping readers
+        if let Some(ref bc) = self.block_cache {
+            let mut cache = bc.lock().unwrap();
+            for level in [source_level, target_level] {
+                if let Some(readers) = levels.get(level) {
+                    for r in readers {
+                        cache.evict_sst(r.sst_id());
+                    }
+                }
+            }
+        }
 
         // Clear source level
         if let Some(s) = levels.get_mut(source_level) {
@@ -1409,7 +1446,11 @@ impl DB {
     /// Walks `<db>/sst/<namespace>/L<n>/` directories, opens each `.sst`
     /// file, and returns the per-namespace leveled reader lists plus the
     /// next sequence number to use.
-    fn scan_sstables(db_path: &Path, max_levels: usize) -> Result<(LeveledSSTables, u64)> {
+    fn scan_sstables(
+        db_path: &Path,
+        max_levels: usize,
+        block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
+    ) -> Result<(LeveledSSTables, u64)> {
         let sst_root = db_path.join("sst");
         let mut result: LeveledSSTables = HashMap::new();
         let mut max_seq: u64 = 0;
@@ -1456,8 +1497,12 @@ impl DB {
                 }
 
                 let mut readers = Vec::with_capacity(files.len());
-                for (_seq, path) in &files {
-                    readers.push(sstable::SSTableReader::open(path)?);
+                for (seq, path) in &files {
+                    readers.push(sstable::SSTableReader::open(
+                        path,
+                        *seq,
+                        block_cache.clone(),
+                    )?);
                 }
                 levels.push(readers);
             }
