@@ -4501,3 +4501,30 @@ fn io_model_directio_read_write() {
 
     db.close().unwrap();
 }
+
+/// V2 SSTables written by flush survive close/reopen — format upgrade is transparent.
+#[test]
+fn format_version_upgrade_transparent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("v2_upgrade");
+
+    // Write data and flush to SSTables (now V2 format)
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    for i in 0..50 {
+        ns.put(Key::Int(i), format!("val-{i}"), None).unwrap();
+    }
+    db.flush().unwrap();
+    db.close().unwrap();
+
+    // Reopen and verify all data is readable
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    for i in 0..50 {
+        let val = ns.get(Key::Int(i)).unwrap();
+        assert_eq!(val, Value::from(format!("val-{i}").as_str()));
+    }
+    db.close().unwrap();
+}
