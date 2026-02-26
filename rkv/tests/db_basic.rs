@@ -3271,6 +3271,7 @@ fn auto_compact_triggers_on_l0_count() {
     // Flush 3: hits l0_max_count=3, triggers auto-compact
     ns.put(3, "c", None).unwrap();
     db.flush().unwrap();
+    db.wait_for_compaction();
 
     // After auto-compact, L0 should be empty (merged into L1)
     let l0_count = std::fs::read_dir(&l0_dir).map(|d| d.count()).unwrap_or(0);
@@ -3323,6 +3324,7 @@ fn auto_compact_data_survives_restart() {
         db.flush().unwrap();
         ns.put(2, "second", None).unwrap();
         db.flush().unwrap(); // triggers auto-compact
+        db.wait_for_compaction();
 
         db.close().unwrap();
     }
@@ -3347,6 +3349,7 @@ fn auto_compact_triggers_on_l0_size() {
 
     ns.put(1, "value", None).unwrap();
     db.flush().unwrap();
+    db.wait_for_compaction();
 
     // L0 should be empty after auto-compact
     let l0_dir = tmp.path().join("sst").join("_").join("L0");

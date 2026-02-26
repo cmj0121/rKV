@@ -573,9 +573,10 @@ self-describing and independently verifiable via its checksum.
 
 #### Compaction
 
-| Method    | Kind     | Signature             | Description                                 |
-| --------- | -------- | --------------------- | ------------------------------------------- |
-| `compact` | instance | `&self -> Result<()>` | Trigger manual compaction of SSTable levels |
+| Method                | Kind     | Signature             | Description                                  |
+| --------------------- | -------- | --------------------- | -------------------------------------------- |
+| `compact`             | instance | `&self -> Result<()>` | Trigger manual compaction of SSTable levels  |
+| `wait_for_compaction` | instance | `&self`               | Block until background compaction cycle done |
 
 `compact` merges L0 SSTables into L1, then cascades through deeper levels when a
 level exceeds its size threshold. The merge processes entries oldest-to-newest so that
@@ -611,10 +612,36 @@ When `max_levels` is 1, compaction is a no-op (no merge target available).
 
 ##### Auto-Compaction
 
-After each `flush()`, the engine checks whether any namespace's L0 level exceeds
-the configured thresholds (`l0_max_count` or `l0_max_size`). If either threshold
-is met, `compact()` is called automatically. This eliminates the need for manual
-compaction in typical workloads while still allowing explicit `compact()` calls.
+After each `flush()`, the engine signals the background compaction thread.
+The thread checks whether any namespace's L0 level exceeds the configured
+thresholds (`l0_max_count` or `l0_max_size`). If either threshold is met,
+compaction runs automatically. This eliminates the need for manual compaction
+in typical workloads while still allowing explicit `compact()` calls.
+
+##### Background Compaction Thread
+
+Compaction runs on a dedicated background thread, keeping `flush()` and
+read/write paths non-blocking. The thread uses a Condvar-based signaling
+mechanism:
+
+1. **Signal**: Every `flush()` sets a pending flag and wakes the thread.
+2. **Drain loop**: The thread compacts repeatedly until all levels are
+   within their thresholds, then sleeps. This prevents L0 pile-up under
+   sustained write workloads.
+3. **Safety-net poll**: The thread also wakes every 30 seconds to catch
+   any missed signals.
+
+Manual `compact()` calls serialize with the background thread via a shared
+mutex — both paths use the same static compaction helpers, so behavior is
+identical.
+
+`wait_for_compaction()` signals the thread and blocks until its current
+cycle completes. This is intended for deterministic testing — production
+callers should not need it.
+
+Shutdown (`close()` / `Drop`) sets a stop flag, wakes the thread, and
+joins it, ensuring all in-progress compaction finishes before the `DB`
+handle is released.
 
 ##### Bin Object GC
 

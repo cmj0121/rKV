@@ -30,7 +30,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -222,18 +222,23 @@ pub struct DB {
     revision_gen: revision::RevisionGen,
     namespace_data: RwLock<HashMap<String, Mutex<memtable::MemTable>>>,
     aol: Arc<Mutex<aol::Aol>>,
-    object_stores: RwLock<HashMap<String, objects::ObjectStore>>,
+    object_stores: Arc<RwLock<HashMap<String, objects::ObjectStore>>>,
     /// Per-namespace, per-level SSTable readers.
     /// `sstables[ns][level]` = Vec of readers.
     /// Level 0: newest-first (overlapping key ranges).
     /// Level 1+: key-order (non-overlapping key ranges after compaction).
-    sstables: RwLock<LeveledSSTables>,
+    sstables: Arc<RwLock<LeveledSSTables>>,
     /// Monotonically increasing counter for SSTable file naming.
-    sst_sequence: AtomicU64,
+    sst_sequence: Arc<AtomicU64>,
     /// Shared LRU block cache for decompressed SSTable blocks.
     block_cache: Option<Arc<Mutex<cache::BlockCache>>>,
     flush_stop: Arc<AtomicBool>,
     flush_thread: Option<JoinHandle<()>>,
+    compaction_stop: Arc<AtomicBool>,
+    compaction_notify: Arc<(Mutex<bool>, Condvar)>,
+    compaction_mutex: Arc<Mutex<()>>,
+    compaction_done: Arc<(Mutex<bool>, Condvar)>,
+    compaction_thread: Option<JoinHandle<()>>,
     // Operation counters (persistent across restarts)
     op_puts: AtomicU64,
     op_gets: AtomicU64,
@@ -284,7 +289,7 @@ impl DB {
         }
 
         // Per-namespace object stores (created lazily on first access)
-        let object_stores = RwLock::new(HashMap::new());
+        let object_stores = Arc::new(RwLock::new(HashMap::new()));
 
         // Block cache for decompressed SSTable blocks
         let block_cache = if config.cache_size > 0 {
@@ -298,6 +303,8 @@ impl DB {
         // Scan existing SSTable files across all levels and recover sequence counter
         let (sstables, sst_sequence) =
             Self::scan_sstables(&config.path, config.max_levels, &block_cache)?;
+        let sstables = Arc::new(RwLock::new(sstables));
+        let sst_sequence = Arc::new(AtomicU64::new(sst_sequence));
 
         // Open AOL for appending
         let aol = Arc::new(Mutex::new(aol::Aol::open(
@@ -326,6 +333,71 @@ impl DB {
             }))
         };
 
+        // Background compaction thread
+        let compaction_stop = Arc::new(AtomicBool::new(false));
+        let compaction_notify = Arc::new((Mutex::new(false), Condvar::new()));
+        let compaction_mutex = Arc::new(Mutex::new(()));
+        let compaction_done = Arc::new((Mutex::new(false), Condvar::new()));
+        let compaction_thread = {
+            let stop = Arc::clone(&compaction_stop);
+            let notify = Arc::clone(&compaction_notify);
+            let c_mutex = Arc::clone(&compaction_mutex);
+            let done = Arc::clone(&compaction_done);
+            let config = config.clone();
+            let sstables = Arc::clone(&sstables);
+            let sst_sequence = Arc::clone(&sst_sequence);
+            let block_cache = block_cache.clone();
+
+            Some(thread::spawn(move || {
+                loop {
+                    // Wait for notification or 30s safety-net poll
+                    {
+                        let (lock, cvar) = &*notify;
+                        let mut pending = lock.lock().unwrap();
+                        if !*pending && !stop.load(Ordering::Relaxed) {
+                            let result =
+                                cvar.wait_timeout(pending, Duration::from_secs(30)).unwrap();
+                            pending = result.0;
+                        }
+                        *pending = false;
+                    }
+
+                    if stop.load(Ordering::Relaxed) {
+                        let (lock, cvar) = &*done;
+                        let mut d = lock.lock().unwrap();
+                        *d = true;
+                        cvar.notify_all();
+                        break;
+                    }
+
+                    // Drain loop: keep compacting while any level is over threshold
+                    loop {
+                        if !DB::check_should_compact(&sstables, &config) {
+                            break;
+                        }
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+
+                        let _guard = c_mutex.lock().unwrap();
+                        // Re-check after acquiring mutex (another thread may have compacted)
+                        if !DB::check_should_compact(&sstables, &config) {
+                            break;
+                        }
+                        let _ = DB::do_compact(&config, &sstables, &sst_sequence, &block_cache);
+                    }
+
+                    // Signal wait_for_compaction() callers
+                    {
+                        let (lock, cvar) = &*done;
+                        let mut d = lock.lock().unwrap();
+                        *d = true;
+                        cvar.notify_all();
+                    }
+                }
+            }))
+        };
+
         // Load persisted operation counters
         let (op_puts, op_gets, op_deletes) = Self::load_stats_meta(&config.path);
 
@@ -338,11 +410,16 @@ impl DB {
             namespace_data,
             aol,
             object_stores,
-            sstables: RwLock::new(sstables),
-            sst_sequence: AtomicU64::new(sst_sequence),
+            sstables,
+            sst_sequence,
             block_cache,
             flush_stop,
             flush_thread,
+            compaction_stop,
+            compaction_notify,
+            compaction_mutex,
+            compaction_done,
+            compaction_thread,
             op_puts: AtomicU64::new(op_puts),
             op_gets: AtomicU64::new(op_gets),
             op_deletes: AtomicU64::new(op_deletes),
@@ -352,6 +429,16 @@ impl DB {
     pub fn close(mut self) -> Result<()> {
         self.flush_stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.flush_thread.take() {
+            let _ = handle.join();
+        }
+        self.compaction_stop.store(true, Ordering::Relaxed);
+        {
+            let (lock, cvar) = &*self.compaction_notify;
+            let mut pending = lock.lock().unwrap();
+            *pending = true;
+            cvar.notify_one();
+        }
+        if let Some(handle) = self.compaction_thread.take() {
             let _ = handle.join();
         }
         self.save_stats_meta();
@@ -595,29 +682,15 @@ impl DB {
             aol.truncate(&self.config.path)?;
         }
 
-        // Auto-compact if any namespace's L0 exceeds thresholds
-        if flushed_any && self.should_compact() {
-            self.compact()?;
+        // Signal background compaction thread
+        if flushed_any {
+            let (lock, cvar) = &*self.compaction_notify;
+            let mut pending = lock.lock().unwrap();
+            *pending = true;
+            cvar.notify_one();
         }
 
         Ok(())
-    }
-
-    /// Check if any namespace's L0 level exceeds the compaction thresholds.
-    fn should_compact(&self) -> bool {
-        let sst = self.sstables.read().unwrap();
-        for (_ns, levels) in sst.iter() {
-            if let Some(l0_readers) = levels.first() {
-                if l0_readers.len() >= self.config.l0_max_count {
-                    return true;
-                }
-                let l0_size: usize = l0_readers.iter().map(|r| r.size_bytes()).sum();
-                if l0_size >= self.config.l0_max_size {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     /// Flush and fsync all data to durable storage.
@@ -947,39 +1020,100 @@ impl DB {
 
     /// Trigger a manual compaction.
     ///
+    /// Serializes with the background compaction thread via a shared mutex.
     /// For each namespace, merges L0 into L1, then cascades through
     /// deeper levels when a level exceeds its size threshold. Tombstones
     /// are dropped only at the bottommost level (`max_levels - 1`).
     pub fn compact(&self) -> Result<()> {
+        let _guard = self.compaction_mutex.lock().unwrap();
+        Self::do_compact(
+            &self.config,
+            &self.sstables,
+            &self.sst_sequence,
+            &self.block_cache,
+        )
+    }
+
+    /// Block until the background compaction thread completes its current cycle.
+    ///
+    /// Signals the compaction thread to wake up and waits until it finishes
+    /// processing. Useful for deterministic testing — ensures all pending
+    /// compaction is done before asserting on-disk state.
+    pub fn wait_for_compaction(&self) {
+        // Clear done flag to ensure we wait for the NEXT cycle, not a stale one
+        {
+            let (lock, _cvar) = &*self.compaction_done;
+            let mut done = lock.lock().unwrap();
+            *done = false;
+        }
+        // Signal the compaction thread
+        {
+            let (lock, cvar) = &*self.compaction_notify;
+            let mut pending = lock.lock().unwrap();
+            *pending = true;
+            cvar.notify_one();
+        }
+        // Wait for the compaction thread to signal done
+        let (lock, cvar) = &*self.compaction_done;
+        let mut done = lock.lock().unwrap();
+        while !*done {
+            done = cvar.wait(done).unwrap();
+        }
+        *done = false;
+    }
+
+    /// Check if any namespace's L0 level exceeds the compaction thresholds.
+    fn check_should_compact(sstables: &RwLock<LeveledSSTables>, config: &Config) -> bool {
+        let sst = sstables.read().unwrap();
+        for (_ns, levels) in sst.iter() {
+            if let Some(l0_readers) = levels.first() {
+                if l0_readers.len() >= config.l0_max_count {
+                    return true;
+                }
+                let l0_size: usize = l0_readers.iter().map(|r| r.size_bytes()).sum();
+                if l0_size >= config.l0_max_size {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Run compaction across all namespaces (static helper for background thread).
+    fn do_compact(
+        config: &Config,
+        sstables: &RwLock<LeveledSSTables>,
+        sst_sequence: &AtomicU64,
+        block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
+    ) -> Result<()> {
         let namespaces: Vec<String> = {
-            let sst = self.sstables.read().unwrap();
+            let sst = sstables.read().unwrap();
             sst.keys().cloned().collect()
         };
 
         for ns_name in &namespaces {
-            self.compact_namespace(ns_name)?;
+            Self::do_compact_namespace(ns_name, config, sstables, sst_sequence, block_cache)?;
         }
 
         Ok(())
     }
 
-    /// Compact a single namespace with cascading level merges.
-    ///
-    /// 1. Merge L0 → L1 (drop tombstones if L1 is the bottommost level).
-    /// 2. For each subsequent level, if it exceeds its size threshold,
-    ///    merge into the next level. Tombstones are dropped when the
-    ///    target is the bottommost level (`max_levels - 1`).
-    fn compact_namespace(&self, ns: &str) -> Result<()> {
-        let max_levels = self.config.max_levels;
+    /// Compact a single namespace with cascading level merges (static helper).
+    fn do_compact_namespace(
+        ns: &str,
+        config: &Config,
+        sstables: &RwLock<LeveledSSTables>,
+        sst_sequence: &AtomicU64,
+        block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
+    ) -> Result<()> {
+        let max_levels = config.max_levels;
 
-        // Nothing to do with fewer than 2 levels
         if max_levels < 2 {
             return Ok(());
         }
 
-        // Nothing to compact if L0 is empty
         {
-            let sst = self.sstables.read().unwrap();
+            let sst = sstables.read().unwrap();
             let has_l0 = sst
                 .get(ns)
                 .and_then(|levels| levels.first())
@@ -991,25 +1125,45 @@ impl DB {
 
         // Step 1: merge L0 → L1
         let is_bottom = max_levels <= 2;
-        self.merge_two_levels(ns, 0, 1, is_bottom)?;
+        Self::do_merge_two_levels(
+            ns,
+            0,
+            1,
+            is_bottom,
+            config,
+            sstables,
+            sst_sequence,
+            block_cache,
+        )?;
 
         // Step 2: cascade through deeper levels
         for level in 1..max_levels - 1 {
-            if self.level_total_size(ns, level) <= self.level_max_size(level) {
+            if Self::do_level_total_size(sstables, ns, level)
+                <= Self::do_level_max_size(config, level)
+            {
                 break;
             }
             let target = level + 1;
             let drop = target >= max_levels - 1;
-            self.merge_two_levels(ns, level, target, drop)?;
+            Self::do_merge_two_levels(
+                ns,
+                level,
+                target,
+                drop,
+                config,
+                sstables,
+                sst_sequence,
+                block_cache,
+            )?;
         }
 
         // Step 3: garbage-collect orphaned bin objects
-        self.gc_orphaned_objects(ns)?;
+        Self::do_gc_orphaned_objects(ns, config, sstables)?;
 
         Ok(())
     }
 
-    /// Merge all SSTables from `source_level` into `target_level`.
+    /// Merge all SSTables from `source_level` into `target_level` (static helper).
     ///
     /// Target entries are loaded first (oldest), then source entries
     /// (newer wins via BTreeMap). For L0 source, readers are iterated
@@ -1019,15 +1173,19 @@ impl DB {
     /// output (safe only when target is the bottommost level).
     ///
     /// Returns the output SSTable size in bytes (0 if nothing to merge).
-    fn merge_two_levels(
-        &self,
+    #[allow(clippy::too_many_arguments)]
+    fn do_merge_two_levels(
         ns: &str,
         source_level: usize,
         target_level: usize,
         drop_tombstones: bool,
+        config: &Config,
+        sstables: &RwLock<LeveledSSTables>,
+        sst_sequence: &AtomicU64,
+        block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
     ) -> Result<usize> {
         let (source_paths, merged) = {
-            let sst = self.sstables.read().unwrap();
+            let sst = sstables.read().unwrap();
             let levels = match sst.get(ns) {
                 Some(l) => l,
                 None => return Ok(0),
@@ -1052,7 +1210,7 @@ impl DB {
 
             // Target entries are oldest
             for reader in target {
-                for (key, value) in reader.iter_entries(self.config.verify_checksums)? {
+                for (key, value) in reader.iter_entries(config.verify_checksums)? {
                     merged.insert(key, value);
                 }
             }
@@ -1061,19 +1219,18 @@ impl DB {
             // L1+ iterate in natural order.
             if source_level == 0 {
                 for reader in source.iter().rev() {
-                    for (key, value) in reader.iter_entries(self.config.verify_checksums)? {
+                    for (key, value) in reader.iter_entries(config.verify_checksums)? {
                         merged.insert(key, value);
                     }
                 }
             } else {
                 for reader in source {
-                    for (key, value) in reader.iter_entries(self.config.verify_checksums)? {
+                    for (key, value) in reader.iter_entries(config.verify_checksums)? {
                         merged.insert(key, value);
                     }
                 }
             }
 
-            // Filter tombstones if requested
             if drop_tombstones {
                 merged.retain(|_, v| !v.is_tombstone());
             }
@@ -1081,7 +1238,7 @@ impl DB {
             // Collect source file paths for cleanup by scanning disk
             let mut source_paths = Vec::new();
             for level in [source_level, target_level] {
-                let level_dir = self.sst_level_dir(ns, level);
+                let level_dir = Self::static_sst_level_dir(&config.path, ns, level);
                 if level_dir.exists() {
                     for entry in fs::read_dir(&level_dir)? {
                         let entry = entry?;
@@ -1101,10 +1258,9 @@ impl DB {
             for path in &source_paths {
                 let _ = fs::remove_file(path);
             }
-            let mut sst = self.sstables.write().unwrap();
+            let mut sst = sstables.write().unwrap();
             if let Some(levels) = sst.get_mut(ns) {
-                // Evict old SSTable blocks from the cache
-                if let Some(ref bc) = self.block_cache {
+                if let Some(ref bc) = block_cache {
                     let mut cache = bc.lock().unwrap();
                     for level in [source_level, target_level] {
                         if let Some(readers) = levels.get(level) {
@@ -1125,17 +1281,17 @@ impl DB {
         }
 
         // Write merged output as a new SSTable in target level
-        let seq = self.sst_sequence.fetch_add(1, Ordering::Relaxed) + 1;
-        let target_dir = self.sst_level_dir(ns, target_level);
+        let seq = sst_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        let target_dir = Self::static_sst_level_dir(&config.path, ns, target_level);
         fs::create_dir_all(&target_dir)?;
         let output_path = target_dir.join(format!("{seq:06}.sst"));
 
         let mut writer = sstable::SSTableWriter::new(
             &output_path,
-            self.config.block_size,
-            self.config.compression.clone(),
-            self.config.bloom_bits,
-            self.config.bloom_prefix_len,
+            config.block_size,
+            config.compression.clone(),
+            config.bloom_bits,
+            config.bloom_prefix_len,
         )?;
         for (key, value) in &merged {
             writer.add(key, value)?;
@@ -1148,13 +1304,13 @@ impl DB {
         }
 
         // Open the new reader and update the in-memory level structure
-        let reader = sstable::SSTableReader::open(&output_path, seq, self.block_cache.clone())?;
+        let reader = sstable::SSTableReader::open(&output_path, seq, block_cache.clone())?;
         let output_size = reader.size_bytes();
-        let mut sst = self.sstables.write().unwrap();
+        let mut sst = sstables.write().unwrap();
         let levels = sst.entry(ns.to_owned()).or_insert_with(|| vec![Vec::new()]);
 
         // Evict old SSTable blocks from the cache before dropping readers
-        if let Some(ref bc) = self.block_cache {
+        if let Some(ref bc) = block_cache {
             let mut cache = bc.lock().unwrap();
             for level in [source_level, target_level] {
                 if let Some(readers) = levels.get(level) {
@@ -1165,12 +1321,10 @@ impl DB {
             }
         }
 
-        // Clear source level
         if let Some(s) = levels.get_mut(source_level) {
             s.clear();
         }
 
-        // Set target level to the single merged reader
         while levels.len() <= target_level {
             levels.push(Vec::new());
         }
@@ -1179,44 +1333,40 @@ impl DB {
         Ok(output_size)
     }
 
-    /// Maximum size in bytes for a given level before it should be compacted.
-    fn level_max_size(&self, level: usize) -> usize {
+    fn do_level_max_size(config: &Config, level: usize) -> usize {
         match level {
-            0 => usize::MAX, // L0 uses count/size triggers, not a cap
-            1 => self.config.l1_max_size,
-            _ => self.config.default_max_size,
+            0 => usize::MAX,
+            1 => config.l1_max_size,
+            _ => config.default_max_size,
         }
     }
 
-    /// Total size in bytes of all SSTables at a given level for a namespace.
-    fn level_total_size(&self, ns: &str, level: usize) -> usize {
-        let sst = self.sstables.read().unwrap();
+    fn do_level_total_size(sstables: &RwLock<LeveledSSTables>, ns: &str, level: usize) -> usize {
+        let sst = sstables.read().unwrap();
         sst.get(ns)
             .and_then(|levels| levels.get(level))
             .map(|readers| readers.iter().map(|r| r.size_bytes()).sum())
             .unwrap_or(0)
     }
 
-    /// Garbage-collect orphaned bin objects for a namespace.
-    ///
-    /// Collects all live `ValuePointer` hashes from every SSTable level,
-    /// then walks the object store directory and deletes any object file
-    /// whose hash is not in the live set. Safe with dedup: an object is
-    /// kept as long as at least one SSTable entry references it.
-    fn gc_orphaned_objects(&self, ns: &str) -> Result<()> {
-        let obj_dir = self.config.path.join("objects").join(ns);
+    /// Garbage-collect orphaned bin objects for a namespace (static helper).
+    fn do_gc_orphaned_objects(
+        ns: &str,
+        config: &Config,
+        sstables: &RwLock<LeveledSSTables>,
+    ) -> Result<()> {
+        let obj_dir = config.path.join("objects").join(ns);
         if !obj_dir.exists() {
             return Ok(());
         }
 
-        // Collect live Pointer hashes from all SSTable levels
         let live_hashes: std::collections::HashSet<String> = {
-            let sst = self.sstables.read().unwrap();
+            let sst = sstables.read().unwrap();
             let mut hashes = std::collections::HashSet::new();
             if let Some(levels) = sst.get(ns) {
                 for level_readers in levels {
                     for reader in level_readers {
-                        for (_key, value) in reader.iter_entries(self.config.verify_checksums)? {
+                        for (_key, value) in reader.iter_entries(config.verify_checksums)? {
                             if let Value::Pointer(vp) = value {
                                 hashes.insert(vp.hex_hash());
                             }
@@ -1227,8 +1377,7 @@ impl DB {
             hashes
         };
 
-        // Walk object store and delete orphans
-        let store = self.get_or_create_object_store(ns)?;
+        let store = objects::ObjectStore::open(&config.path, ns)?;
         let on_disk = store.list_object_hashes()?;
         for hash in &on_disk {
             if !live_hashes.contains(hash) {
@@ -1434,11 +1583,12 @@ impl DB {
 
     /// SSTable directory for a specific level: `<db>/sst/<namespace>/L<level>/`.
     fn sst_level_dir(&self, ns: &str, level: usize) -> PathBuf {
-        self.config
-            .path
-            .join("sst")
-            .join(ns)
-            .join(format!("L{level}"))
+        Self::static_sst_level_dir(&self.config.path, ns, level)
+    }
+
+    /// SSTable directory for a specific level (static helper for background thread).
+    fn static_sst_level_dir(db_path: &Path, ns: &str, level: usize) -> PathBuf {
+        db_path.join("sst").join(ns).join(format!("L{level}"))
     }
 
     /// Scan existing SSTable files across all levels on startup.
@@ -1598,6 +1748,16 @@ impl Drop for DB {
     fn drop(&mut self) {
         self.flush_stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.flush_thread.take() {
+            let _ = handle.join();
+        }
+        self.compaction_stop.store(true, Ordering::Relaxed);
+        {
+            let (lock, cvar) = &*self.compaction_notify;
+            let mut pending = lock.lock().unwrap();
+            *pending = true;
+            cvar.notify_one();
+        }
+        if let Some(handle) = self.compaction_thread.take() {
             let _ = handle.join();
         }
         self.save_stats_meta();
