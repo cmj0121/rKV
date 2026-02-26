@@ -76,6 +76,7 @@ impl Key {
                         data.len()
                     )));
                 }
+                // SAFETY: data.len() == 9 checked above — slice is exactly 8 bytes
                 let flipped = u64::from_be_bytes(data[1..9].try_into().unwrap());
                 let v = (flipped ^ SIGN_FLIP) as i64;
                 Ok(Key::Int(v))

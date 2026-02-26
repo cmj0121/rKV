@@ -1789,6 +1789,7 @@ impl DB {
         if version != STATS_VERSION {
             return (0, 0, 0);
         }
+        // SAFETY: data.len() >= 30 checked above — slices are exactly 8 bytes each
         let puts = u64::from_be_bytes(data[6..14].try_into().unwrap());
         let gets = u64::from_be_bytes(data[14..22].try_into().unwrap());
         let deletes = u64::from_be_bytes(data[22..30].try_into().unwrap());

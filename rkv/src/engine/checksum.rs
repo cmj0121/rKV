@@ -94,6 +94,7 @@ impl Checksum {
                 )));
             }
         };
+        // SAFETY: data.len() == 5 checked above — slice is exactly 4 bytes
         let value = u32::from_be_bytes(data[1..5].try_into().unwrap());
         Ok(Self { algo, value })
     }

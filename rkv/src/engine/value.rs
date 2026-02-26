@@ -221,6 +221,7 @@ impl ValuePointer {
         }
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&data[..32]);
+        // SAFETY: data.len() == 36 checked above — slice is exactly 4 bytes
         let size = u32::from_be_bytes(data[32..36].try_into().unwrap());
         Ok(Self { hash, size })
     }

@@ -153,6 +153,7 @@ impl Aol {
         if data[0..4] != MAGIC {
             return Err(Error::Corruption("AOL magic mismatch".into()));
         }
+        // SAFETY: data.len() >= HEADER_SIZE (8) checked above — slice is exactly 2 bytes
         let version = u16::from_be_bytes(data[4..6].try_into().unwrap());
         if version != VERSION {
             return Err(Error::Corruption(format!(
@@ -170,6 +171,7 @@ impl Aol {
                 skipped += 1;
                 break;
             }
+            // SAFETY: bounds checked above — slice is exactly 4 bytes
             let payload_len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
 
@@ -318,7 +320,12 @@ fn decode_payload(data: &[u8]) -> Result<AolRecord> {
     if pos + 2 > data.len() {
         return Err(Error::Corruption("truncated ns_len".into()));
     }
-    let ns_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+    // SAFETY: bounds checked above — slice is exactly 2 bytes
+    let ns_len = u16::from_be_bytes(
+        data[pos..pos + 2]
+            .try_into()
+            .map_err(|_| Error::Corruption("truncated ns_len bytes".into()))?,
+    ) as usize;
     pos += 2;
 
     if pos + ns_len > data.len() {
@@ -333,21 +340,36 @@ fn decode_payload(data: &[u8]) -> Result<AolRecord> {
     if pos + 16 > data.len() {
         return Err(Error::Corruption("truncated revision".into()));
     }
-    let revision = u128::from_be_bytes(data[pos..pos + 16].try_into().unwrap());
+    // SAFETY: bounds checked above — slice is exactly 16 bytes
+    let revision = u128::from_be_bytes(
+        data[pos..pos + 16]
+            .try_into()
+            .map_err(|_| Error::Corruption("truncated revision bytes".into()))?,
+    );
     pos += 16;
 
     // expires_at_ms
     if pos + 8 > data.len() {
         return Err(Error::Corruption("truncated expires_at_ms".into()));
     }
-    let expires_at_ms = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+    // SAFETY: bounds checked above — slice is exactly 8 bytes
+    let expires_at_ms = u64::from_be_bytes(
+        data[pos..pos + 8]
+            .try_into()
+            .map_err(|_| Error::Corruption("truncated expires_at_ms bytes".into()))?,
+    );
     pos += 8;
 
     // key
     if pos + 2 > data.len() {
         return Err(Error::Corruption("truncated key_len".into()));
     }
-    let key_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+    // SAFETY: bounds checked above — slice is exactly 2 bytes
+    let key_len = u16::from_be_bytes(
+        data[pos..pos + 2]
+            .try_into()
+            .map_err(|_| Error::Corruption("truncated key_len bytes".into()))?,
+    ) as usize;
     pos += 2;
 
     if pos + key_len > data.len() {

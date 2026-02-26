@@ -7,6 +7,7 @@ fn bloom_hash(data: &[u8]) -> u32 {
 
     let mut i = 0;
     while i + 4 <= data.len() {
+        // SAFETY: i + 4 <= data.len() ensured by while condition
         h = h.wrapping_add(u32::from_le_bytes(data[i..i + 4].try_into().unwrap()));
         h = h.wrapping_mul(m);
         h ^= h >> 16;

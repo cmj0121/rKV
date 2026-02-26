@@ -113,6 +113,7 @@ impl DumpReader {
             )));
         }
 
+        // SAFETY: data.len() >= 8 checked above — slices are exactly 2 bytes
         let version = u16::from_be_bytes(self.data[4..6].try_into().unwrap());
         if version != VERSION {
             return Err(Error::Corruption(format!(
@@ -120,6 +121,7 @@ impl DumpReader {
             )));
         }
 
+        // SAFETY: data.len() >= 8 checked above — slice is exactly 2 bytes
         let path_len = u16::from_be_bytes(self.data[6..8].try_into().unwrap()) as usize;
         if 8 + path_len > self.data.len() {
             return Err(Error::Corruption("dump file header truncated".into()));
@@ -140,6 +142,7 @@ impl DumpReader {
             ));
         }
 
+        // SAFETY: bounds checked above — slice is exactly 4 bytes
         let payload_len =
             u32::from_be_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap()) as usize;
         self.pos += 4;
@@ -208,7 +211,12 @@ fn decode_payload(data: &[u8]) -> Result<DumpRecord> {
     if pos + 2 > data.len() {
         return Err(Error::Corruption("dump record truncated at ns_len".into()));
     }
-    let ns_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+    // SAFETY: bounds checked above — slice is exactly 2 bytes
+    let ns_len = u16::from_be_bytes(
+        data[pos..pos + 2]
+            .try_into()
+            .map_err(|_| Error::Corruption("dump record truncated at ns_len bytes".into()))?,
+    ) as usize;
     pos += 2;
     if pos + ns_len > data.len() {
         return Err(Error::Corruption(
@@ -223,7 +231,12 @@ fn decode_payload(data: &[u8]) -> Result<DumpRecord> {
     if pos + 2 > data.len() {
         return Err(Error::Corruption("dump record truncated at key_len".into()));
     }
-    let key_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+    // SAFETY: bounds checked above — slice is exactly 2 bytes
+    let key_len = u16::from_be_bytes(
+        data[pos..pos + 2]
+            .try_into()
+            .map_err(|_| Error::Corruption("dump record truncated at key_len bytes".into()))?,
+    ) as usize;
     pos += 2;
     if pos + key_len > data.len() {
         return Err(Error::Corruption("dump record truncated at key".into()));
@@ -246,7 +259,11 @@ fn decode_payload(data: &[u8]) -> Result<DumpRecord> {
             "dump record truncated at value_data_len".into(),
         ));
     }
-    let value_data_len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+    // SAFETY: bounds checked above — slice is exactly 4 bytes
+    let value_data_len =
+        u32::from_be_bytes(data[pos..pos + 4].try_into().map_err(|_| {
+            Error::Corruption("dump record truncated at value_data_len bytes".into())
+        })?) as usize;
     pos += 4;
     if pos + value_data_len > data.len() {
         return Err(Error::Corruption(
@@ -262,7 +279,11 @@ fn decode_payload(data: &[u8]) -> Result<DumpRecord> {
             "dump record truncated at expires_at_ms".into(),
         ));
     }
-    let expires_at_ms = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+    // SAFETY: bounds checked above — slice is exactly 8 bytes
+    let expires_at_ms =
+        u64::from_be_bytes(data[pos..pos + 8].try_into().map_err(|_| {
+            Error::Corruption("dump record truncated at expires_at_ms bytes".into())
+        })?);
 
     Ok(DumpRecord {
         namespace,
