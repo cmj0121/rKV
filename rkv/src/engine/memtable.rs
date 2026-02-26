@@ -13,6 +13,17 @@ pub(crate) struct MemEntry {
     pub expires_at: Option<Instant>,
 }
 
+/// Result of a memtable key lookup — distinguishes "key is tombstoned"
+/// from "key was never written".
+pub(crate) enum MemLookup<'a> {
+    /// Key exists with a live (non-expired) value.
+    Found(&'a Value),
+    /// Key exists but is tombstoned or expired — do NOT fall through to SSTables.
+    Tombstone,
+    /// Key was never written to this memtable — caller should check SSTables.
+    NotFound,
+}
+
 /// In-memory sorted write buffer (memtable).
 ///
 /// Holds all active writes for a namespace before they are flushed to disk.
@@ -102,6 +113,33 @@ impl MemTable {
         }
 
         Some(&latest.value)
+    }
+
+    /// Three-state lookup: Found / Tombstone / NotFound.
+    ///
+    /// Unlike `get()`, this distinguishes "key is tombstoned" from "key was
+    /// never written". `Namespace::get()` uses this to avoid falling through
+    /// to stale SSTable data when the memtable holds a tombstone.
+    pub(crate) fn lookup(&self, key: &Key) -> MemLookup<'_> {
+        let Some(entries) = self.entries.get(key) else {
+            return MemLookup::NotFound;
+        };
+        let Some(latest) = entries.last() else {
+            return MemLookup::NotFound;
+        };
+
+        // Expired → treat as tombstone (do not fall through)
+        if let Some(expires_at) = latest.expires_at {
+            if Instant::now() > expires_at {
+                return MemLookup::Tombstone;
+            }
+        }
+
+        if latest.value.is_tombstone() {
+            return MemLookup::Tombstone;
+        }
+
+        MemLookup::Found(&latest.value)
     }
 
     /// Check if a key exists (non-expired, non-tombstone).

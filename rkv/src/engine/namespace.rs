@@ -4,6 +4,7 @@ use std::time::Duration;
 use super::crypto;
 use super::error::{Error, Result};
 use super::key::Key;
+use super::memtable::MemLookup;
 use super::revision::RevisionID;
 use super::value::Value;
 use super::DB;
@@ -106,21 +107,22 @@ impl<'db> Namespace<'db> {
         let key = key.into();
         self.db.inc_op_gets();
 
-        // 1. Check MemTable first
-        let mt_value = {
+        // 1. Check MemTable first (3-state lookup)
+        let value = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap();
-            mt.get(&key).cloned()
-        };
-
-        let value = if let Some(v) = mt_value {
-            v
-        } else {
-            // 2. Fall through to L0 SSTables (newest first)
-            match self.db.get_from_sstables(&self.name, &key)? {
-                Some(v) if v.is_tombstone() => return Err(Error::KeyNotFound),
-                Some(v) => v,
-                None => return Err(Error::KeyNotFound),
+            match mt.lookup(&key) {
+                MemLookup::Found(v) => v.clone(),
+                MemLookup::Tombstone => return Err(Error::KeyNotFound),
+                MemLookup::NotFound => {
+                    // 2. Fall through to SSTables only when key was never in memtable
+                    drop(mt);
+                    match self.db.get_from_sstables(&self.name, &key)? {
+                        Some(v) if v.is_tombstone() => return Err(Error::KeyNotFound),
+                        Some(v) => v,
+                        None => return Err(Error::KeyNotFound),
+                    }
+                }
             }
         };
 
