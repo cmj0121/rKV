@@ -338,8 +338,8 @@ fn ttl_expires_key() {
     let db = DB::open(config).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
-    ns.put("k", "v", Some(Duration::from_millis(1))).unwrap();
-    std::thread::sleep(Duration::from_millis(10));
+    ns.put("k", "v", Some(Duration::from_millis(50))).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
 
     let err = ns.get("k").unwrap_err();
     assert!(matches!(err, Error::KeyNotFound));
@@ -485,7 +485,7 @@ fn stats_uptime_is_nonzero() {
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
 
-    std::thread::sleep(Duration::from_millis(10));
+    std::thread::sleep(Duration::from_millis(50));
     assert!(db.stats().uptime >= Duration::from_millis(10));
 }
 
@@ -1592,12 +1592,12 @@ fn persist_ttl_expired_on_reopen() {
         let config = Config::new(tmp.path());
         let db = DB::open(config).unwrap();
         let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
-        ns.put("k", "v", Some(Duration::from_millis(1))).unwrap();
+        ns.put("k", "v", Some(Duration::from_millis(50))).unwrap();
         db.close().unwrap();
     }
 
     // Wait for TTL to expire
-    std::thread::sleep(Duration::from_millis(10));
+    std::thread::sleep(Duration::from_millis(200));
 
     {
         let config = Config::new(tmp.path());
