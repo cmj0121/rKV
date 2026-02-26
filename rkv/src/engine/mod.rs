@@ -1847,3 +1847,50 @@ fn hex_nibble(b: u8) -> Option<u8> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_decode_valid() {
+        let hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut out = [0u8; 32];
+        assert!(hex_decode(hex, &mut out));
+        assert_eq!(out[0], 0x00);
+        assert_eq!(out[1], 0x11);
+        assert_eq!(out[15], 0xFF);
+    }
+
+    #[test]
+    fn hex_decode_wrong_length() {
+        let mut out = [0u8; 32];
+        assert!(!hex_decode("0011", &mut out)); // too short
+        assert!(!hex_decode("", &mut out));
+    }
+
+    #[test]
+    fn hex_decode_invalid_hi_nibble() {
+        // 'g' in high nibble position
+        let hex = "g0112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut out = [0u8; 32];
+        assert!(!hex_decode(hex, &mut out));
+    }
+
+    #[test]
+    fn hex_decode_invalid_lo_nibble() {
+        // 'z' in low nibble position
+        let hex = "0z112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut out = [0u8; 32];
+        assert!(!hex_decode(hex, &mut out));
+    }
+
+    #[test]
+    fn hex_decode_uppercase() {
+        let hex = "AABBCCDD00112233445566778899EEFF00112233445566778899AABBCCDDEEFF";
+        let mut out = [0u8; 32];
+        assert!(hex_decode(hex, &mut out));
+        assert_eq!(out[0], 0xAA);
+        assert_eq!(out[1], 0xBB);
+    }
+}

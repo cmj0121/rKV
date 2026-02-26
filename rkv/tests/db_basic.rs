@@ -4235,3 +4235,113 @@ fn stats_default_includes_level_stats() {
     assert_eq!(ls.file_count, 0);
     assert_eq!(ls.size_bytes, 0);
 }
+
+// --- stats.meta corruption ---
+
+#[test]
+fn stats_meta_too_small() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db");
+
+    // Create a DB, write some ops, close to persist stats.meta
+    {
+        let config = Config::new(&db_path);
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put(1, "a", None).unwrap();
+        db.close().unwrap();
+    }
+
+    // Truncate stats.meta to only 10 bytes (needs 30)
+    let meta_path = db_path.join("stats.meta");
+    std::fs::write(&meta_path, &[0u8; 10]).unwrap();
+
+    // Reopen — should silently reset counters to 0
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+    let s = db.stats();
+    assert_eq!(s.op_puts, 0);
+    db.close().unwrap();
+}
+
+#[test]
+fn stats_meta_bad_magic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db");
+
+    {
+        let config = Config::new(&db_path);
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put(1, "a", None).unwrap();
+        db.close().unwrap();
+    }
+
+    // Corrupt magic bytes in stats.meta
+    let meta_path = db_path.join("stats.meta");
+    let mut data = std::fs::read(&meta_path).unwrap();
+    data[0] = 0xFF;
+    data[1] = 0xFF;
+    std::fs::write(&meta_path, &data).unwrap();
+
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+    let s = db.stats();
+    assert_eq!(s.op_puts, 0);
+    db.close().unwrap();
+}
+
+#[test]
+fn stats_meta_bad_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db");
+
+    {
+        let config = Config::new(&db_path);
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        ns.put(1, "a", None).unwrap();
+        db.close().unwrap();
+    }
+
+    // Corrupt version in stats.meta (bytes 4-5)
+    let meta_path = db_path.join("stats.meta");
+    let mut data = std::fs::read(&meta_path).unwrap();
+    data[4] = 0xFF;
+    data[5] = 0xFF;
+    std::fs::write(&meta_path, &data).unwrap();
+
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+    let s = db.stats();
+    assert_eq!(s.op_puts, 0);
+    db.close().unwrap();
+}
+
+// --- pending compactions ---
+
+#[test]
+fn stats_pending_compactions_l0_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db");
+
+    // Set l0_max_count very low to trigger pending compaction detection
+    let mut config = Config::new(&db_path);
+    config.l0_max_count = 2;
+    config.write_buffer_size = 64; // small buffer to force frequent flushes
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // Write and flush enough times to exceed l0_max_count
+    for i in 0..3 {
+        ns.put(i, format!("value_{i}").as_str(), None).unwrap();
+        db.flush().unwrap();
+    }
+
+    let s = db.stats();
+    assert!(
+        s.pending_compactions > 0,
+        "expected pending compactions > 0"
+    );
+    db.close().unwrap();
+}
