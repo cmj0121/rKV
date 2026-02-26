@@ -749,6 +749,145 @@ mod tests {
         assert!(!aol.dirty);
     }
 
+    // --- decode_payload truncation ---
+
+    #[test]
+    fn decode_payload_truncated_ns_len() {
+        assert!(decode_payload(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn decode_payload_truncated_namespace() {
+        let mut data = vec![];
+        data.extend_from_slice(&10u16.to_be_bytes()); // ns_len = 10
+        data.extend_from_slice(&[0x41, 0x42]); // only 2 bytes
+        assert!(decode_payload(&data).is_err());
+    }
+
+    #[test]
+    fn decode_payload_truncated_revision() {
+        let payload = encode_payload("_", 1, 0, &Key::Int(1), &Value::from("v"));
+        // 2 (ns_len) + 1 (ns "_") = 3; need 16 more for revision, truncate at 10
+        assert!(decode_payload(&payload[..10]).is_err());
+    }
+
+    #[test]
+    fn decode_payload_truncated_expires() {
+        let payload = encode_payload("_", 1, 0, &Key::Int(1), &Value::from("v"));
+        // 2 + 1 + 16 = 19; need 8 for expires_at_ms, truncate at 22
+        assert!(decode_payload(&payload[..22]).is_err());
+    }
+
+    #[test]
+    fn decode_payload_truncated_key_len() {
+        let payload = encode_payload("_", 1, 0, &Key::Int(1), &Value::from("v"));
+        // 2 + 1 + 16 + 8 = 27; need 2 for key_len, truncate at 28
+        assert!(decode_payload(&payload[..28]).is_err());
+    }
+
+    #[test]
+    fn decode_payload_truncated_key() {
+        let payload = encode_payload("_", 1, 0, &Key::Int(1), &Value::from("v"));
+        // 2 + 1 + 16 + 8 + 2 = 29; key is 9 bytes, truncate at 32
+        assert!(decode_payload(&payload[..32]).is_err());
+    }
+
+    #[test]
+    fn decode_payload_truncated_value_tag() {
+        let payload = encode_payload("_", 1, 0, &Key::Int(1), &Value::from("v"));
+        // 2 + 1 + 16 + 8 + 2 + 9 = 38; truncate right before value_tag
+        assert!(decode_payload(&payload[..38]).is_err());
+    }
+
+    // --- replay error paths ---
+
+    #[test]
+    fn replay_bad_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let _aol = Aol::open(tmp.path(), 0).unwrap();
+        }
+
+        let path = aol_path(tmp.path());
+        let mut data = std::fs::read(&path).unwrap();
+        // Set version to 99
+        data[4] = 0;
+        data[5] = 99;
+        std::fs::write(&path, &data).unwrap();
+
+        let err = Aol::replay(tmp.path(), true).unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)));
+    }
+
+    #[test]
+    fn replay_truncated_payload_len() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut aol = Aol::open(tmp.path(), 0).unwrap();
+            aol.append("_", 1, &Key::Int(1), &Value::from("v"), None)
+                .unwrap();
+        }
+
+        // Truncate so only 2 bytes remain after the valid record (partial payload_len)
+        let path = aol_path(tmp.path());
+        let data = std::fs::read(&path).unwrap();
+        // Append 2 garbage bytes to simulate partial payload_len
+        let mut truncated = data.clone();
+        truncated.push(0xFF);
+        truncated.push(0xFF);
+        std::fs::write(&path, &truncated).unwrap();
+
+        let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
+        assert_eq!(records.len(), 1); // first record OK
+        assert_eq!(skipped, 1); // truncated tail
+    }
+
+    #[test]
+    fn replay_bad_checksum() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut aol = Aol::open(tmp.path(), 0).unwrap();
+            aol.append("_", 1, &Key::Int(1), &Value::from("v"), None)
+                .unwrap();
+        }
+
+        // Corrupt the checksum tag byte (first byte of checksum)
+        let path = aol_path(tmp.path());
+        let mut data = std::fs::read(&path).unwrap();
+        // Checksum is last 5 bytes; corrupt the tag byte
+        let cksum_tag_pos = data.len() - 5;
+        data[cksum_tag_pos] = 0xFF; // invalid algo tag
+        std::fs::write(&path, &data).unwrap();
+
+        let (records, skipped) = Aol::replay(tmp.path(), true).unwrap();
+        assert!(records.is_empty());
+        assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn replay_corrupt_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut aol = Aol::open(tmp.path(), 0).unwrap();
+            aol.append("_", 1, &Key::Int(1), &Value::from("v"), None)
+                .unwrap();
+        }
+
+        // Corrupt the payload so decode_payload fails (but checksum verification is off)
+        let path = aol_path(tmp.path());
+        let mut data = std::fs::read(&path).unwrap();
+        // Zero out most of the payload area (after payload_len field)
+        for i in (HEADER_SIZE + 4)..(data.len() - 5) {
+            data[i] = 0x00;
+        }
+        std::fs::write(&path, &data).unwrap();
+
+        // With verify=false, checksum passes but decode_payload may fail
+        let (records, skipped) = Aol::replay(tmp.path(), false).unwrap();
+        // Either way, records+skipped should account for the entry
+        assert_eq!(records.len() + skipped as usize, 1);
+    }
+
     #[test]
     fn drop_without_flush_loses_buffered_records() {
         let tmp = tempfile::tempdir().unwrap();

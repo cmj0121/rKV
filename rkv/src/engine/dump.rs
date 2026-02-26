@@ -360,4 +360,159 @@ mod tests {
         let err = r.read_header().unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
     }
+
+    // --- decode_payload truncation ---
+
+    #[test]
+    fn decode_payload_truncated_ns_len() {
+        assert!(decode_payload(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn decode_payload_truncated_namespace() {
+        // ns_len = 10, but only 2 bytes of data follow
+        let mut data = vec![];
+        data.extend_from_slice(&10u16.to_be_bytes());
+        data.extend_from_slice(&[0x41, 0x42]);
+        assert!(decode_payload(&data).is_err());
+    }
+
+    #[test]
+    fn decode_payload_truncated_key_len() {
+        // Valid namespace, but truncated at key_len
+        let payload = encode_payload("ns", &Key::Int(1), &Value::from("v"), 0);
+        // namespace is 2 bytes len + 2 bytes "ns" = 4 bytes; truncate just after
+        assert!(decode_payload(&payload[..4]).is_err());
+    }
+
+    #[test]
+    fn decode_payload_truncated_key() {
+        let payload = encode_payload("ns", &Key::Int(1), &Value::from("v"), 0);
+        // 2 (ns_len) + 2 (ns) + 2 (key_len) = 6; key needs 9 bytes, give only 2
+        assert!(decode_payload(&payload[..8]).is_err());
+    }
+
+    #[test]
+    fn decode_payload_truncated_value_tag() {
+        let payload = encode_payload("ns", &Key::Int(1), &Value::from("v"), 0);
+        // 2 + 2 + 2 + 9 = 15 bytes to get past key; truncate before value_tag
+        assert!(decode_payload(&payload[..15]).is_err());
+    }
+
+    #[test]
+    fn decode_payload_truncated_value_data_len() {
+        let payload = encode_payload("ns", &Key::Int(1), &Value::from("v"), 0);
+        // 15 + 1 (tag) = 16; need 4 more for value_data_len, give only 2
+        assert!(decode_payload(&payload[..18]).is_err());
+    }
+
+    #[test]
+    fn decode_payload_truncated_value_data() {
+        let payload = encode_payload("ns", &Key::Int(1), &Value::from("hello"), 0);
+        // 15 + 1 (tag) + 4 (data_len) = 20; data = 5 bytes, give only 2
+        assert!(decode_payload(&payload[..22]).is_err());
+    }
+
+    #[test]
+    fn decode_payload_truncated_expires() {
+        let payload = encode_payload("ns", &Key::Int(1), &Value::from("v"), 12345);
+        // Cut off the last 8 bytes (expires_at_ms)
+        assert!(decode_payload(&payload[..payload.len() - 8]).is_err());
+    }
+
+    // --- DumpReader error paths ---
+
+    #[test]
+    fn read_header_bad_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("badver.rkv");
+        let mut data = vec![];
+        data.extend_from_slice(b"rKVD"); // magic
+        data.extend_from_slice(&99u16.to_be_bytes()); // bad version
+        data.extend_from_slice(&0u16.to_be_bytes()); // path_len = 0
+        fs::write(&path, &data).unwrap();
+
+        let mut r = DumpReader::open(&path).unwrap();
+        let err = r.read_header().unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)));
+    }
+
+    #[test]
+    fn read_header_truncated_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trunc_path.rkv");
+        let mut data = vec![];
+        data.extend_from_slice(b"rKVD");
+        data.extend_from_slice(&1u16.to_be_bytes()); // version
+        data.extend_from_slice(&100u16.to_be_bytes()); // path_len = 100 (but no data follows)
+        fs::write(&path, &data).unwrap();
+
+        let mut r = DumpReader::open(&path).unwrap();
+        let err = r.read_header().unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)));
+    }
+
+    #[test]
+    fn read_record_truncated_at_payload_len() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trunc_rec.rkv");
+
+        {
+            let mut w = DumpWriter::new(&path).unwrap();
+            w.write_header(Path::new("/tmp/db")).unwrap();
+            w.write_record("_", &Key::Int(1), &Value::from("a"), 0)
+                .unwrap();
+            w.finish().unwrap();
+        }
+
+        // Read the file, then truncate it so the second record's payload_len is cut
+        let data = fs::read(&path).unwrap();
+        // Remove last 2 bytes from EOF sentinel area
+        fs::write(&path, &data[..data.len() - 2]).unwrap();
+
+        let mut r = DumpReader::open(&path).unwrap();
+        r.read_header().unwrap();
+        r.read_record(true).unwrap().unwrap(); // first record OK
+        assert!(r.read_record(true).is_err()); // truncated
+    }
+
+    #[test]
+    fn read_record_truncated_at_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trunc_pay.rkv");
+
+        {
+            let mut w = DumpWriter::new(&path).unwrap();
+            w.write_header(Path::new("/tmp/db")).unwrap();
+            w.write_record("_", &Key::Int(1), &Value::from("a"), 0)
+                .unwrap();
+            w.finish().unwrap();
+        }
+
+        // Read the file, find the first record payload and truncate mid-payload
+        let data = fs::read(&path).unwrap();
+        // Header is magic(4) + version(2) + path_len(2) + path
+        // Truncate 10 bytes before EOF to cut into the record's payload
+        fs::write(&path, &data[..data.len() - 10]).unwrap();
+
+        let mut r = DumpReader::open(&path).unwrap();
+        r.read_header().unwrap();
+        // The first record's payload + checksum may be partially cut
+        let result = r.read_record(true);
+        // Either the first record fails, or it succeeds and the sentinel read fails
+        assert!(result.is_err() || r.read_record(true).is_err());
+    }
+
+    // --- Pointer value round-trip ---
+
+    #[test]
+    fn roundtrip_pointer_value() {
+        use super::super::value::ValuePointer;
+
+        let vp = ValuePointer::new([0xAA; 32], 1234);
+        let value = Value::Pointer(vp);
+        let payload = encode_payload("ns", &Key::Int(1), &value, 0);
+        let record = decode_payload(&payload).unwrap();
+        assert!(record.value.is_pointer());
+    }
 }

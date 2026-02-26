@@ -1,4 +1,4 @@
-.PHONY: all clean test run build bench upgrade help $(SUBDIR)
+.PHONY: all clean test fuzz run build bench upgrade help $(SUBDIR)
 
 all: $(SUBDIR) 		# default action
 	@[ -f .git/hooks/pre-commit ] || pre-commit install --install-hooks
@@ -10,6 +10,9 @@ clean: $(SUBDIR)	# clean-up environment
 
 test:				# run all tests (all features)
 	cargo test --workspace
+
+fuzz:				# run fuzz test (RKV_FUZZ_SECS=N, RKV_FUZZ_SEED=N)
+	RKV_FUZZ_SECS=60 cargo test -p rkv --test fuzz -- --nocapture
 
 run:				# run in the local environment
 	cargo run -p rkv
