@@ -951,6 +951,227 @@ mod tests {
         assert!(drained.is_empty());
     }
 
+    // --- Unordered rscan ---
+
+    #[test]
+    fn rscan_unordered_prefix_matching() {
+        let mut mt = MemTable::new();
+        mt.put(
+            Key::from("user:1"),
+            Value::from("a"),
+            RevisionID::from(1u128),
+            None,
+        );
+        mt.put(
+            Key::from("user:2"),
+            Value::from("b"),
+            RevisionID::from(2u128),
+            None,
+        );
+        mt.put(
+            Key::from("post:1"),
+            Value::from("c"),
+            RevisionID::from(3u128),
+            None,
+        );
+
+        let keys = mt.rscan(&Key::from("user:"), 10, 0);
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&Key::from("user:1")));
+        assert!(keys.contains(&Key::from("user:2")));
+    }
+
+    #[test]
+    fn rscan_unordered_with_offset() {
+        let mut mt = MemTable::new();
+        mt.put(
+            Key::from("k:1"),
+            Value::from("a"),
+            RevisionID::from(1u128),
+            None,
+        );
+        mt.put(
+            Key::from("k:2"),
+            Value::from("b"),
+            RevisionID::from(2u128),
+            None,
+        );
+        mt.put(
+            Key::from("k:3"),
+            Value::from("c"),
+            RevisionID::from(3u128),
+            None,
+        );
+
+        // Reversed BTree order + skip 1, take 1
+        let keys = mt.rscan(&Key::from("k:"), 1, 1);
+        assert_eq!(keys.len(), 1);
+    }
+
+    #[test]
+    fn rscan_unordered_excludes_tombstones() {
+        let mut mt = MemTable::new();
+        mt.put(
+            Key::from("x:1"),
+            Value::from("a"),
+            RevisionID::from(1u128),
+            None,
+        );
+        mt.put(
+            Key::from("x:2"),
+            Value::from("b"),
+            RevisionID::from(2u128),
+            None,
+        );
+        mt.delete(Key::from("x:2"), RevisionID::from(3u128));
+
+        let keys = mt.rscan(&Key::from("x:"), 10, 0);
+        assert_eq!(keys, vec![Key::from("x:1")]);
+    }
+
+    // --- scan_raw ---
+
+    #[test]
+    fn scan_raw_ordered() {
+        let mut mt = MemTable::new();
+        mt.put(Key::Int(1), Value::from("a"), RevisionID::from(1u128), None);
+        mt.put(Key::Int(2), Value::from("b"), RevisionID::from(2u128), None);
+        mt.delete(Key::Int(3), RevisionID::from(3u128));
+
+        let pairs = mt.scan_raw(&Key::Int(1), 10, 0);
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0], (Key::Int(1), Value::from("a")));
+        assert!(pairs[2].1.is_tombstone());
+    }
+
+    #[test]
+    fn scan_raw_unordered_prefix() {
+        let mut mt = MemTable::new();
+        mt.put(
+            Key::from("ns:a"),
+            Value::from("1"),
+            RevisionID::from(1u128),
+            None,
+        );
+        mt.put(
+            Key::from("ns:b"),
+            Value::from("2"),
+            RevisionID::from(2u128),
+            None,
+        );
+        mt.put(
+            Key::from("other:c"),
+            Value::from("3"),
+            RevisionID::from(3u128),
+            None,
+        );
+
+        let pairs = mt.scan_raw(&Key::from("ns:"), 10, 0);
+        assert_eq!(pairs.len(), 2);
+    }
+
+    #[test]
+    fn scan_raw_with_limit_offset() {
+        let mut mt = MemTable::new();
+        mt.put(Key::Int(1), Value::from("a"), RevisionID::from(1u128), None);
+        mt.put(Key::Int(2), Value::from("b"), RevisionID::from(2u128), None);
+        mt.put(Key::Int(3), Value::from("c"), RevisionID::from(3u128), None);
+
+        let pairs = mt.scan_raw(&Key::Int(1), 1, 1);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, Key::Int(2));
+    }
+
+    // --- rscan_raw ---
+
+    #[test]
+    fn rscan_raw_ordered() {
+        let mut mt = MemTable::new();
+        mt.put(Key::Int(1), Value::from("a"), RevisionID::from(1u128), None);
+        mt.put(Key::Int(2), Value::from("b"), RevisionID::from(2u128), None);
+        mt.put(Key::Int(3), Value::from("c"), RevisionID::from(3u128), None);
+
+        let pairs = mt.rscan_raw(&Key::Int(3), 10, 0);
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0].0, Key::Int(3));
+        assert_eq!(pairs[2].0, Key::Int(1));
+    }
+
+    #[test]
+    fn rscan_raw_unordered_prefix() {
+        let mut mt = MemTable::new();
+        mt.put(
+            Key::from("r:1"),
+            Value::from("a"),
+            RevisionID::from(1u128),
+            None,
+        );
+        mt.put(
+            Key::from("r:2"),
+            Value::from("b"),
+            RevisionID::from(2u128),
+            None,
+        );
+        mt.put(
+            Key::from("other:1"),
+            Value::from("c"),
+            RevisionID::from(3u128),
+            None,
+        );
+
+        let pairs = mt.rscan_raw(&Key::from("r:"), 10, 0);
+        assert_eq!(pairs.len(), 2);
+    }
+
+    // --- rscan_all_raw ---
+
+    #[test]
+    fn rscan_all_raw_unordered() {
+        let mut mt = MemTable::new();
+        mt.put(
+            Key::from("p:1"),
+            Value::from("a"),
+            RevisionID::from(1u128),
+            None,
+        );
+        mt.put(
+            Key::from("p:2"),
+            Value::from("b"),
+            RevisionID::from(2u128),
+            None,
+        );
+        mt.put(
+            Key::from("q:1"),
+            Value::from("c"),
+            RevisionID::from(3u128),
+            None,
+        );
+
+        let pairs = mt.rscan_all_raw(&Key::from("p:"));
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.iter().all(|(k, _)| k.to_string().starts_with("p:")));
+    }
+
+    // --- scan_raw skips expired ---
+
+    #[test]
+    fn scan_raw_skips_expired() {
+        let mut mt = MemTable::new();
+        mt.put(
+            Key::Int(1),
+            Value::from("a"),
+            RevisionID::from(1u128),
+            Some(Duration::from_millis(1)),
+        );
+        mt.put(Key::Int(2), Value::from("b"), RevisionID::from(2u128), None);
+
+        std::thread::sleep(Duration::from_millis(10));
+
+        let pairs = mt.scan_raw(&Key::Int(1), 10, 0);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, Key::Int(2));
+    }
+
     #[test]
     fn expired_key_invisible() {
         let mut mt = MemTable::new();
