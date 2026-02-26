@@ -532,7 +532,6 @@ impl SSTableReader {
     /// - `prefix_bytes`: serialized key prefix to match against.
     /// - `ordered_mode`: if true, scan from prefix forward (range scan);
     ///   if false, check all blocks for string prefix matching.
-    #[allow(dead_code)]
     pub(crate) fn scan_entries(
         &self,
         prefix_bytes: &[u8],
@@ -583,6 +582,67 @@ impl SSTableReader {
                     }
                 }
             }
+        }
+
+        Ok(result)
+    }
+
+    /// Reverse-scan entries matching a prefix/range.
+    ///
+    /// For ordered mode: returns entries with keys <= prefix_bytes.
+    /// For unordered mode: same as scan_entries (prefix matching).
+    pub(crate) fn rscan_entries(
+        &self,
+        prefix_bytes: &[u8],
+        ordered_mode: bool,
+        verify_checksums: bool,
+    ) -> Result<Vec<(Key, Value)>> {
+        if self.index.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut result = Vec::new();
+
+        if ordered_mode {
+            // Range scan: find blocks that may contain keys <= prefix_bytes.
+            // We need all blocks from the beginning up to the block whose
+            // last_key >= prefix_bytes.
+            let end_block = match self
+                .index
+                .binary_search_by(|e| e.last_key.as_slice().cmp(prefix_bytes))
+            {
+                Ok(i) => i,
+                Err(i) => {
+                    if i == 0 {
+                        // All blocks have last_key < prefix, so check if
+                        // any keys exist <= prefix. Process all blocks.
+                        // Actually, if i == 0, the first block's last_key < prefix,
+                        // meaning all keys in block 0 could be <= prefix.
+                        // We need to read up to block i (exclusive would miss keys).
+                        // Let's just include block 0 if it has any keys <= prefix.
+                    }
+                    if i > 0 {
+                        i - 1
+                    } else {
+                        0
+                    }
+                }
+            };
+
+            // Read from block 0 up to end_block inclusive
+            for ie in &self.index[..=end_block] {
+                let entries = self.read_block(ie, verify_checksums)?;
+                for (key_bytes, value_tag, value_data) in entries {
+                    if key_bytes.as_slice() <= prefix_bytes {
+                        let key = Key::from_bytes(&key_bytes)?;
+                        let value = Value::from_tag(value_tag, &value_data)?;
+                        result.push((key, value));
+                    }
+                }
+            }
+        } else {
+            // Prefix matching: same as forward scan
+            return self.scan_entries(prefix_bytes, ordered_mode, verify_checksums);
         }
 
         Ok(result)

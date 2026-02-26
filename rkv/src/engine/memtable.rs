@@ -116,7 +116,6 @@ impl MemTable {
     }
 
     /// Returns true if the memtable is in ordered mode (Int keys only).
-    #[allow(dead_code)]
     pub(crate) fn is_ordered(&self) -> bool {
         self.ordered_mode
     }
@@ -145,6 +144,7 @@ impl MemTable {
     /// - **Unordered mode** (Str keys): prefix matching on string representation.
     ///
     /// Tombstoned and expired keys are excluded.
+    #[allow(dead_code)]
     pub(crate) fn scan(&self, prefix: &Key, limit: usize, offset: usize) -> Vec<Key> {
         if self.ordered_mode {
             self.entries
@@ -174,6 +174,7 @@ impl MemTable {
     /// - **Unordered mode**: prefix matching, reverse iteration order.
     ///
     /// Tombstoned and expired keys are excluded.
+    #[allow(dead_code)]
     pub(crate) fn rscan(&self, prefix: &Key, limit: usize, offset: usize) -> Vec<Key> {
         if self.ordered_mode {
             self.entries
@@ -203,11 +204,34 @@ impl MemTable {
     ///
     /// No limit/offset — returns everything. Used by the merged scan to
     /// overlay MemTable entries on top of SSTable results.
-    #[allow(dead_code)]
     pub(crate) fn scan_all_raw(&self, prefix: &Key) -> Vec<(Key, Value)> {
         if self.ordered_mode {
             self.entries
                 .range(prefix..)
+                .filter(|(_, entries)| self.is_not_expired(entries))
+                .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
+                .collect()
+        } else {
+            let prefix_str = prefix.to_string();
+            self.entries
+                .iter()
+                .filter(|(k, entries)| {
+                    k.to_string().starts_with(&prefix_str) && self.is_not_expired(entries)
+                })
+                .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
+                .collect()
+        }
+    }
+
+    /// Return all raw `(Key, Value)` pairs matching a prefix in reverse,
+    /// including tombstones.
+    ///
+    /// For ordered mode: returns keys <= prefix. For unordered mode: prefix
+    /// matching (same as forward). Used by merged rscan.
+    pub(crate) fn rscan_all_raw(&self, prefix: &Key) -> Vec<(Key, Value)> {
+        if self.ordered_mode {
+            self.entries
+                .range(..=prefix.clone())
                 .filter(|(_, entries)| self.is_not_expired(entries))
                 .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
                 .collect()
