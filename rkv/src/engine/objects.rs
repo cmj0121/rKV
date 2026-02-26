@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::error::{Error, Result};
+use super::io::IoBackend;
 use super::value::ValuePointer;
 
 /// Object file flags — bit 0 indicates LZ4 compression.
@@ -14,14 +16,15 @@ const FLAG_LZ4: u8 = 0x01;
 /// the hash) to avoid excessive entries per directory.
 pub(crate) struct ObjectStore {
     base: PathBuf,
+    io: Arc<dyn IoBackend>,
 }
 
 impl ObjectStore {
     /// Open (or create) the object store directory for a namespace under `db_dir`.
-    pub(crate) fn open(db_dir: &Path, ns: &str) -> Result<Self> {
+    pub(crate) fn open(db_dir: &Path, ns: &str, io: Arc<dyn IoBackend>) -> Result<Self> {
         let base = db_dir.join("objects").join(ns);
         fs::create_dir_all(&base)?;
-        Ok(Self { base })
+        Ok(Self { base, io })
     }
 
     /// Write a value to the object store, returning a `ValuePointer`.
@@ -57,10 +60,8 @@ impl ObjectStore {
         content.push(flags);
         content.extend_from_slice(&payload);
 
-        // Atomic write: write to tmp file, then rename
-        let tmp_path = path.with_extension("tmp");
-        fs::write(&tmp_path, &content)?;
-        fs::rename(&tmp_path, &path)?;
+        // Atomic write via IoBackend
+        self.io.write_file_atomic(&path, &content)?;
 
         Ok(vp)
     }
@@ -71,11 +72,11 @@ impl ObjectStore {
     pub(crate) fn read(&self, vp: &ValuePointer, verify: bool) -> Result<Vec<u8>> {
         let path = self.object_path(vp);
 
-        let content = fs::read(&path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
+        let content = self.io.read_file(&path).map_err(|e| {
+            if matches!(e, Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound) {
                 Error::Corruption(format!("object file missing: {}", path.display()))
             } else {
-                Error::Io(e)
+                e
             }
         })?;
 
@@ -165,10 +166,14 @@ impl ObjectStore {
 mod tests {
     use super::*;
 
+    fn test_io() -> Arc<dyn IoBackend> {
+        Arc::new(super::super::io::BufferedIo)
+    }
+
     #[test]
     fn write_read_roundtrip_raw() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_").unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
 
         let data = b"hello world, this is a test value";
         let vp = store.write(data, false).unwrap();
@@ -181,7 +186,7 @@ mod tests {
     #[test]
     fn write_read_roundtrip_compressed() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_").unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
 
         let data = b"hello world, this is a test value for compression";
         let vp = store.write(data, true).unwrap();
@@ -194,7 +199,7 @@ mod tests {
     #[test]
     fn dedup_same_content() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_").unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
 
         let data = b"same content";
         let vp1 = store.write(data, true).unwrap();
@@ -206,7 +211,7 @@ mod tests {
     #[test]
     fn exists_after_write() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_").unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
 
         let data = b"some data";
         let vp = store.write(data, false).unwrap();
@@ -217,7 +222,7 @@ mod tests {
     #[test]
     fn exists_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_").unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
 
         let vp = ValuePointer::new([0xFFu8; 32], 100);
         assert!(!store.exists(&vp));
@@ -226,7 +231,7 @@ mod tests {
     #[test]
     fn read_missing_file_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_").unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
 
         let vp = ValuePointer::new([0xFFu8; 32], 100);
         let err = store.read(&vp, false).unwrap_err();
@@ -236,7 +241,7 @@ mod tests {
     #[test]
     fn read_empty_file_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_").unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
 
         // Create an empty file at the object path
         let vp = ValuePointer::new([0xAAu8; 32], 100);
@@ -251,7 +256,7 @@ mod tests {
     #[test]
     fn blake3_verification_catches_corruption() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_").unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
 
         let data = b"test data for verification";
         let vp = store.write(data, false).unwrap();
@@ -269,7 +274,7 @@ mod tests {
     #[test]
     fn fan_out_directory_created() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_").unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
 
         let data = b"test data";
         let vp = store.write(data, false).unwrap();
@@ -288,6 +293,7 @@ mod tests {
         // Don't create the ObjectStore — just instantiate with a non-existent base
         let store = ObjectStore {
             base: tmp.path().join("nonexistent"),
+            io: test_io(),
         };
         let hashes = store.list_object_hashes().unwrap();
         assert!(hashes.is_empty());
@@ -296,7 +302,7 @@ mod tests {
     #[test]
     fn list_object_hashes_skips_non_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_").unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
 
         // Create a regular file in the base dir (not a directory)
         let non_dir = store.base.join("not_a_dir");
@@ -314,7 +320,7 @@ mod tests {
     #[test]
     fn large_value_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_").unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
 
         // 64 KB of data
         let data: Vec<u8> = (0..65536).map(|i| (i % 256) as u8).collect();
