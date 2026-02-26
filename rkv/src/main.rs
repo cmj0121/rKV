@@ -660,6 +660,11 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                     c.bloom_bits.to_string(),
                 ),
                 (
+                    "  lsm.bloom_prefix_len",
+                    "prefix bloom bytes (0 = off)",
+                    c.bloom_prefix_len.to_string(),
+                ),
+                (
                     "  lsm.verify_checksums",
                     "verify on read",
                     c.verify_checksums.to_string(),
@@ -929,6 +934,13 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
         "lsm.bloom_bits" => match value.parse::<usize>() {
             Ok(v) => {
                 c.bloom_bits = v;
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected a number"),
+        },
+        "lsm.bloom_prefix_len" => match value.parse::<usize>() {
+            Ok(v) => {
+                c.bloom_prefix_len = v;
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected a number"),

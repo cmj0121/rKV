@@ -147,6 +147,12 @@ pub struct Config {
     /// Bloom filter bits per key (default: 10, ~1% false-positive rate).
     /// Set to 0 to disable bloom filters.
     pub bloom_bits: usize,
+    /// Bloom filter prefix length for scan optimization (default: 0 = disabled).
+    /// When > 0, the first `bloom_prefix_len` bytes of each key's serialized
+    /// form are hashed into a prefix bloom filter per SSTable. Scans check
+    /// this filter to skip SSTables that definitely don't contain matching
+    /// prefixes.
+    pub bloom_prefix_len: usize,
     /// Verify checksums on read (default: true).
     /// When enabled, every WAL entry and SSTable block is verified against
     /// its stored checksum during reads. Disabling trades safety for speed.
@@ -182,6 +188,7 @@ impl Config {
             object_size: 1024,
             compress: true,
             bloom_bits: 10,
+            bloom_prefix_len: 0,
             verify_checksums: true,
             compression: Compression::default(),
             io_model: IoModel::default(),
@@ -548,6 +555,7 @@ impl DB {
                 self.config.block_size,
                 self.config.compression.clone(),
                 self.config.bloom_bits,
+                self.config.bloom_prefix_len,
             )?;
             for (key, value) in &entries {
                 writer.add(key, value)?;
@@ -1102,6 +1110,7 @@ impl DB {
             self.config.block_size,
             self.config.compression.clone(),
             self.config.bloom_bits,
+            self.config.bloom_prefix_len,
         )?;
         for (key, value) in &merged {
             writer.add(key, value)?;
