@@ -378,4 +378,34 @@ mod tests {
     fn try_narrow_int_unchanged() {
         assert_eq!(Key::Int(42).try_narrow(), Key::Int(42));
     }
+
+    // --- to_prefix_bytes ---
+
+    #[test]
+    fn to_prefix_bytes_int() {
+        let key = Key::Int(42);
+        // For Int keys, to_prefix_bytes is the same as to_bytes
+        assert_eq!(key.to_prefix_bytes(), key.to_bytes());
+    }
+
+    #[test]
+    fn to_prefix_bytes_int_negative() {
+        let key = Key::Int(-100);
+        assert_eq!(key.to_prefix_bytes(), key.to_bytes());
+    }
+
+    #[test]
+    fn to_prefix_bytes_str_prefix_matching() {
+        let prefix = Key::from("user:");
+        let full = Key::from("user:123");
+
+        let prefix_bytes = prefix.to_prefix_bytes();
+        let full_bytes = full.to_bytes();
+
+        // Full key bytes should start with prefix bytes (no null terminator)
+        assert!(full_bytes.starts_with(&prefix_bytes));
+
+        // But full key bytes should NOT start with to_bytes (has null terminator)
+        assert!(!full_bytes.starts_with(&prefix.to_bytes()));
+    }
 }

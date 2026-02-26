@@ -283,6 +283,35 @@ mod tests {
     }
 
     #[test]
+    fn list_object_hashes_nonexistent_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Don't create the ObjectStore — just instantiate with a non-existent base
+        let store = ObjectStore {
+            base: tmp.path().join("nonexistent"),
+        };
+        let hashes = store.list_object_hashes().unwrap();
+        assert!(hashes.is_empty());
+    }
+
+    #[test]
+    fn list_object_hashes_skips_non_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(tmp.path(), "_").unwrap();
+
+        // Create a regular file in the base dir (not a directory)
+        let non_dir = store.base.join("not_a_dir");
+        fs::write(&non_dir, b"data").unwrap();
+
+        // Also write a real object
+        let data = b"test data for list";
+        let _vp = store.write(data, false).unwrap();
+
+        let hashes = store.list_object_hashes().unwrap();
+        // Should find exactly 1 hash (the real object), skipping the regular file
+        assert_eq!(hashes.len(), 1);
+    }
+
+    #[test]
     fn large_value_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let store = ObjectStore::open(tmp.path(), "_").unwrap();
