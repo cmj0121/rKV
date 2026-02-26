@@ -21,7 +21,7 @@ pub use key::Key;
 pub use namespace::Namespace;
 pub use recovery::RecoveryReport;
 pub use revision::RevisionID;
-pub use stats::Stats;
+pub use stats::{LevelStat, Stats};
 pub use value::Value;
 
 use std::collections::HashMap;
@@ -460,17 +460,72 @@ impl DB {
             write_buffer_bytes += mt.approximate_size() as u64;
         }
 
+        // SSTable stats from self.sstables
+        let sst = self.sstables.read().unwrap();
+        let max_levels = self.config.max_levels;
+        let mut sstable_count: u64 = 0;
+        let mut pending_compactions: u64 = 0;
+        let mut level_stats = vec![stats::LevelStat::default(); max_levels];
+
+        for (_ns, levels) in sst.iter() {
+            for (level, readers) in levels.iter().enumerate() {
+                let count = readers.len() as u64;
+                let size: u64 = readers.iter().map(|r| r.size_bytes() as u64).sum();
+                sstable_count += count;
+                if level < max_levels {
+                    level_stats[level].file_count += count;
+                    level_stats[level].size_bytes += size;
+                }
+            }
+
+            // L0 compaction trigger
+            if let Some(l0_readers) = levels.first() {
+                if l0_readers.len() >= self.config.l0_max_count {
+                    pending_compactions += 1;
+                } else {
+                    let l0_size: usize = l0_readers.iter().map(|r| r.size_bytes()).sum();
+                    if l0_size >= self.config.l0_max_size {
+                        pending_compactions += 1;
+                    }
+                }
+            }
+
+            // L1+ compaction triggers
+            for level in 1..max_levels {
+                let total_size: usize = levels
+                    .get(level)
+                    .map(|readers| readers.iter().map(|r| r.size_bytes()).sum())
+                    .unwrap_or(0);
+                if total_size >= Self::do_level_max_size(&self.config, level) {
+                    pending_compactions += 1;
+                }
+            }
+        }
+        drop(sst);
+
+        // Cache hit/miss counters
+        let (cache_hits, cache_misses) = if let Some(ref bc) = self.block_cache {
+            let cache = bc.lock().unwrap();
+            (cache.hits(), cache.misses())
+        } else {
+            (0, 0)
+        };
+
         Stats {
             total_keys,
             data_size_bytes: write_buffer_bytes,
             namespace_count,
-            level_count: self.config.max_levels,
+            level_count: max_levels,
+            sstable_count,
             write_buffer_bytes,
+            pending_compactions,
+            level_stats,
             op_puts: self.op_puts.load(Ordering::Relaxed),
             op_gets: self.op_gets.load(Ordering::Relaxed),
             op_deletes: self.op_deletes.load(Ordering::Relaxed),
+            cache_hits,
+            cache_misses,
             uptime: self.opened_at.elapsed(),
-            ..Stats::default()
         }
     }
 

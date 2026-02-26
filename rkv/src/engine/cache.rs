@@ -74,12 +74,10 @@ impl BlockCache {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn hits(&self) -> u64 {
         self.hits
     }
 
-    #[allow(dead_code)]
     pub(crate) fn misses(&self) -> u64 {
         self.misses
     }
