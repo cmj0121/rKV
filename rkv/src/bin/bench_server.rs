@@ -365,6 +365,8 @@ fn bench_rev_count(n: usize) -> std::time::Duration {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    let no_save = std::env::args().any(|a| a == "--no-save");
+
     eprintln!("Collecting machine info...");
     let info = collect_machine_info();
 
@@ -451,14 +453,17 @@ fn main() {
     md.push_str("\n## Reproduce\n\n");
     md.push_str("```sh\ncargo run --features server --bin bench_server --release\n```\n");
 
-    // Write to BENCH_SERVER.md at project root
-    let bench_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("BENCH_SERVER.md");
+    if no_save {
+        print!("{md}");
+    } else {
+        let bench_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("BENCH_SERVER.md");
 
-    let mut file = std::fs::File::create(&bench_path).unwrap();
-    file.write_all(md.as_bytes()).unwrap();
+        let mut file = std::fs::File::create(&bench_path).unwrap();
+        file.write_all(md.as_bytes()).unwrap();
 
-    eprintln!("Wrote {}", bench_path.display());
+        eprintln!("Wrote {}", bench_path.display());
+    }
 }
