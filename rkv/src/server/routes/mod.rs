@@ -2,6 +2,7 @@ mod admin;
 mod health;
 mod keys;
 mod namespaces;
+mod revisions;
 mod scan;
 
 use std::sync::Arc;
@@ -36,6 +37,13 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(scan::list_keys).delete(scan::delete_keys),
         )
         .route("/api/{ns}/count", get(scan::count_keys))
+        // Revisions & TTL
+        .route("/api/{ns}/keys/{key}/revisions", get(revisions::rev_count))
+        .route(
+            "/api/{ns}/keys/{key}/revisions/{index}",
+            get(revisions::rev_get),
+        )
+        .route("/api/{ns}/keys/{key}/ttl", get(revisions::get_ttl))
         // Admin
         .route("/api/admin/stats", get(admin::get_stats))
         .route("/api/admin/analyze", post(admin::analyze))

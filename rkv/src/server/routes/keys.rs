@@ -121,7 +121,7 @@ fn json_body_to_value(body: &[u8]) -> Result<rkv::Value, ServerError> {
 }
 
 /// Convert a Value to JSON bytes for the response body.
-fn value_to_json_bytes(value: &rkv::Value) -> Vec<u8> {
+pub(super) fn value_to_json_bytes(value: &rkv::Value) -> Vec<u8> {
     match value.as_bytes() {
         Some(bytes) => {
             if let Ok(s) = std::str::from_utf8(bytes) {
