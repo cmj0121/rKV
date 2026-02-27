@@ -44,7 +44,7 @@ pub async fn list_keys(
         .prefix
         .as_deref()
         .map(parse_key)
-        .unwrap_or(rkv::Key::Int(0));
+        .unwrap_or_else(|| rkv::Key::from(""));
 
     let keys = if params.reverse.unwrap_or(false) {
         ns.rscan(&prefix, SCAN_LIMIT + 1, offset)?
