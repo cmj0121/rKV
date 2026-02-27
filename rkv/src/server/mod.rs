@@ -102,9 +102,14 @@ mod tests {
     use tower::ServiceExt;
 
     fn temp_db() -> crate::DB {
+        temp_db_with_buffer(4 * 1024 * 1024) // default 4 MB
+    }
+
+    fn temp_db_with_buffer(write_buffer_size: usize) -> crate::DB {
         let dir = tempfile::tempdir().unwrap();
         let mut config = crate::Config::new(dir.path());
         config.create_if_missing = true;
+        config.write_buffer_size = write_buffer_size;
         std::mem::forget(dir);
         crate::DB::open(config).unwrap()
     }
@@ -792,5 +797,626 @@ mod tests {
             .unwrap();
         // Without ConnectInfo, peer_ip is None — request passes
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fuzz test — oracle-based randomized testing through HTTP
+    // -----------------------------------------------------------------------
+
+    /// Build a router with a large write buffer to prevent auto-flush.
+    ///
+    /// Several engine operations (`count`, `exists`, `delete_range`,
+    /// `delete_prefix`) only read the memtable. After auto-flush they
+    /// silently miss keys that moved to SSTables. A 256 MB buffer keeps
+    /// the entire fuzz session in-memory so the oracle stays in sync.
+    fn fuzz_app() -> axum::Router {
+        super::build_router(temp_db_with_buffer(256 * 1024 * 1024))
+    }
+
+    const FUZZ_KEY_SPACE: u32 = 50;
+    const FUZZ_NAMESPACES: &[&str] = &["_", "ns1"];
+    const FUZZ_VERIFY_INTERVAL: u64 = 200;
+
+    struct FuzzOracle {
+        namespaces:
+            std::collections::HashMap<String, std::collections::HashMap<String, Option<Vec<u8>>>>,
+        write_counts: std::collections::HashMap<(String, String), u64>,
+    }
+
+    impl FuzzOracle {
+        fn new() -> Self {
+            Self {
+                namespaces: std::collections::HashMap::new(),
+                write_counts: std::collections::HashMap::new(),
+            }
+        }
+
+        fn ns_mut(&mut self, ns: &str) -> &mut std::collections::HashMap<String, Option<Vec<u8>>> {
+            self.namespaces.entry(ns.to_owned()).or_default()
+        }
+
+        fn put(&mut self, ns: &str, key: &str, value: Vec<u8>) {
+            self.ns_mut(ns).insert(key.to_owned(), Some(value));
+            *self
+                .write_counts
+                .entry((ns.to_owned(), key.to_owned()))
+                .or_insert(0) += 1;
+        }
+
+        fn delete(&mut self, ns: &str, key: &str) {
+            self.ns_mut(ns).insert(key.to_owned(), None);
+            *self
+                .write_counts
+                .entry((ns.to_owned(), key.to_owned()))
+                .or_insert(0) += 1;
+        }
+
+        fn get(&self, ns: &str, key: &str) -> Option<&[u8]> {
+            self.namespaces
+                .get(ns)
+                .and_then(|m| m.get(key))
+                .and_then(|v| v.as_deref())
+        }
+
+        fn exists(&self, ns: &str, key: &str) -> bool {
+            self.get(ns, key).is_some()
+        }
+
+        fn count(&self, ns: &str) -> u64 {
+            self.namespaces
+                .get(ns)
+                .map(|m| m.values().filter(|v| v.is_some()).count() as u64)
+                .unwrap_or(0)
+        }
+
+        fn write_count(&self, ns: &str, key: &str) -> u64 {
+            self.write_counts
+                .get(&(ns.to_owned(), key.to_owned()))
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn scan(&self, ns: &str, prefix: &str, limit: usize, offset: usize) -> Vec<String> {
+            let Some(m) = self.namespaces.get(ns) else {
+                return Vec::new();
+            };
+            let mut keys: Vec<&String> = m
+                .iter()
+                .filter(|(k, v)| v.is_some() && k.starts_with(prefix))
+                .map(|(k, _)| k)
+                .collect();
+            keys.sort();
+            keys.into_iter().skip(offset).take(limit).cloned().collect()
+        }
+
+        fn rscan(&self, ns: &str, prefix: &str, limit: usize, offset: usize) -> Vec<String> {
+            let Some(m) = self.namespaces.get(ns) else {
+                return Vec::new();
+            };
+            let mut keys: Vec<&String> = m
+                .iter()
+                .filter(|(k, v)| v.is_some() && k.starts_with(prefix))
+                .map(|(k, _)| k)
+                .collect();
+            keys.sort();
+            keys.reverse();
+            keys.into_iter().skip(offset).take(limit).cloned().collect()
+        }
+
+        fn delete_prefix(&mut self, ns: &str, prefix: &str) -> u64 {
+            let Some(m) = self.namespaces.get(ns) else {
+                return 0;
+            };
+            let keys: Vec<String> = m
+                .iter()
+                .filter(|(k, v)| v.is_some() && k.starts_with(prefix))
+                .map(|(k, _)| k.clone())
+                .collect();
+            let count = keys.len() as u64;
+            for k in &keys {
+                self.ns_mut(ns).insert(k.clone(), None);
+                *self
+                    .write_counts
+                    .entry((ns.to_owned(), k.clone()))
+                    .or_insert(0) += 1;
+            }
+            count
+        }
+
+        fn delete_range(&mut self, ns: &str, start: &str, end: &str, inclusive: bool) -> u64 {
+            let Some(m) = self.namespaces.get(ns) else {
+                return 0;
+            };
+            let keys: Vec<String> = m
+                .iter()
+                .filter(|(k, v)| {
+                    if v.is_none() {
+                        return false;
+                    }
+                    let k: &str = k.as_str();
+                    if inclusive {
+                        k >= start && k <= end
+                    } else {
+                        k >= start && k < end
+                    }
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+            let count = keys.len() as u64;
+            for k in &keys {
+                self.ns_mut(ns).insert(k.clone(), None);
+                *self
+                    .write_counts
+                    .entry((ns.to_owned(), k.clone()))
+                    .or_insert(0) += 1;
+            }
+            count
+        }
+    }
+
+    fn fuzz_gen_key(rng: &mut fastrand::Rng) -> String {
+        format!("k{}", rng.u32(0..FUZZ_KEY_SPACE))
+    }
+
+    fn fuzz_gen_value(rng: &mut fastrand::Rng) -> Vec<u8> {
+        let len = rng.usize(0..100);
+        let mut buf = vec![0u8; len];
+        rng.fill(&mut buf);
+        buf
+    }
+
+    fn fuzz_gen_prefix(rng: &mut fastrand::Rng) -> String {
+        let choice = rng.u32(0..6);
+        if choice == 5 {
+            "k".to_owned()
+        } else {
+            format!("k{choice}")
+        }
+    }
+
+    /// Pick a weighted random operation index (0..12).
+    fn fuzz_gen_op(rng: &mut fastrand::Rng) -> u32 {
+        let roll = rng.u32(0..100);
+        match roll {
+            0..30 => 0,   // put            30%
+            30..50 => 1,  // get            20%
+            50..60 => 2,  // delete         10%
+            60..65 => 3,  // head            5%
+            65..70 => 4,  // count           5%
+            70..77 => 5,  // scan            7%
+            77..84 => 6,  // rscan           7%
+            84..88 => 7,  // del_prefix      4%
+            88..92 => 8,  // del_range       4%
+            92..95 => 9,  // rev_count       3%
+            95..98 => 10, // switch_ns       3%
+            _ => 11,      // ttl             2%
+        }
+    }
+
+    /// Full verification: walk every oracle entry and compare against the HTTP API.
+    async fn fuzz_verify_full(app: &axum::Router, oracle: &FuzzOracle, label: &str) {
+        for (ns_name, entries) in &oracle.namespaces {
+            for (key_str, expected) in entries {
+                let resp = app
+                    .clone()
+                    .oneshot(
+                        Request::get(format!("/api/{ns_name}/keys/{key_str}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+
+                match expected {
+                    Some(bytes) => {
+                        assert!(
+                            resp.status() == StatusCode::OK
+                                || resp.status() == StatusCode::NO_CONTENT,
+                            "[{label}] ns={ns_name} key={key_str}: expected 200/204, got {}",
+                            resp.status()
+                        );
+                        if resp.status() == StatusCode::OK {
+                            let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                            // The HTTP layer JSON-encodes string values, so we need to decode
+                            let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+                            if let Ok(s) = serde_json::from_str::<String>(&body_str) {
+                                assert_eq!(
+                                    s.as_bytes(),
+                                    bytes.as_slice(),
+                                    "[{label}] ns={ns_name} key={key_str}: value mismatch"
+                                );
+                            } else {
+                                // Binary data — compare raw
+                                assert_eq!(
+                                    body_bytes.as_ref(),
+                                    bytes.as_slice(),
+                                    "[{label}] ns={ns_name} key={key_str}: value mismatch (binary)"
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        assert_eq!(
+                            resp.status(),
+                            StatusCode::NOT_FOUND,
+                            "[{label}] ns={ns_name} key={key_str}: expected 404, got {}",
+                            resp.status()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fuzz_http_ops() {
+        let fuzz_secs: u64 = std::env::var("RKV_SERVER_FUZZ_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
+
+        let seed: u64 = std::env::var("RKV_SERVER_FUZZ_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| fastrand::u64(..));
+
+        eprintln!("server fuzz: seed={seed} duration={fuzz_secs}s");
+
+        let mut rng = fastrand::Rng::with_seed(seed);
+        let app = fuzz_app();
+
+        // Create ns1 namespace upfront
+        app.clone()
+            .oneshot(
+                Request::post("/api/namespaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{\"name\": \"ns1\"}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut oracle = FuzzOracle::new();
+        let mut current_ns = "_".to_owned();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(fuzz_secs);
+        let mut op_count: u64 = 0;
+
+        while std::time::Instant::now() < deadline {
+            let op = fuzz_gen_op(&mut rng);
+            op_count += 1;
+
+            match op {
+                // --- put ---
+                0 => {
+                    let key = fuzz_gen_key(&mut rng);
+                    let raw_value = fuzz_gen_value(&mut rng);
+                    // HTTP API round-trips through JSON strings, which
+                    // replaces invalid UTF-8 with U+FFFD. Store the
+                    // lossy-converted bytes in the oracle to match.
+                    let value_str = String::from_utf8_lossy(&raw_value).into_owned();
+                    let json_body = serde_json::to_string(&value_str).unwrap();
+                    let oracle_value = value_str.into_bytes();
+
+                    let resp = app
+                        .clone()
+                        .oneshot(
+                            Request::put(format!("/api/{}/keys/{}", current_ns, key))
+                                .header("content-type", "application/json")
+                                .body(Body::from(json_body))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        resp.status(),
+                        StatusCode::CREATED,
+                        "op#{op_count} put({key}): expected 201, got {}",
+                        resp.status()
+                    );
+                    oracle.put(&current_ns, &key, oracle_value);
+                }
+
+                // --- get ---
+                1 => {
+                    let key = fuzz_gen_key(&mut rng);
+                    let resp = app
+                        .clone()
+                        .oneshot(
+                            Request::get(format!("/api/{}/keys/{}", current_ns, key))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+
+                    match oracle.get(&current_ns, &key) {
+                        Some(expected) => {
+                            assert!(
+                                resp.status() == StatusCode::OK
+                                    || resp.status() == StatusCode::NO_CONTENT,
+                                "op#{op_count} get({key}): expected 200/204, got {}",
+                                resp.status()
+                            );
+                            if resp.status() == StatusCode::OK {
+                                let body = body_string(resp.into_body()).await;
+                                if let Ok(s) = serde_json::from_str::<String>(&body) {
+                                    assert_eq!(
+                                        s.as_bytes(),
+                                        expected,
+                                        "op#{op_count} get({key}): value mismatch"
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            assert_eq!(
+                                resp.status(),
+                                StatusCode::NOT_FOUND,
+                                "op#{op_count} get({key}): expected 404, got {}",
+                                resp.status()
+                            );
+                        }
+                    }
+                }
+
+                // --- delete ---
+                2 => {
+                    let key = fuzz_gen_key(&mut rng);
+                    let resp = app
+                        .clone()
+                        .oneshot(
+                            Request::delete(format!("/api/{}/keys/{}", current_ns, key))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    // delete returns 202 on success, 404 if key didn't exist
+                    assert!(
+                        resp.status() == StatusCode::ACCEPTED
+                            || resp.status() == StatusCode::NOT_FOUND,
+                        "op#{op_count} delete({key}): expected 202/404, got {}",
+                        resp.status()
+                    );
+                    // Only track in oracle when delete actually succeeded
+                    // (HTTP delete returns 404 for non-existent keys, unlike
+                    // the direct API which always writes a tombstone)
+                    if resp.status() == StatusCode::ACCEPTED {
+                        oracle.delete(&current_ns, &key);
+                    }
+                }
+
+                // --- head ---
+                3 => {
+                    let key = fuzz_gen_key(&mut rng);
+                    let resp = app
+                        .clone()
+                        .oneshot(
+                            Request::head(format!("/api/{}/keys/{}", current_ns, key))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+
+                    if oracle.exists(&current_ns, &key) {
+                        assert!(
+                            resp.status() == StatusCode::OK
+                                || resp.status() == StatusCode::NO_CONTENT,
+                            "op#{op_count} head({key}): expected 200/204, got {}",
+                            resp.status()
+                        );
+                    } else {
+                        assert_eq!(
+                            resp.status(),
+                            StatusCode::NOT_FOUND,
+                            "op#{op_count} head({key}): expected 404, got {}",
+                            resp.status()
+                        );
+                    }
+                }
+
+                // --- count ---
+                4 => {
+                    let resp = app
+                        .clone()
+                        .oneshot(
+                            Request::get(format!("/api/{}/count", current_ns))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(resp.status(), StatusCode::OK);
+                    let body = body_string(resp.into_body()).await;
+                    let http_count: u64 = serde_json::from_str(&body).unwrap();
+                    let oracle_count = oracle.count(&current_ns);
+                    assert_eq!(
+                        http_count, oracle_count,
+                        "op#{op_count} count: http={http_count} oracle={oracle_count}"
+                    );
+                }
+
+                // --- scan ---
+                5 => {
+                    let prefix = fuzz_gen_prefix(&mut rng);
+                    let resp = app
+                        .clone()
+                        .oneshot(
+                            Request::get(format!("/api/{}/keys?prefix={}", current_ns, prefix))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(resp.status(), StatusCode::OK);
+                    let body = body_string(resp.into_body()).await;
+                    let http_keys: Vec<String> = serde_json::from_str(&body).unwrap();
+                    // Scan limit is 40, so oracle scan should match
+                    let oracle_keys = oracle.scan(&current_ns, &prefix, 40, 0);
+                    assert_eq!(
+                        http_keys, oracle_keys,
+                        "op#{op_count} scan(prefix={prefix})"
+                    );
+                }
+
+                // --- rscan ---
+                6 => {
+                    let prefix = fuzz_gen_prefix(&mut rng);
+                    let resp = app
+                        .clone()
+                        .oneshot(
+                            Request::get(format!(
+                                "/api/{}/keys?prefix={}&reverse=true",
+                                current_ns, prefix
+                            ))
+                            .body(Body::empty())
+                            .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(resp.status(), StatusCode::OK);
+                    let body = body_string(resp.into_body()).await;
+                    let http_keys: Vec<String> = serde_json::from_str(&body).unwrap();
+                    let oracle_keys = oracle.rscan(&current_ns, &prefix, 40, 0);
+                    assert_eq!(
+                        http_keys, oracle_keys,
+                        "op#{op_count} rscan(prefix={prefix})"
+                    );
+                }
+
+                // --- del_prefix ---
+                7 => {
+                    let prefix = fuzz_gen_prefix(&mut rng);
+                    let resp = app
+                        .clone()
+                        .oneshot(
+                            Request::delete(format!("/api/{}/keys?prefix={}", current_ns, prefix))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        resp.status(),
+                        StatusCode::ACCEPTED,
+                        "op#{op_count} del_prefix({prefix}): expected 202"
+                    );
+                    let body = body_string(resp.into_body()).await;
+                    let http_count: u64 = serde_json::from_str(&body).unwrap();
+                    let oracle_count = oracle.delete_prefix(&current_ns, &prefix);
+                    assert_eq!(
+                        http_count, oracle_count,
+                        "op#{op_count} del_prefix({prefix}): http={http_count} oracle={oracle_count}"
+                    );
+                }
+
+                // --- del_range ---
+                8 => {
+                    let a = fuzz_gen_key(&mut rng);
+                    let b = fuzz_gen_key(&mut rng);
+                    let (start, end) = if a <= b { (a, b) } else { (b, a) };
+
+                    let resp = app
+                        .clone()
+                        .oneshot(
+                            Request::delete(format!(
+                                "/api/{}/keys?start={}&end={}",
+                                current_ns, start, end
+                            ))
+                            .body(Body::empty())
+                            .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        resp.status(),
+                        StatusCode::ACCEPTED,
+                        "op#{op_count} del_range({start}..{end}): expected 202"
+                    );
+                    let body = body_string(resp.into_body()).await;
+                    let http_count: u64 = serde_json::from_str(&body).unwrap();
+                    // HTTP default is inclusive=false
+                    let oracle_count = oracle.delete_range(&current_ns, &start, &end, false);
+                    assert_eq!(
+                        http_count, oracle_count,
+                        "op#{op_count} del_range({start}..{end}): http={http_count} oracle={oracle_count}"
+                    );
+                }
+
+                // --- rev_count ---
+                9 => {
+                    let key = fuzz_gen_key(&mut rng);
+                    let resp = app
+                        .clone()
+                        .oneshot(
+                            Request::get(format!("/api/{}/keys/{}/revisions", current_ns, key))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+
+                    let oracle_writes = oracle.write_count(&current_ns, &key);
+                    if oracle_writes == 0 {
+                        assert_eq!(
+                            resp.status(),
+                            StatusCode::NOT_FOUND,
+                            "op#{op_count} rev_count({key}): never written, expected 404"
+                        );
+                    } else if resp.status() == StatusCode::OK {
+                        // If the endpoint returns OK, the count must be >= oracle writes.
+                        // 404 is also acceptable because bulk deletes (delete_prefix,
+                        // delete_range) may not create individual tombstone revisions.
+                        let body = body_string(resp.into_body()).await;
+                        let http_revs: u64 = serde_json::from_str(&body).unwrap();
+                        assert!(
+                            http_revs >= oracle_writes,
+                            "op#{op_count} rev_count({key}): http={http_revs} < oracle_writes={oracle_writes}"
+                        );
+                    }
+                }
+
+                // --- switch namespace ---
+                10 => {
+                    current_ns = FUZZ_NAMESPACES[rng.usize(0..FUZZ_NAMESPACES.len())].to_owned();
+                }
+
+                // --- ttl (no TTL set — should return null) ---
+                11 => {
+                    let key = fuzz_gen_key(&mut rng);
+                    if oracle.exists(&current_ns, &key) {
+                        let resp = app
+                            .clone()
+                            .oneshot(
+                                Request::get(format!("/api/{}/keys/{}/ttl", current_ns, key))
+                                    .body(Body::empty())
+                                    .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(resp.status(), StatusCode::OK);
+                        let body = body_string(resp.into_body()).await;
+                        assert_eq!(
+                            body, "null",
+                            "op#{op_count} ttl({key}): expected null (no TTL set)"
+                        );
+                    }
+                }
+
+                _ => unreachable!(),
+            }
+
+            // Periodic full verification
+            if op_count.is_multiple_of(FUZZ_VERIFY_INTERVAL) {
+                fuzz_verify_full(&app, &oracle, &format!("periodic @{op_count}")).await;
+            }
+        }
+
+        // Final full verification
+        fuzz_verify_full(&app, &oracle, "final").await;
+
+        eprintln!("server fuzz: completed {op_count} ops in {fuzz_secs}s (seed={seed})");
     }
 }
