@@ -9,6 +9,7 @@ use axum::response::{IntoResponse, Response};
 use crate::server::error::ServerError;
 use crate::server::types::parse_key;
 use crate::server::AppState;
+use crate::Namespace;
 
 /// GET /api/{ns}/keys/{key} -> 200 (data) / 204 (null) / 404
 pub async fn get_key(
@@ -21,7 +22,7 @@ pub async fn get_key(
 
     if value.is_null() {
         let mut resp = StatusCode::NO_CONTENT.into_response();
-        append_ttl_header(&mut resp, &state, &ns_name, &key);
+        append_ttl_header(&mut resp, &ns, &key);
         return Ok(resp);
     }
 
@@ -29,7 +30,7 @@ pub async fn get_key(
     let mut resp = (StatusCode::OK, body).into_response();
     resp.headers_mut()
         .insert("content-type", "application/json".parse().unwrap());
-    append_ttl_header(&mut resp, &state, &ns_name, &key);
+    append_ttl_header(&mut resp, &ns, &key);
     Ok(resp)
 }
 
@@ -78,19 +79,17 @@ pub async fn head_key(
         StatusCode::OK
     };
     let mut resp = status.into_response();
-    append_ttl_header(&mut resp, &state, &ns_name, &key);
+    append_ttl_header(&mut resp, &ns, &key);
     Ok(resp)
 }
 
 /// Append Expires header if the key has a TTL.
-fn append_ttl_header(resp: &mut Response, state: &Arc<AppState>, ns_name: &str, key: &crate::Key) {
-    if let Ok(ns) = state.namespace(ns_name) {
-        if let Ok(Some(ttl)) = ns.ttl(key.clone()) {
-            if let Some(expires) = SystemTime::now().checked_add(ttl) {
-                let datetime = httpdate::fmt_http_date(expires);
-                if let Ok(val) = datetime.parse() {
-                    resp.headers_mut().insert("Expires", val);
-                }
+fn append_ttl_header(resp: &mut Response, ns: &Namespace<'_>, key: &crate::Key) {
+    if let Ok(Some(ttl)) = ns.ttl(key.clone()) {
+        if let Some(expires) = SystemTime::now().checked_add(ttl) {
+            let datetime = httpdate::fmt_http_date(expires);
+            if let Ok(val) = datetime.parse() {
+                resp.headers_mut().insert("Expires", val);
             }
         }
     }
@@ -106,17 +105,17 @@ fn parse_expires_header(headers: &HeaderMap) -> Option<Duration> {
 /// Convert a JSON body to a Value.
 /// `"hello"` -> Data(b"hello"), `42` -> Data(b"42"), `null` -> Null
 fn json_body_to_value(body: &[u8]) -> Result<crate::Value, ServerError> {
-    let json: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|_| ServerError(crate::Error::InvalidKey("invalid JSON body".to_owned())))?;
+    let json: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| ServerError::BadRequest("invalid JSON body"))?;
 
     match json {
         serde_json::Value::String(s) => Ok(crate::Value::from(s)),
         serde_json::Value::Number(n) => Ok(crate::Value::from(n.to_string())),
         serde_json::Value::Null => Ok(crate::Value::Null),
         serde_json::Value::Bool(b) => Ok(crate::Value::from(b.to_string())),
-        _ => Err(ServerError(crate::Error::InvalidKey(
-            "value must be a JSON string, number, boolean, or null".to_owned(),
-        ))),
+        _ => Err(ServerError::BadRequest(
+            "value must be a JSON string, number, boolean, or null",
+        )),
     }
 }
 

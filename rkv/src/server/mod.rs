@@ -811,8 +811,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // API request without ConnectInfo — no peer IP available,
-        // middleware passes through (no IP to check against)
+        // API request without ConnectInfo — default-deny (no peer IP to verify)
         let resp = app
             .oneshot(
                 Request::get("/api/admin/stats")
@@ -821,8 +820,7 @@ mod tests {
             )
             .await
             .unwrap();
-        // Without ConnectInfo, peer_ip is None — request passes
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

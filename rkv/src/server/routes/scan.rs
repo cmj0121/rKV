@@ -73,8 +73,18 @@ pub async fn count_keys(
 
     if let Some(prefix) = params.prefix {
         let prefix_key = parse_key(&prefix);
-        let keys = ns.scan(&prefix_key, usize::MAX, 0)?;
-        Ok(Json(keys.len() as u64))
+        // Paginate to avoid loading all keys into memory at once
+        let mut count = 0u64;
+        let mut offset = 0;
+        loop {
+            let batch = ns.scan(&prefix_key, SCAN_LIMIT, offset)?;
+            count += batch.len() as u64;
+            if batch.len() < SCAN_LIMIT {
+                break;
+            }
+            offset += SCAN_LIMIT;
+        }
+        Ok(Json(count))
     } else {
         Ok(Json(ns.count()?))
     }

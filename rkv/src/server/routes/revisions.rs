@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 use crate::server::error::ServerError;
@@ -21,12 +23,16 @@ pub async fn rev_count(
 pub async fn rev_get(
     State(state): State<Arc<AppState>>,
     Path((ns_name, raw_key, index)): Path<(String, String, u64)>,
-) -> Result<Vec<u8>, ServerError> {
+) -> Result<Response, ServerError> {
     let key = parse_key(&raw_key);
     let ns = state.namespace(&ns_name)?;
     let value = ns.rev_get(key, index)?;
 
-    Ok(super::keys::value_to_json_bytes(&value))
+    let body = super::keys::value_to_json_bytes(&value);
+    let mut resp = (StatusCode::OK, body).into_response();
+    resp.headers_mut()
+        .insert("content-type", "application/json".parse().unwrap());
+    Ok(resp)
 }
 
 /// GET /api/{ns}/keys/{key}/ttl -> remaining TTL in seconds
