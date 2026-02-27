@@ -109,9 +109,7 @@ pub async fn delete_keys(
         return Ok((StatusCode::ACCEPTED, Json(n)).into_response());
     }
 
-    Ok((
-        StatusCode::BAD_REQUEST,
-        Json("missing prefix or start/end parameters"),
-    )
-        .into_response())
+    Err(ServerError::BadRequest(
+        "missing prefix or start/end parameters",
+    ))
 }
