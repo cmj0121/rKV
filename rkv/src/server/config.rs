@@ -59,8 +59,14 @@ pub fn parse_body_limit(s: &str) -> Result<usize, String> {
         return Err(format!("invalid body limit: {s}"));
     };
 
+    let num_part = num_part.trim();
+
+    // Prefer exact integer arithmetic; fall back to f64 only for fractions.
+    if let Ok(n) = num_part.parse::<usize>() {
+        return Ok(n * multiplier);
+    }
+
     let num: f64 = num_part
-        .trim()
         .parse()
         .map_err(|_| format!("invalid body limit: {s}"))?;
 
@@ -88,6 +94,19 @@ mod tests {
         assert_eq!(parse_body_limit("1gb").unwrap(), 1024 * 1024 * 1024);
         assert_eq!(parse_body_limit("512KB").unwrap(), 512 * 1024);
         assert_eq!(parse_body_limit("100b").unwrap(), 100);
+    }
+
+    #[test]
+    fn parse_body_limit_fractional() {
+        assert_eq!(parse_body_limit("1.5mb").unwrap(), 1_572_864);
+        assert_eq!(parse_body_limit("0.5kb").unwrap(), 512);
+    }
+
+    #[test]
+    fn parse_body_limit_zero() {
+        assert_eq!(parse_body_limit("0").unwrap(), 0);
+        assert_eq!(parse_body_limit("0kb").unwrap(), 0);
+        assert_eq!(parse_body_limit("0mb").unwrap(), 0);
     }
 
     #[test]

@@ -84,7 +84,19 @@ pub fn run(config: ServerConfig) {
                 std::process::exit(1);
             }
         };
-        tracing::info!("rKV server listening on {addr}");
+        let ip_info = if config.allow_all {
+            "all".to_string()
+        } else if config.allow_ip.is_empty() {
+            "127.0.0.1 (default)".to_string()
+        } else {
+            config.allow_ip.join(", ")
+        };
+        tracing::info!(
+            addr = %addr,
+            body_limit = body_limit,
+            allow_ip = %ip_info,
+            "rKV server listening"
+        );
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
