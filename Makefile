@@ -1,4 +1,4 @@
-.PHONY: all clean test fuzz run build bench upgrade help $(SUBDIR)
+.PHONY: all clean test fuzz run build bench bench-server fuzz-server upgrade help $(SUBDIR)
 
 all: $(SUBDIR) 		# default action
 	@[ -f .git/hooks/pre-commit ] || pre-commit install --install-hooks
@@ -19,9 +19,16 @@ run:				# run in the local environment
 
 build:				# build the binary/library (all features)
 	cargo build --workspace --release
+	cargo build -p rkv --features server --release
 
-bench:				# run benchmarks and update BENCH.md
+bench:				# run benchmarks
 	cargo run --bin bench --release
+
+bench-server:			# run HTTP server benchmarks (no file output)
+	cargo run --features server --bin bench_server --release -- --no-save
+
+fuzz-server:			# run HTTP server fuzz test (RKV_SERVER_FUZZ_SECS=N)
+	RKV_SERVER_FUZZ_SECS=60 cargo test -p rkv --features server --lib -- server::tests::fuzz_http_ops --nocapture
 
 upgrade:			# upgrade all the necessary packages
 	pre-commit autoupdate

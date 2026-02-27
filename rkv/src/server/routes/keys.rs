@@ -83,7 +83,7 @@ pub async fn head_key(
 }
 
 /// Append Expires header if the key has a TTL.
-fn append_ttl_header(resp: &mut Response, state: &Arc<AppState>, ns_name: &str, key: &rkv::Key) {
+fn append_ttl_header(resp: &mut Response, state: &Arc<AppState>, ns_name: &str, key: &crate::Key) {
     if let Ok(ns) = state.namespace(ns_name) {
         if let Ok(Some(ttl)) = ns.ttl(key.clone()) {
             if let Some(expires) = SystemTime::now().checked_add(ttl) {
@@ -105,23 +105,23 @@ fn parse_expires_header(headers: &HeaderMap) -> Option<Duration> {
 
 /// Convert a JSON body to a Value.
 /// `"hello"` -> Data(b"hello"), `42` -> Data(b"42"), `null` -> Null
-fn json_body_to_value(body: &[u8]) -> Result<rkv::Value, ServerError> {
+fn json_body_to_value(body: &[u8]) -> Result<crate::Value, ServerError> {
     let json: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|_| ServerError(rkv::Error::InvalidKey("invalid JSON body".to_owned())))?;
+        .map_err(|_| ServerError(crate::Error::InvalidKey("invalid JSON body".to_owned())))?;
 
     match json {
-        serde_json::Value::String(s) => Ok(rkv::Value::from(s)),
-        serde_json::Value::Number(n) => Ok(rkv::Value::from(n.to_string())),
-        serde_json::Value::Null => Ok(rkv::Value::Null),
-        serde_json::Value::Bool(b) => Ok(rkv::Value::from(b.to_string())),
-        _ => Err(ServerError(rkv::Error::InvalidKey(
+        serde_json::Value::String(s) => Ok(crate::Value::from(s)),
+        serde_json::Value::Number(n) => Ok(crate::Value::from(n.to_string())),
+        serde_json::Value::Null => Ok(crate::Value::Null),
+        serde_json::Value::Bool(b) => Ok(crate::Value::from(b.to_string())),
+        _ => Err(ServerError(crate::Error::InvalidKey(
             "value must be a JSON string, number, boolean, or null".to_owned(),
         ))),
     }
 }
 
 /// Convert a Value to JSON bytes for the response body.
-pub(super) fn value_to_json_bytes(value: &rkv::Value) -> Vec<u8> {
+pub(super) fn value_to_json_bytes(value: &crate::Value) -> Vec<u8> {
     match value.as_bytes() {
         Some(bytes) => {
             if let Ok(s) = std::str::from_utf8(bytes) {

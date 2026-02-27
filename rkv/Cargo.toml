@@ -11,6 +11,11 @@ path = "src/main.rs"
 name = "bench"
 path = "src/bin/bench.rs"
 
+[[bin]]
+name = "bench_server"
+path = "src/bin/bench_server.rs"
+required-features = ["server"]
+
 [lib]
 name = "rkv"
 path = "src/lib.rs"

@@ -2,17 +2,17 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-pub struct ServerError(pub rkv::Error);
+pub struct ServerError(pub crate::Error);
 
-impl From<rkv::Error> for ServerError {
-    fn from(err: rkv::Error) -> Self {
+impl From<crate::Error> for ServerError {
+    fn from(err: crate::Error) -> Self {
         Self(err)
     }
 }
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
-        use rkv::Error;
+        use crate::Error;
 
         let (status, msg) = match &self.0 {
             Error::KeyNotFound => (StatusCode::NOT_FOUND, "key not found"),
