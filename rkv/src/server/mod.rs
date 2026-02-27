@@ -65,16 +65,22 @@ pub fn run(config: ServerConfig) {
         };
 
         let body_limit = config.body_limit;
+        let timeout_secs = config.timeout;
 
         let state = Arc::new(AppState {
             db,
             ns_passwords: RwLock::new(HashMap::new()),
         });
         let ip_layer = middleware::IpFilterLayer::new(config.allow_all, &config.allow_ip);
-        let app = routes::router(state)
-            .layer(axum::extract::DefaultBodyLimit::max(body_limit))
-            .layer(TraceLayer::new_for_http())
-            .layer(ip_layer);
+        let mut app =
+            routes::router(state.clone()).layer(axum::extract::DefaultBodyLimit::max(body_limit));
+        if timeout_secs > 0 {
+            app = app.layer(tower_http::timeout::TimeoutLayer::with_status_code(
+                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                std::time::Duration::from_secs(timeout_secs),
+            ));
+        }
+        let app = app.layer(TraceLayer::new_for_http()).layer(ip_layer);
 
         let addr = format!("{}:{}", config.bind, config.port);
         let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -91,9 +97,15 @@ pub fn run(config: ServerConfig) {
         } else {
             config.allow_ip.join(", ")
         };
+        let timeout_info = if timeout_secs > 0 {
+            format!("{timeout_secs}s")
+        } else {
+            "none".to_string()
+        };
         tracing::info!(
             addr = %addr,
             body_limit = body_limit,
+            timeout = %timeout_info,
             allow_ip = %ip_info,
             "rKV server listening"
         );
@@ -104,6 +116,18 @@ pub fn run(config: ServerConfig) {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+
+        // Graceful DB close: flush AOL buffer and stop background threads
+        match Arc::try_unwrap(state) {
+            Ok(app_state) => {
+                if let Err(e) = app_state.db.close() {
+                    tracing::error!("failed to close database: {e}");
+                }
+            }
+            Err(_) => {
+                tracing::warn!("database not closed: outstanding references");
+            }
+        }
     });
 }
 

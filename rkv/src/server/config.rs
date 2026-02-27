@@ -29,6 +29,10 @@ pub struct ServerConfig {
     /// Maximum request body size (e.g. "2mb", "512kb", "1gb", or plain bytes)
     #[arg(long, default_value = "2mb", value_parser = parse_body_limit)]
     pub body_limit: usize,
+
+    /// Request timeout in seconds (0 = no timeout)
+    #[arg(long, default_value_t = 30)]
+    pub timeout: u64,
 }
 
 /// Parse a human-readable size string into bytes.
