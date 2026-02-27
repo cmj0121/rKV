@@ -6,7 +6,7 @@ use rkv::{Config, Key, Namespace, DB, DEFAULT_NAMESPACE};
 use rustyline::DefaultEditor;
 
 #[cfg(feature = "server")]
-mod server;
+use rkv::server;
 
 #[derive(Parser)]
 #[command(name = "rkv", about = "rKV — revisioned key-value store")]

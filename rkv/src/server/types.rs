@@ -1,4 +1,4 @@
-use rkv::Key;
+use crate::Key;
 
 /// Parse URL key segment: try i64 first, fall back to Str.
 /// Same logic as the REPL's `parse_key`.

@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use rkv::{Config, Namespace, DB};
+use crate::{Config, Namespace, DB};
 
 pub struct AppState {
     pub db: DB,
@@ -22,16 +22,16 @@ pub struct AppState {
 
 impl AppState {
     /// Open a namespace, using cached password if available.
-    pub fn namespace(&self, name: &str) -> rkv::Result<Namespace<'_>> {
+    pub fn namespace(&self, name: &str) -> crate::Result<Namespace<'_>> {
         let passwords = self.ns_passwords.read().unwrap();
         let pw = passwords.get(name).map(|s| s.as_str());
         self.db.namespace(name, pw)
     }
 }
 
-/// Build the Axum router with shared state (no IP filter, for testing).
-#[cfg(test)]
-fn build_router(db: DB) -> axum::Router {
+/// Build the Axum router with shared state (no IP filter, for testing/benchmarking).
+#[doc(hidden)]
+pub fn build_router(db: DB) -> axum::Router {
     let state = Arc::new(AppState {
         db,
         ns_passwords: RwLock::new(HashMap::new()),
@@ -101,12 +101,12 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    fn temp_db() -> rkv::DB {
+    fn temp_db() -> crate::DB {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = rkv::Config::new(dir.path());
+        let mut config = crate::Config::new(dir.path());
         config.create_if_missing = true;
         std::mem::forget(dir);
-        rkv::DB::open(config).unwrap()
+        crate::DB::open(config).unwrap()
     }
 
     fn app() -> axum::Router {
@@ -252,7 +252,7 @@ mod tests {
         for key in &["alpha", "beta", "gamma"] {
             app.clone()
                 .oneshot(
-                    Request::put(&format!("/api/_/keys/{key}"))
+                    Request::put(format!("/api/_/keys/{key}"))
                         .header("content-type", "application/json")
                         .body(Body::from("\"v\""))
                         .unwrap(),
@@ -278,7 +278,7 @@ mod tests {
         for key in &["a", "b", "c"] {
             app.clone()
                 .oneshot(
-                    Request::put(&format!("/api/_/keys/{key}"))
+                    Request::put(format!("/api/_/keys/{key}"))
                         .header("content-type", "application/json")
                         .body(Body::from("\"v\""))
                         .unwrap(),
@@ -468,7 +468,7 @@ mod tests {
         for i in 0..42 {
             app.clone()
                 .oneshot(
-                    Request::put(&format!("/api/_/keys/k{i:03}"))
+                    Request::put(format!("/api/_/keys/k{i:03}"))
                         .header("content-type", "application/json")
                         .body(Body::from("\"v\""))
                         .unwrap(),
@@ -500,7 +500,7 @@ mod tests {
         for key in &["user:1", "user:2", "user:3", "order:1"] {
             app.clone()
                 .oneshot(
-                    Request::put(&format!("/api/_/keys/{key}"))
+                    Request::put(format!("/api/_/keys/{key}"))
                         .header("content-type", "application/json")
                         .body(Body::from("\"v\""))
                         .unwrap(),
@@ -606,7 +606,7 @@ mod tests {
         for key in &["foo:1", "foo:2", "bar:1"] {
             app.clone()
                 .oneshot(
-                    Request::put(&format!("/api/_/keys/{key}"))
+                    Request::put(format!("/api/_/keys/{key}"))
                         .header("content-type", "application/json")
                         .body(Body::from("\"v\""))
                         .unwrap(),
@@ -649,7 +649,7 @@ mod tests {
         for key in &["a", "b", "c", "d", "e"] {
             app.clone()
                 .oneshot(
-                    Request::put(&format!("/api/_/keys/{key}"))
+                    Request::put(format!("/api/_/keys/{key}"))
                         .header("content-type", "application/json")
                         .body(Body::from("\"v\""))
                         .unwrap(),
