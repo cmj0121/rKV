@@ -1,16 +1,30 @@
 mod config;
+mod error;
 mod routes;
+mod types;
 
 pub use config::ServerConfig;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use rkv::{Config, DB};
+use rkv::{Config, Namespace, DB};
 
-#[allow(dead_code)] // db consumed in Phase 2+
 pub struct AppState {
     pub db: DB,
+    /// Cached passwords for encrypted namespaces.
+    /// Populated by POST /api/namespaces, lost on restart.
+    ns_passwords: RwLock<HashMap<String, String>>,
+}
+
+impl AppState {
+    /// Open a namespace, using cached password if available.
+    pub fn namespace(&self, name: &str) -> rkv::Result<Namespace<'_>> {
+        let passwords = self.ns_passwords.read().unwrap();
+        let pw = passwords.get(name).map(|s| s.as_str());
+        self.db.namespace(name, pw)
+    }
 }
 
 pub fn run(config: ServerConfig) {
@@ -29,7 +43,10 @@ pub fn run(config: ServerConfig) {
             }
         };
 
-        let state = Arc::new(AppState { db });
+        let state = Arc::new(AppState {
+            db,
+            ns_passwords: RwLock::new(HashMap::new()),
+        });
         let app = routes::router(state);
 
         let addr = format!("{}:{}", config.bind, config.port);

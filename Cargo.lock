@@ -1011,6 +1011,7 @@ dependencies = [
  "dirs-sys",
  "fast32",
  "fastrand",
+ "httpdate",
  "libc",
  "lz4_flex",
  "memmap2",
