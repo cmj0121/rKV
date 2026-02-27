@@ -5,6 +5,9 @@ use clap::Parser;
 use rkv::{Config, Key, Namespace, DB, DEFAULT_NAMESPACE};
 use rustyline::DefaultEditor;
 
+#[cfg(feature = "server")]
+mod server;
+
 #[derive(Parser)]
 #[command(name = "rkv", about = "rKV — revisioned key-value store")]
 struct Args {
@@ -18,6 +21,17 @@ struct Args {
     /// Create the database if it does not exist
     #[arg(short, long, default_value_t = true)]
     create: bool,
+
+    #[cfg(feature = "server")]
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[cfg(feature = "server")]
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Start the HTTP server
+    Serve(server::ServerConfig),
 }
 
 enum Action {
@@ -1120,6 +1134,12 @@ fn run_repl(db: &mut DB, initial_ns: &str) {
 
 fn main() {
     let args = Args::parse();
+
+    #[cfg(feature = "server")]
+    if let Some(Command::Serve(config)) = args.command {
+        server::run(config);
+        return;
+    }
 
     let path = args.path.map(PathBuf::from).unwrap_or_else(|| {
         dirs_sys::home_dir()
