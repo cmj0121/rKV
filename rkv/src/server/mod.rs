@@ -1,11 +1,13 @@
 mod config;
 mod error;
+mod middleware;
 mod routes;
 mod types;
 
 pub use config::ServerConfig;
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -47,7 +49,8 @@ pub fn run(config: ServerConfig) {
             db,
             ns_passwords: RwLock::new(HashMap::new()),
         });
-        let app = routes::router(state);
+        let ip_layer = middleware::IpFilterLayer::new(config.allow_all, &config.allow_ip);
+        let app = routes::router(state).layer(ip_layer);
 
         let addr = format!("{}:{}", config.bind, config.port);
         let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -58,10 +61,13 @@ pub fn run(config: ServerConfig) {
             }
         };
         println!("rKV server listening on {addr}");
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
     });
 }
 
