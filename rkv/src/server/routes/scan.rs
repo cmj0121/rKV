@@ -73,8 +73,18 @@ pub async fn count_keys(
 
     if let Some(prefix) = params.prefix {
         let prefix_key = parse_key(&prefix);
-        let keys = ns.scan(&prefix_key, usize::MAX, 0)?;
-        Ok(Json(keys.len() as u64))
+        // Paginate to avoid loading all keys into memory at once
+        let mut count = 0u64;
+        let mut offset = 0;
+        loop {
+            let batch = ns.scan(&prefix_key, SCAN_LIMIT, offset)?;
+            count += batch.len() as u64;
+            if batch.len() < SCAN_LIMIT {
+                break;
+            }
+            offset += SCAN_LIMIT;
+        }
+        Ok(Json(count))
     } else {
         Ok(Json(ns.count()?))
     }
@@ -99,9 +109,7 @@ pub async fn delete_keys(
         return Ok((StatusCode::ACCEPTED, Json(n)).into_response());
     }
 
-    Ok((
-        StatusCode::BAD_REQUEST,
-        Json("missing prefix or start/end parameters"),
-    )
-        .into_response())
+    Err(ServerError::BadRequest(
+        "missing prefix or start/end parameters",
+    ))
 }

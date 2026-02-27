@@ -11,6 +11,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::EnvFilter;
+
 use crate::{Config, Namespace, DB};
 
 pub struct AppState {
@@ -40,6 +43,12 @@ pub fn build_router(db: DB) -> axum::Router {
 }
 
 pub fn run(config: ServerConfig) {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async move {
         let path = config.db.unwrap_or_else(default_db_path);
@@ -50,27 +59,56 @@ pub fn run(config: ServerConfig) {
         let db = match DB::open(db_config) {
             Ok(db) => db,
             Err(e) => {
-                eprintln!("failed to open database: {e}");
+                tracing::error!("failed to open database: {e}");
                 std::process::exit(1);
             }
         };
+
+        let body_limit = config.body_limit;
+        let timeout_secs = config.timeout;
 
         let state = Arc::new(AppState {
             db,
             ns_passwords: RwLock::new(HashMap::new()),
         });
         let ip_layer = middleware::IpFilterLayer::new(config.allow_all, &config.allow_ip);
-        let app = routes::router(state).layer(ip_layer);
+        let mut app =
+            routes::router(state.clone()).layer(axum::extract::DefaultBodyLimit::max(body_limit));
+        if timeout_secs > 0 {
+            app = app.layer(tower_http::timeout::TimeoutLayer::with_status_code(
+                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                std::time::Duration::from_secs(timeout_secs),
+            ));
+        }
+        let app = app.layer(TraceLayer::new_for_http()).layer(ip_layer);
 
         let addr = format!("{}:{}", config.bind, config.port);
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("failed to bind {addr}: {e}");
+                tracing::error!("failed to bind {addr}: {e}");
                 std::process::exit(1);
             }
         };
-        println!("rKV server listening on {addr}");
+        let ip_info = if config.allow_all {
+            "all".to_string()
+        } else if config.allow_ip.is_empty() {
+            "127.0.0.1 (default)".to_string()
+        } else {
+            config.allow_ip.join(", ")
+        };
+        let timeout_info = if timeout_secs > 0 {
+            format!("{timeout_secs}s")
+        } else {
+            "none".to_string()
+        };
+        tracing::info!(
+            addr = %addr,
+            body_limit = body_limit,
+            timeout = %timeout_info,
+            allow_ip = %ip_info,
+            "rKV server listening"
+        );
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -78,6 +116,18 @@ pub fn run(config: ServerConfig) {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+
+        // Graceful DB close: flush AOL buffer and stop background threads
+        match Arc::try_unwrap(state) {
+            Ok(app_state) => {
+                if let Err(e) = app_state.db.close() {
+                    tracing::error!("failed to close database: {e}");
+                }
+            }
+            Err(_) => {
+                tracing::warn!("database not closed: outstanding references");
+            }
+        }
     });
 }
 
@@ -91,7 +141,7 @@ async fn shutdown_signal() {
     tokio::signal::ctrl_c()
         .await
         .expect("failed to listen for ctrl-c");
-    println!("\nshutting down...");
+    tracing::info!("shutting down...");
 }
 
 #[cfg(test)]
@@ -785,8 +835,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // API request without ConnectInfo — no peer IP available,
-        // middleware passes through (no IP to check against)
+        // API request without ConnectInfo — default-deny (no peer IP to verify)
         let resp = app
             .oneshot(
                 Request::get("/api/admin/stats")
@@ -795,8 +844,25 @@ mod tests {
             )
             .await
             .unwrap();
-        // Without ConnectInfo, peer_ip is None — request passes
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn body_limit_returns_413() {
+        let app = super::build_router(temp_db()).layer(axum::extract::DefaultBodyLimit::max(64));
+
+        // PUT with body > 64 bytes should be rejected
+        let big_body = "\"".to_owned() + &"x".repeat(128) + "\"";
+        let resp = app
+            .oneshot(
+                Request::put("/api/_/keys/toobig")
+                    .header("content-type", "application/json")
+                    .body(Body::from(big_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     // -----------------------------------------------------------------------

@@ -40,7 +40,7 @@ pub async fn flush(State(state): State<Arc<AppState>>) -> Result<Json<&'static s
     let st = state.clone();
     tokio::task::spawn_blocking(move || st.db.flush())
         .await
-        .unwrap()?;
+        .map_err(|_| ServerError::Internal("flush task cancelled"))??;
     Ok(Json("ok"))
 }
 
@@ -49,7 +49,7 @@ pub async fn sync(State(state): State<Arc<AppState>>) -> Result<Json<&'static st
     let st = state.clone();
     tokio::task::spawn_blocking(move || st.db.sync())
         .await
-        .unwrap()?;
+        .map_err(|_| ServerError::Internal("sync task cancelled"))??;
     Ok(Json("ok"))
 }
 
@@ -60,7 +60,7 @@ pub async fn compact(
     let st = state.clone();
     tokio::task::spawn_blocking(move || st.db.compact())
         .await
-        .unwrap()?;
+        .map_err(|_| ServerError::Internal("compact task cancelled"))??;
     Ok(Json("ok"))
 }
 

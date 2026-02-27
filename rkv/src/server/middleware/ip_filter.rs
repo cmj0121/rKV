@@ -88,8 +88,10 @@ where
                 .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
                 .map(|ci| ci.0.ip());
 
-            if let Some(ip) = peer_ip {
-                if !self.state.allowed.contains(&ip) {
+            match peer_ip {
+                Some(ip) if self.state.allowed.contains(&ip) => {} // allowed
+                _ => {
+                    // No ConnectInfo or IP not in allow list → deny
                     return Box::pin(async move { Ok(StatusCode::FORBIDDEN.into_response()) });
                 }
             }
