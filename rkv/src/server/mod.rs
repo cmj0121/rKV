@@ -64,12 +64,15 @@ pub fn run(config: ServerConfig) {
             }
         };
 
+        let body_limit = config.body_limit;
+
         let state = Arc::new(AppState {
             db,
             ns_passwords: RwLock::new(HashMap::new()),
         });
         let ip_layer = middleware::IpFilterLayer::new(config.allow_all, &config.allow_ip);
         let app = routes::router(state)
+            .layer(axum::extract::DefaultBodyLimit::max(body_limit))
             .layer(TraceLayer::new_for_http())
             .layer(ip_layer);
 
@@ -808,6 +811,24 @@ mod tests {
             .unwrap();
         // Without ConnectInfo, peer_ip is None — request passes
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn body_limit_returns_413() {
+        let app = super::build_router(temp_db()).layer(axum::extract::DefaultBodyLimit::max(64));
+
+        // PUT with body > 64 bytes should be rejected
+        let big_body = "\"".to_owned() + &"x".repeat(128) + "\"";
+        let resp = app
+            .oneshot(
+                Request::put("/api/_/keys/toobig")
+                    .header("content-type", "application/json")
+                    .body(Body::from(big_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     // -----------------------------------------------------------------------
