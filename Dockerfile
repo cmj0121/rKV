@@ -17,7 +17,7 @@ RUN mkdir -p rkv/src rkv-ffi/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --target x86_64-unknown-linux-musl -p rkv --features server \
+    cargo build --release --target x86_64-unknown-linux-musl -p rkv --features server --bin rkv \
     || true
 
 # Copy real source and build
@@ -27,8 +27,8 @@ COPY rkv-ffi/src rkv-ffi/src
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --target x86_64-unknown-linux-musl -p rkv --features server \
-    && musl-strip /src/target/x86_64-unknown-linux-musl/release/rkv \
+    cargo build --release --target x86_64-unknown-linux-musl -p rkv --features server --bin rkv \
+    && strip /src/target/x86_64-unknown-linux-musl/release/rkv \
     && cp /src/target/x86_64-unknown-linux-musl/release/rkv /rkv
 
 # --- Runtime stage ---
