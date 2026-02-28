@@ -1,0 +1,12 @@
+target/
+.git/
+deploy/
+CONCEPTS.md
+BENCH.md
+README.md
+Makefile
+*.md
+.pre-commit-config.yaml
+.git-commit-template
+.github/
+.claude/
