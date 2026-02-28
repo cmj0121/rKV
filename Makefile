@@ -1,4 +1,4 @@
-.PHONY: all clean test fuzz run build bench bench-server fuzz-server upgrade help $(SUBDIR)
+.PHONY: all clean test fuzz run build bench bench-server fuzz-server docker-up docker-down upgrade help $(SUBDIR)
 
 all: $(SUBDIR) 		# default action
 	@[ -f .git/hooks/pre-commit ] || pre-commit install --install-hooks
@@ -29,6 +29,12 @@ bench-server:			# run HTTP server benchmarks (no file output)
 
 fuzz-server:			# run HTTP server fuzz test (RKV_SERVER_FUZZ_SECS=N)
 	RKV_SERVER_FUZZ_SECS=60 cargo test -p rkv --features server --lib -- server::tests::fuzz_http_ops --nocapture
+
+docker-up:			# start rKV in Docker (build + run)
+	docker compose up --build -d
+
+docker-down:			# stop rKV Docker service
+	docker compose down
 
 upgrade:			# upgrade all the necessary packages
 	pre-commit autoupdate

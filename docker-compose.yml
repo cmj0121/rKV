@@ -1,0 +1,16 @@
+services:
+  rkv:
+    build: .
+    platform: linux/amd64
+    ports:
+      - "8321:8321"
+    volumes:
+      - .data:/data
+    command:
+      ["serve", "--bind", "0.0.0.0", "--db", "/data", "--allow-all", "--ui"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

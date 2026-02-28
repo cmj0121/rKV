@@ -1,0 +1,14 @@
+rKV has been deployed!
+
+Get the service URL:
+{{- if eq .Values.service.type "ClusterIP" }}
+  kubectl port-forward svc/{{ include "rkv.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  curl http://localhost:{{ .Values.service.port }}/health
+{{- else if eq .Values.service.type "NodePort" }}
+  export NODE_PORT=$(kubectl get svc {{ include "rkv.fullname" . }} -o jsonpath='{.spec.ports[0].nodePort}')
+  export NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}')
+  curl http://$NODE_IP:$NODE_PORT/health
+{{- else if eq .Values.service.type "LoadBalancer" }}
+  export LB_IP=$(kubectl get svc {{ include "rkv.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+  curl http://$LB_IP:{{ .Values.service.port }}/health
+{{- end }}
