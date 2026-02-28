@@ -1493,4 +1493,36 @@ mod tests {
 
         eprintln!("server fuzz: completed {op_count} ops in {fuzz_secs}s (seed={seed})");
     }
+
+    // ---- UI tests ----
+
+    #[tokio::test]
+    async fn ui_serves_html() {
+        let app = super::build_router_with_ui(temp_db(), true);
+        let resp = app
+            .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.contains("text/html"), "expected text/html, got {ct}");
+        let body = body_string(resp.into_body()).await;
+        assert!(body.contains("<html"), "body should contain <html");
+    }
+
+    #[tokio::test]
+    async fn ui_disabled_returns_404() {
+        let app = super::build_router_with_ui(temp_db(), false);
+        let resp = app
+            .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
 }
