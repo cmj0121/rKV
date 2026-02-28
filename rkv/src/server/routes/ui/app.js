@@ -57,6 +57,9 @@ function api(method, path, body) {
     opts.body = JSON.stringify(body);
   }
   return fetch(path, opts).then(function (r) {
+    if (r.status === 410) {
+      return { status: 410, headers: r.headers, data: null };
+    }
     if (!r.ok) {
       return r.text().then(function (t) {
         throw new Error(r.status + " " + (t || r.statusText));
@@ -395,32 +398,20 @@ function renderKeyRows() {
             { className: "actions" },
             (function () {
               var btns = [];
-              if (binary) {
-                btns.push(
-                  el("button", {
-                    className: "btn-blue",
-                    textContent: "Download",
-                    onClick: function () {
-                      downloadKey(entry.key);
-                    },
-                  }),
-                );
-              } else {
-                btns.push(
-                  el("button", {
-                    className: "btn-green",
-                    textContent: "Edit",
-                    onClick: function () {
-                      openEditDialog(
-                        entry.key,
-                        entry.value,
-                        entry.status === 204,
-                        entry.expires,
-                      );
-                    },
-                  }),
-                );
-              }
+              btns.push(
+                el("button", {
+                  className: "btn-green",
+                  textContent: "Edit",
+                  onClick: function () {
+                    openEditDialog(
+                      entry.key,
+                      entry.value,
+                      entry.status === 204,
+                      entry.expires,
+                    );
+                  },
+                }),
+              );
               btns.push(
                 el("button", {
                   className: "btn-red",
@@ -533,11 +524,16 @@ function openRevDialog(key, revCount) {
     (function (idx) {
       api("GET", nsPath + "/revisions/" + idx)
         .then(function (r) {
-          var isRevNull = r.status === 204 || r.data === null;
+          var isDeleted = r.status === 410;
+          var isRevNull = !isDeleted && (r.status === 204 || r.data === null);
           var revBinary =
-            !isRevNull && r.data != null && isBinary(String(r.data));
+            !isDeleted &&
+            !isRevNull &&
+            r.data != null &&
+            isBinary(String(r.data));
           var valText;
-          if (isRevNull) valText = "(null)";
+          if (isDeleted) valText = "(deleted)";
+          else if (isRevNull) valText = "(null)";
           else if (revBinary) valText = "(binary)";
           else valText = String(r.data);
           if (!revBinary && valText.length > 120)
@@ -561,7 +557,14 @@ function openRevDialog(key, revCount) {
           }
 
           var valChildren = [];
-          if (revBinary) {
+          if (isDeleted) {
+            valChildren.push(
+              el("span", {
+                className: "val-deleted",
+                textContent: "(deleted)",
+              }),
+            );
+          } else if (revBinary) {
             valChildren.push(
               el("span", { className: "val-binary", textContent: "(binary)" }),
             );

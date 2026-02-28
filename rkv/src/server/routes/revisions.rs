@@ -28,6 +28,10 @@ pub async fn rev_get(
     let ns = state.namespace(&ns_name)?;
     let value = ns.rev_get(key, index)?;
 
+    if value.is_tombstone() {
+        return Ok(StatusCode::GONE.into_response());
+    }
+
     let body = super::keys::value_to_json_bytes(&value);
     let mut resp = (StatusCode::OK, body).into_response();
     resp.headers_mut()

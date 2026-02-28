@@ -198,6 +198,12 @@ td .actions {
   margin-right: 8px;
 }
 
+.val-deleted {
+  color: #e57373;
+  font-style: italic;
+  text-decoration: line-through;
+}
+
 .btn-download {
   font-size: 11px;
   padding: 2px 8px;
