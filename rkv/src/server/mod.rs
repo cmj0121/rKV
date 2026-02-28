@@ -756,6 +756,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rev_get_tombstone_returns_410() {
+        let app = app();
+
+        // Put a key
+        app.clone()
+            .oneshot(
+                Request::put("/api/_/keys/tk")
+                    .header("content-type", "application/json")
+                    .body(Body::from("\"alive\""))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Delete the key (creates tombstone revision)
+        app.clone()
+            .oneshot(
+                Request::delete("/api/_/keys/tk")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Revision 0 (the put) should return 200
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/_/keys/tk/revisions/0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_string(resp.into_body()).await, "\"alive\"");
+
+        // Revision 1 (the tombstone) should return 410 Gone
+        let resp = app
+            .oneshot(
+                Request::get("/api/_/keys/tk/revisions/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
     async fn admin_flush() {
         let resp = app()
             .oneshot(
