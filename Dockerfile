@@ -25,6 +25,9 @@ COPY rkv/src rkv/src
 COPY rkv/tests rkv/tests
 COPY rkv-ffi/src rkv-ffi/src
 
+# Touch source to invalidate cargo fingerprints from the dependency-cache step
+RUN find rkv/src -name '*.rs' -exec touch {} +
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --target x86_64-unknown-linux-musl -p rkv --features server --bin rkv \
@@ -40,4 +43,5 @@ COPY --from=builder /rkv /rkv
 EXPOSE 8321
 VOLUME /data
 
-ENTRYPOINT ["/rkv", "serve", "--bind", "0.0.0.0", "--db", "/data", "--allow-all"]
+ENTRYPOINT ["/rkv"]
+CMD ["serve", "--bind", "0.0.0.0", "--db", "/data", "--allow-all"]
