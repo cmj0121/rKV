@@ -35,13 +35,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp /src/target/x86_64-unknown-linux-musl/release/rkv /rkv
 
 # --- Runtime stage ---
-FROM scratch
+FROM busybox:musl
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=builder /rkv /rkv
+COPY --from=builder /rkv /usr/local/bin/rkv
 
 EXPOSE 8321
 VOLUME /data
 
-ENTRYPOINT ["/rkv"]
+ENTRYPOINT ["rkv"]
 CMD ["serve", "--bind", "0.0.0.0", "--db", "/data", "--allow-all"]
