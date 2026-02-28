@@ -35,11 +35,17 @@ impl AppState {
 /// Build the Axum router with shared state (no IP filter, for testing/benchmarking).
 #[doc(hidden)]
 pub fn build_router(db: DB) -> axum::Router {
+    build_router_with_ui(db, false)
+}
+
+/// Build the Axum router with optional UI enabled.
+#[doc(hidden)]
+pub fn build_router_with_ui(db: DB, enable_ui: bool) -> axum::Router {
     let state = Arc::new(AppState {
         db,
         ns_passwords: RwLock::new(HashMap::new()),
     });
-    routes::router(state)
+    routes::router(state, enable_ui)
 }
 
 pub fn run(config: ServerConfig) {
@@ -66,14 +72,15 @@ pub fn run(config: ServerConfig) {
 
         let body_limit = config.body_limit;
         let timeout_secs = config.timeout;
+        let enable_ui = config.ui;
 
         let state = Arc::new(AppState {
             db,
             ns_passwords: RwLock::new(HashMap::new()),
         });
         let ip_layer = middleware::IpFilterLayer::new(config.allow_all, &config.allow_ip);
-        let mut app =
-            routes::router(state.clone()).layer(axum::extract::DefaultBodyLimit::max(body_limit));
+        let mut app = routes::router(state.clone(), enable_ui)
+            .layer(axum::extract::DefaultBodyLimit::max(body_limit));
         if timeout_secs > 0 {
             app = app.layer(tower_http::timeout::TimeoutLayer::with_status_code(
                 axum::http::StatusCode::GATEWAY_TIMEOUT,
@@ -107,6 +114,7 @@ pub fn run(config: ServerConfig) {
             body_limit = body_limit,
             timeout = %timeout_info,
             allow_ip = %ip_info,
+            ui = enable_ui,
             "rKV server listening"
         );
         axum::serve(
@@ -825,7 +833,7 @@ mod tests {
 
         // Build router with IP filter allowing only 10.0.0.1
         let ip_layer = super::middleware::IpFilterLayer::new(false, &["10.0.0.1".to_string()]);
-        let app = super::routes::router(state).layer(ip_layer);
+        let app = super::routes::router(state, false).layer(ip_layer);
 
         // Health is exempt — should pass
         let resp = app
@@ -1484,5 +1492,37 @@ mod tests {
         fuzz_verify_full(&app, &oracle, "final").await;
 
         eprintln!("server fuzz: completed {op_count} ops in {fuzz_secs}s (seed={seed})");
+    }
+
+    // ---- UI tests ----
+
+    #[tokio::test]
+    async fn ui_serves_html() {
+        let app = super::build_router_with_ui(temp_db(), true);
+        let resp = app
+            .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.contains("text/html"), "expected text/html, got {ct}");
+        let body = body_string(resp.into_body()).await;
+        assert!(body.contains("<html"), "body should contain <html");
+    }
+
+    #[tokio::test]
+    async fn ui_disabled_returns_404() {
+        let app = super::build_router_with_ui(temp_db(), false);
+        let resp = app
+            .oneshot(Request::get("/ui").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

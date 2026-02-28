@@ -4,6 +4,7 @@ mod keys;
 mod namespaces;
 mod revisions;
 mod scan;
+mod ui;
 
 use std::sync::Arc;
 
@@ -12,8 +13,8 @@ use axum::Router;
 
 use super::AppState;
 
-pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+pub fn router(state: Arc<AppState>, enable_ui: bool) -> Router {
+    let mut r = Router::new()
         // Health (no auth)
         .route("/", get(health::root))
         .route("/health", get(health::health))
@@ -51,5 +52,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/admin/sync", post(admin::sync))
         .route("/api/admin/compact", post(admin::compact))
         .route("/api/admin/config", get(admin::get_config))
-        .with_state(state)
+        .with_state(state);
+
+    if enable_ui {
+        r = r
+            .route("/ui", get(ui::index))
+            .route("/ui/app.js", get(ui::app_js))
+            .route("/ui/style.css", get(ui::style_css));
+    }
+
+    r
 }

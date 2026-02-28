@@ -33,6 +33,10 @@ pub struct ServerConfig {
     /// Request timeout in seconds (0 = no timeout)
     #[arg(long, default_value_t = 30)]
     pub timeout: u64,
+
+    /// Enable embedded web UI at /ui
+    #[arg(long, default_value_t = false)]
+    pub ui: bool,
 }
 
 /// Parse a human-readable size string into bytes.
