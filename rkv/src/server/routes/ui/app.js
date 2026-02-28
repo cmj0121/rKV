@@ -616,6 +616,16 @@ function openRevDialog(key, revCount) {
 // ---------------------------------------------------------------------------
 // Create / Edit key dialog
 // ---------------------------------------------------------------------------
+
+/** Route TTL input to the right header: X-RKV-TTL for durations, Expires for HTTP dates. */
+function setTtlHeader(headers, value) {
+  if (/^\d+[smhd]?$/.test(value)) {
+    headers["X-RKV-TTL"] = value;
+  } else {
+    headers["Expires"] = value;
+  }
+}
+
 function openCreateDialog() {
   showKeyDialog(
     "Create Key",
@@ -628,7 +638,7 @@ function openCreateDialog() {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
       };
-      if (expires) opts.headers["Expires"] = expires;
+      if (expires) setTtlHeader(opts.headers, expires);
       opts.body = JSON.stringify(value);
       fetch(
         "/api/" +
@@ -665,7 +675,7 @@ function openEditDialog(key, currentValue, isNull, currentExpires) {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
       };
-      if (expires) opts.headers["Expires"] = expires;
+      if (expires) setTtlHeader(opts.headers, expires);
       opts.body = JSON.stringify(value);
       fetch(
         "/api/" +
@@ -799,12 +809,12 @@ function showKeyDialog(title, keyVal, valueVal, isNull, expiresVal, onSubmit) {
   if (isNull) valInput.disabled = true;
 
   dlg.appendChild(
-    el("label", { textContent: "Expires (HTTP date, optional)" }),
+    el("label", { textContent: "TTL (e.g. 60s, 10m, 1h, 1d) or HTTP date" }),
   );
   var expInput = el("input", {
     type: "text",
     value: expiresVal,
-    placeholder: "Thu, 01 Jan 2099 00:00:00 GMT",
+    placeholder: "60s / 10m / 1h / 1d",
   });
   dlg.appendChild(expInput);
 
