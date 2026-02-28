@@ -31,7 +31,7 @@ pub async fn get_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::V
 
 /// POST /api/admin/analyze
 pub async fn analyze(State(state): State<Arc<AppState>>) -> Json<&'static str> {
-    let _ = state.db.analyze();
+    state.db.analyze();
     Json("ok")
 }
 
@@ -68,7 +68,7 @@ pub async fn compact(
 pub async fn get_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let c = state.db.config();
     Json(serde_json::json!({
-        "path": c.path.display().to_string(),
+        "path": "<redacted>",
         "create_if_missing": c.create_if_missing,
         "write_buffer_size": c.write_buffer_size,
         "max_levels": c.max_levels,

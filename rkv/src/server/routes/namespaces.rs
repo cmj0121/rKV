@@ -30,7 +30,11 @@ pub async fn create_namespace(
 
     // Cache password for subsequent CRUD requests
     if let Some(pw) = req.password {
-        state.ns_passwords.write().unwrap().insert(req.name, pw);
+        state
+            .ns_passwords
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(req.name, pw);
     }
     Ok(StatusCode::OK)
 }
@@ -41,6 +45,10 @@ pub async fn drop_namespace(
     Path(ns_name): Path<String>,
 ) -> Result<StatusCode, ServerError> {
     state.db.drop_namespace(&ns_name)?;
-    state.ns_passwords.write().unwrap().remove(&ns_name);
+    state
+        .ns_passwords
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&ns_name);
     Ok(StatusCode::ACCEPTED)
 }

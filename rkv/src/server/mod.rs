@@ -26,7 +26,7 @@ pub struct AppState {
 impl AppState {
     /// Open a namespace, using cached password if available.
     pub fn namespace(&self, name: &str) -> crate::Result<Namespace<'_>> {
-        let passwords = self.ns_passwords.read().unwrap();
+        let passwords = self.ns_passwords.read().unwrap_or_else(|e| e.into_inner());
         let pw = passwords.get(name).map(|s| s.as_str());
         self.db.namespace(name, pw)
     }

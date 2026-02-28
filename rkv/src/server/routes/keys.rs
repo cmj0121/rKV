@@ -53,7 +53,7 @@ pub async fn put_key(
     Ok(resp)
 }
 
-/// DELETE /api/{ns}/keys/{key} -> 202 / 404
+/// DELETE /api/{ns}/keys/{key} -> 202
 pub async fn delete_key(
     State(state): State<Arc<AppState>>,
     Path((ns_name, raw_key)): Path<(String, String)>,

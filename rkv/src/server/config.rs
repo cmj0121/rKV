@@ -82,6 +82,10 @@ pub fn parse_body_limit(s: &str) -> Result<usize, String> {
         return Err(format!("body limit cannot be negative: {s}"));
     }
 
+    if !num.is_finite() {
+        return Err(format!("invalid body limit: {s}"));
+    }
+
     Ok((num * multiplier as f64) as usize)
 }
 

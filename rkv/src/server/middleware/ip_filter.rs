@@ -32,6 +32,8 @@ impl IpFilterLayer {
         // Always allow loopback when explicit IPs are given
         if allowed.is_empty() && !allow_all {
             allowed.insert("127.0.0.1".parse().unwrap());
+            allowed.insert("::1".parse().unwrap());
+            allowed.insert("::ffff:127.0.0.1".parse().unwrap());
         }
         Self {
             state: Arc::new(AllowList { allow_all, allowed }),
