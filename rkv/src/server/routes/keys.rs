@@ -43,7 +43,7 @@ pub async fn put_key(
 ) -> Result<Response, ServerError> {
     let key = parse_key(&raw_key);
     let ns = state.namespace(&ns_name)?;
-    let ttl = parse_expires_header(&headers);
+    let ttl = parse_expires_header(&headers).or_else(|| parse_ttl_header(&headers));
     let value = json_body_to_value(&body)?;
     let rev = ns.put(key, value, ttl)?;
 
@@ -100,6 +100,27 @@ fn parse_expires_header(headers: &HeaderMap) -> Option<Duration> {
     let val = headers.get("Expires")?.to_str().ok()?;
     let expires = httpdate::parse_http_date(val).ok()?;
     expires.duration_since(SystemTime::now()).ok()
+}
+
+/// Parse the `X-RKV-TTL` header into a Duration.
+///
+/// Accepts human-readable suffixes: `s` (seconds), `m` (minutes), `h` (hours),
+/// `d` (days). A plain number is treated as seconds (e.g. `120` = 2 minutes).
+fn parse_ttl_header(headers: &HeaderMap) -> Option<Duration> {
+    let val = headers.get("X-RKV-TTL")?.to_str().ok()?;
+    let s = val.trim();
+    let (num, unit) = if let Some(n) = s.strip_suffix('d') {
+        (n.parse::<u64>().ok()?, 86400)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n.parse::<u64>().ok()?, 3600)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n.parse::<u64>().ok()?, 60)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n.parse::<u64>().ok()?, 1)
+    } else {
+        (s.parse::<u64>().ok()?, 1)
+    };
+    Some(Duration::from_secs(num * unit))
 }
 
 /// Convert a JSON body to a Value.

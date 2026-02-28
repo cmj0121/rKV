@@ -538,6 +538,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ttl_via_x_rkv_ttl_header() {
+        let app = app();
+
+        app.clone()
+            .oneshot(
+                Request::put("/api/_/keys/ttl_hdr")
+                    .header("content-type", "application/json")
+                    .header("X-RKV-TTL", "60s")
+                    .body(Body::from("\"v\""))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/_/keys/ttl_hdr/ttl")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let secs: u64 = serde_json::from_str(&body).unwrap();
+        assert!(secs > 0 && secs <= 60);
+    }
+
+    #[tokio::test]
+    async fn ttl_expires_header_takes_precedence() {
+        let app = app();
+
+        // Expires = 120s from now, X-RKV-TTL = 10s — Expires should win
+        let expires = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+        let expires_str = httpdate::fmt_http_date(expires);
+
+        app.clone()
+            .oneshot(
+                Request::put("/api/_/keys/ttl_prio")
+                    .header("content-type", "application/json")
+                    .header("Expires", &expires_str)
+                    .header("X-RKV-TTL", "10s")
+                    .body(Body::from("\"v\""))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/_/keys/ttl_prio/ttl")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let secs: u64 = serde_json::from_str(&body).unwrap();
+        // Should be ~120s (from Expires), not ~10s (from X-RKV-TTL)
+        assert!(secs > 60, "expected >60s (Expires wins), got {secs}s");
+    }
+
+    #[tokio::test]
+    async fn ttl_plain_seconds() {
+        let app = app();
+
+        app.clone()
+            .oneshot(
+                Request::put("/api/_/keys/ttl_plain")
+                    .header("content-type", "application/json")
+                    .header("X-RKV-TTL", "120")
+                    .body(Body::from("\"v\""))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/_/keys/ttl_plain/ttl")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let secs: u64 = serde_json::from_str(&body).unwrap();
+        assert!(secs > 60 && secs <= 120, "expected ~120s, got {secs}s");
+    }
+
+    #[tokio::test]
     async fn scan_has_more_header() {
         let app = app();
 
