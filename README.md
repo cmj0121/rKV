@@ -24,6 +24,41 @@ name
 > exit
 ```
 
+## HTTP Server
+
+Run rKV as a JSON-over-HTTP service (requires `--features server`):
+
+```sh
+# Start with default settings (localhost:8321)
+cargo run --features server -- serve
+
+# Bind to all interfaces with the web UI enabled
+cargo run --features server -- serve --bind 0.0.0.0 --ui
+```
+
+Basic operations with curl:
+
+```sh
+# Put a value
+curl -X PUT http://localhost:8321/api/_/keys/greeting \
+  -d '"hello world"'
+
+# Get a value
+curl http://localhost:8321/api/_/keys/greeting
+
+# Scan keys by prefix
+curl http://localhost:8321/api/_/keys?prefix=greet
+
+# Delete a key
+curl -X DELETE http://localhost:8321/api/_/keys/greeting
+```
+
+The server binds to loopback only by default. Use `--allow-ip` to allow specific
+remote addresses, or `--allow-all` to disable IP filtering. Pass `--ui` to enable
+a browser-based dashboard at `http://localhost:8321/ui`.
+
+For architecture details, see [CONCEPTS.md](CONCEPTS.md#http-server).
+
 ## Concept
 
 - **Revision-aware** — every write produces a unique RevisionID; query history with `rev_get`/`rev_count`

@@ -1081,6 +1081,30 @@ The `put` command supports loading values from files:
 - `put mykey @/path/to/file` — reads the file contents as the value (binary-safe)
 - `put mykey @@literal` — escape: stores the literal string `@literal`
 
+### HTTP Server
+
+The optional HTTP server (`rkv serve`) exposes rKV as a networked JSON-over-HTTP service, enabling non-Rust clients
+(browsers, scripts, microservices) to interact with the database without linking the library or FFI layer.
+
+The server is built with Axum and gated behind the `server` Cargo feature flag (`--features server`). It is not
+included in the default build to keep the core library dependency-free.
+
+The REST API is namespace-aware: every data operation targets a specific namespace in its URL path. Supported
+operations include key-value CRUD (`get`, `put`, `delete`), prefix scans with pagination, revision history queries,
+TTL management, and administrative actions (flush, compact, stats). Custom response headers carry metadata such as
+revision IDs and TTL information.
+
+**Security**: By default the server binds to `127.0.0.1` (loopback only) and rejects requests from non-local IPs.
+For network-accessible deployments, an IP allow-list (`--allow-ip`) restricts API access to explicitly trusted
+addresses. Health endpoints (`/health`) are exempt from IP filtering so load balancers can probe without
+authorization.
+
+An embedded single-page web UI is available via the `--ui` flag. When enabled, the server serves a browser-based
+dashboard at `/ui` for browsing keys, managing namespaces, and viewing database statistics — useful for debugging
+and exploration without curl.
+
+See the [README](README.md#http-server) for startup examples and curl recipes.
+
 ## Design Decisions
 
 - **Interior mutability**: `DB` is `Send + Sync`. All mutable fields use `Mutex<T>` or `RwLock<T>` so public methods
