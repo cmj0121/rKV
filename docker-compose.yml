@@ -1,6 +1,7 @@
 services:
   rkv:
     build: .
+    platform: linux/amd64
     ports:
       - "8321:8321"
     volumes:
