@@ -565,9 +565,9 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             }
             let prefix = parse_key(prefix_token);
             let result = if tokens[0] == "scan" {
-                ns.scan(&prefix, limit, offset)
+                ns.scan(&prefix, limit, offset, false)
             } else {
-                ns.rscan(&prefix, limit, offset)
+                ns.rscan(&prefix, limit, offset, false)
             };
             match result {
                 Ok(keys) => {

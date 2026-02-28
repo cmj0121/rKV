@@ -139,6 +139,7 @@ var state = {
   hasMore: false,
   offset: 0,
   prefix: "",
+  showDeleted: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -230,6 +231,20 @@ function renderKeys(app) {
     }),
   );
 
+  var delBox = el("input", { type: "checkbox", id: "del-check" });
+  if (state.showDeleted) delBox.checked = true;
+  delBox.addEventListener("change", function () {
+    state.showDeleted = delBox.checked;
+    state.offset = 0;
+    loadKeys();
+  });
+  toolbar.appendChild(
+    el("label", { className: "del-toggle" }, [
+      delBox,
+      document.createTextNode(" Show deleted"),
+    ]),
+  );
+
   toolbar.appendChild(
     el("button", {
       className: "btn-blue",
@@ -281,6 +296,7 @@ function populateNsSelect() {
 function loadKeys() {
   var qs = "?offset=" + state.offset;
   if (state.prefix) qs += "&prefix=" + encodeURIComponent(state.prefix);
+  if (state.showDeleted) qs += "&deleted=true";
   api("GET", "/api/" + encodeURIComponent(state.ns) + "/keys" + qs)
     .then(function (r) {
       state.keys = r.data || [];
@@ -345,22 +361,29 @@ function renderKeyRows() {
 
   Promise.all(promises).then(function (entries) {
     entries.forEach(function (entry) {
+      var isDeleted = entry.status === 410;
       var binary =
+        !isDeleted &&
         entry.status !== 204 &&
         entry.value != null &&
         isBinary(String(entry.value));
       var valText;
-      if (entry.status === 204) valText = "(null)";
+      if (isDeleted) valText = "(deleted)";
+      else if (entry.status === 204) valText = "(null)";
       else if (entry.value == null) valText = "(empty)";
       else if (binary) valText = "(binary)";
       else valText = String(entry.value);
-      if (!binary && valText.length > 80)
+      if (!isDeleted && !binary && valText.length > 80)
         valText = valText.slice(0, 77) + "...";
       var ttlText = entry.expires || "-";
 
       // Value cell: show text or binary badge + download
       var valCell = el("td");
-      if (binary) {
+      if (isDeleted) {
+        valCell.appendChild(
+          el("span", { className: "val-deleted", textContent: "(deleted)" }),
+        );
+      } else if (binary) {
         valCell.appendChild(
           el("span", { className: "val-binary", textContent: "(binary)" }),
         );
@@ -397,6 +420,7 @@ function renderKeyRows() {
             "div",
             { className: "actions" },
             (function () {
+              if (isDeleted) return [];
               var btns = [];
               btns.push(
                 el("button", {

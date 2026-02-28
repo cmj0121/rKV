@@ -137,6 +137,37 @@ impl<'db> Namespace<'db> {
         self.decrypt_value(value)
     }
 
+    /// Like `get()`, but returns `Some(Value::Tombstone)` for deleted keys
+    /// instead of `Err(KeyNotFound)`. Returns `None` when the key never existed.
+    #[allow(dead_code)] // used by server feature (routes/keys.rs)
+    pub(crate) fn get_raw(&self, key: impl Into<Key>) -> Result<Option<Value>> {
+        let key = key.into();
+        self.db.inc_op_gets();
+
+        let mt = self.db.get_or_create_memtable(&self.name);
+        let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+        match mt.lookup(&key) {
+            MemLookup::Found(v) => {
+                let v = v.clone();
+                drop(mt);
+                let v = self.db.resolve_value(&self.name, &v)?;
+                Ok(Some(self.decrypt_value(v)?))
+            }
+            MemLookup::Tombstone => Ok(Some(Value::tombstone())),
+            MemLookup::NotFound => {
+                drop(mt);
+                match self.db.get_from_sstables(&self.name, &key)? {
+                    Some(v) if v.is_tombstone() => Ok(Some(Value::tombstone())),
+                    Some(v) => {
+                        let v = self.db.resolve_value(&self.name, &v)?;
+                        Ok(Some(self.decrypt_value(v)?))
+                    }
+                    None => Ok(None),
+                }
+            }
+        }
+    }
+
     pub fn delete(&self, key: impl Into<Key>) -> Result<()> {
         let key = key.into();
         let rev = self.db.generate_revision();
@@ -220,7 +251,13 @@ impl<'db> Namespace<'db> {
         Ok(mt.exists(&key))
     }
 
-    pub fn scan(&self, prefix: &Key, limit: usize, offset: usize) -> Result<Vec<Key>> {
+    pub fn scan(
+        &self,
+        prefix: &Key,
+        limit: usize,
+        offset: usize,
+        include_deleted: bool,
+    ) -> Result<Vec<Key>> {
         let (mt_entries, ordered_mode) = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
@@ -237,14 +274,20 @@ impl<'db> Namespace<'db> {
 
         Ok(merged
             .into_iter()
-            .filter(|(_, v)| !v.is_tombstone())
+            .filter(|(_, v)| include_deleted || !v.is_tombstone())
             .map(|(k, _)| k)
             .skip(offset)
             .take(limit)
             .collect())
     }
 
-    pub fn rscan(&self, prefix: &Key, limit: usize, offset: usize) -> Result<Vec<Key>> {
+    pub fn rscan(
+        &self,
+        prefix: &Key,
+        limit: usize,
+        offset: usize,
+        include_deleted: bool,
+    ) -> Result<Vec<Key>> {
         let (mt_entries, ordered_mode) = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
@@ -262,7 +305,7 @@ impl<'db> Namespace<'db> {
         // Collect and reverse for rscan
         let all: Vec<Key> = merged
             .into_iter()
-            .filter(|(_, v)| !v.is_tombstone())
+            .filter(|(_, v)| include_deleted || !v.is_tombstone())
             .map(|(k, _)| k)
             .collect();
 

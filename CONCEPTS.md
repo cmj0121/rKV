@@ -56,14 +56,16 @@ Booleans are syntax sugar: `true` → `Int(1)`, `false` → `Int(0)`.
 `Str` (e.g., `Int(42)` becomes `Str("42")`), and the database enters **unordered mode** permanently. Exact-match
 operations (`get`, `has`, `del`) continue to work normally in both modes.
 
-**Scan behavior** depends on the database mode. Both `scan` and `rscan` accept `(prefix, limit, offset)` where
-`offset` skips the first N matching keys before collecting up to `limit` results (for pagination).
+**Scan behavior** depends on the database mode. Both `scan` and `rscan` accept
+`(prefix, limit, offset, include_deleted)` where `offset` skips the first N matching keys before collecting up to
+`limit` results (for pagination). When `include_deleted` is `true`, tombstoned keys are included in the results
+alongside live keys; when `false` (default), tombstones are filtered out.
 
-- **Ordered mode** (Int keys): `scan(prefix, limit, offset)` returns keys in ascending order starting from `prefix`;
-  `rscan` returns keys in descending order.
-- **Unordered mode** (Str keys): `scan(prefix, limit, offset)` returns keys whose string representation starts with
-  `prefix`; `rscan` returns the same prefix-matched keys in reverse order. Ordering-based range queries are not
-  available.
+- **Ordered mode** (Int keys): `scan(prefix, limit, offset, include_deleted)` returns keys in ascending order
+  starting from `prefix`; `rscan` returns keys in descending order.
+- **Unordered mode** (Str keys): `scan(prefix, limit, offset, include_deleted)` returns keys whose string
+  representation starts with `prefix`; `rscan` returns the same prefix-matched keys in reverse order.
+  Ordering-based range queries are not available.
 
 ### Value
 
@@ -72,8 +74,10 @@ A Value is the payload associated with a key. It has three internal states:
 - **Data** — arbitrary-length byte vector. An empty `Data` (zero bytes) is a valid, distinct value.
 - **Null** — the key exists but carries no payload. `Null` is semantically different from empty `Data`.
 - **Tombstone** — an internal deletion marker. When a key is deleted, the engine writes a tombstone instead of
-  physically removing the entry. Tombstones are invisible to the public API — `get` on a tombstoned key returns
-  "key not found", indistinguishable from a key that never existed. Tombstones are resolved (garbage-collected) during
+  physically removing the entry. Tombstones are invisible to the public `get` API — it returns "key not found",
+  indistinguishable from a key that never existed. The crate-internal `get_raw` method distinguishes tombstoned keys
+  (`Some(Tombstone)`) from never-existed keys (`None`). The HTTP API uses this to return **410 Gone** for deleted
+  keys vs **404 Not Found** for keys that never existed. Tombstones are resolved (garbage-collected) during
   SSTable compaction.
 
 ### Value Separation (Bin Objects)
@@ -858,11 +862,11 @@ and `compact()` — not just for point lookups, but for prefix/range iteration t
 **Merge strategy** (oldest-to-newest, newest wins):
 
 ```text
-Namespace::scan(prefix, limit, offset)
+Namespace::scan(prefix, limit, offset, include_deleted)
   1. Collect SSTable entries matching prefix (merge order below)
   2. Collect MemTable raw entries matching prefix (includes tombstones)
   3. Insert all into BTreeMap<Key, Value> — newer entries overwrite older
-  4. Filter out tombstones from merged result
+  4. Filter: include_deleted || !is_tombstone (skip tombstones when false)
   5. Apply offset, then limit
   6. For rscan: reverse iteration order before offset/limit
 ```
@@ -946,8 +950,8 @@ backed by a `BTreeMap<Key, Vec<MemEntry>>` — each key maps to its full revisio
 (oldest entry at index 0). The MemTable provides:
 
 - **put/get/delete/exists** — core key-value operations
-- **scan/rscan** — ordered iteration with offset/limit pagination (range queries in ordered mode,
-  prefix matching in unordered mode)
+- **scan/rscan** — ordered iteration with offset/limit pagination and optional `include_deleted` flag
+  (range queries in ordered mode, prefix matching in unordered mode)
 - **count** — live key count (excludes tombstones and expired entries)
 - **rev_count/rev_get** — revision history access
 - **ttl** — remaining time-to-live for a key
@@ -1101,7 +1105,14 @@ authorization.
 
 An embedded single-page web UI is available via the `--ui` flag. When enabled, the server serves a browser-based
 dashboard at `/ui` for browsing keys, managing namespaces, and viewing database statistics — useful for debugging
-and exploration without curl.
+and exploration without curl. The UI includes a "Show deleted" toggle that lists tombstoned keys alongside live ones.
+
+**Key GET status codes**: `GET /api/{ns}/keys/{key}` returns **200** (data), **204** (null value), **410 Gone**
+(tombstoned/deleted key), or **404** (key never existed). The 410 vs 404 distinction uses the internal `get_raw`
+method to detect tombstones.
+
+**Scan with deleted keys**: `GET /api/{ns}/keys?deleted=true` passes `include_deleted=true` to the engine scan,
+returning tombstoned keys alongside live ones. Without `deleted=true`, tombstoned keys are hidden (default).
 
 See the [README](README.md#http-server) for startup examples and curl recipes.
 

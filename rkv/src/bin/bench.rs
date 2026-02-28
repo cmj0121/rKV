@@ -211,7 +211,7 @@ fn bench_scan(n: usize) -> std::time::Duration {
     }
 
     let start = Instant::now();
-    let _ = ns.scan(&Key::Int(0), n, 0).unwrap();
+    let _ = ns.scan(&Key::Int(0), n, 0, false).unwrap();
     start.elapsed()
 }
 
