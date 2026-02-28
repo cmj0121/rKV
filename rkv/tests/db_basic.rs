@@ -267,6 +267,48 @@ fn rscan_with_offset() {
 }
 
 #[test]
+fn scan_include_deleted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put(1_i64, "a", None).unwrap();
+    ns.put(2_i64, "b", None).unwrap();
+    ns.put(3_i64, "c", None).unwrap();
+    ns.delete(2_i64).unwrap();
+
+    // Without include_deleted: tombstoned key is hidden
+    let keys = ns.scan(&Key::Int(1), 10, 0, false).unwrap();
+    assert_eq!(keys, vec![Key::Int(1), Key::Int(3)]);
+
+    // With include_deleted: tombstoned key is included
+    let keys = ns.scan(&Key::Int(1), 10, 0, true).unwrap();
+    assert_eq!(keys, vec![Key::Int(1), Key::Int(2), Key::Int(3)]);
+}
+
+#[test]
+fn rscan_include_deleted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put(1_i64, "a", None).unwrap();
+    ns.put(2_i64, "b", None).unwrap();
+    ns.put(3_i64, "c", None).unwrap();
+    ns.delete(2_i64).unwrap();
+
+    // Without include_deleted: tombstoned key is hidden
+    let keys = ns.rscan(&Key::Int(3), 10, 0, false).unwrap();
+    assert_eq!(keys, vec![Key::Int(3), Key::Int(1)]);
+
+    // With include_deleted: tombstoned key is included
+    let keys = ns.rscan(&Key::Int(3), 10, 0, true).unwrap();
+    assert_eq!(keys, vec![Key::Int(3), Key::Int(2), Key::Int(1)]);
+}
+
+#[test]
 fn count_excludes_tombstones() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
