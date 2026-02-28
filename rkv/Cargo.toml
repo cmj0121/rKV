@@ -11,9 +11,18 @@ path = "src/main.rs"
 name = "bench"
 path = "src/bin/bench.rs"
 
+[[bin]]
+name = "bench_server"
+path = "src/bin/bench_server.rs"
+required-features = ["server"]
+
 [lib]
 name = "rkv"
 path = "src/lib.rs"
+
+[features]
+default = []
+server = ["dep:axum", "dep:tokio", "dep:serde", "dep:serde_json", "dep:tower", "dep:tower-http", "dep:httpdate", "dep:http-body-util", "dep:tracing", "dep:tracing-subscriber"]
 
 [dependencies]
 aes-gcm = "0.10"
@@ -33,3 +42,15 @@ rustyline = "17"
 tempfile = "3"
 thiserror = "2"
 zstd = "0.13"
+
+# Server (optional — enabled by `server` feature)
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+tower = { version = "0.5", optional = true }
+tower-http = { version = "0.6", features = ["trace", "cors", "timeout"], optional = true }
+httpdate = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
