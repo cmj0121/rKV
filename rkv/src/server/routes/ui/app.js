@@ -398,17 +398,6 @@ function renderKeyRows() {
             { className: "actions" },
             (function () {
               var btns = [];
-              if (binary) {
-                btns.push(
-                  el("button", {
-                    className: "btn-blue",
-                    textContent: "Download",
-                    onClick: function () {
-                      downloadKey(entry.key);
-                    },
-                  }),
-                );
-              }
               btns.push(
                 el("button", {
                   className: "btn-green",
