@@ -1,0 +1,46 @@
+image:
+  repository: rkv
+  tag: latest
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+service:
+  type: ClusterIP
+  port: 8321
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: rkv.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+persistence:
+  enabled: true
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 1Gi
+
+resources: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# rKV server flags (mapped 1:1 to `rkv serve` CLI args)
+server:
+  bind: "0.0.0.0"
+  port: 8321
+  allowAll: true
+  bodyLimit: "2mb"
+  timeout: 30
+  ui: false
