@@ -107,6 +107,15 @@ h2 {
   min-width: 200px;
 }
 
+.del-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
 /* ---- Buttons ---- */
 button,
 .btn {
