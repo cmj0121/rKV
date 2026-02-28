@@ -270,7 +270,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-        // GET after delete → 404
+        // GET after delete → 410 Gone (tombstoned)
         let resp = app
             .oneshot(
                 Request::get("/api/_/keys/greeting")
@@ -279,7 +279,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), StatusCode::GONE);
     }
 
     #[tokio::test]
@@ -806,6 +806,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_key_tombstone_returns_410() {
+        let app = app();
+
+        // Put a key
+        app.clone()
+            .oneshot(
+                Request::put("/api/_/keys/gk")
+                    .header("content-type", "application/json")
+                    .body(Body::from("\"hello\""))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Delete the key
+        app.clone()
+            .oneshot(
+                Request::delete("/api/_/keys/gk")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // GET should return 410 Gone (not 404)
+        let resp = app
+            .oneshot(Request::get("/api/_/keys/gk").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn list_keys_with_deleted() {
+        let app = app();
+
+        // Put three keys
+        for key in &["dk1", "dk2", "dk3"] {
+            app.clone()
+                .oneshot(
+                    Request::put(format!("/api/_/keys/{key}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from("\"v\""))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Delete dk2
+        app.clone()
+            .oneshot(
+                Request::delete("/api/_/keys/dk2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Without deleted param: dk2 is hidden
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/_/keys?prefix=dk")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let keys: Vec<String> = serde_json::from_str(&body).unwrap();
+        assert_eq!(keys, vec!["dk1", "dk3"]);
+
+        // With deleted=true: dk2 is included
+        let resp = app
+            .oneshot(
+                Request::get("/api/_/keys?prefix=dk&deleted=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let keys: Vec<String> = serde_json::from_str(&body).unwrap();
+        assert_eq!(keys, vec!["dk1", "dk2", "dk3"]);
+    }
+
+    #[tokio::test]
     async fn admin_flush() {
         let resp = app()
             .oneshot(
@@ -1267,10 +1357,10 @@ mod tests {
                         }
                     }
                     None => {
-                        assert_eq!(
-                            resp.status(),
-                            StatusCode::NOT_FOUND,
-                            "[{label}] ns={ns_name} key={key_str}: expected 404, got {}",
+                        assert!(
+                            resp.status() == StatusCode::NOT_FOUND
+                                || resp.status() == StatusCode::GONE,
+                            "[{label}] ns={ns_name} key={key_str}: expected 404/410, got {}",
                             resp.status()
                         );
                     }
@@ -1381,10 +1471,10 @@ mod tests {
                             }
                         }
                         None => {
-                            assert_eq!(
-                                resp.status(),
-                                StatusCode::NOT_FOUND,
-                                "op#{op_count} get({key}): expected 404, got {}",
+                            assert!(
+                                resp.status() == StatusCode::NOT_FOUND
+                                    || resp.status() == StatusCode::GONE,
+                                "op#{op_count} get({key}): expected 404/410, got {}",
                                 resp.status()
                             );
                         }

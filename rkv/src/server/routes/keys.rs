@@ -11,14 +11,19 @@ use crate::server::types::parse_key;
 use crate::server::AppState;
 use crate::Namespace;
 
-/// GET /api/{ns}/keys/{key} -> 200 (data) / 204 (null) / 404
+/// GET /api/{ns}/keys/{key} -> 200 (data) / 204 (null) / 410 (deleted) / 404
 pub async fn get_key(
     State(state): State<Arc<AppState>>,
     Path((ns_name, raw_key)): Path<(String, String)>,
 ) -> Result<Response, ServerError> {
     let key = parse_key(&raw_key);
     let ns = state.namespace(&ns_name)?;
-    let value = ns.get(key.clone())?;
+
+    let value = match ns.get_raw(key.clone())? {
+        None => return Err(ServerError::from(crate::Error::KeyNotFound)),
+        Some(v) if v.is_tombstone() => return Ok(StatusCode::GONE.into_response()),
+        Some(v) => v,
+    };
 
     if value.is_null() {
         let mut resp = StatusCode::NO_CONTENT.into_response();
