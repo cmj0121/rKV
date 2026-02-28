@@ -358,7 +358,7 @@ fn fuzz_random_ops() {
                 let ns = db.namespace(&current_ns, None).unwrap();
                 let prefix_key = Key::from(prefix.as_str());
                 let db_keys: Vec<String> = ns
-                    .scan(&prefix_key, limit, offset)
+                    .scan(&prefix_key, limit, offset, false)
                     .unwrap()
                     .into_iter()
                     .map(|k| k.to_string())
@@ -378,7 +378,7 @@ fn fuzz_random_ops() {
                 let ns = db.namespace(&current_ns, None).unwrap();
                 let prefix_key = Key::from(prefix.as_str());
                 let db_keys: Vec<String> = ns
-                    .rscan(&prefix_key, limit, offset)
+                    .rscan(&prefix_key, limit, offset, false)
                     .unwrap()
                     .into_iter()
                     .map(|k| k.to_string())

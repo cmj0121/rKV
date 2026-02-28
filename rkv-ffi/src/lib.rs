@@ -512,7 +512,7 @@ unsafe fn rkv_scan_inner(
         }
     };
     let keys = if reverse {
-        match namespace.rscan(&prefix_key, limit, offset) {
+        match namespace.rscan(&prefix_key, limit, offset, false) {
             Ok(k) => k,
             Err(e) => {
                 set_last_error(e.to_string());
@@ -520,7 +520,7 @@ unsafe fn rkv_scan_inner(
             }
         }
     } else {
-        match namespace.scan(&prefix_key, limit, offset) {
+        match namespace.scan(&prefix_key, limit, offset, false) {
             Ok(k) => k,
             Err(e) => {
                 set_last_error(e.to_string());

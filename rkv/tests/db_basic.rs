@@ -186,7 +186,7 @@ fn scan_ordered_mode() {
     ns.put(1_i64, "a", None).unwrap();
     ns.put(2_i64, "b", None).unwrap();
 
-    let keys = ns.scan(&Key::Int(1), 10, 0).unwrap();
+    let keys = ns.scan(&Key::Int(1), 10, 0, false).unwrap();
     assert_eq!(keys, vec![Key::Int(1), Key::Int(2), Key::Int(3)]);
 }
 
@@ -201,7 +201,7 @@ fn rscan_ordered_mode() {
     ns.put(2_i64, "b", None).unwrap();
     ns.put(3_i64, "c", None).unwrap();
 
-    let keys = ns.rscan(&Key::Int(3), 10, 0).unwrap();
+    let keys = ns.rscan(&Key::Int(3), 10, 0, false).unwrap();
     assert_eq!(keys, vec![Key::Int(3), Key::Int(2), Key::Int(1)]);
 }
 
@@ -216,7 +216,7 @@ fn scan_unordered_mode() {
     ns.put("user:2", "b", None).unwrap();
     ns.put("post:1", "c", None).unwrap();
 
-    let keys = ns.scan(&Key::from("user:"), 10, 0).unwrap();
+    let keys = ns.scan(&Key::from("user:"), 10, 0, false).unwrap();
     assert_eq!(keys.len(), 2);
     assert!(keys.contains(&Key::from("user:1")));
     assert!(keys.contains(&Key::from("user:2")));
@@ -236,11 +236,11 @@ fn scan_with_offset() {
     ns.put(5_i64, "e", None).unwrap();
 
     // Skip first 2, take next 2
-    let keys = ns.scan(&Key::Int(1), 2, 2).unwrap();
+    let keys = ns.scan(&Key::Int(1), 2, 2, false).unwrap();
     assert_eq!(keys, vec![Key::Int(3), Key::Int(4)]);
 
     // Skip all
-    let keys = ns.scan(&Key::Int(1), 10, 10).unwrap();
+    let keys = ns.scan(&Key::Int(1), 10, 10, false).unwrap();
     assert!(keys.is_empty());
 }
 
@@ -258,11 +258,11 @@ fn rscan_with_offset() {
     ns.put(5_i64, "e", None).unwrap();
 
     // rscan from 5, skip first 1 (5), take next 2 (4, 3)
-    let keys = ns.rscan(&Key::Int(5), 2, 1).unwrap();
+    let keys = ns.rscan(&Key::Int(5), 2, 1, false).unwrap();
     assert_eq!(keys, vec![Key::Int(4), Key::Int(3)]);
 
     // Skip all
-    let keys = ns.rscan(&Key::Int(5), 10, 10).unwrap();
+    let keys = ns.rscan(&Key::Int(5), 10, 10, false).unwrap();
     assert!(keys.is_empty());
 }
 
@@ -1753,7 +1753,7 @@ fn persist_scan_after_reopen() {
         let config = Config::new(tmp.path());
         let db = DB::open(config).unwrap();
         let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
-        let keys = ns.scan(&Key::from("user:"), 10, 0).unwrap();
+        let keys = ns.scan(&Key::from("user:"), 10, 0, false).unwrap();
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&Key::from("user:1")));
         assert!(keys.contains(&Key::from("user:2")));
@@ -1798,7 +1798,7 @@ fn persist_int_keys() {
         assert_eq!(ns.get(2_i64).unwrap(), Value::from("b"));
         assert_eq!(ns.get(3_i64).unwrap(), Value::from("c"));
         // Scan should work in ordered mode
-        let keys = ns.scan(&Key::Int(1), 10, 0).unwrap();
+        let keys = ns.scan(&Key::Int(1), 10, 0, false).unwrap();
         assert_eq!(keys, vec![Key::Int(1), Key::Int(2), Key::Int(3)]);
     }
 }
@@ -2664,7 +2664,7 @@ fn encrypted_scan_returns_keys() {
     ns.put("user:2", "b", None).unwrap();
     ns.put("post:1", "c", None).unwrap();
 
-    let keys = ns.scan(&Key::from("user:"), 10, 0).unwrap();
+    let keys = ns.scan(&Key::from("user:"), 10, 0, false).unwrap();
     assert_eq!(keys.len(), 2);
 }
 
@@ -3727,7 +3727,7 @@ fn scan_after_flush_sees_all_keys() {
     ns.put("user:3", "charlie", None).unwrap();
 
     // Scan should return all three
-    let keys = ns.scan(&Key::from("user:"), 10, 0).unwrap();
+    let keys = ns.scan(&Key::from("user:"), 10, 0, false).unwrap();
     assert_eq!(keys.len(), 3);
     assert!(keys.contains(&Key::from("user:1")));
     assert!(keys.contains(&Key::from("user:2")));
@@ -3746,7 +3746,7 @@ fn scan_after_flush_only_sstable() {
     db.flush().unwrap();
 
     // All keys are in SSTable, MemTable is empty
-    let keys = ns.scan(&Key::from(""), 10, 0).unwrap();
+    let keys = ns.scan(&Key::from(""), 10, 0, false).unwrap();
     assert_eq!(keys.len(), 2);
 }
 
@@ -3764,7 +3764,7 @@ fn scan_tombstone_shadows_sstable() {
     // Delete user:1 in MemTable — should shadow the SSTable entry
     ns.delete("user:1").unwrap();
 
-    let keys = ns.scan(&Key::from("user:"), 10, 0).unwrap();
+    let keys = ns.scan(&Key::from("user:"), 10, 0, false).unwrap();
     assert_eq!(keys, vec![Key::from("user:2")]);
 }
 
@@ -3782,7 +3782,7 @@ fn scan_memtable_overwrites_sstable() {
     ns.put("key", "new_value", None).unwrap();
 
     // Scan should return the key once (not duplicate)
-    let keys = ns.scan(&Key::from(""), 10, 0).unwrap();
+    let keys = ns.scan(&Key::from(""), 10, 0, false).unwrap();
     assert_eq!(keys, vec![Key::from("key")]);
 
     // Verify value is the new one
@@ -3802,7 +3802,7 @@ fn rscan_after_flush() {
     db.flush().unwrap();
     ns.put(3_i64, "c", None).unwrap();
 
-    let keys = ns.rscan(&Key::Int(3), 10, 0).unwrap();
+    let keys = ns.rscan(&Key::Int(3), 10, 0, false).unwrap();
     assert_eq!(keys, vec![Key::Int(3), Key::Int(2), Key::Int(1)]);
 }
 
@@ -3824,7 +3824,7 @@ fn scan_after_compaction() {
     // Compact merges into L1
     db.compact().unwrap();
 
-    let keys = ns.scan(&Key::from(""), 10, 0).unwrap();
+    let keys = ns.scan(&Key::from(""), 10, 0, false).unwrap();
     assert_eq!(keys.len(), 3);
     assert!(keys.contains(&Key::from("a")));
     assert!(keys.contains(&Key::from("b")));
@@ -3853,7 +3853,7 @@ fn scan_after_restart() {
         let db = DB::open(config).unwrap();
         let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
-        let keys = ns.scan(&Key::from(""), 10, 0).unwrap();
+        let keys = ns.scan(&Key::from(""), 10, 0, false).unwrap();
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&Key::from("x")));
         assert!(keys.contains(&Key::from("y")));
@@ -3875,7 +3875,7 @@ fn scan_with_limit_and_offset_across_sources() {
     ns.put("d", "4", None).unwrap();
 
     // Skip 1, take 2 from merged (a, b, c, d)
-    let keys = ns.scan(&Key::from(""), 2, 1).unwrap();
+    let keys = ns.scan(&Key::from(""), 2, 1, false).unwrap();
     assert_eq!(keys, vec![Key::from("b"), Key::from("c")]);
 }
 
@@ -3891,7 +3891,7 @@ fn scan_ordered_after_flush() {
     db.flush().unwrap();
     ns.put(30_i64, "c", None).unwrap();
 
-    let keys = ns.scan(&Key::Int(15), 10, 0).unwrap();
+    let keys = ns.scan(&Key::Int(15), 10, 0, false).unwrap();
     assert_eq!(keys, vec![Key::Int(20), Key::Int(30)]);
 }
 
@@ -3909,7 +3909,7 @@ fn scan_multiple_flushes_dedup() {
     db.flush().unwrap();
 
     // Key appears in two SSTables but should only show up once in scan
-    let keys = ns.scan(&Key::from(""), 10, 0).unwrap();
+    let keys = ns.scan(&Key::from(""), 10, 0, false).unwrap();
     assert_eq!(keys, vec![Key::from("key")]);
 
     // Value should be the newest
@@ -3930,11 +3930,11 @@ fn scan_prefix_bloom_skip() {
     db.flush().unwrap();
 
     // Scan for a different prefix — prefix bloom should filter this SSTable
-    let keys = ns.scan(&Key::from("post:"), 10, 0).unwrap();
+    let keys = ns.scan(&Key::from("post:"), 10, 0, false).unwrap();
     assert!(keys.is_empty());
 
     // Scan for matching prefix — should find both keys
-    let keys = ns.scan(&Key::from("user:"), 10, 0).unwrap();
+    let keys = ns.scan(&Key::from("user:"), 10, 0, false).unwrap();
     assert_eq!(keys.len(), 2);
 }
 
@@ -3952,7 +3952,7 @@ fn rscan_tombstone_shadows_sstable() {
 
     ns.delete(2_i64).unwrap();
 
-    let keys = ns.rscan(&Key::Int(3), 10, 0).unwrap();
+    let keys = ns.rscan(&Key::Int(3), 10, 0, false).unwrap();
     assert_eq!(keys, vec![Key::Int(3), Key::Int(1)]);
 }
 
@@ -3969,8 +3969,8 @@ fn scan_cross_namespace_isolation_after_flush() {
     ns2.put("shared_key", "from_ns2", None).unwrap();
     db.flush().unwrap();
 
-    let keys1 = ns1.scan(&Key::from(""), 10, 0).unwrap();
-    let keys2 = ns2.scan(&Key::from(""), 10, 0).unwrap();
+    let keys1 = ns1.scan(&Key::from(""), 10, 0, false).unwrap();
+    let keys2 = ns2.scan(&Key::from(""), 10, 0, false).unwrap();
     assert_eq!(keys1.len(), 1);
     assert_eq!(keys2.len(), 1);
     assert_eq!(ns1.get("shared_key").unwrap(), Value::from("from_ns1"));
@@ -4051,7 +4051,7 @@ fn cache_disabled_with_zero_size() {
     }
 
     // Scans should also work
-    let results = ns.scan(&Key::Int(0), 100, 0).unwrap();
+    let results = ns.scan(&Key::Int(0), 100, 0, false).unwrap();
     assert_eq!(results.len(), 10);
 }
 

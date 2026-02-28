@@ -17,6 +17,7 @@ pub struct ScanParams {
     pub prefix: Option<String>,
     pub offset: Option<usize>,
     pub reverse: Option<bool>,
+    pub deleted: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -46,10 +47,11 @@ pub async fn list_keys(
         .map(parse_key)
         .unwrap_or_else(|| crate::Key::from(""));
 
+    let include_deleted = params.deleted.unwrap_or(false);
     let keys = if params.reverse.unwrap_or(false) {
-        ns.rscan(&prefix, SCAN_LIMIT + 1, offset)?
+        ns.rscan(&prefix, SCAN_LIMIT + 1, offset, include_deleted)?
     } else {
-        ns.scan(&prefix, SCAN_LIMIT + 1, offset)?
+        ns.scan(&prefix, SCAN_LIMIT + 1, offset, include_deleted)?
     };
 
     let has_more = keys.len() > SCAN_LIMIT;
@@ -77,7 +79,7 @@ pub async fn count_keys(
         let mut count = 0u64;
         let mut offset = 0;
         loop {
-            let batch = ns.scan(&prefix_key, SCAN_LIMIT, offset)?;
+            let batch = ns.scan(&prefix_key, SCAN_LIMIT, offset, false)?;
             count += batch.len() as u64;
             if batch.len() < SCAN_LIMIT {
                 break;
