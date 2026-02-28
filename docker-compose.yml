@@ -4,9 +4,6 @@ services:
     ports:
       - "8321:8321"
     volumes:
-      - rkv-data:/data
+      - .data:/data
     command:
       ["serve", "--bind", "0.0.0.0", "--db", "/data", "--allow-all", "--ui"]
-
-volumes:
-  rkv-data:
