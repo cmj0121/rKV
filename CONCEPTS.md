@@ -1134,23 +1134,34 @@ background threads alongside the existing flush and compaction threads.
 
 #### Roles
 
-Each node operates in one of three roles, configured at startup:
+Each node operates in one of four roles, configured at startup:
 
 - **Standalone** (default): No replication. The node accepts reads and writes independently.
 - **Primary**: Accepts all reads and writes. Streams every write to connected replicas in real time.
 - **Replica**: Connects to a primary, receives data, and serves reads. Rejects all local writes with
   a `ReadOnlyReplica` error.
+- **Peer**: Master-master replication. Each node accepts reads and writes. Writes propagate
+  bidirectionally using last-writer-wins (LWW) conflict resolution (see Peer Replication below).
 
 #### How It Works
 
 When a replica connects to a primary, replication proceeds in two phases:
 
-1. **Full sync**: The primary flushes its write buffer, then streams all SSTable and bin-object files
-   to the replica. The replica writes these files to its local storage, bringing it up to the primary's
-   baseline state.
-2. **Live streaming**: After full sync, the primary forwards every AOL (append-only log) record to the
-   replica as it is written. The replica applies each record to its local AOL and in-memory write buffer,
-   staying current with the primary's writes.
+1. **Initial sync**: The replica sends a `SyncRequest` with its last known revision (from a persisted
+   checkpoint). The primary decides between two strategies:
+   - **Incremental sync**: If the replica's revision is non-zero and the primary's AOL contains records
+     after that revision, only the new records are sent. This is fast and avoids re-transferring data
+     the replica already has.
+   - **Full sync**: If the replica's revision is zero, the AOL has been truncated (after a flush), or
+     `force_full` is set, the primary streams all SSTable and bin-object files. The replica writes
+     these files to local storage, then calls `post_sync_fn` to reload the SSTable index, reset
+     memtables in-place, truncate its local AOL, and register new namespaces.
+2. **Live streaming**: After initial sync, the primary forwards every AOL (append-only log) record to
+   the replica as it is written. The replica applies each record to its local AOL and in-memory write
+   buffer, staying current with the primary's writes.
+
+A **checkpoint file** (`repl_checkpoint`) persists the highest revision seen across restarts, enabling
+incremental sync on reconnection. The checkpoint is saved on clean shutdown and on every disconnect.
 
 #### Wire Protocol
 
@@ -1161,8 +1172,9 @@ message. A handshake exchange at connection start verifies cluster membership vi
 #### Failure Handling
 
 - **Replica reconnection**: If the connection to the primary drops, the replica automatically reconnects
-  with exponential backoff (1 second to 30 seconds). On reconnection, a fresh full sync is performed
-  to ensure consistency.
+  with exponential backoff (1 second to 30 seconds). On reconnection, the replica attempts incremental
+  sync using its persisted checkpoint. If the primary's AOL has been truncated (e.g. after a flush),
+  it falls back to a full sync.
 - **Primary tolerance**: The primary accepts multiple concurrent replicas. If a replica disconnects,
   the primary cleans up its resources without affecting other replicas or write throughput.
 
@@ -1208,22 +1220,76 @@ The node's role is exposed through multiple channels:
 
 #### CLI Arguments
 
-| Flag             | Default      | Description                                          |
-| ---------------- | ------------ | ---------------------------------------------------- |
-| `--role`         | `standalone` | Node role: `standalone`, `primary`, or `replica`     |
-| `--repl-port`    | `8322`       | TCP port for replica connections (primary only)      |
-| `--primary-addr` | _(none)_     | Primary address (replica only, e.g. `10.0.0.1:8322`) |
+| Flag             | Default      | Description                                              |
+| ---------------- | ------------ | -------------------------------------------------------- |
+| `--role`         | `standalone` | Node role: `standalone`, `primary`, `replica`, or `peer` |
+| `--repl-port`    | `8322`       | TCP port for replication connections                     |
+| `--primary-addr` | _(none)_     | Primary address (replica only, e.g. `10.0.0.1:8322`)     |
+| `--peers`        | _(none)_     | Comma-separated peer addresses (peer only)               |
+| `--cluster-id`   | _(random)_   | Unique cluster ID for this node (peer only)              |
 
 #### Docker Compose Topology
 
-A `docker-compose.yml` in the project root defines a two-node topology:
+A `docker-compose.yml` in the project root defines a two-node topology (supports both
+primary-replica and peer modes):
 
-- **primary** — `rkv serve --role primary --repl-port 8322`, API on port 8321,
-  healthcheck via `/health`
-- **replica** — `rkv serve --role replica --primary-addr primary:8322`, API on
-  port 8323 (mapped to container 8321), depends on primary healthy
+- **Primary-replica**: primary on port 8321/8322, replica on port 8323
+- **Peer**: peer-a on port 8321/8322, peer-b on port 8323/8324, each configured with
+  `--peers` pointing to the other
 
-Data is bind-mounted to `.data/primary/` and `.data/replica/` respectively.
+Data is bind-mounted to `.data/` subdirectories.
+
+### Peer Replication
+
+Peer (master-master) replication allows two or more nodes to accept writes independently, with
+changes propagating bidirectionally. Conflicts are resolved using last-writer-wins (LWW) based on
+revision timestamps.
+
+#### Peer Sync Protocol
+
+When a peer connector establishes a TCP connection to another peer's listener, initial sync follows
+the same incremental-or-full strategy as primary-replica:
+
+1. **Connector** sends `SyncRequest` with its `last_revision` (loaded from `peer_checkpoint` file).
+2. **Listener** decides:
+   - If `last_revision > 0` and AOL has records after that revision → **incremental sync** (send
+     only new records). The listener flushes its AOL buffer before reading to ensure all records
+     are visible.
+   - Otherwise → **full sync** (stream SSTable and object files).
+3. **Connector** processes the response:
+   - **Non-empty full sync**: Writes SST/object files to disk, then calls `post_sync_fn` to reload
+     the SSTable index, reset memtables, truncate the local AOL, and register namespaces.
+   - **Empty full sync** (0 SSTs, 0 objects): Skipped — an empty sync means the sender has no
+     persisted data and should not wipe the receiver's local state.
+   - **Incremental sync**: Records are replayed via `replay_fn` (LWW resolution), which updates
+     the memtable and appends to the local AOL.
+
+After initial sync, both sides enter **bidirectional live streaming**.
+
+#### Conflict Resolution
+
+Incoming peer records are applied using `put_if_newer` (LWW). A record is accepted only if its
+revision is strictly newer than the existing revision for that key. Rejected records increment
+the `conflicts_resolved` counter.
+
+#### Loop Prevention
+
+Each AOL record carries the originating cluster ID in its revision. When a peer receives a record
+whose cluster ID matches its own, the record is silently dropped (it originated locally and was
+forwarded back by another peer).
+
+#### Checkpoint Persistence
+
+Each peer connector maintains a `peer_checkpoint` file (16-byte big-endian u128 revision). The
+checkpoint is saved on clean shutdown (`stop_replication`), on session death (before backoff),
+and on clean exit from the connector loop. On startup, the connector loads the checkpoint to
+enable incremental sync.
+
+#### Bidirectional Connections
+
+In a two-node setup, each node runs both a `PeerListener` and a `PeerConnector`, resulting in
+two TCP connections (A→B and B→A). Each connection independently handles initial sync and live
+streaming. This is redundant but harmless — LWW ensures idempotent application of records.
 
 ## Design Decisions
 
