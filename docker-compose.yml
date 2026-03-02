@@ -1,11 +1,12 @@
 services:
-  primary:
+  # --- Write nodes (peer mode, accept reads and writes) ---
+  write-1:
     build: .
     platform: linux/amd64
     ports:
       - "8321:8321"
     volumes:
-      - .data/primary:/data
+      - .data/write-1:/data
     command:
       [
         "serve",
@@ -16,9 +17,13 @@ services:
         "--allow-all",
         "--ui",
         "--role",
-        "primary",
+        "peer",
         "--repl-port",
         "8322",
+        "--cluster-id",
+        "1",
+        "--peers",
+        "write-2:8322",
       ]
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
@@ -27,13 +32,13 @@ services:
       retries: 3
       start_period: 5s
 
-  replica:
+  write-2:
     build: .
     platform: linux/amd64
     ports:
       - "8323:8321"
     volumes:
-      - .data/replica:/data
+      - .data/write-2:/data
     command:
       [
         "serve",
@@ -44,12 +49,49 @@ services:
         "--allow-all",
         "--ui",
         "--role",
-        "replica",
-        "--primary-addr",
-        "primary:8322",
+        "peer",
+        "--repl-port",
+        "8322",
+        "--cluster-id",
+        "2",
+        "--peers",
+        "write-1:8322",
+      ]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  # --- Read nodes (peer mode, designated for read traffic) ---
+  read-1:
+    build: .
+    platform: linux/amd64
+    ports:
+      - "8324:8321"
+    volumes:
+      - .data/read-1:/data
+    command:
+      [
+        "serve",
+        "--bind",
+        "0.0.0.0",
+        "--db",
+        "/data",
+        "--allow-all",
+        "--ui",
+        "--role",
+        "peer",
+        "--repl-port",
+        "8322",
+        "--cluster-id",
+        "3",
+        "--peers",
+        "write-1:8322,write-2:8322",
       ]
     depends_on:
-      primary:
+      write-1:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
@@ -58,13 +100,13 @@ services:
       retries: 3
       start_period: 5s
 
-  peer-a:
+  read-2:
     build: .
     platform: linux/amd64
     ports:
-      - "8324:8321"
+      - "8325:8321"
     volumes:
-      - .data/peer-a:/data
+      - .data/read-2:/data
     command:
       [
         "serve",
@@ -78,9 +120,14 @@ services:
         "peer",
         "--repl-port",
         "8322",
+        "--cluster-id",
+        "4",
         "--peers",
-        "peer-b:8322",
+        "write-1:8322,write-2:8322",
       ]
+    depends_on:
+      write-1:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
       interval: 10s
@@ -88,13 +135,13 @@ services:
       retries: 3
       start_period: 5s
 
-  peer-b:
+  read-3:
     build: .
     platform: linux/amd64
     ports:
-      - "8325:8321"
+      - "8326:8321"
     volumes:
-      - .data/peer-b:/data
+      - .data/read-3:/data
     command:
       [
         "serve",
@@ -108,9 +155,14 @@ services:
         "peer",
         "--repl-port",
         "8322",
+        "--cluster-id",
+        "5",
         "--peers",
-        "peer-a:8322",
+        "write-1:8322,write-2:8322",
       ]
+    depends_on:
+      write-2:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
       interval: 10s
