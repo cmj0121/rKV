@@ -486,7 +486,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             };
             let result = ns.put(parse_key(tokens[1]), value, ttl);
             match result {
-                Ok(_) => {}
+                Ok(rev) => println!("rev {rev}"),
                 Err(e) => eprintln!("error: {e}"),
             }
         }
@@ -495,8 +495,11 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 eprintln!("usage: get <key>");
                 return Action::Continue;
             }
-            match ns.get(parse_key(tokens[1])) {
-                Ok(val) => println!("{val}"),
+            match ns.get_with_revision(parse_key(tokens[1])) {
+                Ok((val, rev)) => {
+                    println!("{val}");
+                    println!("rev {rev}");
+                }
                 Err(e) => eprintln!("error: {e}"),
             }
         }
