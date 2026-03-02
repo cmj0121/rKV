@@ -73,20 +73,20 @@ cargo run --features server -- serve --role replica --primary-addr 127.0.0.1:832
 
 # Peer-Peer
 cargo run --features server -- serve --role peer --repl-port 8322 \
-  --cluster-id 1 --peers 10.0.0.2:8322
+  --peers 10.0.0.2:8322
 cargo run --features server -- serve --role peer --repl-port 8322 \
-  --cluster-id 2 --peers 10.0.0.1:8322
+  --peers 10.0.0.1:8322
 ```
 
 Replicas reject all write operations with a `ReadOnlyReplica` error. Peers accept
 reads and writes; namespace creation, drops, and data changes propagate automatically.
 
-A `docker-compose.yml` provides a five-node topology (2 write peers + 3 read peers):
+A `docker-compose.yml` provides a five-node topology (2 write peers + 3 read replicas):
 
 ```sh
 docker compose up --build
-# Write nodes: http://localhost:8321, http://localhost:8323
-# Read nodes:  http://localhost:8324, http://localhost:8325, http://localhost:8326
+# Write nodes:   http://localhost:8321 (primary), http://localhost:8323 (peer)
+# Read replicas: http://localhost:8324, http://localhost:8325, http://localhost:8326
 ```
 
 For protocol details and architecture, see [Replication](docs/replication.md#primary-replica-replication).

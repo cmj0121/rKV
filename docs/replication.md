@@ -135,22 +135,22 @@ The node's role is exposed through multiple channels:
 | `--repl-port`    | `8322`       | TCP port for replication connections                     |
 | `--primary-addr` | _(none)_     | Primary address (replica only, e.g. `10.0.0.1:8322`)     |
 | `--peers`        | _(none)_     | Comma-separated peer addresses (peer only)               |
-| `--cluster-id`   | _(random)_   | Unique cluster ID for this node (peer only)              |
 
 ### Docker Compose Topology
 
 A `docker-compose.yml` in the project root defines a five-node topology with two write nodes
 and three read nodes, all using peer replication:
 
-- **write-1** (port 8321, cluster-id 1): Peer, connects to write-2
-- **write-2** (port 8323, cluster-id 2): Peer, connects to write-1
-- **read-1** (port 8324, cluster-id 3): Peer, connects to both write nodes
-- **read-2** (port 8325, cluster-id 4): Peer, connects to both write nodes
-- **read-3** (port 8326, cluster-id 5): Peer, connects to both write nodes
+- **primary** (port 8321): Peer, connects to peer
+- **peer** (port 8323): Peer, connects to primary
+- **replica-01** (port 8324): Peer, connects to both write nodes
+- **replica-02** (port 8325): Peer, connects to both write nodes (no volume)
+- **replica-03** (port 8326): Peer, connects to both write nodes (no volume)
 
-All nodes are technically peers (can accept writes), but the read nodes are designated
+All nodes are technically peers (can accept writes), but the replica nodes are designated
 for read traffic. Writes on any node propagate to all others via peer replication.
-Data is bind-mounted to `.data/` subdirectories.
+Write nodes and replica-01 bind-mount data to `.data/` subdirectories; replica-02 and
+replica-03 use ephemeral container storage.
 
 ## Peer Replication
 
