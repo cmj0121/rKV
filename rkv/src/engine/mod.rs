@@ -527,6 +527,100 @@ impl DB {
         }
     }
 
+    /// Build a callback that performs a memtable→SSTable flush without
+    /// broadcasting `FlushNotify` (to avoid infinite loops when the flush
+    /// is triggered by a remote `FlushNotify`).
+    fn make_memtable_flush_fn(&self) -> Arc<dyn Fn() -> Result<()> + Send + Sync> {
+        let ns_data = Arc::clone(&self.namespace_data);
+        let sst_seq = Arc::clone(&self.sst_sequence);
+        let sstables = Arc::clone(&self.sstables);
+        let aol = Arc::clone(&self.aol);
+        let io_backend = Arc::clone(&self.io_backend);
+        let block_cache = self.block_cache.clone();
+        let compaction_notify = Arc::clone(&self.compaction_notify);
+        let db_path = self.config.path.clone();
+        let block_size = self.config.block_size;
+        let compression = self.config.compression.clone();
+        let bloom_bits = self.config.bloom_bits;
+        let bloom_prefix_len = self.config.bloom_prefix_len;
+
+        Arc::new(move || {
+            let namespaces: Vec<String> = {
+                let map = ns_data.read().unwrap_or_else(|e| e.into_inner());
+                map.keys().cloned().collect()
+            };
+
+            let mut flushed_any = false;
+
+            for ns_name in &namespaces {
+                let entries = {
+                    let map = ns_data.read().unwrap_or_else(|e| e.into_inner());
+                    let Some(mt_mutex) = map.get(ns_name) else {
+                        continue;
+                    };
+                    let mut mt = mt_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                    if mt.is_empty() {
+                        continue;
+                    }
+                    mt.drain_latest()
+                };
+
+                if entries.is_empty() {
+                    continue;
+                }
+
+                let seq = sst_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                let l0_dir = DB::static_sst_level_dir(&db_path, ns_name, 0);
+                fs::create_dir_all(&l0_dir)?;
+                let sst_path = l0_dir.join(format!("{seq:06}.sst"));
+
+                let mut writer = sstable::SSTableWriter::new(
+                    &sst_path,
+                    block_size,
+                    compression.clone(),
+                    bloom_bits,
+                    bloom_prefix_len,
+                    &*io_backend,
+                )?;
+                for (key, value, revision) in &entries {
+                    writer.add(key, value, *revision)?;
+                }
+                writer.finish()?;
+
+                let reader = sstable::SSTableReader::open(
+                    &sst_path,
+                    seq,
+                    block_cache.clone(),
+                    &*io_backend,
+                )?;
+                let mut sst = sstables.write().unwrap_or_else(|e| e.into_inner());
+                let levels = sst
+                    .entry(ns_name.clone())
+                    .or_insert_with(|| vec![Vec::new()]);
+                if levels.is_empty() {
+                    levels.push(Vec::new());
+                }
+                levels[0].insert(0, reader);
+
+                flushed_any = true;
+            }
+
+            if flushed_any {
+                let mut aol = aol.lock().unwrap_or_else(|e| e.into_inner());
+                aol.truncate(&db_path)?;
+            }
+
+            if flushed_any {
+                let (lock, cvar) = &*compaction_notify;
+                let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
+                *pending = true;
+                cvar.notify_one();
+            }
+
+            Ok(())
+        })
+    }
+
     /// Start replication based on the configured role.
     fn start_replication(&mut self) -> Result<()> {
         match self.config.role {
@@ -796,6 +890,10 @@ impl DB {
                     Ok(())
                 });
 
+                // Build a flush callback for FlushNotify messages.
+                // Uses make_memtable_flush_fn to avoid re-broadcasting.
+                let flush_fn: repl_receiver::FlushFn = self.make_memtable_flush_fn();
+
                 let force_sync = Arc::new(AtomicBool::new(false));
                 self.repl_force_sync = Some(Arc::clone(&force_sync));
 
@@ -804,6 +902,7 @@ impl DB {
                     post_sync_fn,
                     drop_ns_fn,
                     cleanup_fn,
+                    flush_fn,
                     last_revision,
                     force_sync,
                 };
@@ -1025,6 +1124,9 @@ impl DB {
                     Ok(())
                 });
 
+                // Build a memtable flush callback for FlushNotify messages
+                let memtable_flush_fn = self.make_memtable_flush_fn();
+
                 let peer_config = Arc::new(repl_peer::PeerSessionConfig {
                     local_cluster_id: cluster_id,
                     db_path: db_path.clone(),
@@ -1035,6 +1137,7 @@ impl DB {
                     post_sync_fn,
                     last_revision: Arc::clone(&last_revision),
                     flush_fn,
+                    memtable_flush_fn,
                     drop_ns_fn,
                 });
 
@@ -1403,6 +1506,14 @@ impl DB {
     /// and prepends the reader to the L0 cache. After all namespaces are
     /// flushed, the AOL is truncated.
     pub fn flush(&self) -> Result<()> {
+        self.flush_internal(true)
+    }
+
+    /// Internal flush implementation. When `broadcast` is true, notifies
+    /// connected replicas/peers that a flush occurred. The callback-driven
+    /// flushes (triggered by a remote `FlushNotify`) pass `false` to avoid
+    /// infinite broadcast loops.
+    fn flush_internal(&self, broadcast: bool) -> Result<()> {
         let namespaces: Vec<String> = {
             let map = self
                 .namespace_data
@@ -1476,6 +1587,19 @@ impl DB {
             let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
             *pending = true;
             cvar.notify_one();
+        }
+
+        // Notify connected replicas/peers about the flush
+        if flushed_any && broadcast {
+            if let Some(ref sender) = self.repl_sender {
+                sender.broadcast_flush();
+            }
+            if self.config.role == replication::Role::Peer {
+                let sessions = self.peer_sessions.lock().unwrap_or_else(|e| e.into_inner());
+                for session in sessions.iter() {
+                    session.send_flush();
+                }
+            }
         }
 
         Ok(())

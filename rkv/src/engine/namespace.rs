@@ -366,11 +366,18 @@ impl<'db> Namespace<'db> {
         let mt = self.db.get_or_create_memtable(&self.name);
         let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(n) = mt.rev_count(&key) {
-            return Ok(n);
+            // Key is in memtable — also check SSTable for older snapshot
+            drop(mt);
+            let sst_count = match self.db.get_from_sstables(&self.name, &key)? {
+                Some((v, _)) if v.is_tombstone() => 0,
+                Some(_) => 1,
+                None => 0,
+            };
+            return Ok(n + sst_count);
         }
         drop(mt);
 
-        // Fall back to SSTable — only the latest revision is stored.
+        // Key not in memtable — fall back to SSTable only.
         match self.db.get_from_sstables(&self.name, &key)? {
             Some((v, _)) if v.is_tombstone() => Err(Error::KeyNotFound),
             Some(_) => Ok(1),
@@ -387,11 +394,31 @@ impl<'db> Namespace<'db> {
         let value = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
-            match mt.rev_get(&key, index) {
-                Some(v) => v.clone(),
-                None => {
+            let mt_count = mt.rev_count(&key);
+            match mt_count {
+                Some(_) => {
                     drop(mt);
-                    // Fall back to SSTable (only index 0 = latest)
+                    // Key is in memtable — check SSTable for older snapshot
+                    let sst_entry = self.db.get_from_sstables(&self.name, &key)?;
+                    let has_sst = matches!(&sst_entry, Some((v, _)) if !v.is_tombstone());
+
+                    if has_sst && index == 0 {
+                        // Index 0 = SSTable (oldest) entry
+                        sst_entry.unwrap().0
+                    } else {
+                        // Shift index if SSTable entry exists
+                        let mt_index = if has_sst { index - 1 } else { index };
+                        let mt = self.db.get_or_create_memtable(&self.name);
+                        let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+                        match mt.rev_get(&key, mt_index) {
+                            Some(v) => v.clone(),
+                            None => return Err(Error::KeyNotFound),
+                        }
+                    }
+                }
+                None => {
+                    // Key not in memtable — SSTable only
+                    drop(mt);
                     if index != 0 {
                         return Err(Error::KeyNotFound);
                     }
@@ -417,8 +444,27 @@ impl<'db> Namespace<'db> {
         let (value, expired, remaining) = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
-            match mt.rev_get_with_ttl(&key, index) {
-                Some((v, exp, rem)) => (v.clone(), exp, rem),
+            let mt_count = mt.rev_count(&key);
+            match mt_count {
+                Some(_) => {
+                    drop(mt);
+                    // Key is in memtable — check SSTable for older snapshot
+                    let sst_entry = self.db.get_from_sstables(&self.name, &key)?;
+                    let has_sst = matches!(&sst_entry, Some((v, _)) if !v.is_tombstone());
+
+                    if has_sst && index == 0 {
+                        // Index 0 = SSTable (oldest) entry — no TTL info
+                        (sst_entry.unwrap().0, false, None)
+                    } else {
+                        let mt_index = if has_sst { index - 1 } else { index };
+                        let mt = self.db.get_or_create_memtable(&self.name);
+                        let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+                        match mt.rev_get_with_ttl(&key, mt_index) {
+                            Some((v, exp, rem)) => (v.clone(), exp, rem),
+                            None => return Err(Error::KeyNotFound),
+                        }
+                    }
+                }
                 None => {
                     drop(mt);
                     if index != 0 {

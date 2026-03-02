@@ -82,6 +82,8 @@ const MSG_DROP_NAMESPACE: u8 = 0x0A;
 const MSG_SYNC_REQUEST: u8 = 0x0B;
 #[allow(dead_code)]
 const MSG_INCREMENTAL_SYNC_START: u8 = 0x0C;
+#[allow(dead_code)]
+const MSG_FLUSH_NOTIFY: u8 = 0x0D;
 
 /// Role tags for handshake messages.
 #[allow(dead_code)]
@@ -142,6 +144,8 @@ pub(crate) enum ReplMessage {
     },
     /// Primary signals the start of an incremental sync.
     IncrementalSyncStart { record_count: u32 },
+    /// Notify connected nodes that a flush has completed.
+    FlushNotify,
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +310,7 @@ impl ReplMessage {
                 MSG_INCREMENTAL_SYNC_START,
                 record_count.to_be_bytes().to_vec(),
             ),
+            ReplMessage::FlushNotify => (MSG_FLUSH_NOTIFY, Vec::new()),
         }
     }
 
@@ -452,6 +457,7 @@ impl ReplMessage {
                 let record_count = u32::from_be_bytes(data[0..4].try_into().unwrap());
                 Ok(ReplMessage::IncrementalSyncStart { record_count })
             }
+            MSG_FLUSH_NOTIFY => Ok(ReplMessage::FlushNotify),
             _ => Err(Error::Corruption(format!(
                 "unknown replication message type: 0x{tag:02x}"
             ))),
@@ -663,6 +669,12 @@ mod tests {
     #[test]
     fn roundtrip_incremental_sync_start_zero() {
         let msg = ReplMessage::IncrementalSyncStart { record_count: 0 };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn roundtrip_flush_notify() {
+        let msg = ReplMessage::FlushNotify;
         assert_eq!(roundtrip(&msg), msg);
     }
 

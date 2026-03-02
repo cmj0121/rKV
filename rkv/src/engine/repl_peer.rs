@@ -24,6 +24,8 @@ pub(crate) enum PeerMsg {
     Aol(Vec<u8>),
     /// Instruct the peer to drop a namespace.
     DropNamespace(String),
+    /// Notify the peer that a flush has completed.
+    Flush,
 }
 
 /// Callback signature for replaying a peer record with LWW resolution.
@@ -37,6 +39,9 @@ pub(crate) type PeerBroadcastFn = Arc<dyn Fn(&[u8], u16) + Send + Sync>;
 /// Callback invoked when a peer sends a DropNamespace message.
 pub(crate) type PeerDropNsFn = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
 
+/// Callback for a full memtable→SSTable flush (triggered by remote `FlushNotify`).
+pub(crate) type PeerMemtableFlushFn = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
 /// Configuration for starting a peer session.
 pub(crate) struct PeerSessionConfig {
     pub(crate) local_cluster_id: u16,
@@ -48,6 +53,7 @@ pub(crate) struct PeerSessionConfig {
     pub(crate) post_sync_fn: PeerPostSyncFn,
     pub(crate) last_revision: Arc<std::sync::Mutex<u128>>,
     pub(crate) flush_fn: PeerFlushFn,
+    pub(crate) memtable_flush_fn: PeerMemtableFlushFn,
     pub(crate) drop_ns_fn: PeerDropNsFn,
 }
 
@@ -241,12 +247,14 @@ impl PeerSession {
         // Reader thread: reads incoming messages from the peer
         let stop_clone2 = Arc::clone(&stop);
         let drop_ns_fn = Arc::clone(&config.drop_ns_fn);
+        let memtable_flush_fn = Arc::clone(&config.memtable_flush_fn);
         let reader_handle = thread::spawn(move || {
             if let Err(e) = Self::reader_loop(
                 &mut reader,
                 &replay_fn,
                 &broadcast_to_others,
                 &drop_ns_fn,
+                &memtable_flush_fn,
                 remote_cluster_id,
                 &stop_clone2,
             ) {
@@ -270,6 +278,11 @@ impl PeerSession {
         self.writer_tx
             .try_send(PeerMsg::Aol(payload.to_vec()))
             .is_ok()
+    }
+
+    /// Send a flush notification to this peer.
+    pub(crate) fn send_flush(&self) -> bool {
+        self.writer_tx.try_send(PeerMsg::Flush).is_ok()
     }
 
     /// Send a drop-namespace command to this peer.
@@ -363,6 +376,9 @@ impl PeerSession {
             PeerMsg::DropNamespace(namespace) => {
                 ReplMessage::DropNamespace { namespace }.write_to(writer)?;
             }
+            PeerMsg::Flush => {
+                ReplMessage::FlushNotify.write_to(writer)?;
+            }
         }
         Ok(())
     }
@@ -372,6 +388,7 @@ impl PeerSession {
         replay_fn: &PeerReplayFn,
         broadcast_to_others: &PeerBroadcastFn,
         drop_ns_fn: &PeerDropNsFn,
+        flush_fn: &PeerFlushFn,
         remote_cluster_id: u16,
         stop: &Arc<AtomicBool>,
     ) -> Result<()> {
@@ -416,6 +433,12 @@ impl PeerSession {
                 ReplMessage::DropNamespace { namespace } => {
                     if let Err(e) = drop_ns_fn(&namespace) {
                         eprintln!("peer({remote_cluster_id}): drop namespace error: {e}");
+                    }
+                }
+                ReplMessage::FlushNotify => {
+                    // Peer flushed — flush local memtable (best-effort)
+                    if let Err(e) = flush_fn() {
+                        eprintln!("peer({remote_cluster_id}): flush on FlushNotify failed: {e}");
                     }
                 }
                 ReplMessage::Heartbeat { .. } => {
@@ -886,12 +909,20 @@ mod tests {
             });
 
         let drop_ns_fn: PeerDropNsFn = Arc::new(|_| Ok(()));
+        let flush_fn: PeerFlushFn = Arc::new(|| Ok(()));
         let stop = Arc::new(AtomicBool::new(false));
         let mut cursor = Cursor::new(buf);
 
         // Will hit EOF → ConnectionReset
-        let result =
-            PeerSession::reader_loop(&mut cursor, &replay_fn, &broadcast, &drop_ns_fn, 42, &stop);
+        let result = PeerSession::reader_loop(
+            &mut cursor,
+            &replay_fn,
+            &broadcast,
+            &drop_ns_fn,
+            &flush_fn,
+            42,
+            &stop,
+        );
         assert!(result.is_err());
 
         let records = received.lock().unwrap();
@@ -922,11 +953,19 @@ mod tests {
             });
 
         let drop_ns_fn: PeerDropNsFn = Arc::new(|_| Ok(()));
+        let flush_fn: PeerFlushFn = Arc::new(|| Ok(()));
         let stop = Arc::new(AtomicBool::new(false));
         let mut cursor = Cursor::new(buf);
 
-        let _ =
-            PeerSession::reader_loop(&mut cursor, &replay_fn, &broadcast, &drop_ns_fn, 99, &stop);
+        let _ = PeerSession::reader_loop(
+            &mut cursor,
+            &replay_fn,
+            &broadcast,
+            &drop_ns_fn,
+            &flush_fn,
+            99,
+            &stop,
+        );
 
         // Should not forward rejected records
         let fwd = forwarded.lock().unwrap();
@@ -946,12 +985,20 @@ mod tests {
         let broadcast: Arc<dyn Fn(&[u8], u16) + Send + Sync> = Arc::new(|_, _| {});
 
         let drop_ns_fn: PeerDropNsFn = Arc::new(|_| Ok(()));
+        let flush_fn: PeerFlushFn = Arc::new(|| Ok(()));
         let stop = Arc::new(AtomicBool::new(false));
         let mut cursor = Cursor::new(buf);
 
         // Should process heartbeat and then EOF
-        let result =
-            PeerSession::reader_loop(&mut cursor, &replay_fn, &broadcast, &drop_ns_fn, 1, &stop);
+        let result = PeerSession::reader_loop(
+            &mut cursor,
+            &replay_fn,
+            &broadcast,
+            &drop_ns_fn,
+            &flush_fn,
+            1,
+            &stop,
+        );
         assert!(result.is_err()); // EOF
     }
 
@@ -962,11 +1009,19 @@ mod tests {
         let broadcast: Arc<dyn Fn(&[u8], u16) + Send + Sync> = Arc::new(|_, _| {});
 
         let drop_ns_fn: PeerDropNsFn = Arc::new(|_| Ok(()));
+        let flush_fn: PeerFlushFn = Arc::new(|| Ok(()));
         let stop = Arc::new(AtomicBool::new(true)); // already stopped
         let mut cursor = Cursor::new(buf);
 
-        let result =
-            PeerSession::reader_loop(&mut cursor, &replay_fn, &broadcast, &drop_ns_fn, 1, &stop);
+        let result = PeerSession::reader_loop(
+            &mut cursor,
+            &replay_fn,
+            &broadcast,
+            &drop_ns_fn,
+            &flush_fn,
+            1,
+            &stop,
+        );
         assert!(result.is_ok());
     }
 
@@ -1005,12 +1060,20 @@ mod tests {
             Ok(())
         });
 
+        let flush_fn: PeerFlushFn = Arc::new(|| Ok(()));
         let stop = Arc::new(AtomicBool::new(false));
         let mut cursor = Cursor::new(buf);
 
         // Will hit EOF after processing
-        let _ =
-            PeerSession::reader_loop(&mut cursor, &replay_fn, &broadcast, &drop_ns_fn, 7, &stop);
+        let _ = PeerSession::reader_loop(
+            &mut cursor,
+            &replay_fn,
+            &broadcast,
+            &drop_ns_fn,
+            &flush_fn,
+            7,
+            &stop,
+        );
 
         let ns_list = dropped.lock().unwrap();
         assert_eq!(ns_list.len(), 1);

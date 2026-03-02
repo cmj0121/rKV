@@ -4783,3 +4783,36 @@ fn format_version_upgrade_transparent() {
     }
     db.close().unwrap();
 }
+
+#[test]
+fn revision_count_spans_memtable_and_sstable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path().join("revspan"));
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // First put → flush to SSTable
+    let _rev1 = ns.put("key", "v1", None).unwrap();
+    db.flush().unwrap();
+
+    // Second put → stays in memtable
+    let _rev2 = ns.put("key", "v2", None).unwrap();
+
+    // rev_count should see both: 1 SSTable + 1 memtable
+    assert_eq!(ns.rev_count("key").unwrap(), 2);
+
+    // Index 0 = SSTable (oldest), index 1 = memtable (newest)
+    assert_eq!(ns.rev_get("key", 0).unwrap(), Value::from("v1"));
+    assert_eq!(ns.rev_get("key", 1).unwrap(), Value::from("v2"));
+
+    // Out-of-bounds index returns KeyNotFound
+    assert!(ns.rev_get("key", 2).is_err());
+
+    // rev_get_with_ttl follows the same index semantics
+    let (val, _expired, _ttl) = ns.rev_get_with_ttl("key", 0).unwrap();
+    assert_eq!(val, Value::from("v1"));
+    let (val, _expired, _ttl) = ns.rev_get_with_ttl("key", 1).unwrap();
+    assert_eq!(val, Value::from("v2"));
+
+    db.close().unwrap();
+}
