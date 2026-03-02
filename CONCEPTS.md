@@ -263,7 +263,9 @@ SSTable cache. This covers namespaces created at runtime, replayed from the AOL,
 
 Constraints:
 
-- The default namespace `_` cannot be dropped → `InvalidNamespace` error
+- The default namespace `_` **can** be dropped. It is automatically re-created (empty) on the next access,
+  so the database always has a usable default namespace. This is useful for clearing all data without
+  dropping individual keys.
 - Dropping a non-existent namespace → `InvalidNamespace` error
 - **CLI**: dropping the current namespace auto-switches the prompt back to `_`
 
@@ -1164,6 +1166,36 @@ message. A handshake exchange at connection start verifies cluster membership vi
 - **Primary tolerance**: The primary accepts multiple concurrent replicas. If a replica disconnects,
   the primary cleans up its resources without affecting other replicas or write throughput.
 
+#### Read-Only Enforcement
+
+Replicas enforce read-only access through defense-in-depth across four layers:
+
+Replicas reject mutations at every layer to prevent silent failures:
+
+- **Engine**: `put`, `delete`, `delete_range`, `delete_prefix` return `ReadOnlyReplica`
+- **HTTP routes**: Guards on `PUT /keys`, `DELETE /keys`, `DELETE /scan`, namespace routes
+- **REPL**: Commands `put`, `del`, `wipe`, `drop`, `config set` blocked with error message
+- **Web UI**: Mutation buttons disabled; role badge shown in header
+
+Maintenance operations (`flush`, `sync`, `compact`) are **not** writes — they reorganize local
+storage and are allowed on replicas.
+
+#### Namespace Synchronization
+
+When a primary node creates a new namespace (via `db.namespace(name, pw)`), it broadcasts a
+**sentinel record** — an AOL entry with an empty key (`Key::Str("")`) and `Value::Null` — to
+all connected replicas. This ensures replicas learn about new namespaces immediately, even before
+any data is written to them. The sentinel is detected and skipped during replay (no key is
+inserted); only the namespace registration side-effect is applied.
+
+#### Post-Sync Memory Safety
+
+After a full sync, the replica reloads its SSTable index via `post_sync_fn`. This callback resets
+each in-memory MemTable **in-place** (replacing the contents of each `Mutex<MemTable>` without
+removing map entries) and registers any new namespace entries. The HashMap of namespace data only
+grows and is never shrunk, preserving the safety invariant that raw pointers returned by
+`get_or_create_memtable()` remain valid for the lifetime of the `DB`.
+
 #### Observability
 
 The node's role is exposed through multiple channels:
@@ -1171,6 +1203,27 @@ The node's role is exposed through multiple channels:
 - **Stats**: `stats` command (CLI) and `GET /api/admin/stats` include a `role` field.
 - **Health**: `GET /health` returns JSON with `status`, `role`, and `uptime_secs`.
 - **Config**: `config` command shows the current replication settings.
+- **REPL prompt**: Shows `[primary]>` or `[replica]>` when not in standalone mode.
+- **Web UI**: A role badge appears next to the logo; the admin stats grid includes the role.
+
+#### CLI Arguments
+
+| Flag             | Default      | Description                                          |
+| ---------------- | ------------ | ---------------------------------------------------- |
+| `--role`         | `standalone` | Node role: `standalone`, `primary`, or `replica`     |
+| `--repl-port`    | `8322`       | TCP port for replica connections (primary only)      |
+| `--primary-addr` | _(none)_     | Primary address (replica only, e.g. `10.0.0.1:8322`) |
+
+#### Docker Compose Topology
+
+A `docker-compose.yml` in the project root defines a two-node topology:
+
+- **primary** — `rkv serve --role primary --repl-port 8322`, API on port 8321,
+  healthcheck via `/health`
+- **replica** — `rkv serve --role replica --primary-addr primary:8322`, API on
+  port 8323 (mapped to container 8321), depends on primary healthy
+
+Data is bind-mounted to `.data/primary/` and `.data/replica/` respectively.
 
 ## Design Decisions
 
