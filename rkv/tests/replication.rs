@@ -967,3 +967,217 @@ fn checkpoint_persists_across_restarts() {
     replica.close().unwrap();
     primary.close().unwrap();
 }
+
+// --- Peer (master-master) replication tests ---
+
+fn open_peer(path: &std::path::Path, repl_port: u16, peers: Vec<String>, cluster_id: u16) -> DB {
+    let mut config = Config::new(path);
+    config.role = Role::Peer;
+    config.repl_bind = "127.0.0.1".to_owned();
+    config.repl_port = repl_port;
+    config.peers = peers;
+    config.cluster_id = Some(cluster_id);
+    DB::open(config).unwrap()
+}
+
+#[test]
+fn peer_write_propagates_bidirectionally() {
+    let tmp_a = tempfile::tempdir().unwrap();
+    let tmp_b = tempfile::tempdir().unwrap();
+    let port_a = free_port();
+    let port_b = free_port();
+
+    let peer_a = open_peer(tmp_a.path(), port_a, vec![format!("127.0.0.1:{port_b}")], 1);
+    thread::sleep(Duration::from_millis(100));
+
+    let peer_b = open_peer(tmp_b.path(), port_b, vec![format!("127.0.0.1:{port_a}")], 2);
+    thread::sleep(Duration::from_millis(1000));
+
+    // Write on A → should appear on B
+    let ns_a = peer_a.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns_a.put("from_a", "hello_a", None).unwrap();
+    drop(ns_a);
+
+    thread::sleep(Duration::from_millis(500));
+
+    let ns_b = peer_b.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    let val = ns_b.get("from_a");
+    assert!(
+        val.is_ok(),
+        "write from A should appear on B: {:?}",
+        val.err()
+    );
+
+    // Write on B → should appear on A
+    ns_b.put("from_b", "hello_b", None).unwrap();
+    drop(ns_b);
+
+    thread::sleep(Duration::from_millis(500));
+
+    let ns_a = peer_a.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    let val = ns_a.get("from_b");
+    assert!(
+        val.is_ok(),
+        "write from B should appear on A: {:?}",
+        val.err()
+    );
+    drop(ns_a);
+
+    peer_b.close().unwrap();
+    peer_a.close().unwrap();
+}
+
+#[test]
+fn peer_lww_conflict_resolution() {
+    let tmp_a = tempfile::tempdir().unwrap();
+    let tmp_b = tempfile::tempdir().unwrap();
+    let port_a = free_port();
+    let port_b = free_port();
+
+    let peer_a = open_peer(tmp_a.path(), port_a, vec![format!("127.0.0.1:{port_b}")], 1);
+    thread::sleep(Duration::from_millis(100));
+
+    let peer_b = open_peer(tmp_b.path(), port_b, vec![format!("127.0.0.1:{port_a}")], 2);
+    thread::sleep(Duration::from_millis(1000));
+
+    // Write the same key on A first, then on B (B's revision is newer)
+    let ns_a = peer_a.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns_a.put("conflict_key", "value_a", None).unwrap();
+    drop(ns_a);
+    thread::sleep(Duration::from_millis(50));
+
+    let ns_b = peer_b.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns_b.put("conflict_key", "value_b", None).unwrap();
+    drop(ns_b);
+
+    // Wait for sync to propagate
+    thread::sleep(Duration::from_millis(1000));
+
+    // Both nodes should converge to the same value (B's, since it's newer)
+    let ns_a = peer_a.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    let ns_b = peer_b.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    let val_a = ns_a.get("conflict_key").unwrap();
+    let val_b = ns_b.get("conflict_key").unwrap();
+    assert_eq!(
+        val_a.as_bytes(),
+        val_b.as_bytes(),
+        "both peers should converge to the same value"
+    );
+    assert_eq!(
+        val_b.as_bytes(),
+        Some(b"value_b".as_slice()),
+        "LWW should pick B's newer write"
+    );
+    drop(ns_a);
+    drop(ns_b);
+
+    // Verify conflicts_resolved counter increased on at least one node
+    let stats_a = peer_a.stats();
+    let stats_b = peer_b.stats();
+    assert!(
+        stats_a.conflicts_resolved + stats_b.conflicts_resolved > 0,
+        "at least one node should have resolved a conflict, a={} b={}",
+        stats_a.conflicts_resolved,
+        stats_b.conflicts_resolved,
+    );
+
+    peer_b.close().unwrap();
+    peer_a.close().unwrap();
+}
+
+#[test]
+fn peer_loop_prevention() {
+    let tmp_a = tempfile::tempdir().unwrap();
+    let tmp_b = tempfile::tempdir().unwrap();
+    let port_a = free_port();
+    let port_b = free_port();
+
+    let peer_a = open_peer(tmp_a.path(), port_a, vec![format!("127.0.0.1:{port_b}")], 1);
+    thread::sleep(Duration::from_millis(100));
+
+    let peer_b = open_peer(tmp_b.path(), port_b, vec![format!("127.0.0.1:{port_a}")], 2);
+    thread::sleep(Duration::from_millis(1000));
+
+    // Write a key on A
+    let ns_a = peer_a.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns_a.put("loop_test", "original", None).unwrap();
+    drop(ns_a);
+
+    thread::sleep(Duration::from_millis(500));
+
+    // Verify B received it
+    let ns_b = peer_b.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    let val = ns_b.get("loop_test").unwrap();
+    assert_eq!(val.as_bytes(), Some(b"original".as_slice()));
+    drop(ns_b);
+
+    // Overwrite on A — the new version should propagate to B
+    // but B should NOT send it back to A (loop prevention)
+    let ns_a = peer_a.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns_a.put("loop_test", "updated", None).unwrap();
+    drop(ns_a);
+
+    thread::sleep(Duration::from_millis(500));
+
+    let ns_b = peer_b.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    let val = ns_b.get("loop_test").unwrap();
+    assert_eq!(val.as_bytes(), Some(b"updated".as_slice()));
+    drop(ns_b);
+
+    // A should still have the updated value (not overwritten by loop-back)
+    let ns_a = peer_a.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    let val = ns_a.get("loop_test").unwrap();
+    assert_eq!(val.as_bytes(), Some(b"updated".as_slice()));
+    drop(ns_a);
+
+    peer_b.close().unwrap();
+    peer_a.close().unwrap();
+}
+
+#[test]
+fn peer_stats_reflect_connections() {
+    let tmp_a = tempfile::tempdir().unwrap();
+    let tmp_b = tempfile::tempdir().unwrap();
+    let port_a = free_port();
+    let port_b = free_port();
+
+    let peer_a = open_peer(tmp_a.path(), port_a, vec![format!("127.0.0.1:{port_b}")], 1);
+    thread::sleep(Duration::from_millis(100));
+
+    let peer_b = open_peer(tmp_b.path(), port_b, vec![format!("127.0.0.1:{port_a}")], 2);
+    thread::sleep(Duration::from_millis(1500));
+
+    let stats_a = peer_a.stats();
+    let stats_b = peer_b.stats();
+    assert_eq!(stats_a.role, "peer");
+    assert_eq!(stats_b.role, "peer");
+    // Each node should see at least 1 peer session
+    assert!(
+        stats_a.peer_count >= 1,
+        "A should have at least 1 peer, got: {}",
+        stats_a.peer_count,
+    );
+    assert!(
+        stats_b.peer_count >= 1,
+        "B should have at least 1 peer, got: {}",
+        stats_b.peer_count,
+    );
+
+    peer_b.close().unwrap();
+    peer_a.close().unwrap();
+}
+
+#[test]
+fn peer_without_peers_list_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let mut config = Config::new(tmp.path());
+    config.role = Role::Peer;
+    config.repl_bind = "127.0.0.1".to_owned();
+    config.repl_port = port;
+    config.peers = vec![];
+    config.cluster_id = Some(99);
+
+    let result = DB::open(config);
+    assert!(result.is_err(), "peer with empty peers list should fail");
+}
