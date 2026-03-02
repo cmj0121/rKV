@@ -29,4 +29,6 @@ pub struct Stats {
     pub uptime: Duration,
     // Replication
     pub role: String,
+    pub peer_count: u64,
+    pub conflicts_resolved: u64,
 }

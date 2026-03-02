@@ -1,0 +1,570 @@
+# Storage Engine
+
+> Internal storage details for [rKV](../CONCEPTS.md). For core concepts (keys, values,
+> namespaces, revisions, configuration), see the main [Concepts](../CONCEPTS.md) document.
+
+## Maintenance Operations
+
+Maintenance operations handle durability, recovery, backup, and storage optimization.
+Most maintenance methods return `Result`. `flush`, `compact`, `list_namespaces`, and
+`drop_namespace` are implemented; remaining methods are stubs (`NotImplemented`).
+
+### Flush / Sync
+
+| Method  | Kind     | Signature             | Description                                 |
+| ------- | -------- | --------------------- | ------------------------------------------- |
+| `flush` | instance | `&self -> Result<()>` | Flush the in-memory write buffer to disk    |
+| `sync`  | instance | `&self -> Result<()>` | Flush and fsync all data to durable storage |
+
+`flush` drains every non-empty namespace MemTable and writes an L0 SSTable per namespace.
+After all SSTables are written, the AOL is truncated back to a header-only state. The flush
+path is:
+
+```text
+DB::flush()
+  for each namespace with non-empty MemTable:
+    1. drain_latest() — extract latest value per key (sorted, includes tombstones)
+    2. SSTableWriter::add() each entry in key order
+    3. SSTableWriter::finish() — write index + footer
+    4. SSTableReader::open() — cache reader (newest first)
+  truncate AOL
+```
+
+SSTable files are stored at `<db>/sst/<namespace>/L<level>/<seq>.sst` where `<level>` is
+the LSM level (0, 1, ...) and `<seq>` is a zero-padded monotonically increasing counter
+(e.g., `000001.sst`). On `DB::open()`, the engine scans these directories to recover the
+reader cache and sequence counter across all levels.
+
+`sync` flushes any buffered AOL writes and calls `fsync` on the AOL file descriptor,
+guaranteeing that all committed data is persisted to the storage device.
+
+**Limitations (V1)**:
+
+- TTL is not preserved across flush — keys with TTL become permanent once flushed
+- `scan`, `rscan`, `count`, and `exists` only check the MemTable (not SSTables)
+- Revision history is not flushed — only the latest value per key is written
+
+### Destroy / Repair
+
+| Method    | Kind   | Signature                          | Description                  |
+| --------- | ------ | ---------------------------------- | ---------------------------- |
+| `destroy` | static | `(path) -> Result<()>`             | Delete database and all data |
+| `repair`  | static | `(path) -> Result<RecoveryReport>` | Repair a corrupted database  |
+
+Both are static methods — they operate on a path, not a live `DB` handle.
+
+**Destroy** validates the path contains an rKV signature (`aol` file or `sst/` directory) before
+removing the entire directory tree. Returns an I/O error if the path does not exist, or a
+`Corruption` error if the directory does not look like an rKV database.
+
+**Repair** performs an offline scan of three data sources:
+
+1. **AOL**: Replays with checksum verification. Corrupted/truncated records are skipped. If any
+   records were skipped, the AOL is rewritten with only valid records.
+2. **SSTables**: Opens each `.sst` file and verifies block checksums via `iter_entries(true)`.
+   Corrupted files are deleted.
+3. **Bin objects**: Reads each object with BLAKE3 hash verification. Corrupted objects are deleted.
+
+Returns a `RecoveryReport` describing what was scanned, recovered, and lost (see [Data Integrity](#data-integrity)
+below). The database is openable after repair.
+
+### Dump / Load
+
+| Method | Kind     | Signature                                       | Description                               |
+| ------ | -------- | ----------------------------------------------- | ----------------------------------------- |
+| `dump` | instance | `&self, path: impl Into<PathBuf> -> Result<()>` | Export database to a portable backup file |
+| `load` | static   | `(path: impl Into<PathBuf>) -> Result<DB>`      | Import database from a backup file        |
+
+`dump` flushes all in-memory write buffers, merges SSTable levels per namespace
+(same strategy as compaction), filters tombstones, resolves `Pointer` values to
+inline `Data`, and writes each entry to the dump file with a CRC32C checksum.
+Encrypted namespaces are skipped (v1 limitation).
+
+`load` reads the dump file, creates a fresh DB at the stored path, replays all
+records via `namespace.put()`, and flushes. Returns `InvalidConfig` if the target
+path already contains data.
+
+`load` is not exposed in the CLI because it would require replacing the live DB
+handle mid-session.
+
+#### Dump File Format
+
+```text
+Header:
+  [magic: 4B "rKVD"]  [version: 2B BE]
+  [path_len: 2B BE]   [path: UTF-8 bytes]
+
+Records (repeating):
+  [payload_len: 4B BE] [payload] [checksum: 5B CRC32C]
+
+Payload:
+  [ns_len: 2B BE]  [namespace]
+  [key_len: 2B BE] [key_bytes]
+  [value_tag: 1B]  [value_data_len: 4B BE] [value_data]
+  [expires_at_ms: 8B BE]
+
+EOF sentinel:
+  [payload_len: 4B = 0x00000000]
+```
+
+The format mirrors the AOL record layout for consistency. Each record is
+self-describing and independently verifiable via its checksum.
+
+### Compaction
+
+| Method                | Kind     | Signature             | Description                                  |
+| --------------------- | -------- | --------------------- | -------------------------------------------- |
+| `compact`             | instance | `&self -> Result<()>` | Trigger manual compaction of SSTable levels  |
+| `wait_for_compaction` | instance | `&self`               | Block until background compaction cycle done |
+
+`compact` merges L0 SSTables into L1, then cascades through deeper levels when a
+level exceeds its size threshold. The merge processes entries oldest-to-newest so that
+newer values overwrite older ones. Old source files are deleted after a successful merge.
+
+The compaction path per namespace:
+
+```text
+DB::compact()
+  for each namespace with L0 SSTables:
+    1. Merge L0 + L1 → new L1 SSTable
+    2. For level in 1..max_levels-1:
+         if level_total_size <= level_max_size: stop
+         Merge level + (level+1) → new (level+1) SSTable
+         Drop tombstones if target is the bottommost level
+```
+
+Level size thresholds:
+
+| Level | Threshold          | Config field       |
+| ----- | ------------------ | ------------------ |
+| L0    | n/a (count-based)  | `l0_max_count`     |
+| L1    | `l1_max_size`      | `l1_max_size`      |
+| L2+   | `default_max_size` | `default_max_size` |
+
+Tombstones are preserved at intermediate levels because they may shadow data in
+deeper levels. At the bottommost level (`max_levels - 1`), tombstones are dropped
+because no deeper level exists to shadow.
+
+Compaction is idempotent — calling it when L0 is empty is a no-op. After compaction,
+new flushes continue writing to L0 and a subsequent compact merges them into L1 again.
+When `max_levels` is 1, compaction is a no-op (no merge target available).
+
+#### Auto-Compaction
+
+After each `flush()`, the engine signals the background compaction thread.
+The thread checks whether any namespace's L0 level exceeds the configured
+thresholds (`l0_max_count` or `l0_max_size`). If either threshold is met,
+compaction runs automatically. This eliminates the need for manual compaction
+in typical workloads while still allowing explicit `compact()` calls.
+
+#### Background Compaction Thread
+
+Compaction runs on a dedicated background thread, keeping `flush()` and
+read/write paths non-blocking. The thread uses a Condvar-based signaling
+mechanism:
+
+1. **Signal**: Every `flush()` sets a pending flag and wakes the thread.
+2. **Drain loop**: The thread compacts repeatedly until all levels are
+   within their thresholds, then sleeps. This prevents L0 pile-up under
+   sustained write workloads.
+3. **Safety-net poll**: The thread also wakes every 30 seconds to catch
+   any missed signals.
+
+Manual `compact()` calls serialize with the background thread via a shared
+mutex — both paths use the same static compaction helpers, so behavior is
+identical.
+
+`wait_for_compaction()` signals the thread and blocks until its current
+cycle completes. This is intended for deterministic testing — production
+callers should not need it.
+
+Shutdown (`close()` / `Drop`) sets a stop flag, wakes the thread, and
+joins it, ensuring all in-progress compaction finishes before the `DB`
+handle is released.
+
+#### Bin Object GC
+
+After all level merges complete for a namespace, compaction runs a
+garbage-collection sweep over the bin object store:
+
+1. Collect all live `ValuePointer` hashes from every surviving SSTable.
+2. Walk `<db>/objects/<namespace>/` and list all object files on disk.
+3. Delete any object whose hash is not in the live set.
+
+This handles overwrites (old Pointer orphaned), tombstones (shadowed
+Pointer orphaned), and dedup safely (an object is kept as long as at
+least one SSTable entry still references it).
+
+The CLI exposes compaction via the `compact` REPL command.
+
+## Data Integrity
+
+Every WAL entry and SSTable block carries a CRC32C checksum. On write the engine computes
+the checksum over the raw data; on read the engine recomputes and compares to detect
+corruption caused by bit rot, partial writes, or disk errors.
+
+Bin objects use BLAKE3 content hashes via `ValuePointer` — a separate, complementary
+integrity mechanism (see [Value Separation](../CONCEPTS.md#value-separation-bin-objects)).
+
+### Checksum Format
+
+Each checksum is 5 bytes on disk:
+
+| Field   | Type  | Bytes | Description                     |
+| ------- | ----- | ----- | ------------------------------- |
+| `algo`  | `u8`  | 1     | Algorithm tag (`0x01` = CRC32C) |
+| `value` | `u32` | 4     | Big-endian checksum value       |
+
+The algorithm tag allows future extension to stronger checksums without breaking
+existing data files.
+
+### Read-Time Verification
+
+When `verify_checksums` is enabled (default: `true`), every block and WAL entry read
+from disk is verified against its stored checksum. A mismatch produces a `Corruption`
+error. Disabling verification trades safety for read speed — useful for bulk scans
+where occasional corruption is acceptable.
+
+### Offline Recovery
+
+`DB::repair(path)` performs an offline scan of a database directory and returns a
+`RecoveryReport`:
+
+| Field                      | Type          | Description                                  |
+| -------------------------- | ------------- | -------------------------------------------- |
+| `wal_records_scanned`      | `u64`         | WAL records examined                         |
+| `wal_records_skipped`      | `u64`         | WAL records skipped due to checksum mismatch |
+| `sstable_blocks_scanned`   | `u64`         | SSTable blocks examined                      |
+| `sstable_blocks_corrupted` | `u64`         | SSTable blocks with checksum mismatch        |
+| `objects_scanned`          | `u64`         | Bin objects examined                         |
+| `objects_corrupted`        | `u64`         | Bin objects with hash mismatch               |
+| `keys_recovered`           | `u64`         | Keys recovered from redundant sources        |
+| `keys_lost`                | `u64`         | Keys permanently lost (no redundant copy)    |
+| `warnings`                 | `Vec<String>` | Human-readable warnings from the repair pass |
+
+Helper methods on `RecoveryReport`:
+
+- `is_clean()` — all corruption counters are zero.
+- `total_corrupted()` — sum of skipped + corrupted counters.
+- `has_data_loss()` — `keys_lost > 0`.
+
+Recovery is best-effort: the engine replays valid WAL entries, removes corrupted SSTable
+files, and deletes bin objects that fail BLAKE3 verification. The AOL is rewritten to
+exclude corrupted records. After repair, the database can be reopened normally. Silent
+self-healing from bit-flips is not possible without redundancy and is out of scope.
+
+## LSM-Tree Storage
+
+Data is organized in levels. Fresh writes land in an in-memory buffer (MemTable) and are
+flushed to sorted L0 SSTable files on disk via `DB::flush()`. `DB::compact()` merges L0
+files into a single L1 SSTable. The read path checks the MemTable first, then searches
+SSTables from newest to oldest across all levels.
+
+### Block Compression
+
+SSTable data blocks can be compressed to reduce disk usage and I/O bandwidth. The `compression`
+config field selects the algorithm applied when blocks are flushed to disk:
+
+| Algorithm | Enum variant        | Characteristics                            |
+| --------- | ------------------- | ------------------------------------------ |
+| `none`    | `Compression::None` | No compression — lowest CPU, largest files |
+| `lz4`     | `Compression::LZ4`  | Fast with moderate ratio **(default)**     |
+| `zstd`    | `Compression::Zstd` | Better ratio, higher CPU cost              |
+
+Compression is applied per block at flush time and reversed on read. The block cache stores
+**decompressed** blocks, so the CPU cost is paid once per cache miss, not per read.
+
+Block compression is independent of bin object compression (`compress` config field), which
+controls LZ4 compression of large values in the object store.
+
+### LRU Block Cache
+
+An LRU (Least Recently Used) block cache stores decompressed and parsed SSTable data blocks
+in memory, keyed by `(sst_id, block_index)`. This avoids redundant decompression and parsing
+when the same block is read repeatedly (e.g., hot keys, repeated scans).
+
+The `cache_size` config field controls the total byte budget (default 8 MB). Set to `0` to
+disable the cache entirely — all operations remain functionally correct but may be slower
+for workloads with repeated block access.
+
+**Behavior:**
+
+- **Lookup**: On each `read_block()` call, the cache is checked first. A hit returns a clone
+  of the parsed entries and promotes the block to MRU (most recently used) position.
+- **Insert**: On a cache miss, after decompression and parsing, the block is inserted into the
+  cache. If the cache exceeds its capacity, LRU entries are evicted until the budget is met.
+  Blocks larger than the total capacity are silently skipped to prevent thrashing.
+- **Compaction eviction**: When SSTables are merged during compaction, all cached blocks for
+  the old (replaced) SSTables are evicted, freeing memory for the new merged SSTable's blocks.
+- **Restart**: The cache is in-memory only. On `DB::open()`, the cache starts empty and warms
+  up naturally through reads.
+
+**Size estimation** per cached block: `64 + Σ(key_bytes.len() + 1 + value_data.len() + 48)`
+bytes, where the sum runs over all entries in the block.
+
+### SSTable File Format
+
+An SSTable is a read-only file of sorted key-value entries. The file is divided into three
+regions written sequentially: data blocks, an index block, and a fixed-size footer.
+
+```text
+┌──────────────────────────────┐
+│  Data Block 0                │  ← compressed entries + checksum
+│  Data Block 1                │
+│  ...                         │
+│  Data Block N                │
+├──────────────────────────────┤
+│  Index Block                 │  ← one entry per data block
+├──────────────────────────────┤
+│  Footer (48 bytes)           │  ← magic, version, metadata, checksum
+└──────────────────────────────┘
+```
+
+**Data block on-disk layout:**
+
+```text
+[compression_tag: u8][compressed_payload][checksum: 5B CRC32C]
+```
+
+The `compression_tag` identifies the algorithm (0x00 = none, 0x01 = LZ4, 0x02 = Zstd).
+The checksum covers the tag byte plus the compressed payload.
+
+**Entry encoding (within a decompressed block):**
+
+```text
+[key_len: u16 BE][key_bytes][value_tag: u8][value_len: u32 BE][value_data]
+```
+
+Entries are stored in sorted key order. `key_bytes` uses the same memcmp-preserving
+serialization as `Key::to_bytes()`. `value_tag` encodes the Value variant (0x00 = Data,
+0x01 = Null, 0x02 = Tombstone, 0x03 = Pointer).
+
+**Index block layout:**
+
+```text
+repeated: [key_len: u16 BE][last_key_bytes][offset: u64 BE][size: u32 BE]
+```
+
+Each entry records the last key in a data block plus the block's file offset and on-disk
+size. Point lookups binary-search the index to find the candidate block, then linear-scan
+entries within that block.
+
+**Footer layout (48 bytes):**
+
+```text
+[magic: 4B "rKVS"][version: u16 BE][entry_count: u64 BE]
+[index_offset: u64 BE][index_size: u32 BE]
+[data_blocks: u32 BE][reserved: 13B][checksum: 5B CRC32C]
+```
+
+The footer checksum covers the first 43 bytes. The reader verifies magic, version, and
+checksum before parsing the index.
+
+### SSTable Read Path
+
+Point lookups (`get`) check the MemTable first, then search SSTables level by level
+(L0 newest-first, then L1, L2, ...). The first match wins:
+
+```text
+Namespace::get(key)
+  1. MemTable lookup — if found, return value
+  2. For each level (L0, L1, L2, ...):
+     For each SSTable in the level (L0: newest first; L1+: ascending):
+       a. Bloom filter check — if key is definitely absent, skip SSTable
+       b. Binary search index for candidate block
+       c. Decompress + verify checksum
+       d. Linear scan entries for key
+       e. If found:
+          - Tombstone → return KeyNotFound
+          - Pointer → resolve via ObjectStore
+          - Data/Null → return value
+  3. Not found in any SSTable → return KeyNotFound
+```
+
+### Merged Scan
+
+`scan` and `rscan` query across both the MemTable and all SSTable levels to produce
+a unified, deduplicated result. This ensures that data remains visible after `flush()`
+and `compact()` — not just for point lookups, but for prefix/range iteration too.
+
+**Merge strategy** (oldest-to-newest, newest wins):
+
+```text
+Namespace::scan(prefix, limit, offset, include_deleted)
+  1. Collect SSTable entries matching prefix (merge order below)
+  2. Collect MemTable raw entries matching prefix (includes tombstones)
+  3. Insert all into BTreeMap<Key, Value> — newer entries overwrite older
+  4. Filter: include_deleted || !is_tombstone (skip tombstones when false)
+  5. Apply offset, then limit
+  6. For rscan: reverse iteration order before offset/limit
+```
+
+**SSTable merge order** ensures newer values shadow older ones:
+
+1. Deepest level first (L_max, L_max-1, ..., L1) — ascending key order within each
+2. L0: oldest SSTable first → newest SSTable last (so newest overwrites oldest)
+3. MemTable entries inserted last (always win over any SSTable)
+
+**Scan modes**:
+
+- **Ordered mode** (Int keys): Uses the block index to find the starting block, then
+  reads forward (scan) or backward (rscan) from the prefix key. Stops when keys move
+  out of range.
+- **Unordered mode** (Str keys): Serializes the prefix using `Key::to_prefix_bytes()`
+  (omitting the trailing null terminator), then checks each SSTable entry with
+  `starts_with`. All matching blocks must be read.
+
+**Tombstone shadowing**: MemTable raw entries include tombstones. When a MemTable
+tombstone overwrites an SSTable value in the merge map, the tombstone is filtered out
+in step 4 — correctly hiding the deleted key from the final result.
+
+### Bloom Filters
+
+Each SSTable embeds a bloom filter that enables skipping SSTables during point lookups.
+The filter is built from all keys at flush/compaction time and serialized into the SSTable
+file between the data blocks and the index block.
+
+**Hash function**: LevelDB-compatible murmur-inspired 32-bit hash with double-hashing
+probe strategy (`h.rotate_left(15)` per probe). The number of hash probes is computed as
+`k = ln(2) * bits_per_key`, clamped to `[1, 30]`.
+
+**Serialization**: `[num_hashes: u8][bit_array...]`. Stored in the SSTable footer via
+`filter_offset` and `filter_size` fields (formerly reserved bytes). Old SSTables with
+`filter_size = 0` are backwards compatible — `may_contain()` returns `true`.
+
+**Configuration**: `bloom_bits` (default 10) controls the bits-per-key. At 10 bits/key,
+the false-positive rate is approximately 1%. Set to 0 to disable bloom filters entirely.
+
+On `DB::open()`, the engine scans `<db>/sst/<namespace>/L<n>/` directories and opens all
+`.sst` files into an in-memory reader cache. L0 readers are ordered newest-first; L1+
+readers are ordered by ascending sequence number.
+
+### Prefix Bloom Filter
+
+In addition to the per-key bloom filter used for point lookups, each SSTable can embed
+a **prefix bloom filter** that accelerates scan operations. During scan, the prefix bloom
+allows skipping SSTables that definitely contain no keys matching the query prefix.
+
+**Configuration**: `bloom_prefix_len` (default 0 = disabled). When > 0, the first
+`bloom_prefix_len` bytes of each key's serialized form (`Key::to_bytes()`) are hashed into
+a second bloom filter at flush/compaction time. On scan, the query prefix is truncated to
+`bloom_prefix_len` bytes before checking the filter.
+
+**Key prefix semantics**:
+
+- Str keys: prefix bytes are `[0x02][first N-1 chars]` (the tag byte plus string bytes)
+- Int keys: all share the same tag byte `0x01`, so the prefix bloom is less selective for
+  Int-heavy workloads but still harmless
+
+**Compound filter format**: To store both blooms in a single filter block, the SSTable uses
+a compound format identified by a footer byte:
+
+| Format byte | Layout                                                                     |
+| ----------- | -------------------------------------------------------------------------- |
+| `0x00`      | Legacy — filter block contains key bloom only                              |
+| `0x01`      | Compound — `[key_bloom_len: u32 LE][key_bloom][prefix_len: u8][pfx_bloom]` |
+
+Old SSTables with format byte `0x00` are backwards compatible — `may_contain_prefix()`
+returns `true` (no prefix bloom available, so no skipping).
+
+**Sizing**: The prefix bloom uses the same `bloom_bits` (bits-per-key) setting as the key
+bloom. For workloads with many distinct prefixes, 10 bits/key provides ~1% false-positive
+rate on prefix checks.
+
+### WriteBuffer (MemTable)
+
+The WriteBuffer is the first component in the write path. It is an in-memory sorted store
+backed by a `BTreeMap<Key, Vec<MemEntry>>` — each key maps to its full revision history
+(oldest entry at index 0). The MemTable provides:
+
+- **put/get/delete/exists** — core key-value operations
+- **scan/rscan** — ordered iteration with offset/limit pagination and optional `include_deleted` flag
+  (range queries in ordered mode, prefix matching in unordered mode)
+- **count** — live key count (excludes tombstones and expired entries)
+- **rev_count/rev_get** — revision history access
+- **ttl** — remaining time-to-live for a key
+- **auto-upgrade** — when the first `Str` key is inserted, all existing `Int` keys are widened to `Str`
+
+Each namespace has its own independent MemTable. The `DB` struct holds a
+`RwLock<HashMap<String, Mutex<MemTable>>>` for per-namespace memtables, created lazily
+on first access. A shared `RevisionGen` produces candidate RevisionIDs; individual MemTables
+enforce per-key monotonicity.
+
+**Current status**: The MemTable serves as the write buffer. On startup, the AOL is replayed
+to reconstruct memtable state (see [Append-Only Log](#append-only-log-aol) below). `DB::flush()` calls
+`drain_latest()` to extract the latest value per key in sorted order, writes an L0 SSTable,
+and truncates the AOL. After flush, the MemTable is empty and ready for new writes.
+
+### Append-Only Log (AOL)
+
+The AOL is the durability layer in the write path. Every mutation is appended to the AOL
+**before** being applied to the MemTable. On crash recovery, `DB::open()` replays the AOL
+to reconstruct the in-memory state.
+
+**Write path**: `Client API -> AOL (append + flush) -> MemTable -> Response`
+
+#### AOL File Format
+
+The AOL is a single file (`aol`) in the database directory. It begins with an 8-byte header
+followed by a sequence of variable-length records.
+
+**Header (8 bytes, written once)**:
+
+| Offset | Size | Field    | Value                         |
+| ------ | ---- | -------- | ----------------------------- |
+| 0      | 4    | magic    | `0x724B564C` (ASCII `"rKVL"`) |
+| 4      | 2    | version  | `0x0001` (u16 BE)             |
+| 6      | 2    | reserved | `0x0000`                      |
+
+**Record layout (repeated)**:
+
+```text
+[payload_len: u32 BE (4B)] [payload: var] [checksum: 5B]
+```
+
+- `payload_len`: byte count of the payload (excludes length prefix and checksum)
+- `checksum`: CRC32C over the payload bytes (`Checksum::to_bytes()` format)
+- Total overhead per record: 9 bytes
+
+**Payload layout**:
+
+```text
+[ns_len: u16 BE] [namespace: ns_len bytes] [revision: u128 BE (16B)]
+[expires_at_ms: u64 BE] [key_len: u16 BE] [key_bytes: key_len bytes]
+[value_tag: u8] [value_data: remaining bytes]
+```
+
+- `revision`: candidate RevisionID from `RevisionGen` (MemTable enforces per-key monotonicity on replay)
+- `expires_at_ms`: absolute expiry as ms since Unix epoch (0 = no expiry)
+- `value_tag`: `0x00` = Data, `0x01` = Null, `0x02` = Tombstone, `0x03` = Pointer
+- `value_data`: present for Data (raw bytes) and Pointer (36-byte `ValuePointer`); empty for Null/Tombstone
+
+#### TTL Encoding
+
+TTL is stored as an **absolute timestamp** (ms since Unix epoch) rather than a relative
+duration. This ensures correct expiry semantics on replay — if a key was set to expire at
+time T, it expires at time T regardless of when the database is reopened. Expired records
+are skipped during replay.
+
+#### Replay Semantics
+
+On `DB::open()`, the engine replays the AOL sequentially:
+
+1. Skip records where `expires_at_ms > 0` and `expires_at_ms <= now`
+2. For surviving records, get-or-create the namespace's MemTable
+3. Feed each record through `MemTable::put()` with the stored revision and remaining TTL
+4. Per-key monotonicity is enforced by the MemTable (candidate revisions may be bumped)
+
+Truncated or corrupted records at the tail of the file are silently skipped (counted in the
+skip counter). This handles partial writes from crashes during append.
+
+#### Limitations
+
+- **No truncation**: The AOL grows without bound until flush/compaction is implemented.
+  Once SSTable flushing lands, the AOL will be truncated after a successful flush.
+- **Buffered flush**: The AOL buffers up to `aol_buffer_size` records (default 128) before
+  flushing to the OS. A background thread flushes every 60 s if dirty data exists. On a
+  hard crash, up to `aol_buffer_size` records (or 60 s of writes) may be lost. Set to 0
+  for per-record flush (maximum durability). `DB::close()` always flushes remaining data.
+- **No fsync on every write**: The implementation flushes the userspace buffer but does not
+  call `fsync` per record. A future `sync_mode` config option will control this.

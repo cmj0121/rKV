@@ -991,6 +991,8 @@ function loadStats() {
         ["Deletes", s.op_deletes],
         ["Cache Hits", s.cache_hits],
         ["Cache Misses", s.cache_misses],
+        ["Peers", s.peer_count],
+        ["Conflicts Resolved", s.conflicts_resolved],
         ["Uptime", s.uptime_secs + "s"],
       ];
       items.forEach(function (pair) {

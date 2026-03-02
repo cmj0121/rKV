@@ -665,6 +665,8 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("  cache_misses:      {}", s.cache_misses);
             println!("Replication:");
             println!("  role:              {}", s.role);
+            println!("  peer_count:        {}", s.peer_count);
+            println!("  conflicts:         {}", s.conflicts_resolved);
             println!("Uptime:");
             println!("  uptime:            {}", format_duration(s.uptime));
         }
@@ -793,6 +795,15 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                     "  repl.primary_addr",
                     "primary address (replica only)",
                     c.primary_addr.clone().unwrap_or_else(|| "none".to_owned()),
+                ),
+                (
+                    "  repl.peers",
+                    "peer addresses (peer only)",
+                    if c.peers.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        c.peers.join(", ")
+                    },
                 ),
             ];
             for (key, desc, val) in items {
@@ -1104,6 +1115,14 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
                 c.primary_addr = None;
             } else {
                 c.primary_addr = Some(value.to_owned());
+            }
+            println!("OK (takes effect on next restart)");
+        }
+        "repl.peers" => {
+            if value == "none" {
+                c.peers.clear();
+            } else {
+                c.peers = value.split(',').map(|s| s.trim().to_owned()).collect();
             }
             println!("OK (takes effect on next restart)");
         }

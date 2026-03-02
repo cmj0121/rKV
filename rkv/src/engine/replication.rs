@@ -14,6 +14,8 @@ pub enum Role {
     Primary,
     /// Replica node — receives writes from primary, rejects local writes.
     Replica,
+    /// Peer node — accepts writes and syncs bidirectionally with other peers.
+    Peer,
 }
 
 impl Default for Role {
@@ -28,6 +30,7 @@ impl fmt::Display for Role {
             Self::Standalone => write!(f, "standalone"),
             Self::Primary => write!(f, "primary"),
             Self::Replica => write!(f, "replica"),
+            Self::Peer => write!(f, "peer"),
         }
     }
 }
@@ -40,8 +43,9 @@ impl FromStr for Role {
             "standalone" => Ok(Self::Standalone),
             "primary" => Ok(Self::Primary),
             "replica" => Ok(Self::Replica),
+            "peer" => Ok(Self::Peer),
             _ => Err(Error::InvalidConfig(format!(
-                "unknown role '{s}' (expected: standalone, primary, replica)"
+                "unknown role '{s}' (expected: standalone, primary, replica, peer)"
             ))),
         }
     }
@@ -84,6 +88,8 @@ const MSG_INCREMENTAL_SYNC_START: u8 = 0x0C;
 const ROLE_PRIMARY: u8 = 0x01;
 #[allow(dead_code)]
 const ROLE_REPLICA: u8 = 0x02;
+#[allow(dead_code)]
+const ROLE_PEER: u8 = 0x03;
 
 /// Magic bytes for the replication protocol: ASCII `rKVR`.
 #[allow(dead_code)]
@@ -220,6 +226,7 @@ impl ReplMessage {
                 let role_tag = match role {
                     Role::Primary => ROLE_PRIMARY,
                     Role::Replica => ROLE_REPLICA,
+                    Role::Peer => ROLE_PEER,
                     Role::Standalone => 0x00,
                 };
                 let mut buf = Vec::with_capacity(3);
@@ -312,6 +319,7 @@ impl ReplMessage {
                 let role = match data[2] {
                     ROLE_PRIMARY => Role::Primary,
                     ROLE_REPLICA => Role::Replica,
+                    ROLE_PEER => Role::Peer,
                     0x00 => Role::Standalone,
                     other => {
                         return Err(Error::Corruption(format!(
@@ -470,6 +478,7 @@ mod tests {
         assert_eq!(Role::Standalone.to_string(), "standalone");
         assert_eq!(Role::Primary.to_string(), "primary");
         assert_eq!(Role::Replica.to_string(), "replica");
+        assert_eq!(Role::Peer.to_string(), "peer");
     }
 
     #[test]
@@ -477,6 +486,7 @@ mod tests {
         assert_eq!("standalone".parse::<Role>().unwrap(), Role::Standalone);
         assert_eq!("primary".parse::<Role>().unwrap(), Role::Primary);
         assert_eq!("replica".parse::<Role>().unwrap(), Role::Replica);
+        assert_eq!("peer".parse::<Role>().unwrap(), Role::Peer);
         assert!("invalid".parse::<Role>().is_err());
     }
 
@@ -528,6 +538,15 @@ mod tests {
         let msg = ReplMessage::Handshake {
             cluster_id: 42,
             role: Role::Replica,
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn roundtrip_handshake_peer() {
+        let msg = ReplMessage::Handshake {
+            cluster_id: 99,
+            role: Role::Peer,
         };
         assert_eq!(roundtrip(&msg), msg);
     }

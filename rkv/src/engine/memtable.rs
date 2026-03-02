@@ -90,6 +90,46 @@ impl MemTable {
         actual_rev
     }
 
+    /// Insert a value only if `rev` is strictly greater than the current
+    /// revision for this key. Returns `true` if the write was applied.
+    #[allow(dead_code)]
+    ///
+    /// Unlike `put()`, this does NOT bump the revision for monotonicity —
+    /// the incoming revision is used as-is. This is the LWW path used for
+    /// peer-replicated writes.
+    pub(crate) fn put_if_newer(
+        &mut self,
+        key: Key,
+        value: Value,
+        rev: RevisionID,
+        ttl: Option<Duration>,
+    ) -> bool {
+        if let Some(&last) = self.last_rev.get(&key) {
+            if rev <= last {
+                return false;
+            }
+        }
+
+        // Auto-upgrade: first Str key triggers irreversible widening
+        if matches!(key, Key::Str(_)) && self.ordered_mode {
+            self.upgrade_to_unordered();
+        }
+
+        self.last_rev.insert(key.clone(), rev);
+
+        let expires_at = ttl.map(|d| Instant::now() + d);
+        self.approximate_size += Self::entry_size(&key, &value);
+
+        let entry = MemEntry {
+            revision: rev,
+            value,
+            expires_at,
+        };
+        self.entries.entry(key).or_default().push(entry);
+
+        true
+    }
+
     /// Insert a tombstone for the given key.
     pub(crate) fn delete(&mut self, key: Key, rev: RevisionID) -> RevisionID {
         self.put(key, Value::tombstone(), rev, None)

@@ -49,6 +49,14 @@ pub struct ServerConfig {
     /// Primary address to connect to (replica only, e.g. "10.0.0.1:8322")
     #[arg(long)]
     pub primary_addr: Option<String>,
+
+    /// Peer addresses for master-master replication (repeatable, e.g. --peers "10.0.0.2:8322")
+    #[arg(long)]
+    pub peers: Vec<String>,
+
+    /// Cluster ID for RevisionID generation (0–65535, omit for random)
+    #[arg(long)]
+    pub cluster_id: Option<u16>,
 }
 
 /// Parse a human-readable size string into bytes.

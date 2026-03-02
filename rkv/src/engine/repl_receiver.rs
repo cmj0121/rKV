@@ -300,7 +300,7 @@ impl ReplReceiver {
     }
 
     /// Receive full sync when the `FullSyncStart` message has already been read.
-    fn receive_full_sync_from_msg<R: std::io::Read>(
+    pub(crate) fn receive_full_sync_from_msg<R: std::io::Read>(
         first_msg: ReplMessage,
         reader: &mut R,
         db_path: &Path,
