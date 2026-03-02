@@ -490,6 +490,190 @@ impl PeerSession {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PeerListener — accepts inbound peer connections
+// ---------------------------------------------------------------------------
+
+/// Listens for inbound peer connections and spawns a PeerSession for each.
+#[allow(dead_code)]
+pub(crate) struct PeerListener {
+    handle: Option<JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+}
+
+#[allow(dead_code)]
+impl PeerListener {
+    pub(crate) fn start(
+        bind: &str,
+        port: u16,
+        config: Arc<PeerSessionConfig>,
+        sessions: Arc<std::sync::Mutex<Vec<PeerSession>>>,
+        stop: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        let addr = format!("{bind}:{port}");
+        let listener = std::net::TcpListener::bind(&addr)?;
+        listener.set_nonblocking(true)?;
+        let stop_clone = Arc::clone(&stop);
+
+        let handle = thread::spawn(move || {
+            Self::listen_loop(listener, &config, &sessions, &stop_clone);
+        });
+
+        Ok(Self {
+            handle: Some(handle),
+            stop,
+        })
+    }
+
+    pub(crate) fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+
+    fn listen_loop(
+        listener: std::net::TcpListener,
+        config: &PeerSessionConfig,
+        sessions: &std::sync::Mutex<Vec<PeerSession>>,
+        stop: &Arc<AtomicBool>,
+    ) {
+        while !stop.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, addr)) => {
+                    let session_stop = Arc::new(AtomicBool::new(false));
+                    match PeerSession::start(stream, config, false, session_stop) {
+                        Ok(session) => {
+                            let cid = session.remote_cluster_id();
+                            eprintln!(
+                                "peer: accepted inbound connection from {addr} (cluster {cid})"
+                            );
+                            let mut sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                            // Remove dead sessions
+                            sessions.retain(|s| s.is_alive());
+                            sessions.push(session);
+                        }
+                        Err(e) => {
+                            eprintln!("peer: inbound connection from {addr} failed: {e}");
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(200));
+                }
+                Err(e) => {
+                    eprintln!("peer: accept error: {e}");
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PeerConnector — dials outbound peer connections with reconnect
+// ---------------------------------------------------------------------------
+
+/// Connects to a configured peer address and maintains the connection
+/// with exponential backoff on failure.
+#[allow(dead_code)]
+pub(crate) struct PeerConnector {
+    handle: Option<JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+}
+
+#[allow(dead_code)]
+impl PeerConnector {
+    pub(crate) fn start(
+        peer_addr: String,
+        config: Arc<PeerSessionConfig>,
+        sessions: Arc<std::sync::Mutex<Vec<PeerSession>>>,
+        stop: Arc<AtomicBool>,
+    ) -> Self {
+        let stop_clone = Arc::clone(&stop);
+
+        let handle = thread::spawn(move || {
+            Self::connect_loop(&peer_addr, &config, &sessions, &stop_clone);
+        });
+
+        Self {
+            handle: Some(handle),
+            stop,
+        }
+    }
+
+    pub(crate) fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+
+    fn connect_loop(
+        addr: &str,
+        config: &PeerSessionConfig,
+        sessions: &std::sync::Mutex<Vec<PeerSession>>,
+        stop: &Arc<AtomicBool>,
+    ) {
+        let mut backoff = Duration::from_secs(1);
+        let max_backoff = Duration::from_secs(30);
+
+        while !stop.load(Ordering::Relaxed) {
+            match TcpStream::connect(addr) {
+                Ok(stream) => {
+                    let session_stop = Arc::new(AtomicBool::new(false));
+                    match PeerSession::start(stream, config, true, session_stop) {
+                        Ok(session) => {
+                            let cid = session.remote_cluster_id();
+                            eprintln!("peer: connected to {addr} (cluster {cid})");
+                            backoff = Duration::from_secs(1);
+
+                            {
+                                let mut sessions =
+                                    sessions.lock().unwrap_or_else(|e| e.into_inner());
+                                sessions.retain(|s| s.is_alive());
+                                sessions.push(session);
+                            }
+
+                            // Wait for the session to die before reconnecting
+                            loop {
+                                if stop.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                thread::sleep(Duration::from_secs(1));
+
+                                let sessions = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                                let still_alive = sessions
+                                    .iter()
+                                    .any(|s| s.remote_cluster_id() == cid && s.is_alive());
+                                if !still_alive {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("peer: handshake with {addr} failed: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("peer: connect to {addr} failed: {e}");
+                }
+            }
+
+            // Backoff before reconnecting
+            let sleep_end = std::time::Instant::now() + backoff;
+            while std::time::Instant::now() < sleep_end {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            backoff = (backoff * 2).min(max_backoff);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
