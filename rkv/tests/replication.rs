@@ -673,3 +673,297 @@ fn expired_key_visible_after_flush() {
 
     primary.close().unwrap();
 }
+
+/// After a reconnect, the replica should perform an incremental sync — only
+/// records written since the last known revision are sent, not a full sync.
+#[test]
+fn incremental_sync_after_reconnect() {
+    let tmp_primary = tempfile::tempdir().unwrap();
+    let tmp_replica = tempfile::tempdir().unwrap();
+    let port = free_port();
+
+    let primary = open_primary(tmp_primary.path(), port);
+    thread::sleep(Duration::from_millis(100));
+
+    // Connect replica first (empty full sync)
+    let replica = open_replica(tmp_replica.path(), &format!("127.0.0.1:{port}"));
+    thread::sleep(Duration::from_millis(1500));
+
+    // Write k1 via live stream so replay_fn updates revision tracker
+    let ns = primary.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns.put("k1", "v1", None).unwrap();
+    drop(ns);
+
+    // Wait for live-stream propagation
+    thread::sleep(Duration::from_millis(500));
+
+    // Verify k1 arrived via live stream
+    let ns = replica.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    let val = ns.get("k1").unwrap();
+    assert_eq!(val.as_bytes(), Some(b"v1".as_slice()));
+    drop(ns);
+
+    // Close replica (saves checkpoint with non-zero revision from live stream)
+    replica.close().unwrap();
+
+    // Write more data while replica is offline (stays in primary's AOL)
+    let ns = primary.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns.put("k2", "v2", None).unwrap();
+    drop(ns);
+
+    // Reconnect replica — checkpoint has k1's revision, primary AOL has k2
+    // → incremental sync sends only k2
+    let replica = open_replica(tmp_replica.path(), &format!("127.0.0.1:{port}"));
+    thread::sleep(Duration::from_millis(1500));
+
+    // Both old and new data should be present
+    let ns = replica.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    let val = ns.get("k1");
+    assert!(
+        val.is_ok(),
+        "old key should survive incremental sync, got: {:?}",
+        val.err()
+    );
+    let val = ns.get("k2");
+    assert!(
+        val.is_ok(),
+        "new key should arrive via incremental sync, got: {:?}",
+        val.err()
+    );
+    drop(ns);
+
+    // Verify checkpoint file exists
+    let checkpoint = tmp_replica.path().join("repl_checkpoint");
+    replica.close().unwrap();
+    assert!(
+        checkpoint.exists(),
+        "checkpoint file should be persisted on close"
+    );
+
+    primary.close().unwrap();
+}
+
+/// When the primary's AOL has been truncated (after flush), the replica
+/// should fall back to a full sync instead of incremental.
+#[test]
+fn fallback_to_full_sync_after_flush() {
+    let tmp_primary = tempfile::tempdir().unwrap();
+    let tmp_replica = tempfile::tempdir().unwrap();
+    let port = free_port();
+
+    let primary = open_primary(tmp_primary.path(), port);
+    thread::sleep(Duration::from_millis(100));
+
+    // Write initial data and flush so SSTables exist
+    let ns = primary.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns.put("k1", "v1", None).unwrap();
+    drop(ns);
+    primary.flush().unwrap();
+
+    // Connect replica — full sync copies SSTables (k1)
+    let replica = open_replica(tmp_replica.path(), &format!("127.0.0.1:{port}"));
+    thread::sleep(Duration::from_millis(1500));
+
+    let ns = replica.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    let val = ns.get("k1");
+    assert!(val.is_ok(), "k1 should arrive via full sync");
+    drop(ns);
+
+    // Close replica (saves checkpoint)
+    replica.close().unwrap();
+
+    // Write more data on primary AND flush — this truncates the AOL
+    let ns = primary.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns.put("k2", "v2", None).unwrap();
+    drop(ns);
+    primary.flush().unwrap();
+
+    // Reconnect replica — AOL is truncated, so must fall back to full sync
+    let replica = open_replica(tmp_replica.path(), &format!("127.0.0.1:{port}"));
+    thread::sleep(Duration::from_millis(1500));
+
+    // Both keys should be present (full sync copies all SSTables)
+    let ns = replica.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    let val = ns.get("k1");
+    assert!(
+        val.is_ok(),
+        "k1 should survive full-sync fallback, got: {:?}",
+        val.err()
+    );
+    let val = ns.get("k2");
+    assert!(
+        val.is_ok(),
+        "k2 should arrive via full-sync fallback, got: {:?}",
+        val.err()
+    );
+    drop(ns);
+
+    replica.close().unwrap();
+    primary.close().unwrap();
+}
+
+/// Force-sync wipes all local state and performs a fresh full sync.
+#[test]
+fn force_sync_wipes_and_resyncs() {
+    let tmp_primary = tempfile::tempdir().unwrap();
+    let tmp_replica = tempfile::tempdir().unwrap();
+    let port = free_port();
+
+    let primary = open_primary(tmp_primary.path(), port);
+    thread::sleep(Duration::from_millis(100));
+
+    // Write initial data and flush
+    let ns = primary.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns.put("k1", "v1", None).unwrap();
+    drop(ns);
+    primary.flush().unwrap();
+
+    let replica = open_replica(tmp_replica.path(), &format!("127.0.0.1:{port}"));
+    thread::sleep(Duration::from_millis(1500));
+
+    // Verify data arrived
+    let ns = replica.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    assert_eq!(ns.get("k1").unwrap().as_bytes(), Some(b"v1".as_slice()));
+    drop(ns);
+
+    // Write more data on primary
+    let ns = primary.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns.put("k2", "v2", None).unwrap();
+    drop(ns);
+
+    // Wait for live-stream propagation
+    thread::sleep(Duration::from_millis(500));
+
+    let ns = replica.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    assert_eq!(ns.get("k2").unwrap().as_bytes(), Some(b"v2".as_slice()));
+    drop(ns);
+
+    // Trigger force-sync
+    replica.force_sync().unwrap();
+
+    // Wait for wipe + reconnect + full sync
+    thread::sleep(Duration::from_millis(3000));
+
+    // All data should still be present after re-sync (primary has it all)
+    let ns = replica.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    let val = ns.get("k1");
+    assert!(
+        val.is_ok(),
+        "k1 should be present after force-sync, got: {:?}",
+        val.err()
+    );
+    let val = ns.get("k2");
+    assert!(
+        val.is_ok(),
+        "k2 should be present after force-sync, got: {:?}",
+        val.err()
+    );
+    drop(ns);
+
+    replica.close().unwrap();
+    primary.close().unwrap();
+}
+
+/// force_sync() on a non-replica should return an error.
+#[test]
+fn force_sync_on_non_replica_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let primary = open_primary(tmp.path(), port);
+
+    let err = primary.force_sync().unwrap_err();
+    assert!(
+        matches!(err, Error::ReadOnlyReplica),
+        "expected ReadOnlyReplica, got: {err}"
+    );
+
+    primary.close().unwrap();
+
+    // Standalone should also fail
+    let tmp2 = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp2.path());
+    let db = DB::open(config).unwrap();
+    let err = db.force_sync().unwrap_err();
+    assert!(
+        matches!(err, Error::ReadOnlyReplica),
+        "expected ReadOnlyReplica on standalone, got: {err}"
+    );
+    db.close().unwrap();
+}
+
+/// Checkpoint file should persist the last-revision across replica restarts.
+#[test]
+fn checkpoint_persists_across_restarts() {
+    let tmp_primary = tempfile::tempdir().unwrap();
+    let tmp_replica = tempfile::tempdir().unwrap();
+    let port = free_port();
+
+    let primary = open_primary(tmp_primary.path(), port);
+    thread::sleep(Duration::from_millis(100));
+
+    // Connect replica first (empty full sync)
+    let replica = open_replica(tmp_replica.path(), &format!("127.0.0.1:{port}"));
+    thread::sleep(Duration::from_millis(1500));
+
+    // Write data via live stream so replay_fn updates revision tracker
+    let ns = primary.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns.put("ck1", "cv1", None).unwrap();
+    drop(ns);
+
+    // Wait for live-stream propagation
+    thread::sleep(Duration::from_millis(500));
+
+    // Verify data arrived via live stream
+    let ns = replica.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    let val = ns.get("ck1").unwrap();
+    assert_eq!(val.as_bytes(), Some(b"cv1".as_slice()));
+    drop(ns);
+
+    // Close replica — checkpoint should be saved with non-zero revision
+    replica.close().unwrap();
+
+    let checkpoint_path = tmp_replica.path().join("repl_checkpoint");
+    assert!(
+        checkpoint_path.exists(),
+        "checkpoint file should exist after replica close"
+    );
+
+    // Read the checkpoint — it should be a 16-byte big-endian u128 > 0
+    let data = std::fs::read(&checkpoint_path).unwrap();
+    assert_eq!(data.len(), 16, "checkpoint should be 16 bytes");
+    let rev = u128::from_be_bytes(data[0..16].try_into().unwrap());
+    assert!(
+        rev > 0,
+        "checkpoint revision should be non-zero, got: {rev}"
+    );
+
+    // Write more data while replica is offline so incremental sync is triggered
+    // (otherwise, records_after_revision returns empty → full sync → wipes memtable)
+    let ns = primary.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns.put("ck2", "cv2", None).unwrap();
+    drop(ns);
+
+    // Reopen the replica — it should load the checkpoint and request
+    // incremental sync (primary's AOL has ck2 after the checkpoint revision)
+    let replica = open_replica(tmp_replica.path(), &format!("127.0.0.1:{port}"));
+    thread::sleep(Duration::from_millis(1500));
+
+    // Old data (from replica's own AOL replay) + new data (from incremental sync)
+    let ns = replica.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    let val = ns.get("ck1");
+    assert!(
+        val.is_ok(),
+        "old key should be accessible after restart, got: {:?}",
+        val.err()
+    );
+    let val = ns.get("ck2");
+    assert!(
+        val.is_ok(),
+        "new key should arrive via incremental sync after restart, got: {:?}",
+        val.err()
+    );
+    drop(ns);
+
+    replica.close().unwrap();
+    primary.close().unwrap();
+}
