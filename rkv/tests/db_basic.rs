@@ -4557,6 +4557,109 @@ fn io_model_directio_read_write() {
     db.close().unwrap();
 }
 
+/// Revision persists through flush to SSTable and can be retrieved via get_with_revision.
+#[test]
+fn revision_survives_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("rev_flush");
+
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let rev1 = ns.put("name", "Alice", None).unwrap();
+    let rev2 = ns.put("age", "30", None).unwrap();
+    assert_ne!(rev1, rev2);
+
+    // Verify from memtable first
+    let (val, rev) = ns.get_with_revision("name").unwrap();
+    assert_eq!(val, Value::from("Alice"));
+    assert_eq!(rev, rev1);
+
+    // Flush to SSTable
+    db.flush().unwrap();
+
+    // Verify from SSTable
+    let (val, rev) = ns.get_with_revision("name").unwrap();
+    assert_eq!(val, Value::from("Alice"));
+    assert_eq!(rev, rev1);
+
+    let (val, rev) = ns.get_with_revision("age").unwrap();
+    assert_eq!(val, Value::from("30"));
+    assert_eq!(rev, rev2);
+
+    db.close().unwrap();
+}
+
+/// Revision persists through compaction.
+#[test]
+fn revision_survives_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("rev_compact");
+
+    let mut config = Config::new(&db_path);
+    config.write_buffer_size = 1024 * 1024; // don't auto-flush
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // Write first batch and flush
+    let rev_a = ns.put("a", "first", None).unwrap();
+    let rev_b = ns.put("b", "first", None).unwrap();
+    db.flush().unwrap();
+
+    // Write second batch (overlapping key "a") and flush
+    let rev_a2 = ns.put("a", "second", None).unwrap();
+    let rev_c = ns.put("c", "first", None).unwrap();
+    db.flush().unwrap();
+
+    // Compact — merges both L0 SSTables
+    db.compact().unwrap();
+
+    // "a" should have the newer revision
+    let (val, rev) = ns.get_with_revision("a").unwrap();
+    assert_eq!(val, Value::from("second"));
+    assert_eq!(rev, rev_a2);
+    assert_ne!(rev, rev_a); // overwritten revision differs
+
+    // "b" should keep its original revision
+    let (val, rev) = ns.get_with_revision("b").unwrap();
+    assert_eq!(val, Value::from("first"));
+    assert_eq!(rev, rev_b);
+
+    // "c" should have its revision
+    let (val, rev) = ns.get_with_revision("c").unwrap();
+    assert_eq!(val, Value::from("first"));
+    assert_eq!(rev, rev_c);
+
+    db.close().unwrap();
+}
+
+/// Revision survives close/reopen — persisted in SSTable on disk.
+#[test]
+fn revision_survives_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("rev_reopen");
+
+    let rev1;
+    {
+        let config = Config::new(&db_path);
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+        rev1 = ns.put("key", "value", None).unwrap();
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+
+    // Reopen
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    let (val, rev) = ns.get_with_revision("key").unwrap();
+    assert_eq!(val, Value::from("value"));
+    assert_eq!(rev, rev1);
+    db.close().unwrap();
+}
+
 /// V2 SSTables written by flush survive close/reopen — format upgrade is transparent.
 #[test]
 fn format_version_upgrade_transparent() {
