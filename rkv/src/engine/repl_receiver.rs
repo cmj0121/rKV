@@ -2,12 +2,15 @@ use std::io::{BufReader, BufWriter, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::error::{Error, Result};
 use super::replication::{ReplMessage, Role};
+
+/// Checkpoint file name — stores the replica's last applied revision (16 bytes BE u128).
+const CHECKPOINT_FILE: &str = "repl_checkpoint";
 
 /// Callback signature for replaying an AOL record payload on the replica.
 ///
@@ -27,11 +30,14 @@ pub(crate) type PostSyncFn = Box<dyn Fn() -> Result<()> + Send + Sync>;
 /// SSTables, object store) and delete on-disk files for the dropped namespace.
 pub(crate) type DropNsFn = Box<dyn Fn(&str) -> Result<()> + Send + Sync>;
 
-/// Bundles all replica callbacks to avoid too-many-arguments.
+/// Bundles all replica callbacks and shared state to avoid too-many-arguments.
 pub(crate) struct ReplicaCallbacks {
     pub(crate) replay_fn: ReplayFn,
     pub(crate) post_sync_fn: PostSyncFn,
     pub(crate) drop_ns_fn: DropNsFn,
+    /// Tracks the highest revision seen by the replica. Updated by `replay_fn`
+    /// in mod.rs; read here when building `SyncRequest`.
+    pub(crate) last_revision: Arc<Mutex<u128>>,
 }
 
 /// Manages the replica-side replication connection to a primary.
@@ -97,6 +103,17 @@ impl ReplReceiver {
         callbacks: &ReplicaCallbacks,
         stop: &Arc<AtomicBool>,
     ) {
+        // Load checkpoint from previous run
+        if let Some(rev) = load_checkpoint(db_path) {
+            let mut lr = callbacks
+                .last_revision
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if rev > *lr {
+                *lr = rev;
+            }
+        }
+
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(30);
 
@@ -105,11 +122,24 @@ impl ReplReceiver {
                 addr, cluster_id, db_path, max_levels, callbacks, stop,
             ) {
                 Ok(()) => {
-                    // Clean exit (stop signal)
+                    // Clean exit (stop signal) — persist checkpoint
+                    let rev = *callbacks
+                        .last_revision
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    save_checkpoint(db_path, rev);
                     break;
                 }
                 Err(e) => {
                     eprintln!("replication: connection to {addr} failed: {e}");
+                    // Persist checkpoint on disconnect so incremental sync
+                    // can resume after reconnect.
+                    let rev = *callbacks
+                        .last_revision
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    save_checkpoint(db_path, rev);
+
                     // Wait with backoff before retrying
                     let sleep_end = std::time::Instant::now() + backoff;
                     while std::time::Instant::now() < sleep_end {
@@ -166,13 +196,65 @@ impl ReplReceiver {
             role: Role::Replica,
         }
         .write_to(&mut writer)?;
+
+        // Send SyncRequest with last known revision
+        let last_rev = *callbacks
+            .last_revision
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ReplMessage::SyncRequest {
+            last_revision: last_rev,
+            force_full: false,
+        }
+        .write_to(&mut writer)?;
         writer.flush()?;
 
-        // --- Full sync ---
-        Self::receive_full_sync(&mut reader, db_path, max_levels, stop)?;
+        // --- Read primary's sync decision ---
+        let first_msg = match ReplMessage::read_from(&mut reader)? {
+            Some(msg) => msg,
+            None => {
+                return Err(Error::Corruption(
+                    "unexpected EOF waiting for sync response".into(),
+                ));
+            }
+        };
 
-        // Reload SSTable index so synced files are queryable
-        (callbacks.post_sync_fn)()?;
+        match first_msg {
+            ReplMessage::FullSyncStart { .. } => {
+                // Full sync — push message back and use existing path
+                Self::receive_full_sync_from_msg(
+                    first_msg,
+                    &mut reader,
+                    db_path,
+                    max_levels,
+                    stop,
+                )?;
+                // Reset revision after full sync (fresh start)
+                {
+                    let mut lr = callbacks
+                        .last_revision
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    *lr = 0;
+                }
+                (callbacks.post_sync_fn)()?;
+            }
+            ReplMessage::IncrementalSyncStart { record_count } => {
+                // Incremental sync — receive N AOL records, then enter live stream
+                Self::receive_incremental_records(
+                    &mut reader,
+                    record_count,
+                    &callbacks.replay_fn,
+                    stop,
+                )?;
+                // No post_sync_fn needed — memtable state is still valid
+            }
+            other => {
+                return Err(Error::Corruption(format!(
+                    "expected FullSyncStart or IncrementalSyncStart, got {other:?}"
+                )));
+            }
+        }
 
         // --- Live streaming ---
         Self::receive_live_stream(
@@ -181,6 +263,30 @@ impl ReplReceiver {
             &callbacks.drop_ns_fn,
             stop,
         )
+    }
+
+    /// Receive full sync when the `FullSyncStart` message has already been read.
+    fn receive_full_sync_from_msg<R: std::io::Read>(
+        first_msg: ReplMessage,
+        reader: &mut R,
+        db_path: &Path,
+        max_levels: usize,
+        stop: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        let (sst_count, object_count) = match first_msg {
+            ReplMessage::FullSyncStart {
+                sst_count,
+                object_count,
+                ..
+            } => (sst_count, object_count),
+            other => {
+                return Err(Error::Corruption(format!(
+                    "expected FullSyncStart, got {other:?}"
+                )));
+            }
+        };
+
+        Self::receive_full_sync_chunks(reader, sst_count, object_count, db_path, max_levels, stop)
     }
 
     fn receive_full_sync<R: std::io::Read>(
@@ -208,6 +314,17 @@ impl ReplReceiver {
             }
         };
 
+        Self::receive_full_sync_chunks(reader, sst_count, object_count, db_path, max_levels, stop)
+    }
+
+    fn receive_full_sync_chunks<R: std::io::Read>(
+        reader: &mut R,
+        sst_count: u32,
+        object_count: u32,
+        db_path: &Path,
+        max_levels: usize,
+        stop: &Arc<AtomicBool>,
+    ) -> Result<()> {
         let total_expected = sst_count + object_count;
         let mut received = 0u32;
 
@@ -269,6 +386,49 @@ impl ReplReceiver {
                 }
             }
         }
+    }
+
+    /// Receive N AOL records during incremental sync.
+    fn receive_incremental_records<R: std::io::Read>(
+        reader: &mut R,
+        record_count: u32,
+        replay_fn: &ReplayFn,
+        stop: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        for i in 0..record_count {
+            if stop.load(Ordering::Relaxed) {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "replication stopped",
+                )));
+            }
+
+            let msg = match ReplMessage::read_from(reader)? {
+                Some(msg) => msg,
+                None => {
+                    return Err(Error::Corruption(format!(
+                        "unexpected EOF during incremental sync at record {i}/{record_count}"
+                    )));
+                }
+            };
+
+            match msg {
+                ReplMessage::AolRecord { payload } => {
+                    replay_fn(&payload)?;
+                }
+                ReplMessage::ErrorMsg { message } => {
+                    return Err(Error::Corruption(format!(
+                        "primary error during incremental sync: {message}"
+                    )));
+                }
+                other => {
+                    return Err(Error::Corruption(format!(
+                        "unexpected message during incremental sync: {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn receive_live_stream<R: std::io::Read>(
@@ -363,6 +523,30 @@ fn write_object_file(db_path: &Path, namespace: &str, hash: &[u8; 32], data: &[u
 #[allow(dead_code)]
 fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint persistence
+// ---------------------------------------------------------------------------
+
+/// Load the last-revision checkpoint from disk. Returns `None` if the file
+/// doesn't exist or is malformed.
+fn load_checkpoint(db_path: &Path) -> Option<u128> {
+    let path = db_path.join(CHECKPOINT_FILE);
+    let data = std::fs::read(&path).ok()?;
+    if data.len() < 16 {
+        return None;
+    }
+    Some(u128::from_be_bytes(data[0..16].try_into().ok()?))
+}
+
+/// Persist the last-revision checkpoint to disk. Best-effort — errors are
+/// logged but not propagated.
+fn save_checkpoint(db_path: &Path, revision: u128) {
+    let path = db_path.join(CHECKPOINT_FILE);
+    if let Err(e) = std::fs::write(&path, revision.to_be_bytes()) {
+        eprintln!("replication: failed to save checkpoint: {e}");
+    }
 }
 
 #[cfg(test)]
@@ -628,6 +812,97 @@ mod tests {
         let ns_list = dropped.lock().unwrap();
         assert_eq!(ns_list.len(), 1);
         assert_eq!(ns_list[0], "myns");
+    }
+
+    // --- Checkpoint persistence ---
+
+    #[test]
+    fn checkpoint_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(load_checkpoint(tmp.path()).is_none());
+
+        let rev: u128 = 0xDEAD_BEEF_CAFE_1234_5678_9ABC_DEF0_1234;
+        save_checkpoint(tmp.path(), rev);
+
+        let loaded = load_checkpoint(tmp.path()).unwrap();
+        assert_eq!(loaded, rev);
+    }
+
+    #[test]
+    fn checkpoint_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_checkpoint(tmp.path(), 0);
+        assert_eq!(load_checkpoint(tmp.path()).unwrap(), 0);
+    }
+
+    #[test]
+    fn checkpoint_malformed_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CHECKPOINT_FILE);
+        std::fs::write(&path, b"short").unwrap();
+        assert!(load_checkpoint(tmp.path()).is_none());
+    }
+
+    // --- Incremental sync ---
+
+    #[test]
+    fn receive_incremental_records_ok() {
+        let mut buf = Vec::new();
+        ReplMessage::AolRecord {
+            payload: b"inc-1".to_vec(),
+        }
+        .write_to(&mut buf)
+        .unwrap();
+        ReplMessage::AolRecord {
+            payload: b"inc-2".to_vec(),
+        }
+        .write_to(&mut buf)
+        .unwrap();
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = Arc::clone(&received);
+        let replay_fn: ReplayFn = Box::new(move |payload: &[u8]| {
+            received_clone.lock().unwrap().push(payload.to_vec());
+            Ok(())
+        });
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut cursor = Cursor::new(buf);
+        ReplReceiver::receive_incremental_records(&mut cursor, 2, &replay_fn, &stop).unwrap();
+
+        let records = received.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0], b"inc-1");
+        assert_eq!(records[1], b"inc-2");
+    }
+
+    #[test]
+    fn receive_incremental_records_eof_error() {
+        let mut buf = Vec::new();
+        ReplMessage::AolRecord {
+            payload: b"only-one".to_vec(),
+        }
+        .write_to(&mut buf)
+        .unwrap();
+
+        let replay_fn: ReplayFn = Box::new(|_| Ok(()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut cursor = Cursor::new(buf);
+
+        // Expect 2 records but only 1 in stream → error
+        let result = ReplReceiver::receive_incremental_records(&mut cursor, 2, &replay_fn, &stop);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn receive_incremental_records_zero() {
+        let buf = Vec::new();
+        let replay_fn: ReplayFn = Box::new(|_| Ok(()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut cursor = Cursor::new(buf);
+
+        // Zero records → immediate success
+        ReplReceiver::receive_incremental_records(&mut cursor, 0, &replay_fn, &stop).unwrap();
     }
 
     use std::sync::Mutex;

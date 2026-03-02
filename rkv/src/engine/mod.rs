@@ -525,11 +525,23 @@ impl DB {
                 let max_levels = self.config.max_levels;
                 let stop = Arc::new(AtomicBool::new(false));
 
+                // Shared revision tracker for incremental sync
+                let last_revision = Arc::new(Mutex::new(0u128));
+                let rev_tracker = Arc::clone(&last_revision);
+
                 // Build a replay callback that writes to local AOL + memtable
                 let aol = Arc::clone(&self.aol);
                 let ns_data = Arc::clone(&self.namespace_data);
                 let replay_fn: repl_receiver::ReplayFn = Box::new(move |payload: &[u8]| {
                     let record = aol::decode_payload(payload)?;
+
+                    // Track highest revision for incremental sync
+                    {
+                        let mut lr = rev_tracker.lock().unwrap_or_else(|e| e.into_inner());
+                        if record.revision > *lr {
+                            *lr = record.revision;
+                        }
+                    }
 
                     // Write to local AOL for crash recovery
                     {
@@ -700,6 +712,7 @@ impl DB {
                     replay_fn,
                     post_sync_fn,
                     drop_ns_fn,
+                    last_revision,
                 };
                 let receiver = repl_receiver::ReplReceiver::start(
                     addr, cluster_id, db_path, max_levels, callbacks, stop,
