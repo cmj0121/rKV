@@ -236,7 +236,8 @@ impl MemTable {
         }
     }
 
-    /// Return all raw `(Key, Value)` pairs matching a prefix, including tombstones.
+    /// Return all raw `(Key, Value)` pairs matching a prefix, including
+    /// tombstones and expired entries (surfaced as tombstones).
     ///
     /// No limit/offset — returns everything. Used by the merged scan to
     /// overlay MemTable entries on top of SSTable results.
@@ -244,23 +245,20 @@ impl MemTable {
         if self.ordered_mode {
             self.entries
                 .range(prefix..)
-                .filter(|(_, entries)| self.is_not_expired(entries))
-                .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
+                .map(|(k, entries)| (k.clone(), Self::latest_or_tombstone(entries)))
                 .collect()
         } else {
             let prefix_str = prefix.to_string();
             self.entries
                 .iter()
-                .filter(|(k, entries)| {
-                    k.to_string().starts_with(&prefix_str) && self.is_not_expired(entries)
-                })
-                .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
+                .filter(|(k, _)| k.to_string().starts_with(&prefix_str))
+                .map(|(k, entries)| (k.clone(), Self::latest_or_tombstone(entries)))
                 .collect()
         }
     }
 
     /// Return all raw `(Key, Value)` pairs matching a prefix in reverse,
-    /// including tombstones.
+    /// including tombstones and expired entries (surfaced as tombstones).
     ///
     /// For ordered mode: returns keys <= prefix. For unordered mode: prefix
     /// matching (same as forward). Used by merged rscan.
@@ -268,17 +266,14 @@ impl MemTable {
         if self.ordered_mode {
             self.entries
                 .range(..=prefix.clone())
-                .filter(|(_, entries)| self.is_not_expired(entries))
-                .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
+                .map(|(k, entries)| (k.clone(), Self::latest_or_tombstone(entries)))
                 .collect()
         } else {
             let prefix_str = prefix.to_string();
             self.entries
                 .iter()
-                .filter(|(k, entries)| {
-                    k.to_string().starts_with(&prefix_str) && self.is_not_expired(entries)
-                })
-                .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
+                .filter(|(k, _)| k.to_string().starts_with(&prefix_str))
+                .map(|(k, entries)| (k.clone(), Self::latest_or_tombstone(entries)))
                 .collect()
         }
     }
@@ -359,6 +354,32 @@ impl MemTable {
     pub(crate) fn rev_get(&self, key: &Key, index: u64) -> Option<&Value> {
         let entries = self.entries.get(key)?;
         entries.get(index as usize).map(|e| &e.value)
+    }
+
+    /// Returns the value and remaining TTL at a specific revision index.
+    ///
+    /// Returns `(value, expired, remaining_ttl)`:
+    /// - `expired`: true if the revision had a TTL that has elapsed
+    /// - `remaining_ttl`: `Some(duration)` if TTL is set and not expired, `None` otherwise
+    pub(crate) fn rev_get_with_ttl(
+        &self,
+        key: &Key,
+        index: u64,
+    ) -> Option<(&Value, bool, Option<Duration>)> {
+        let entries = self.entries.get(key)?;
+        let entry = entries.get(index as usize)?;
+        let (expired, remaining) = match entry.expires_at {
+            Some(expires_at) => {
+                let now = Instant::now();
+                if now > expires_at {
+                    (true, None)
+                } else {
+                    (false, Some(expires_at - now))
+                }
+            }
+            None => (false, None),
+        };
+        Some((&entry.value, expired, remaining))
     }
 
     /// Returns the remaining TTL for a key.
@@ -448,7 +469,19 @@ impl MemTable {
         result
     }
 
+    /// Return the latest value, or a tombstone if the entry is expired.
+    fn latest_or_tombstone(entries: &[MemEntry]) -> Value {
+        let latest = entries.last().expect("non-empty entries");
+        if let Some(expires_at) = latest.expires_at {
+            if Instant::now() > expires_at {
+                return Value::tombstone();
+            }
+        }
+        latest.value.clone()
+    }
+
     /// Check if the latest entry for a key is not expired (may be a tombstone).
+    #[cfg(test)]
     fn is_not_expired(&self, entries: &[MemEntry]) -> bool {
         let Some(latest) = entries.last() else {
             return false;

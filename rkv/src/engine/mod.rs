@@ -11,6 +11,9 @@ mod memtable;
 mod namespace;
 mod objects;
 mod recovery;
+mod repl_receiver;
+mod repl_sender;
+pub(crate) mod replication;
 mod revision;
 mod sstable;
 mod stats;
@@ -20,6 +23,7 @@ pub use error::{Error, Result};
 pub use key::Key;
 pub use namespace::Namespace;
 pub use recovery::RecoveryReport;
+pub use replication::Role;
 pub use revision::RevisionID;
 pub use stats::{LevelStat, Stats};
 pub use value::Value;
@@ -175,6 +179,14 @@ pub struct Config {
     pub l1_max_size: usize,
     /// Default maximum size in bytes for L2+ levels (default: 2 GB).
     pub default_max_size: usize,
+    /// Node role in a replication topology (default: Standalone).
+    pub role: Role,
+    /// Replication listen address (primary only, default: "0.0.0.0").
+    pub repl_bind: String,
+    /// Replication listen port (primary only, default: 8322).
+    pub repl_port: u16,
+    /// Primary address to connect to (replica only, e.g. "10.0.0.1:8322").
+    pub primary_addr: Option<String>,
 }
 
 impl Config {
@@ -199,6 +211,10 @@ impl Config {
             l0_max_size: 64 * 1024 * 1024,
             l1_max_size: 256 * 1024 * 1024,
             default_max_size: 2 * 1024 * 1024 * 1024,
+            role: Role::default(),
+            repl_bind: "0.0.0.0".to_owned(),
+            repl_port: 8322,
+            primary_addr: None,
         }
     }
 }
@@ -219,7 +235,7 @@ pub struct DB {
     encrypted_namespaces: Mutex<HashMap<String, bool>>,
     io_backend: Arc<dyn io::IoBackend>,
     revision_gen: revision::RevisionGen,
-    namespace_data: RwLock<HashMap<String, Mutex<memtable::MemTable>>>,
+    namespace_data: Arc<RwLock<HashMap<String, Mutex<memtable::MemTable>>>>,
     aol: Arc<Mutex<aol::Aol>>,
     object_stores: Arc<RwLock<HashMap<String, objects::ObjectStore>>>,
     /// Per-namespace, per-level SSTable readers.
@@ -242,6 +258,9 @@ pub struct DB {
     op_puts: AtomicU64,
     op_gets: AtomicU64,
     op_deletes: AtomicU64,
+    // Replication
+    repl_sender: Option<repl_sender::ReplSender>,
+    repl_receiver: Option<repl_receiver::ReplReceiver>,
 }
 
 impl DB {
@@ -253,7 +272,7 @@ impl DB {
         let revision_gen = revision::RevisionGen::new(config.cluster_id);
 
         // Replay AOL to reconstruct memtables
-        let namespace_data = RwLock::new(HashMap::new());
+        let namespace_data = Arc::new(RwLock::new(HashMap::new()));
         let (records, _skipped) =
             aol::Aol::replay(&config.path, config.verify_checksums, &*io_backend)?;
 
@@ -265,26 +284,31 @@ impl DB {
         {
             let mut map = namespace_data.write().unwrap_or_else(|e| e.into_inner());
             for record in records {
-                // Skip expired records
+                // Skip expired records — replaying them would create
+                // tombstones in the memtable that shadow valid SSTable data.
                 if record.expires_at_ms > 0 && record.expires_at_ms <= now_ms {
                     continue;
                 }
 
+                // Namespace-creation sentinel: only register the namespace.
+                let is_sentinel = record.key == Key::Str(String::new()) && record.value.is_null();
+
                 let mt = map
                     .entry(record.namespace)
                     .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
-                let mt = mt.get_mut().unwrap();
 
-                let rev = RevisionID::from(record.revision);
-                let ttl = if record.expires_at_ms > 0 {
-                    // Convert absolute expiry back to remaining duration
-                    let remaining_ms = record.expires_at_ms.saturating_sub(now_ms);
-                    Some(Duration::from_millis(remaining_ms))
-                } else {
-                    None
-                };
-
-                mt.put(record.key, record.value, rev, ttl);
+                if !is_sentinel {
+                    let mt = mt.get_mut().unwrap();
+                    let rev = RevisionID::from(record.revision);
+                    let ttl = if record.expires_at_ms > 0 {
+                        // Convert absolute expiry back to remaining duration
+                        let remaining_ms = record.expires_at_ms.saturating_sub(now_ms);
+                        Some(Duration::from_millis(remaining_ms))
+                    } else {
+                        None
+                    };
+                    mt.put(record.key, record.value, rev, ttl);
+                }
             }
         }
 
@@ -403,7 +427,7 @@ impl DB {
         // Load persisted operation counters
         let (op_puts, op_gets, op_deletes) = Self::load_stats_meta(&config.path);
 
-        Ok(Self {
+        let mut db = Self {
             config,
             opened_at: Instant::now(),
             encrypted_namespaces: Mutex::new(HashMap::new()),
@@ -425,10 +449,21 @@ impl DB {
             op_puts: AtomicU64::new(op_puts),
             op_gets: AtomicU64::new(op_gets),
             op_deletes: AtomicU64::new(op_deletes),
-        })
+            repl_sender: None,
+            repl_receiver: None,
+        };
+
+        // Eagerly register the default namespace so it always appears in
+        // list_namespaces(), regardless of whether any data has been written.
+        db.get_or_create_memtable(DEFAULT_NAMESPACE);
+
+        db.start_replication()?;
+
+        Ok(db)
     }
 
     pub fn close(mut self) -> Result<()> {
+        self.stop_replication();
         self.flush_stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.flush_thread.take() {
             let _ = handle.join();
@@ -445,6 +480,197 @@ impl DB {
         }
         self.save_stats_meta();
         Ok(())
+    }
+
+    /// Returns true if this node is configured as a read-only replica.
+    pub fn is_replica(&self) -> bool {
+        self.config.role == replication::Role::Replica
+    }
+
+    /// Start replication based on the configured role.
+    fn start_replication(&mut self) -> Result<()> {
+        match self.config.role {
+            replication::Role::Primary => {
+                let cluster_id = self.revision_gen.cluster_id();
+                let db_path = self.config.path.clone();
+                let max_levels = self.config.max_levels;
+                let stop = Arc::new(AtomicBool::new(false));
+
+                // Build a flush callback for full sync
+                let aol_for_flush = Arc::clone(&self.aol);
+                let flush_fn = move || {
+                    // Minimal flush: just flush AOL buffer so data is on disk
+                    let mut aol = aol_for_flush.lock().unwrap_or_else(|e| e.into_inner());
+                    aol.flush_if_dirty()?;
+                    Ok(())
+                };
+
+                let sender = repl_sender::ReplSender::start(
+                    &self.config.repl_bind,
+                    self.config.repl_port,
+                    cluster_id,
+                    db_path,
+                    max_levels,
+                    flush_fn,
+                    stop,
+                )?;
+                self.repl_sender = Some(sender);
+            }
+            replication::Role::Replica => {
+                let addr = self.config.primary_addr.as_deref().ok_or_else(|| {
+                    Error::InvalidConfig("primary_addr is required when role is replica".into())
+                })?;
+                let cluster_id = self.revision_gen.cluster_id();
+                let db_path = self.config.path.clone();
+                let max_levels = self.config.max_levels;
+                let stop = Arc::new(AtomicBool::new(false));
+
+                // Build a replay callback that writes to local AOL + memtable
+                let aol = Arc::clone(&self.aol);
+                let ns_data = Arc::clone(&self.namespace_data);
+                let replay_fn: repl_receiver::ReplayFn = Box::new(move |payload: &[u8]| {
+                    let record = aol::decode_payload(payload)?;
+
+                    // Write to local AOL for crash recovery
+                    {
+                        let mut aol = aol.lock().unwrap_or_else(|e| e.into_inner());
+                        aol.append_encoded(payload)?;
+                    }
+
+                    // Apply to memtable
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+
+                    // Skip expired records — replaying them would create
+                    // tombstones in the memtable that shadow valid SSTable data.
+                    if record.expires_at_ms > 0 && record.expires_at_ms <= now_ms {
+                        return Ok(());
+                    }
+
+                    // Namespace-creation sentinel: empty key + Null value.
+                    // Only ensures the namespace memtable exists; no data to store.
+                    let is_sentinel =
+                        record.key == Key::Str(String::new()) && record.value.is_null();
+
+                    let map = ns_data.read().unwrap_or_else(|e| e.into_inner());
+                    if let Some(mt_mutex) = map.get(&record.namespace) {
+                        if !is_sentinel {
+                            let mut mt = mt_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                            let rev = RevisionID::from(record.revision);
+                            let ttl = if record.expires_at_ms > 0 {
+                                let remaining_ms = record.expires_at_ms.saturating_sub(now_ms);
+                                Some(Duration::from_millis(remaining_ms))
+                            } else {
+                                None
+                            };
+                            mt.put(record.key, record.value, rev, ttl);
+                        }
+                    } else {
+                        drop(map);
+                        let mut map = ns_data.write().unwrap_or_else(|e| e.into_inner());
+                        let mt = map
+                            .entry(record.namespace)
+                            .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
+                        if !is_sentinel {
+                            let mt = mt.get_mut().unwrap_or_else(|e| e.into_inner());
+                            let rev = RevisionID::from(record.revision);
+                            let ttl = if record.expires_at_ms > 0 {
+                                let remaining_ms = record.expires_at_ms.saturating_sub(now_ms);
+                                Some(Duration::from_millis(remaining_ms))
+                            } else {
+                                None
+                            };
+                            mt.put(record.key, record.value, rev, ttl);
+                        }
+                    }
+
+                    Ok(())
+                });
+
+                // Build a post-sync callback to reload SSTable index
+                let sync_sstables = Arc::clone(&self.sstables);
+                let sync_sst_seq = Arc::clone(&self.sst_sequence);
+                let sync_db_path = self.config.path.clone();
+                let sync_max_levels = self.config.max_levels;
+                let sync_cache = self.block_cache.clone();
+                let sync_io = Arc::clone(&self.io_backend);
+                let sync_ns_data = Arc::clone(&self.namespace_data);
+                let sync_aol = Arc::clone(&self.aol);
+                let post_sync_fn: repl_receiver::PostSyncFn = Box::new(move || {
+                    let (new_sst, new_seq) = Self::scan_sstables(
+                        &sync_db_path,
+                        sync_max_levels,
+                        &sync_cache,
+                        sync_io.as_ref(),
+                    )?;
+
+                    // Clear stale memtable entries so they don't shadow the
+                    // authoritative SSTable snapshot from the primary.
+                    // Re-register synced namespaces with fresh memtables
+                    // and ensure the default namespace always exists.
+                    {
+                        let mut ns_map = sync_ns_data.write().unwrap_or_else(|e| e.into_inner());
+                        ns_map.clear();
+                        for ns_name in new_sst.keys() {
+                            ns_map.insert(ns_name.clone(), Mutex::new(memtable::MemTable::new()));
+                        }
+                        ns_map
+                            .entry(DEFAULT_NAMESPACE.to_owned())
+                            .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
+                    }
+
+                    // Truncate local AOL so stale records don't reappear
+                    // on restart. Future live-stream records will be appended
+                    // to a fresh AOL.
+                    {
+                        let mut aol = sync_aol.lock().unwrap_or_else(|e| e.into_inner());
+                        aol.truncate(&sync_db_path)?;
+                    }
+
+                    // Replace SSTable index
+                    {
+                        let mut sst = sync_sstables.write().unwrap_or_else(|e| e.into_inner());
+                        *sst = new_sst;
+                    }
+
+                    // Update sequence counter
+                    let old_seq = sync_sst_seq.load(Ordering::Relaxed);
+                    if new_seq > old_seq {
+                        sync_sst_seq.store(new_seq, Ordering::Relaxed);
+                    }
+
+                    Ok(())
+                });
+
+                let receiver = repl_receiver::ReplReceiver::start(
+                    addr,
+                    cluster_id,
+                    db_path,
+                    max_levels,
+                    replay_fn,
+                    post_sync_fn,
+                    stop,
+                )?;
+                self.repl_receiver = Some(receiver);
+            }
+            replication::Role::Standalone => {
+                // No replication — nothing to start
+            }
+        }
+        Ok(())
+    }
+
+    fn stop_replication(&mut self) {
+        if let Some(ref mut sender) = self.repl_sender {
+            sender.stop();
+        }
+        self.repl_sender = None;
+        if let Some(ref mut receiver) = self.repl_receiver {
+            receiver.stop();
+        }
+        self.repl_receiver = None;
     }
 
     pub fn path(&self) -> &Path {
@@ -531,6 +757,7 @@ impl DB {
             cache_hits,
             cache_misses,
             uptime: self.opened_at.elapsed(),
+            role: self.config.role.to_string(),
         }
     }
 
@@ -574,8 +801,33 @@ impl DB {
             }
         } else {
             map.insert(name.to_owned(), encrypted);
+            drop(map);
+
+            // Ensure the namespace is registered in the memtable map so it
+            // appears in `list_namespaces` immediately (not only after a write).
+            self.get_or_create_memtable(name);
+
+            // On primary nodes, broadcast a Null sentinel so replicas learn
+            // about the new namespace immediately (even if no data is written).
+            if self.config.role == replication::Role::Primary {
+                let rev = self.revision_gen.generate();
+                self.append_to_aol(
+                    name,
+                    rev.as_u128(),
+                    &Key::Str(String::new()),
+                    &Value::Null,
+                    None,
+                )?;
+            }
+
+            return Namespace::open(self, name, password);
         }
         drop(map);
+
+        // Ensure the namespace is registered in the memtable map so it
+        // appears in `list_namespaces` immediately (not only after a write).
+        self.get_or_create_memtable(name);
+
         Namespace::open(self, name, password)
     }
 
@@ -612,11 +864,6 @@ impl DB {
     /// and flushes remaining namespaces + truncates the AOL so the dropped
     /// namespace cannot reappear on restart.
     pub fn drop_namespace(&self, name: &str) -> Result<()> {
-        if name == DEFAULT_NAMESPACE {
-            return Err(Error::InvalidNamespace(
-                "cannot drop the default namespace".into(),
-            ));
-        }
         if name.is_empty() {
             return Err(Error::InvalidNamespace(
                 "namespace name must not be empty".into(),
@@ -688,6 +935,12 @@ impl DB {
         {
             let mut aol = self.aol.lock().unwrap_or_else(|e| e.into_inner());
             aol.truncate(&self.config.path)?;
+        }
+
+        // Re-create the default namespace if it was just dropped, so it
+        // always appears in list_namespaces().
+        if name == DEFAULT_NAMESPACE {
+            self.get_or_create_memtable(DEFAULT_NAMESPACE);
         }
 
         Ok(())
@@ -1534,7 +1787,24 @@ impl DB {
         ttl: Option<Duration>,
     ) -> Result<()> {
         let mut aol = self.aol.lock().unwrap_or_else(|e| e.into_inner());
-        aol.append(ns, rev, key, value, ttl)
+        aol.append(ns, rev, key, value, ttl)?;
+
+        // Broadcast to replicas if this node is a primary
+        if let Some(ref sender) = self.repl_sender {
+            let expires_at_ms = match ttl {
+                Some(d) => {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    now + d.as_millis() as u64
+                }
+                None => 0,
+            };
+            let payload = aol::encode_payload(ns, rev, expires_at_ms, key, value);
+            sender.broadcast_aol(&payload);
+        }
+        Ok(())
     }
 
     pub(crate) fn get_or_create_object_store(&self, ns: &str) -> Result<&objects::ObjectStore> {
@@ -1866,6 +2136,7 @@ impl DB {
 
 impl Drop for DB {
     fn drop(&mut self) {
+        self.stop_replication();
         self.flush_stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.flush_thread.take() {
             let _ = handle.join();

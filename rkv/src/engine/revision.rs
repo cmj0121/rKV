@@ -79,6 +79,10 @@ impl RevisionGen {
         }
     }
 
+    pub(crate) fn cluster_id(&self) -> u16 {
+        self.cluster_id
+    }
+
     pub(crate) fn generate(&self) -> RevisionID {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)

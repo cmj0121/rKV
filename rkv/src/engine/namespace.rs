@@ -90,6 +90,9 @@ impl<'db> Namespace<'db> {
         value: impl Into<Value>,
         ttl: Option<Duration>,
     ) -> Result<RevisionID> {
+        if self.db.is_replica() {
+            return Err(Error::ReadOnlyReplica);
+        }
         let key = key.into();
         let value = self.encrypt_value(value.into());
         let value = self.db.maybe_separate_value(&self.name, value)?;
@@ -169,6 +172,9 @@ impl<'db> Namespace<'db> {
     }
 
     pub fn delete(&self, key: impl Into<Key>) -> Result<()> {
+        if self.db.is_replica() {
+            return Err(Error::ReadOnlyReplica);
+        }
         let key = key.into();
         let rev = self.db.generate_revision();
         self.db
@@ -192,6 +198,9 @@ impl<'db> Namespace<'db> {
         end: impl Into<Key>,
         inclusive: bool,
     ) -> Result<u64> {
+        if self.db.is_replica() {
+            return Err(Error::ReadOnlyReplica);
+        }
         let start = start.into();
         let end = end.into();
 
@@ -222,6 +231,9 @@ impl<'db> Namespace<'db> {
     ///
     /// Returns the number of keys actually deleted.
     pub fn delete_prefix(&self, prefix: &str) -> Result<u64> {
+        if self.db.is_replica() {
+            return Err(Error::ReadOnlyReplica);
+        }
         let keys = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
@@ -336,6 +348,24 @@ impl<'db> Namespace<'db> {
         };
         let value = self.db.resolve_value(&self.name, &value)?;
         self.decrypt_value(value)
+    }
+
+    /// Returns the value, expiry status, and remaining TTL at a specific revision.
+    pub fn rev_get_with_ttl(
+        &self,
+        key: impl Into<Key>,
+        index: u64,
+    ) -> Result<(Value, bool, Option<Duration>)> {
+        let key = key.into();
+        let (value, expired, remaining) = {
+            let mt = self.db.get_or_create_memtable(&self.name);
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let (v, exp, rem) = mt.rev_get_with_ttl(&key, index).ok_or(Error::KeyNotFound)?;
+            (v.clone(), exp, rem)
+        };
+        let value = self.db.resolve_value(&self.name, &value)?;
+        let value = self.decrypt_value(value)?;
+        Ok((value, expired, remaining))
     }
 
     /// Returns the remaining TTL for a key, or `None` if the key has no expiration.
