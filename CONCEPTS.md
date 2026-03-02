@@ -348,27 +348,31 @@ one character before it. Use `help wipe` for detailed usage.
 
 The `Config` struct controls database behavior and LSM tuning parameters:
 
-| Field               | Type          | Default    | Description                                |
-| ------------------- | ------------- | ---------- | ------------------------------------------ |
-| `path`              | `PathBuf`     | (required) | Database directory path                    |
-| `create_if_missing` | `bool`        | `true`     | Create the directory if it doesn't exist   |
-| `write_buffer_size` | `usize`       | 4 MB       | In-memory write buffer size before flush   |
-| `max_levels`        | `usize`       | 3          | Maximum number of LSM levels               |
-| `block_size`        | `usize`       | 4 KB       | SSTable block size                         |
-| `cache_size`        | `usize`       | 8 MB       | Block cache size for decompressed blocks   |
-| `object_size`       | `usize`       | 1 KB       | Bin object size threshold (see above)      |
-| `compress`          | `bool`        | `true`     | LZ4-compress bin objects on disk           |
-| `bloom_bits`        | `usize`       | 10         | Bloom filter bits per key (0 = disabled)   |
-| `verify_checksums`  | `bool`        | `true`     | Verify checksums on read (see below)       |
-| `compression`       | `Compression` | `LZ4`      | SSTable block compression (see above)      |
-| `io_model`          | `IoModel`     | `Mmap`     | File I/O strategy (see I/O Modes below)    |
-| `cluster_id`        | `Option<u16>` | `None`     | Cluster ID for RevisionID (random if None) |
-| `aol_buffer_size`   | `usize`       | 128        | AOL flush threshold in records (0 = every) |
-| `l0_max_count`      | `usize`       | 4          | Max L0 SSTable count before compaction     |
-| `l0_max_size`       | `usize`       | 64 MB      | Max total L0 size before compaction        |
-| `l1_max_size`       | `usize`       | 256 MB     | Max L1 size before merge to L2             |
-| `default_max_size`  | `usize`       | 2 GB       | Default max size for L2+ levels            |
-| `bloom_prefix_len`  | `usize`       | 0          | Prefix bloom filter length (0 = disabled)  |
+| Field               | Type             | Default    | Description                                |
+| ------------------- | ---------------- | ---------- | ------------------------------------------ |
+| `path`              | `PathBuf`        | (required) | Database directory path                    |
+| `create_if_missing` | `bool`           | `true`     | Create the directory if it doesn't exist   |
+| `write_buffer_size` | `usize`          | 4 MB       | In-memory write buffer size before flush   |
+| `max_levels`        | `usize`          | 3          | Maximum number of LSM levels               |
+| `block_size`        | `usize`          | 4 KB       | SSTable block size                         |
+| `cache_size`        | `usize`          | 8 MB       | Block cache size for decompressed blocks   |
+| `object_size`       | `usize`          | 1 KB       | Bin object size threshold (see above)      |
+| `compress`          | `bool`           | `true`     | LZ4-compress bin objects on disk           |
+| `bloom_bits`        | `usize`          | 10         | Bloom filter bits per key (0 = disabled)   |
+| `verify_checksums`  | `bool`           | `true`     | Verify checksums on read (see below)       |
+| `compression`       | `Compression`    | `LZ4`      | SSTable block compression (see above)      |
+| `io_model`          | `IoModel`        | `Mmap`     | File I/O strategy (see I/O Modes below)    |
+| `cluster_id`        | `Option<u16>`    | `None`     | Cluster ID for RevisionID (random if None) |
+| `aol_buffer_size`   | `usize`          | 128        | AOL flush threshold in records (0 = every) |
+| `l0_max_count`      | `usize`          | 4          | Max L0 SSTable count before compaction     |
+| `l0_max_size`       | `usize`          | 64 MB      | Max total L0 size before compaction        |
+| `l1_max_size`       | `usize`          | 256 MB     | Max L1 size before merge to L2             |
+| `default_max_size`  | `usize`          | 2 GB       | Default max size for L2+ levels            |
+| `bloom_prefix_len`  | `usize`          | 0          | Prefix bloom filter length (0 = disabled)  |
+| `role`              | `Role`           | Standalone | Replication role (see Replication below)   |
+| `repl_bind`         | `String`         | `0.0.0.0`  | Replication listen address (primary only)  |
+| `repl_port`         | `u16`            | 8322       | Replication listen port (primary only)     |
+| `primary_addr`      | `Option<String>` | `None`     | Primary address for replica to connect to  |
 
 The CLI uses dot-notation keys for `config <key> <value>`:
 
@@ -393,6 +397,10 @@ The CLI uses dot-notation keys for `config <key> <value>`:
 | `l1_max_size`       | `lsm.l1_max_size`           |
 | `default_max_size`  | `lsm.default_max_size`      |
 | `bloom_prefix_len`  | `lsm.bloom_prefix_len`      |
+| `role`              | `repl.role`                 |
+| `repl_bind`         | `repl.bind`                 |
+| `repl_port`         | `repl.port`                 |
+| `primary_addr`      | `repl.primary_addr`         |
 
 `Config::new(path)` initializes all fields to their defaults. Fields can be overridden before
 passing the config to `DB::open`.
@@ -1115,6 +1123,54 @@ method to detect tombstones.
 returning tombstoned keys alongside live ones. Without `deleted=true`, tombstoned keys are hidden (default).
 
 See the [README](README.md#http-server) for startup examples and curl recipes.
+
+### Primary-Replica Replication
+
+rKV supports asynchronous primary-replica replication over TCP, enabling read scaling and basic high
+availability. The replication subsystem uses `std::net` (no Tokio dependency), running on dedicated
+background threads alongside the existing flush and compaction threads.
+
+#### Roles
+
+Each node operates in one of three roles, configured at startup:
+
+- **Standalone** (default): No replication. The node accepts reads and writes independently.
+- **Primary**: Accepts all reads and writes. Streams every write to connected replicas in real time.
+- **Replica**: Connects to a primary, receives data, and serves reads. Rejects all local writes with
+  a `ReadOnlyReplica` error.
+
+#### How It Works
+
+When a replica connects to a primary, replication proceeds in two phases:
+
+1. **Full sync**: The primary flushes its write buffer, then streams all SSTable and bin-object files
+   to the replica. The replica writes these files to its local storage, bringing it up to the primary's
+   baseline state.
+2. **Live streaming**: After full sync, the primary forwards every AOL (append-only log) record to the
+   replica as it is written. The replica applies each record to its local AOL and in-memory write buffer,
+   staying current with the primary's writes.
+
+#### Wire Protocol
+
+Messages are framed as `[type: 1 byte][payload length: 4 bytes BE][payload][checksum: 5 bytes CRC32C]`.
+The checksum covers the type, length, and payload bytes, providing integrity verification on every
+message. A handshake exchange at connection start verifies cluster membership via matching cluster IDs.
+
+#### Failure Handling
+
+- **Replica reconnection**: If the connection to the primary drops, the replica automatically reconnects
+  with exponential backoff (1 second to 30 seconds). On reconnection, a fresh full sync is performed
+  to ensure consistency.
+- **Primary tolerance**: The primary accepts multiple concurrent replicas. If a replica disconnects,
+  the primary cleans up its resources without affecting other replicas or write throughput.
+
+#### Observability
+
+The node's role is exposed through multiple channels:
+
+- **Stats**: `stats` command (CLI) and `GET /api/admin/stats` include a `role` field.
+- **Health**: `GET /health` returns JSON with `status`, `role`, and `uptime_secs`.
+- **Config**: `config` command shows the current replication settings.
 
 ## Design Decisions
 
