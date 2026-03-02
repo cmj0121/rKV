@@ -1441,8 +1441,8 @@ impl DB {
                 self.config.bloom_prefix_len,
                 &*self.io_backend,
             )?;
-            for (key, value) in &entries {
-                writer.add(key, value)?;
+            for (key, value, revision) in &entries {
+                writer.add(key, value, *revision)?;
             }
             writer.finish()?;
 
@@ -1747,13 +1747,17 @@ impl DB {
                     if level_idx == 0 {
                         // L0: reverse (oldest-to-newest within L0)
                         for reader in level_readers.iter().rev() {
-                            for (key, value) in reader.iter_entries(self.config.verify_checksums)? {
+                            for (key, value, _rev) in
+                                reader.iter_entries(self.config.verify_checksums)?
+                            {
                                 merged.insert(key, value);
                             }
                         }
                     } else {
                         for reader in level_readers {
-                            for (key, value) in reader.iter_entries(self.config.verify_checksums)? {
+                            for (key, value, _rev) in
+                                reader.iter_entries(self.config.verify_checksums)?
+                            {
                                 merged.insert(key, value);
                             }
                         }
@@ -2012,12 +2016,13 @@ impl DB {
 
             // Merge all entries: process oldest-to-newest so newer values
             // overwrite older ones in the BTreeMap.
-            let mut merged = std::collections::BTreeMap::<Key, Value>::new();
+            let mut merged =
+                std::collections::BTreeMap::<Key, (Value, revision::RevisionID)>::new();
 
             // Target entries are oldest
             for reader in target {
-                for (key, value) in reader.iter_entries(config.verify_checksums)? {
-                    merged.insert(key, value);
+                for (key, value, rev) in reader.iter_entries(config.verify_checksums)? {
+                    merged.insert(key, (value, rev));
                 }
             }
 
@@ -2025,20 +2030,20 @@ impl DB {
             // L1+ iterate in natural order.
             if source_level == 0 {
                 for reader in source.iter().rev() {
-                    for (key, value) in reader.iter_entries(config.verify_checksums)? {
-                        merged.insert(key, value);
+                    for (key, value, rev) in reader.iter_entries(config.verify_checksums)? {
+                        merged.insert(key, (value, rev));
                     }
                 }
             } else {
                 for reader in source {
-                    for (key, value) in reader.iter_entries(config.verify_checksums)? {
-                        merged.insert(key, value);
+                    for (key, value, rev) in reader.iter_entries(config.verify_checksums)? {
+                        merged.insert(key, (value, rev));
                     }
                 }
             }
 
             if drop_tombstones {
-                merged.retain(|_, v| !v.is_tombstone());
+                merged.retain(|_, (v, _)| !v.is_tombstone());
             }
 
             // Collect source file paths for cleanup by scanning disk
@@ -2100,8 +2105,8 @@ impl DB {
             config.bloom_prefix_len,
             &**io,
         )?;
-        for (key, value) in &merged {
-            writer.add(key, value)?;
+        for (key, (value, rev)) in &merged {
+            writer.add(key, value, *rev)?;
         }
         writer.finish()?;
 
@@ -2174,7 +2179,7 @@ impl DB {
             if let Some(levels) = sst.get(ns) {
                 for level_readers in levels {
                     for reader in level_readers {
-                        for (_key, value) in reader.iter_entries(config.verify_checksums)? {
+                        for (_key, value, _rev) in reader.iter_entries(config.verify_checksums)? {
                             if let Value::Pointer(vp) = value {
                                 hashes.insert(vp.hex_hash());
                             }
@@ -2414,7 +2419,7 @@ impl DB {
                 if level_idx == 0 {
                     // L0: reverse (oldest-to-newest within L0)
                     for reader in level_readers.iter().rev() {
-                        for (key, value) in reader.scan_entries(
+                        for (key, value, _rev) in reader.scan_entries(
                             &prefix_bytes,
                             effective_ordered,
                             self.config.verify_checksums,
@@ -2424,7 +2429,7 @@ impl DB {
                     }
                 } else {
                     for reader in level_readers {
-                        for (key, value) in reader.scan_entries(
+                        for (key, value, _rev) in reader.scan_entries(
                             &prefix_bytes,
                             effective_ordered,
                             self.config.verify_checksums,
@@ -2462,7 +2467,7 @@ impl DB {
             for (level_idx, level_readers) in levels.iter().enumerate().rev() {
                 if level_idx == 0 {
                     for reader in level_readers.iter().rev() {
-                        for (key, value) in reader.rscan_entries(
+                        for (key, value, _rev) in reader.rscan_entries(
                             &prefix_bytes,
                             ordered_mode,
                             self.config.verify_checksums,
@@ -2472,7 +2477,7 @@ impl DB {
                     }
                 } else {
                     for reader in level_readers {
-                        for (key, value) in reader.rscan_entries(
+                        for (key, value, _rev) in reader.rscan_entries(
                             &prefix_bytes,
                             ordered_mode,
                             self.config.verify_checksums,
@@ -2490,15 +2495,19 @@ impl DB {
     /// Look up a key across all SSTable levels for a namespace.
     ///
     /// Searches L0 (newest-first), then L1, L2, etc. Returns:
-    /// - `Ok(Some(value))` if found (may be `Tombstone`)
+    /// - `Ok(Some((value, revision)))` if found (may be `Tombstone`)
     /// - `Ok(None)` if not found in any SSTable
-    pub(crate) fn get_from_sstables(&self, ns: &str, key: &Key) -> Result<Option<Value>> {
+    pub(crate) fn get_from_sstables(
+        &self,
+        ns: &str,
+        key: &Key,
+    ) -> Result<Option<(Value, revision::RevisionID)>> {
         let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
         if let Some(levels) = sst.get(ns) {
             for level_readers in levels {
                 for reader in level_readers {
-                    if let Some(value) = reader.get(key, self.config.verify_checksums)? {
-                        return Ok(Some(value));
+                    if let Some(vr) = reader.get(key, self.config.verify_checksums)? {
+                        return Ok(Some(vr));
                     }
                 }
             }

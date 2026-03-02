@@ -128,8 +128,8 @@ impl<'db> Namespace<'db> {
                     // 2. Fall through to SSTables only when key was never in memtable
                     drop(mt);
                     match self.db.get_from_sstables(&self.name, &key)? {
-                        Some(v) if v.is_tombstone() => return Err(Error::KeyNotFound),
-                        Some(v) => v,
+                        Some((v, _rev)) if v.is_tombstone() => return Err(Error::KeyNotFound),
+                        Some((v, _rev)) => v,
                         None => return Err(Error::KeyNotFound),
                     }
                 }
@@ -160,8 +160,8 @@ impl<'db> Namespace<'db> {
             MemLookup::NotFound => {
                 drop(mt);
                 match self.db.get_from_sstables(&self.name, &key)? {
-                    Some(v) if v.is_tombstone() => Ok(Some(Value::tombstone())),
-                    Some(v) => {
+                    Some((v, _rev)) if v.is_tombstone() => Ok(Some(Value::tombstone())),
+                    Some((v, _rev)) => {
                         let v = self.db.resolve_value(&self.name, &v)?;
                         Ok(Some(self.decrypt_value(v)?))
                     }

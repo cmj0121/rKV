@@ -493,14 +493,15 @@ impl MemTable {
 
     /// Drain the latest value for each key in sorted order.
     ///
-    /// Returns a `Vec<(Key, Value)>` containing the most recent non-expired
-    /// value for every key, **including tombstones** (needed for correctness
-    /// when flushing to SSTable — a tombstone must shadow older SSTables).
+    /// Returns a `Vec<(Key, Value, RevisionID)>` containing the most recent
+    /// non-expired value (plus its revision) for every key, **including
+    /// tombstones** (needed for correctness when flushing to SSTable — a
+    /// tombstone must shadow older SSTables).
     ///
     /// Expired entries are flushed as tombstones so they remain visible to
     /// "show deleted" scans after the memtable is drained. Compaction will
     /// eventually garbage-collect them.
-    pub(crate) fn drain_latest(&mut self) -> Vec<(Key, Value)> {
+    pub(crate) fn drain_latest(&mut self) -> Vec<(Key, Value, RevisionID)> {
         let entries = std::mem::take(&mut self.entries);
         self.last_rev.clear();
         self.approximate_size = 0;
@@ -508,14 +509,15 @@ impl MemTable {
         let mut result = Vec::with_capacity(entries.len());
         for (key, revisions) in entries {
             if let Some(latest) = revisions.last() {
+                let rev = latest.revision;
                 if let Some(expires_at) = latest.expires_at {
                     if Instant::now() > expires_at {
                         // Expired → flush as tombstone so "show deleted" works
-                        result.push((key, Value::tombstone()));
+                        result.push((key, Value::tombstone(), rev));
                         continue;
                     }
                 }
-                result.push((key, latest.value.clone()));
+                result.push((key, latest.value.clone(), rev));
             }
         }
         result
@@ -995,9 +997,12 @@ mod tests {
 
         let drained = mt.drain_latest();
         assert_eq!(drained.len(), 3);
-        assert_eq!(drained[0], (Key::Int(1), Value::from("a")));
-        assert_eq!(drained[1], (Key::Int(2), Value::from("b")));
-        assert_eq!(drained[2], (Key::Int(3), Value::from("c")));
+        assert_eq!(drained[0].0, Key::Int(1));
+        assert_eq!(drained[0].1, Value::from("a"));
+        assert_eq!(drained[1].0, Key::Int(2));
+        assert_eq!(drained[1].1, Value::from("b"));
+        assert_eq!(drained[2].0, Key::Int(3));
+        assert_eq!(drained[2].1, Value::from("c"));
     }
 
     #[test]
