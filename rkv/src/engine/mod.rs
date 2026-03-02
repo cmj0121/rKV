@@ -608,13 +608,25 @@ impl DB {
 
                     // Clear stale memtable entries so they don't shadow the
                     // authoritative SSTable snapshot from the primary.
-                    // Re-register synced namespaces with fresh memtables
-                    // and ensure the default namespace always exists.
+                    //
+                    // IMPORTANT: We must NOT call `ns_map.clear()` because
+                    // `get_or_create_memtable()` returns raw pointers into the
+                    // HashMap under the SAFETY invariant "we only grow, never
+                    // shrink". Clearing the map would invalidate those pointers.
+                    // Instead, reset each MemTable in-place and add any new
+                    // namespace entries.
                     {
                         let mut ns_map = sync_ns_data.write().unwrap_or_else(|e| e.into_inner());
-                        ns_map.clear();
+                        // Reset all existing memtables in-place (Mutex stays at same address)
+                        for mt_mutex in ns_map.values() {
+                            let mut mt = mt_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                            *mt = memtable::MemTable::new();
+                        }
+                        // Register new SST namespaces (HashMap only grows)
                         for ns_name in new_sst.keys() {
-                            ns_map.insert(ns_name.clone(), Mutex::new(memtable::MemTable::new()));
+                            ns_map
+                                .entry(ns_name.clone())
+                                .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
                         }
                         ns_map
                             .entry(DEFAULT_NAMESPACE.to_owned())

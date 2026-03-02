@@ -208,14 +208,16 @@ fn live_replication_propagates_writes() {
     // Check if replica received the live data
     let ns = replica.namespace(DEFAULT_NAMESPACE, None).unwrap();
     let val = ns.get("live_key");
-    // Live replication writes to memtable, so this should be visible
-    match val {
-        Ok(v) => assert_eq!(v.as_bytes(), Some(b"live_value".as_slice())),
-        Err(_) => {
-            // Acceptable if replication pipeline has delay; the key point
-            // is that the replica didn't crash and accepted the stream.
-        }
-    }
+    assert!(
+        val.is_ok(),
+        "live key should be readable on replica, got error: {:?}",
+        val.err()
+    );
+    assert_eq!(
+        val.unwrap().as_bytes(),
+        Some(b"live_value".as_slice()),
+        "live key should have correct value on replica"
+    );
 
     drop(ns);
     replica.close().unwrap();
@@ -438,6 +440,64 @@ fn replica_allows_flush_and_compact() {
     assert!(val.is_ok(), "data should survive replica flush");
     drop(ns);
 
+    replica.close().unwrap();
+    primary.close().unwrap();
+}
+
+#[test]
+fn first_key_on_pure_db_visible_on_replica() {
+    let tmp_primary = tempfile::tempdir().unwrap();
+    let tmp_replica = tempfile::tempdir().unwrap();
+    let port = free_port();
+
+    // Both DBs start completely empty (pure)
+    let primary = open_primary(tmp_primary.path(), port);
+    thread::sleep(Duration::from_millis(100));
+
+    let replica = open_replica(tmp_replica.path(), &format!("127.0.0.1:{port}"));
+    // Wait for full sync to complete (empty sync)
+    thread::sleep(Duration::from_millis(1500));
+
+    // Write the FIRST key ever on the primary
+    let ns = primary.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns.put("first_key", "first_value", None).unwrap();
+    drop(ns);
+
+    // Wait for live-stream propagation
+    thread::sleep(Duration::from_millis(1000));
+
+    // Check the key on the replica — must be visible as live data, NOT deleted
+    let ns = replica.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // Strict assertion: get must succeed
+    let val = ns.get("first_key");
+    assert!(
+        val.is_ok(),
+        "first key should be readable on replica, got error: {:?}",
+        val.err()
+    );
+    assert_eq!(
+        val.unwrap().as_bytes(),
+        Some(b"first_value".as_slice()),
+        "first key should have correct value on replica"
+    );
+
+    // Also verify via scan — key should be live (not tombstoned)
+    let prefix = Key::from("");
+    let live_keys = ns.scan(&prefix, 100, 0, false).unwrap();
+    assert!(
+        live_keys.contains(&Key::from("first_key")),
+        "first_key should appear in live scan on replica, got: {live_keys:?}"
+    );
+
+    // Verify it does NOT appear only in deleted scan
+    let all_keys = ns.scan(&prefix, 100, 0, true).unwrap();
+    assert!(
+        all_keys.contains(&Key::from("first_key")),
+        "first_key should appear in full scan on replica, got: {all_keys:?}"
+    );
+
+    drop(ns);
     replica.close().unwrap();
     primary.close().unwrap();
 }
