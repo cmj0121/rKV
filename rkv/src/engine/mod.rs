@@ -1860,13 +1860,17 @@ impl DB {
         prefix: &Key,
         ordered_mode: bool,
     ) -> Result<std::collections::BTreeMap<Key, Value>> {
-        // For ordered mode (range scan), use full serialized key bytes.
-        // For unordered mode (prefix match), use prefix bytes without
-        // the Str null terminator so starts_with works correctly.
-        let prefix_bytes = if ordered_mode {
-            prefix.to_bytes()
+        // In ordered mode, Key::Str("").to_bytes() is [0x02, 0x00] which
+        // sits after all Int keys in byte order. An empty Str prefix means
+        // "scan everything", so switch to unordered prefix matching with
+        // empty bytes — starts_with(&[]) is always true.
+        let scan_all = ordered_mode && *prefix == Key::Str(String::new());
+        let (prefix_bytes, effective_ordered) = if scan_all {
+            (vec![], false)
+        } else if ordered_mode {
+            (prefix.to_bytes(), true)
         } else {
-            prefix.to_prefix_bytes()
+            (prefix.to_prefix_bytes(), false)
         };
         let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
         let mut merged = std::collections::BTreeMap::<Key, Value>::new();
@@ -1879,7 +1883,7 @@ impl DB {
                     for reader in level_readers.iter().rev() {
                         for (key, value) in reader.scan_entries(
                             &prefix_bytes,
-                            ordered_mode,
+                            effective_ordered,
                             self.config.verify_checksums,
                         )? {
                             merged.insert(key, value);
@@ -1889,7 +1893,7 @@ impl DB {
                     for reader in level_readers {
                         for (key, value) in reader.scan_entries(
                             &prefix_bytes,
-                            ordered_mode,
+                            effective_ordered,
                             self.config.verify_checksums,
                         )? {
                             merged.insert(key, value);

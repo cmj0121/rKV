@@ -243,10 +243,20 @@ impl MemTable {
     /// overlay MemTable entries on top of SSTable results.
     pub(crate) fn scan_all_raw(&self, prefix: &Key) -> Vec<(Key, Value)> {
         if self.ordered_mode {
-            self.entries
-                .range(prefix..)
-                .map(|(k, entries)| (k.clone(), Self::latest_or_tombstone(entries)))
-                .collect()
+            // In ordered mode, range(Key::Str("")..) misses all Int keys
+            // because Key::Int < Key::Str. An empty Str prefix means
+            // "scan everything", so iterate all entries.
+            if *prefix == Key::Str(String::new()) {
+                self.entries
+                    .iter()
+                    .map(|(k, entries)| (k.clone(), Self::latest_or_tombstone(entries)))
+                    .collect()
+            } else {
+                self.entries
+                    .range(prefix..)
+                    .map(|(k, entries)| (k.clone(), Self::latest_or_tombstone(entries)))
+                    .collect()
+            }
         } else {
             let prefix_str = prefix.to_string();
             self.entries
@@ -712,6 +722,20 @@ mod tests {
     }
 
     // --- Scan ---
+
+    #[test]
+    fn scan_all_raw_ordered_empty_prefix_includes_int_keys() {
+        let mut mt = MemTable::new();
+        mt.put(Key::Int(1), Value::from("a"), RevisionID::from(1u128), None);
+        mt.put(Key::Int(2), Value::from("b"), RevisionID::from(2u128), None);
+        assert!(mt.is_ordered());
+
+        // Empty Str prefix = "scan everything" — must include Int keys
+        let entries = mt.scan_all_raw(&Key::Str(String::new()));
+        assert_eq!(entries.len(), 2, "Int keys must be visible: {entries:?}");
+        assert_eq!(entries[0].0, Key::Int(1));
+        assert_eq!(entries[1].0, Key::Int(2));
+    }
 
     #[test]
     fn scan_ordered_mode() {
