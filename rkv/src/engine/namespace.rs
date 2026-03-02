@@ -4,7 +4,7 @@ use std::time::Duration;
 use super::crypto;
 use super::error::{Error, Result};
 use super::key::Key;
-use super::memtable::MemLookup;
+use super::memtable::{MemLookup, MemLookupRev};
 use super::revision::RevisionID;
 use super::value::Value;
 use super::DB;
@@ -128,8 +128,8 @@ impl<'db> Namespace<'db> {
                     // 2. Fall through to SSTables only when key was never in memtable
                     drop(mt);
                     match self.db.get_from_sstables(&self.name, &key)? {
-                        Some(v) if v.is_tombstone() => return Err(Error::KeyNotFound),
-                        Some(v) => v,
+                        Some((v, _rev)) if v.is_tombstone() => return Err(Error::KeyNotFound),
+                        Some((v, _rev)) => v,
                         None => return Err(Error::KeyNotFound),
                     }
                 }
@@ -138,6 +138,33 @@ impl<'db> Namespace<'db> {
 
         let value = self.db.resolve_value(&self.name, &value)?;
         self.decrypt_value(value)
+    }
+
+    /// Like `get()`, but also returns the `RevisionID` for the value.
+    pub fn get_with_revision(&self, key: impl Into<Key>) -> Result<(Value, RevisionID)> {
+        let key = key.into();
+        self.db.inc_op_gets();
+
+        let (value, rev) = {
+            let mt = self.db.get_or_create_memtable(&self.name);
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            match mt.lookup_with_revision(&key) {
+                MemLookupRev::Found(v, rev) => (v.clone(), rev),
+                MemLookupRev::Tombstone => return Err(Error::KeyNotFound),
+                MemLookupRev::NotFound => {
+                    drop(mt);
+                    match self.db.get_from_sstables(&self.name, &key)? {
+                        Some((v, _rev)) if v.is_tombstone() => return Err(Error::KeyNotFound),
+                        Some((v, rev)) => (v, rev),
+                        None => return Err(Error::KeyNotFound),
+                    }
+                }
+            }
+        };
+
+        let value = self.db.resolve_value(&self.name, &value)?;
+        let value = self.decrypt_value(value)?;
+        Ok((value, rev))
     }
 
     /// Like `get()`, but returns `Some(Value::Tombstone)` for deleted keys
@@ -160,8 +187,8 @@ impl<'db> Namespace<'db> {
             MemLookup::NotFound => {
                 drop(mt);
                 match self.db.get_from_sstables(&self.name, &key)? {
-                    Some(v) if v.is_tombstone() => Ok(Some(Value::tombstone())),
-                    Some(v) => {
+                    Some((v, _rev)) if v.is_tombstone() => Ok(Some(Value::tombstone())),
+                    Some((v, _rev)) => {
                         let v = self.db.resolve_value(&self.name, &v)?;
                         Ok(Some(self.decrypt_value(v)?))
                     }
@@ -331,20 +358,77 @@ impl<'db> Namespace<'db> {
     }
 
     /// Returns the total number of revisions for a key.
+    ///
+    /// In the memtable the full history is available. After flush only the
+    /// latest snapshot survives in the SSTable, so this returns 1.
     pub fn rev_count(&self, key: impl Into<Key>) -> Result<u64> {
         let key = key.into();
         let mt = self.db.get_or_create_memtable(&self.name);
         let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
-        mt.rev_count(&key).ok_or(Error::KeyNotFound)
+        if let Some(n) = mt.rev_count(&key) {
+            // Key is in memtable — also check SSTable for older snapshot
+            drop(mt);
+            let sst_count = match self.db.get_from_sstables(&self.name, &key)? {
+                Some((v, _)) if v.is_tombstone() => 0,
+                Some(_) => 1,
+                None => 0,
+            };
+            return Ok(n + sst_count);
+        }
+        drop(mt);
+
+        // Key not in memtable — fall back to SSTable only.
+        match self.db.get_from_sstables(&self.name, &key)? {
+            Some((v, _)) if v.is_tombstone() => Err(Error::KeyNotFound),
+            Some(_) => Ok(1),
+            None => Err(Error::KeyNotFound),
+        }
     }
 
     /// Returns the value at a specific revision index (0 = oldest).
+    ///
+    /// When the key is only in SSTables (after flush), only index 0 is
+    /// available — the latest snapshot.
     pub fn rev_get(&self, key: impl Into<Key>, index: u64) -> Result<Value> {
         let key = key.into();
         let value = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
-            mt.rev_get(&key, index).cloned().ok_or(Error::KeyNotFound)?
+            let mt_count = mt.rev_count(&key);
+            match mt_count {
+                Some(_) => {
+                    drop(mt);
+                    // Key is in memtable — check SSTable for older snapshot
+                    let sst_entry = self.db.get_from_sstables(&self.name, &key)?;
+                    let has_sst = matches!(&sst_entry, Some((v, _)) if !v.is_tombstone());
+
+                    if has_sst && index == 0 {
+                        // Index 0 = SSTable (oldest) entry
+                        sst_entry.unwrap().0
+                    } else {
+                        // Shift index if SSTable entry exists
+                        let mt_index = if has_sst { index - 1 } else { index };
+                        let mt = self.db.get_or_create_memtable(&self.name);
+                        let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+                        match mt.rev_get(&key, mt_index) {
+                            Some(v) => v.clone(),
+                            None => return Err(Error::KeyNotFound),
+                        }
+                    }
+                }
+                None => {
+                    // Key not in memtable — SSTable only
+                    drop(mt);
+                    if index != 0 {
+                        return Err(Error::KeyNotFound);
+                    }
+                    match self.db.get_from_sstables(&self.name, &key)? {
+                        Some((v, _)) if v.is_tombstone() => return Err(Error::KeyNotFound),
+                        Some((v, _)) => v,
+                        None => return Err(Error::KeyNotFound),
+                    }
+                }
+            }
         };
         let value = self.db.resolve_value(&self.name, &value)?;
         self.decrypt_value(value)
@@ -360,8 +444,39 @@ impl<'db> Namespace<'db> {
         let (value, expired, remaining) = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
-            let (v, exp, rem) = mt.rev_get_with_ttl(&key, index).ok_or(Error::KeyNotFound)?;
-            (v.clone(), exp, rem)
+            let mt_count = mt.rev_count(&key);
+            match mt_count {
+                Some(_) => {
+                    drop(mt);
+                    // Key is in memtable — check SSTable for older snapshot
+                    let sst_entry = self.db.get_from_sstables(&self.name, &key)?;
+                    let has_sst = matches!(&sst_entry, Some((v, _)) if !v.is_tombstone());
+
+                    if has_sst && index == 0 {
+                        // Index 0 = SSTable (oldest) entry — no TTL info
+                        (sst_entry.unwrap().0, false, None)
+                    } else {
+                        let mt_index = if has_sst { index - 1 } else { index };
+                        let mt = self.db.get_or_create_memtable(&self.name);
+                        let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+                        match mt.rev_get_with_ttl(&key, mt_index) {
+                            Some((v, exp, rem)) => (v.clone(), exp, rem),
+                            None => return Err(Error::KeyNotFound),
+                        }
+                    }
+                }
+                None => {
+                    drop(mt);
+                    if index != 0 {
+                        return Err(Error::KeyNotFound);
+                    }
+                    match self.db.get_from_sstables(&self.name, &key)? {
+                        Some((v, _)) if v.is_tombstone() => return Err(Error::KeyNotFound),
+                        Some((v, _)) => (v, false, None),
+                        None => return Err(Error::KeyNotFound),
+                    }
+                }
+            }
         };
         let value = self.db.resolve_value(&self.name, &value)?;
         let value = self.decrypt_value(value)?;

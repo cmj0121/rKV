@@ -34,12 +34,19 @@ pub(crate) type DropNsFn = Box<dyn Fn(&str) -> Result<()> + Send + Sync>;
 /// SSTables, objects, AOL, checkpoint) before performing a fresh full sync.
 pub(crate) type CleanupFn = Box<dyn Fn() -> Result<()> + Send + Sync>;
 
+/// Callback invoked when the primary sends a `FlushNotify` message.
+///
+/// The replica uses this to flush its own memtable to SSTables, keeping
+/// the replica's on-disk state in sync with the primary.
+pub(crate) type FlushFn = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
 /// Bundles all replica callbacks and shared state to avoid too-many-arguments.
 pub(crate) struct ReplicaCallbacks {
     pub(crate) replay_fn: ReplayFn,
     pub(crate) post_sync_fn: PostSyncFn,
     pub(crate) drop_ns_fn: DropNsFn,
     pub(crate) cleanup_fn: CleanupFn,
+    pub(crate) flush_fn: FlushFn,
     /// Tracks the highest revision seen by the replica. Updated by `replay_fn`
     /// in mod.rs; read here when building `SyncRequest`.
     pub(crate) last_revision: Arc<Mutex<u128>>,
@@ -294,6 +301,7 @@ impl ReplReceiver {
             &mut reader,
             &callbacks.replay_fn,
             &callbacks.drop_ns_fn,
+            &callbacks.flush_fn,
             stop,
             Some(&callbacks.force_sync),
         )
@@ -469,6 +477,7 @@ impl ReplReceiver {
         reader: &mut R,
         replay_fn: &ReplayFn,
         drop_ns_fn: &DropNsFn,
+        flush_fn: &FlushFn,
         stop: &Arc<AtomicBool>,
         force_sync: Option<&Arc<AtomicBool>>,
     ) -> Result<()> {
@@ -511,6 +520,12 @@ impl ReplReceiver {
                 }
                 ReplMessage::DropNamespace { namespace } => {
                     drop_ns_fn(&namespace)?;
+                }
+                ReplMessage::FlushNotify => {
+                    // Primary flushed — flush local memtable (best-effort)
+                    if let Err(e) = flush_fn() {
+                        eprintln!("replication: flush on FlushNotify failed: {e}");
+                    }
                 }
                 ReplMessage::Heartbeat { .. } => {
                     // Heartbeat — connection is alive, nothing to do
@@ -749,6 +764,10 @@ mod tests {
         Box::new(|_| Ok(()))
     }
 
+    fn noop_flush_fn() -> FlushFn {
+        Arc::new(|| Ok(()))
+    }
+
     #[test]
     fn receive_live_stream_aol_records() {
         let mut buf = Vec::new();
@@ -783,6 +802,7 @@ mod tests {
             &mut cursor,
             &replay_fn,
             &noop_drop_ns_fn(),
+            &noop_flush_fn(),
             &stop,
             None,
         );
@@ -822,6 +842,7 @@ mod tests {
             &mut cursor,
             &replay_fn,
             &noop_drop_ns_fn(),
+            &noop_flush_fn(),
             &stop,
             None,
         );
@@ -845,6 +866,7 @@ mod tests {
             &mut cursor,
             &replay_fn,
             &noop_drop_ns_fn(),
+            &noop_flush_fn(),
             &stop,
             None,
         );
@@ -872,8 +894,14 @@ mod tests {
         let mut cursor = Cursor::new(buf);
 
         // EOF after DropNamespace → ConnectionReset
-        let _ =
-            ReplReceiver::receive_live_stream(&mut cursor, &replay_fn, &drop_ns_fn, &stop, None);
+        let _ = ReplReceiver::receive_live_stream(
+            &mut cursor,
+            &replay_fn,
+            &drop_ns_fn,
+            &noop_flush_fn(),
+            &stop,
+            None,
+        );
 
         let ns_list = dropped.lock().unwrap();
         assert_eq!(ns_list.len(), 1);

@@ -18,6 +18,8 @@ pub(crate) enum BroadcastMsg {
     Aol(Vec<u8>),
     /// Instruction to drop a namespace.
     DropNamespace(String),
+    /// Notify replicas that a flush has completed.
+    Flush,
 }
 
 /// Shared configuration for the primary replication listener.
@@ -96,6 +98,12 @@ impl ReplSender {
     pub(crate) fn broadcast_aol(&self, payload: &[u8]) {
         let mut senders = self.aol_senders.lock().unwrap_or_else(|e| e.into_inner());
         senders.retain(|tx| tx.try_send(BroadcastMsg::Aol(payload.to_vec())).is_ok());
+    }
+
+    /// Broadcast a flush notification to all connected replicas.
+    pub(crate) fn broadcast_flush(&self) {
+        let mut senders = self.aol_senders.lock().unwrap_or_else(|e| e.into_inner());
+        senders.retain(|tx| tx.try_send(BroadcastMsg::Flush).is_ok());
     }
 
     /// Broadcast a namespace-drop instruction to all connected replicas.
@@ -356,6 +364,9 @@ impl ReplSender {
             }
             BroadcastMsg::DropNamespace(namespace) => {
                 ReplMessage::DropNamespace { namespace }.write_to(writer)?;
+            }
+            BroadcastMsg::Flush => {
+                ReplMessage::FlushNotify.write_to(writer)?;
             }
         }
         Ok(())

@@ -9,6 +9,7 @@ use super::checksum::Checksum;
 use super::error::{Error, Result};
 use super::io::{IoBackend, IoBytes};
 use super::key::Key;
+use super::revision::RevisionID;
 use super::value::Value;
 use super::Compression;
 
@@ -17,8 +18,8 @@ use super::Compression;
 /// SSTable file magic bytes: "rKVS".
 const MAGIC: [u8; 4] = *b"rKVS";
 
-/// Current SSTable format version (V2 adds feature flags).
-const FORMAT_VERSION: u16 = 2;
+/// Current SSTable format version (V3 adds per-entry revision).
+const FORMAT_VERSION: u16 = 3;
 
 /// Minimum format version this reader can handle.
 const MIN_SUPPORTED_VERSION: u16 = 1;
@@ -108,7 +109,7 @@ impl SSTableWriter {
     }
 
     /// Add a key-value entry. Keys MUST be added in sorted order.
-    pub(crate) fn add(&mut self, key: &Key, value: &Value) -> Result<()> {
+    pub(crate) fn add(&mut self, key: &Key, value: &Value, revision: RevisionID) -> Result<()> {
         let key_bytes = key.to_bytes();
         self.bloom.insert(&key_bytes);
 
@@ -121,11 +122,13 @@ impl SSTableWriter {
         let value_data = value_to_data(value);
         let value_tag = value.to_tag();
 
-        // Encode entry: [key_len: u16 BE][key_bytes][value_tag: u8][value_len: u32 BE][value_data]
+        // V3 entry: [key_len: u16 BE][key_bytes][revision: u128 BE][value_tag: u8][value_len: u32 BE][value_data]
         let key_len = key_bytes.len() as u16;
         let value_len = value_data.len() as u32;
         self.block_buf.extend_from_slice(&key_len.to_be_bytes());
         self.block_buf.extend_from_slice(&key_bytes);
+        self.block_buf
+            .extend_from_slice(&revision.as_u128().to_be_bytes());
         self.block_buf.push(value_tag);
         self.block_buf.extend_from_slice(&value_len.to_be_bytes());
         self.block_buf.extend_from_slice(&value_data);
@@ -368,6 +371,8 @@ pub(crate) struct SSTableReader {
     /// Feature flags bitmask from the footer (0 for V1 files).
     #[allow(dead_code)] // accessed via #[cfg(test)] features() method
     features: u32,
+    /// Format version from the footer (1, 2, or 3).
+    version: u16,
 }
 
 impl SSTableReader {
@@ -550,6 +555,7 @@ impl SSTableReader {
             sst_id,
             cache,
             features,
+            version,
         })
     }
 
@@ -595,10 +601,15 @@ impl SSTableReader {
 
     /// Look up a key in the SSTable.
     ///
-    /// Returns `Some(value)` if found, `None` if the key is not present.
-    /// When `verify_checksums` is true, each data block is verified before
+    /// Returns `Some((value, revision))` if found, `None` if the key is not
+    /// present. Uses the bloom filter for fast negative answers, binary search
+    /// for block selection, and linear scan within the block for final key
     /// decoding.
-    pub(crate) fn get(&self, key: &Key, verify_checksums: bool) -> Result<Option<Value>> {
+    pub(crate) fn get(
+        &self,
+        key: &Key,
+        verify_checksums: bool,
+    ) -> Result<Option<(Value, RevisionID)>> {
         if self.index.is_empty() {
             return Ok(None);
         }
@@ -628,26 +639,28 @@ impl SSTableReader {
         let entries = self.read_block(ie, block_idx, verify_checksums)?;
 
         // Linear scan entries within the block
-        for (kb, value_tag, value_data) in entries {
+        for (kb, revision, value_tag, value_data) in entries {
             if kb == key_bytes {
-                return Ok(Some(Value::from_tag(value_tag, &value_data)?));
+                let value = Value::from_tag(value_tag, &value_data)?;
+                return Ok(Some((value, RevisionID::from(revision))));
             }
         }
         Ok(None)
     }
 
     /// Parse all entries from a decompressed block.
-    fn parse_block_entries(block: &[u8]) -> Result<Vec<RawEntry>> {
+    ///
+    /// V3 format: `[key_len][key][revision: u128 BE][value_tag][value_len][value_data]`
+    /// V1/V2 format: `[key_len][key][value_tag][value_len][value_data]` (revision = 0)
+    fn parse_block_entries(block: &[u8], version: u16) -> Result<Vec<RawEntry>> {
         let mut entries = Vec::new();
         let mut pos = 0;
         while pos < block.len() {
-            // [key_len: u16 BE][key_bytes][value_tag: u8][value_len: u32 BE][value_data]
             if pos + 2 > block.len() {
                 return Err(Error::Corruption(
                     "SSTable entry truncated at key_len".into(),
                 ));
             }
-            // SAFETY: bounds checked above — slice is exactly 2 bytes
             let kl = u16::from_be_bytes(block[pos..pos + 2].try_into().unwrap()) as usize;
             pos += 2;
 
@@ -658,6 +671,20 @@ impl SSTableReader {
             }
             let key_bytes = block[pos..pos + kl].to_vec();
             pos += kl;
+
+            // V3+: parse 16-byte revision after key
+            let revision = if version >= 3 {
+                if pos + 16 > block.len() {
+                    return Err(Error::Corruption(
+                        "SSTable entry truncated at revision".into(),
+                    ));
+                }
+                let rev = u128::from_be_bytes(block[pos..pos + 16].try_into().unwrap());
+                pos += 16;
+                rev
+            } else {
+                0u128
+            };
 
             if pos + 1 > block.len() {
                 return Err(Error::Corruption(
@@ -672,7 +699,6 @@ impl SSTableReader {
                     "SSTable entry truncated at value_len".into(),
                 ));
             }
-            // SAFETY: bounds checked above — slice is exactly 4 bytes
             let vl = u32::from_be_bytes(block[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
 
@@ -684,7 +710,7 @@ impl SSTableReader {
             let value_data = block[pos..pos + vl].to_vec();
             pos += vl;
 
-            entries.push((key_bytes, value_tag, value_data));
+            entries.push((key_bytes, revision, value_tag, value_data));
         }
         Ok(entries)
     }
@@ -692,7 +718,8 @@ impl SSTableReader {
     /// Scan entries matching a prefix/range.
     ///
     /// Uses the block index to skip blocks that cannot contain matching keys.
-    /// Returns `(Key, Value)` pairs in sorted order, including tombstones.
+    /// Returns `(Key, Value, RevisionID)` triples in sorted order, including
+    /// tombstones.
     ///
     /// - `prefix_bytes`: serialized key prefix to match against.
     /// - `ordered_mode`: if true, scan from prefix forward (range scan);
@@ -702,7 +729,7 @@ impl SSTableReader {
         prefix_bytes: &[u8],
         ordered_mode: bool,
         verify_checksums: bool,
-    ) -> Result<Vec<(Key, Value)>> {
+    ) -> Result<Vec<(Key, Value, RevisionID)>> {
         if self.index.is_empty() {
             return Ok(Vec::new());
         }
@@ -733,11 +760,11 @@ impl SSTableReader {
 
             for (bi, ie) in self.index[start_block..].iter().enumerate() {
                 let entries = self.read_block(ie, start_block + bi, verify_checksums)?;
-                for (key_bytes, value_tag, value_data) in entries {
+                for (key_bytes, revision, value_tag, value_data) in entries {
                     if key_bytes.as_slice() >= prefix_bytes {
                         let key = Key::from_bytes(&key_bytes)?;
                         let value = Value::from_tag(value_tag, &value_data)?;
-                        result.push((key, value));
+                        result.push((key, value, RevisionID::from(revision)));
                     }
                 }
             }
@@ -745,11 +772,11 @@ impl SSTableReader {
             // Prefix matching: scan all blocks, filter by prefix.
             for (bi, ie) in self.index.iter().enumerate() {
                 let entries = self.read_block(ie, bi, verify_checksums)?;
-                for (key_bytes, value_tag, value_data) in entries {
+                for (key_bytes, revision, value_tag, value_data) in entries {
                     if key_bytes.starts_with(prefix_bytes) {
                         let key = Key::from_bytes(&key_bytes)?;
                         let value = Value::from_tag(value_tag, &value_data)?;
-                        result.push((key, value));
+                        result.push((key, value, RevisionID::from(revision)));
                     }
                 }
             }
@@ -767,7 +794,7 @@ impl SSTableReader {
         prefix_bytes: &[u8],
         ordered_mode: bool,
         verify_checksums: bool,
-    ) -> Result<Vec<(Key, Value)>> {
+    ) -> Result<Vec<(Key, Value, RevisionID)>> {
         if self.index.is_empty() {
             return Ok(Vec::new());
         }
@@ -809,11 +836,11 @@ impl SSTableReader {
             // Read from block 0 up to end_block inclusive
             for (bi, ie) in self.index[..=end_block].iter().enumerate() {
                 let entries = self.read_block(ie, bi, verify_checksums)?;
-                for (key_bytes, value_tag, value_data) in entries {
+                for (key_bytes, revision, value_tag, value_data) in entries {
                     if key_bytes.as_slice() <= prefix_bytes {
                         let key = Key::from_bytes(&key_bytes)?;
                         let value = Value::from_tag(value_tag, &value_data)?;
-                        result.push((key, value));
+                        result.push((key, value, RevisionID::from(revision)));
                     }
                 }
             }
@@ -896,7 +923,7 @@ impl SSTableReader {
         let compressed_payload = &block_on_disk[1..cksum_start];
         let block_data = decompress_block(compression_tag, compressed_payload)?;
 
-        let entries = Self::parse_block_entries(&block_data)?;
+        let entries = Self::parse_block_entries(&block_data, self.version)?;
 
         // 3. Cache insert (brief lock)
         if let Some(ref c) = self.cache {
@@ -911,15 +938,20 @@ impl SSTableReader {
 
     /// Iterate all entries in sorted key order.
     ///
-    /// Reads every data block, decompresses, and returns `(Key, Value)` pairs.
-    pub(crate) fn iter_entries(&self, verify_checksums: bool) -> Result<Vec<(Key, Value)>> {
+    /// Reads every data block, decompresses, and returns `(Key, Value, RevisionID)` triples.
+    pub(crate) fn iter_entries(
+        &self,
+        verify_checksums: bool,
+    ) -> Result<Vec<(Key, Value, RevisionID)>> {
         let mut result = Vec::with_capacity(self.entry_count as usize);
 
         for (bi, ie) in self.index.iter().enumerate() {
-            for (key_bytes, value_tag, value_data) in self.read_block(ie, bi, verify_checksums)? {
+            for (key_bytes, revision, value_tag, value_data) in
+                self.read_block(ie, bi, verify_checksums)?
+            {
                 let key = Key::from_bytes(&key_bytes)?;
                 let value = Value::from_tag(value_tag, &value_data)?;
-                result.push((key, value));
+                result.push((key, value, RevisionID::from(revision)));
             }
         }
 
@@ -1001,7 +1033,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.sst");
         let mut writer = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
-        writer.add(&Key::Int(1), &Value::from("a")).unwrap();
+        writer
+            .add(&Key::Int(1), &Value::from("a"), RevisionID::ZERO)
+            .unwrap();
         writer.finish().unwrap();
 
         let data = fs::read(&path).unwrap();
@@ -1017,8 +1051,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.sst");
         let mut writer = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
-        writer.add(&Key::Int(1), &Value::from("hello")).unwrap();
-        writer.add(&Key::Int(2), &Value::from("world")).unwrap();
+        writer
+            .add(&Key::Int(1), &Value::from("hello"), RevisionID::ZERO)
+            .unwrap();
+        writer
+            .add(&Key::Int(2), &Value::from("world"), RevisionID::ZERO)
+            .unwrap();
         writer.finish().unwrap();
 
         assert!(path.exists());
@@ -1034,7 +1072,11 @@ mod tests {
         let mut writer = SSTableWriter::new(&path, 32, Compression::None, 0, 0, &io()).unwrap();
         for i in 0..20 {
             writer
-                .add(&Key::Int(i), &Value::from(format!("val{i}").as_str()))
+                .add(
+                    &Key::Int(i),
+                    &Value::from(format!("val{i}").as_str()),
+                    RevisionID::ZERO,
+                )
                 .unwrap();
         }
         writer.finish().unwrap();
@@ -1052,8 +1094,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
-        w.add(&Key::Int(1), &Value::from("a")).unwrap();
-        w.add(&Key::Int(2), &Value::from("b")).unwrap();
+        w.add(&Key::Int(1), &Value::from("a"), RevisionID::ZERO)
+            .unwrap();
+        w.add(&Key::Int(2), &Value::from("b"), RevisionID::ZERO)
+            .unwrap();
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
@@ -1067,8 +1111,12 @@ mod tests {
         let path = tmp.path().join("multi.sst");
         let mut w = SSTableWriter::new(&path, 32, Compression::None, 0, 0, &io()).unwrap();
         for i in 0..20 {
-            w.add(&Key::Int(i), &Value::from(format!("v{i}").as_str()))
-                .unwrap();
+            w.add(
+                &Key::Int(i),
+                &Value::from(format!("v{i}").as_str()),
+                RevisionID::ZERO,
+            )
+            .unwrap();
         }
         w.finish().unwrap();
 
@@ -1084,12 +1132,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("rt.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
-        w.add(&Key::Int(42), &Value::from("hello")).unwrap();
+        w.add(&Key::Int(42), &Value::from("hello"), RevisionID::ZERO)
+            .unwrap();
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
         let val = r.get(&Key::Int(42), true).unwrap();
-        assert_eq!(val, Some(Value::from("hello")));
+        assert_eq!(val, Some((Value::from("hello"), RevisionID::ZERO)));
     }
 
     #[test]
@@ -1098,15 +1147,22 @@ mod tests {
         let path = tmp.path().join("rt.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
         for i in 0..10 {
-            w.add(&Key::Int(i), &Value::from(format!("val{i}").as_str()))
-                .unwrap();
+            w.add(
+                &Key::Int(i),
+                &Value::from(format!("val{i}").as_str()),
+                RevisionID::ZERO,
+            )
+            .unwrap();
         }
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
         for i in 0..10 {
             let val = r.get(&Key::Int(i), true).unwrap();
-            assert_eq!(val, Some(Value::from(format!("val{i}").as_str())));
+            assert_eq!(
+                val,
+                Some((Value::from(format!("val{i}").as_str()), RevisionID::ZERO))
+            );
         }
     }
 
@@ -1117,8 +1173,12 @@ mod tests {
         // Small block size forces multiple blocks
         let mut w = SSTableWriter::new(&path, 32, Compression::None, 0, 0, &io()).unwrap();
         for i in 0..50 {
-            w.add(&Key::Int(i), &Value::from(format!("v{i}").as_str()))
-                .unwrap();
+            w.add(
+                &Key::Int(i),
+                &Value::from(format!("v{i}").as_str()),
+                RevisionID::ZERO,
+            )
+            .unwrap();
         }
         w.finish().unwrap();
 
@@ -1126,7 +1186,10 @@ mod tests {
         assert!(r.block_count() > 1);
         for i in 0..50 {
             let val = r.get(&Key::Int(i), true).unwrap();
-            assert_eq!(val, Some(Value::from(format!("v{i}").as_str())));
+            assert_eq!(
+                val,
+                Some((Value::from(format!("v{i}").as_str()), RevisionID::ZERO))
+            );
         }
     }
 
@@ -1136,8 +1199,12 @@ mod tests {
         let path = tmp.path().join("lz4.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::LZ4, 0, 0, &io()).unwrap();
         for i in 0..10 {
-            w.add(&Key::Int(i), &Value::from(format!("val{i}").as_str()))
-                .unwrap();
+            w.add(
+                &Key::Int(i),
+                &Value::from(format!("val{i}").as_str()),
+                RevisionID::ZERO,
+            )
+            .unwrap();
         }
         w.finish().unwrap();
 
@@ -1145,7 +1212,7 @@ mod tests {
         for i in 0..10 {
             assert_eq!(
                 r.get(&Key::Int(i), true).unwrap(),
-                Some(Value::from(format!("val{i}").as_str()))
+                Some((Value::from(format!("val{i}").as_str()), RevisionID::ZERO))
             );
         }
     }
@@ -1156,8 +1223,12 @@ mod tests {
         let path = tmp.path().join("zstd.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::Zstd, 0, 0, &io()).unwrap();
         for i in 0..10 {
-            w.add(&Key::Int(i), &Value::from(format!("val{i}").as_str()))
-                .unwrap();
+            w.add(
+                &Key::Int(i),
+                &Value::from(format!("val{i}").as_str()),
+                RevisionID::ZERO,
+            )
+            .unwrap();
         }
         w.finish().unwrap();
 
@@ -1165,7 +1236,7 @@ mod tests {
         for i in 0..10 {
             assert_eq!(
                 r.get(&Key::Int(i), true).unwrap(),
-                Some(Value::from(format!("val{i}").as_str()))
+                Some((Value::from(format!("val{i}").as_str()), RevisionID::ZERO))
             );
         }
     }
@@ -1176,23 +1247,26 @@ mod tests {
         let path = tmp.path().join("str.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
         // Str keys must be added in sorted order
-        w.add(&Key::from("aaa"), &Value::from("first")).unwrap();
-        w.add(&Key::from("bbb"), &Value::from("second")).unwrap();
-        w.add(&Key::from("ccc"), &Value::from("third")).unwrap();
+        w.add(&Key::from("aaa"), &Value::from("first"), RevisionID::ZERO)
+            .unwrap();
+        w.add(&Key::from("bbb"), &Value::from("second"), RevisionID::ZERO)
+            .unwrap();
+        w.add(&Key::from("ccc"), &Value::from("third"), RevisionID::ZERO)
+            .unwrap();
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
         assert_eq!(
             r.get(&Key::from("aaa"), true).unwrap(),
-            Some(Value::from("first"))
+            Some((Value::from("first"), RevisionID::ZERO))
         );
         assert_eq!(
             r.get(&Key::from("bbb"), true).unwrap(),
-            Some(Value::from("second"))
+            Some((Value::from("second"), RevisionID::ZERO))
         );
         assert_eq!(
             r.get(&Key::from("ccc"), true).unwrap(),
-            Some(Value::from("third"))
+            Some((Value::from("third"), RevisionID::ZERO))
         );
     }
 
@@ -1201,17 +1275,25 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("special.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
-        w.add(&Key::Int(1), &Value::Null).unwrap();
-        w.add(&Key::Int(2), &Value::tombstone()).unwrap();
-        w.add(&Key::Int(3), &Value::from("data")).unwrap();
+        w.add(&Key::Int(1), &Value::Null, RevisionID::ZERO).unwrap();
+        w.add(&Key::Int(2), &Value::tombstone(), RevisionID::ZERO)
+            .unwrap();
+        w.add(&Key::Int(3), &Value::from("data"), RevisionID::ZERO)
+            .unwrap();
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
-        assert_eq!(r.get(&Key::Int(1), true).unwrap(), Some(Value::Null));
-        assert_eq!(r.get(&Key::Int(2), true).unwrap(), Some(Value::tombstone()));
+        assert_eq!(
+            r.get(&Key::Int(1), true).unwrap(),
+            Some((Value::Null, RevisionID::ZERO))
+        );
+        assert_eq!(
+            r.get(&Key::Int(2), true).unwrap(),
+            Some((Value::tombstone(), RevisionID::ZERO))
+        );
         assert_eq!(
             r.get(&Key::Int(3), true).unwrap(),
-            Some(Value::from("data"))
+            Some((Value::from("data"), RevisionID::ZERO))
         );
     }
 
@@ -1222,8 +1304,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
-        w.add(&Key::Int(1), &Value::from("a")).unwrap();
-        w.add(&Key::Int(3), &Value::from("c")).unwrap();
+        w.add(&Key::Int(1), &Value::from("a"), RevisionID::ZERO)
+            .unwrap();
+        w.add(&Key::Int(3), &Value::from("c"), RevisionID::ZERO)
+            .unwrap();
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
@@ -1235,7 +1319,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
-        w.add(&Key::Int(1), &Value::from("a")).unwrap();
+        w.add(&Key::Int(1), &Value::from("a"), RevisionID::ZERO)
+            .unwrap();
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
@@ -1247,7 +1332,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
-        w.add(&Key::Int(10), &Value::from("a")).unwrap();
+        w.add(&Key::Int(10), &Value::from("a"), RevisionID::ZERO)
+            .unwrap();
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
@@ -1287,7 +1373,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("corrupt.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
-        w.add(&Key::Int(1), &Value::from("hello")).unwrap();
+        w.add(&Key::Int(1), &Value::from("hello"), RevisionID::ZERO)
+            .unwrap();
         w.finish().unwrap();
 
         // Corrupt one byte in the data block (byte 0 is compression tag)
@@ -1305,7 +1392,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("skip.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
-        w.add(&Key::Int(1), &Value::from("hello")).unwrap();
+        w.add(&Key::Int(1), &Value::from("hello"), RevisionID::ZERO)
+            .unwrap();
         w.finish().unwrap();
 
         // Corrupt one byte in the data block
@@ -1332,16 +1420,23 @@ mod tests {
         let path = tmp.path().join("boundary.sst");
         let mut w = SSTableWriter::new(&path, 32, Compression::None, 0, 0, &io()).unwrap();
         for i in 0..100 {
-            w.add(&Key::Int(i), &Value::from(format!("v{i}").as_str()))
-                .unwrap();
+            w.add(
+                &Key::Int(i),
+                &Value::from(format!("v{i}").as_str()),
+                RevisionID::ZERO,
+            )
+            .unwrap();
         }
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
-        assert_eq!(r.get(&Key::Int(0), true).unwrap(), Some(Value::from("v0")));
+        assert_eq!(
+            r.get(&Key::Int(0), true).unwrap(),
+            Some((Value::from("v0"), RevisionID::ZERO))
+        );
         assert_eq!(
             r.get(&Key::Int(99), true).unwrap(),
-            Some(Value::from("v99"))
+            Some((Value::from("v99"), RevisionID::ZERO))
         );
         assert_eq!(r.get(&Key::Int(100), true).unwrap(), None);
     }
@@ -1353,17 +1448,29 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("iter.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
-        w.add(&Key::Int(1), &Value::from("a")).unwrap();
-        w.add(&Key::Int(2), &Value::from("b")).unwrap();
-        w.add(&Key::Int(3), &Value::from("c")).unwrap();
+        w.add(&Key::Int(1), &Value::from("a"), RevisionID::ZERO)
+            .unwrap();
+        w.add(&Key::Int(2), &Value::from("b"), RevisionID::ZERO)
+            .unwrap();
+        w.add(&Key::Int(3), &Value::from("c"), RevisionID::ZERO)
+            .unwrap();
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
         let entries = r.iter_entries(true).unwrap();
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0], (Key::Int(1), Value::from("a")));
-        assert_eq!(entries[1], (Key::Int(2), Value::from("b")));
-        assert_eq!(entries[2], (Key::Int(3), Value::from("c")));
+        assert_eq!(
+            entries[0],
+            (Key::Int(1), Value::from("a"), RevisionID::ZERO)
+        );
+        assert_eq!(
+            entries[1],
+            (Key::Int(2), Value::from("b"), RevisionID::ZERO)
+        );
+        assert_eq!(
+            entries[2],
+            (Key::Int(3), Value::from("c"), RevisionID::ZERO)
+        );
     }
 
     #[test]
@@ -1372,15 +1479,19 @@ mod tests {
         let path = tmp.path().join("iter_multi.sst");
         let mut w = SSTableWriter::new(&path, 32, Compression::None, 0, 0, &io()).unwrap();
         for i in 0..20 {
-            w.add(&Key::Int(i), &Value::from(format!("v{i}").as_str()))
-                .unwrap();
+            w.add(
+                &Key::Int(i),
+                &Value::from(format!("v{i}").as_str()),
+                RevisionID::ZERO,
+            )
+            .unwrap();
         }
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
         let entries = r.iter_entries(true).unwrap();
         assert_eq!(entries.len(), 20);
-        for (i, (key, value)) in entries.iter().enumerate() {
+        for (i, (key, value, _rev)) in entries.iter().enumerate() {
             assert_eq!(*key, Key::Int(i as i64));
             assert_eq!(*value, Value::from(format!("v{i}").as_str()));
         }
@@ -1391,9 +1502,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("iter_tomb.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
-        w.add(&Key::Int(1), &Value::from("live")).unwrap();
-        w.add(&Key::Int(2), &Value::tombstone()).unwrap();
-        w.add(&Key::Int(3), &Value::Null).unwrap();
+        w.add(&Key::Int(1), &Value::from("live"), RevisionID::ZERO)
+            .unwrap();
+        w.add(&Key::Int(2), &Value::tombstone(), RevisionID::ZERO)
+            .unwrap();
+        w.add(&Key::Int(3), &Value::Null, RevisionID::ZERO).unwrap();
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
@@ -1421,16 +1534,26 @@ mod tests {
         let path = tmp.path().join("iter_lz4.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::LZ4, 0, 0, &io()).unwrap();
         for i in 0..10 {
-            w.add(&Key::Int(i), &Value::from(format!("val{i}").as_str()))
-                .unwrap();
+            w.add(
+                &Key::Int(i),
+                &Value::from(format!("val{i}").as_str()),
+                RevisionID::ZERO,
+            )
+            .unwrap();
         }
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
         let entries = r.iter_entries(true).unwrap();
         assert_eq!(entries.len(), 10);
-        assert_eq!(entries[0], (Key::Int(0), Value::from("val0")));
-        assert_eq!(entries[9], (Key::Int(9), Value::from("val9")));
+        assert_eq!(
+            entries[0],
+            (Key::Int(0), Value::from("val0"), RevisionID::ZERO)
+        );
+        assert_eq!(
+            entries[9],
+            (Key::Int(9), Value::from("val9"), RevisionID::ZERO)
+        );
     }
 
     #[test]
@@ -1438,7 +1561,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("size.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
-        w.add(&Key::Int(1), &Value::from("data")).unwrap();
+        w.add(&Key::Int(1), &Value::from("data"), RevisionID::ZERO)
+            .unwrap();
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
@@ -1493,7 +1617,7 @@ mod tests {
     #[test]
     fn parse_block_truncated_key_len() {
         let data = vec![0x00]; // only 1 byte, need 2
-        let err = SSTableReader::parse_block_entries(&data).unwrap_err();
+        let err = SSTableReader::parse_block_entries(&data, 2).unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
     }
 
@@ -1502,7 +1626,7 @@ mod tests {
         let mut data = vec![];
         data.extend_from_slice(&5u16.to_be_bytes()); // key_len = 5
         data.extend_from_slice(&[0x01, 0x02]); // only 2 bytes of key
-        let err = SSTableReader::parse_block_entries(&data).unwrap_err();
+        let err = SSTableReader::parse_block_entries(&data, 2).unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
     }
 
@@ -1513,7 +1637,7 @@ mod tests {
         data.extend_from_slice(&(key.len() as u16).to_be_bytes());
         data.extend_from_slice(&key);
         // No value_tag byte
-        let err = SSTableReader::parse_block_entries(&data).unwrap_err();
+        let err = SSTableReader::parse_block_entries(&data, 2).unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
     }
 
@@ -1525,7 +1649,7 @@ mod tests {
         data.extend_from_slice(&key);
         data.push(0x00); // value_tag
         data.extend_from_slice(&[0x00, 0x00]); // only 2 bytes, need 4 for value_len
-        let err = SSTableReader::parse_block_entries(&data).unwrap_err();
+        let err = SSTableReader::parse_block_entries(&data, 2).unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
     }
 
@@ -1538,7 +1662,7 @@ mod tests {
         data.push(0x00); // value_tag
         data.extend_from_slice(&10u32.to_be_bytes()); // value_len = 10
         data.extend_from_slice(&[0x01, 0x02]); // only 2 bytes of data
-        let err = SSTableReader::parse_block_entries(&data).unwrap_err();
+        let err = SSTableReader::parse_block_entries(&data, 2).unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
     }
 
@@ -1564,8 +1688,10 @@ mod tests {
         let path = tmp.path().join("bloom_scan.sst");
         // bloom_bits=10, bloom_prefix_len=3
         let mut w = SSTableWriter::new(&path, 4096, Compression::None, 10, 3, &io()).unwrap();
-        w.add(&Key::from("aaa:1"), &Value::from("v")).unwrap();
-        w.add(&Key::from("aaa:2"), &Value::from("v")).unwrap();
+        w.add(&Key::from("aaa:1"), &Value::from("v"), RevisionID::ZERO)
+            .unwrap();
+        w.add(&Key::from("aaa:2"), &Value::from("v"), RevisionID::ZERO)
+            .unwrap();
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
@@ -1586,28 +1712,33 @@ mod tests {
     // --- Format versioning ---
 
     #[test]
-    fn v2_footer_size() {
+    fn v3_footer_size() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("v2.sst");
+        let path = tmp.path().join("v3.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
-        w.add(&Key::Int(1), &Value::from("a")).unwrap();
+        w.add(&Key::Int(1), &Value::from("a"), RevisionID::ZERO)
+            .unwrap();
         w.finish().unwrap();
 
         let data = fs::read(&path).unwrap();
         let footer = &data[data.len() - V2_FOOTER_SIZE..];
         assert_eq!(&footer[..4], &MAGIC);
         let version = u16::from_be_bytes(footer[4..6].try_into().unwrap());
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
 
     #[test]
-    fn v2_roundtrip() {
+    fn v3_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("v2rt.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::None, 10, 0, &io()).unwrap();
         for i in 0..10 {
-            w.add(&Key::Int(i), &Value::from(format!("v{i}").as_str()))
-                .unwrap();
+            w.add(
+                &Key::Int(i),
+                &Value::from(format!("v{i}").as_str()),
+                RevisionID::ZERO,
+            )
+            .unwrap();
         }
         w.finish().unwrap();
 
@@ -1616,7 +1747,7 @@ mod tests {
         for i in 0..10 {
             assert_eq!(
                 r.get(&Key::Int(i), true).unwrap(),
-                Some(Value::from(format!("v{i}").as_str()))
+                Some((Value::from(format!("v{i}").as_str()), RevisionID::ZERO))
             );
         }
     }
@@ -1688,7 +1819,7 @@ mod tests {
         assert_eq!(r.features(), 0);
         assert_eq!(
             r.get(&Key::Int(1), true).unwrap(),
-            Some(Value::from("hello"))
+            Some((Value::from("hello"), RevisionID::ZERO))
         );
     }
 
@@ -1698,7 +1829,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("feat.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
-        w.add(&Key::Int(1), &Value::from("a")).unwrap();
+        w.add(&Key::Int(1), &Value::from("a"), RevisionID::ZERO)
+            .unwrap();
         w.finish().unwrap();
 
         let mut data = fs::read(&path).unwrap();
@@ -1728,7 +1860,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("ver99.sst");
         let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
-        w.add(&Key::Int(1), &Value::from("a")).unwrap();
+        w.add(&Key::Int(1), &Value::from("a"), RevisionID::ZERO)
+            .unwrap();
         w.finish().unwrap();
 
         let mut data = fs::read(&path).unwrap();

@@ -407,7 +407,7 @@ function renderKeyRows() {
       var revCell = el("td", null, [
         el("button", {
           className: "btn-rev",
-          textContent: String(entry.revCount),
+          textContent: entry.revCount + " rev",
           onClick: function () {
             openRevDialog(entry.key, entry.revCount);
           },

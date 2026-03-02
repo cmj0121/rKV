@@ -7,7 +7,6 @@ use super::value::Value;
 
 /// A single revision record stored in the MemTable.
 pub(crate) struct MemEntry {
-    #[allow(dead_code)]
     pub revision: RevisionID,
     pub value: Value,
     pub expires_at: Option<Instant>,
@@ -21,6 +20,13 @@ pub(crate) enum MemLookup<'a> {
     /// Key exists but is tombstoned or expired — do NOT fall through to SSTables.
     Tombstone,
     /// Key was never written to this memtable — caller should check SSTables.
+    NotFound,
+}
+
+/// Like `MemLookup` but also carries the revision for the found value.
+pub(crate) enum MemLookupRev<'a> {
+    Found(&'a Value, RevisionID),
+    Tombstone,
     NotFound,
 }
 
@@ -180,6 +186,28 @@ impl MemTable {
         }
 
         MemLookup::Found(&latest.value)
+    }
+
+    /// Like `lookup` but also returns the revision for found values.
+    pub(crate) fn lookup_with_revision(&self, key: &Key) -> MemLookupRev<'_> {
+        let Some(entries) = self.entries.get(key) else {
+            return MemLookupRev::NotFound;
+        };
+        let Some(latest) = entries.last() else {
+            return MemLookupRev::NotFound;
+        };
+
+        if let Some(expires_at) = latest.expires_at {
+            if Instant::now() > expires_at {
+                return MemLookupRev::Tombstone;
+            }
+        }
+
+        if latest.value.is_tombstone() {
+            return MemLookupRev::Tombstone;
+        }
+
+        MemLookupRev::Found(&latest.value, latest.revision)
     }
 
     /// Check if a key exists (non-expired, non-tombstone).
@@ -493,14 +521,15 @@ impl MemTable {
 
     /// Drain the latest value for each key in sorted order.
     ///
-    /// Returns a `Vec<(Key, Value)>` containing the most recent non-expired
-    /// value for every key, **including tombstones** (needed for correctness
-    /// when flushing to SSTable — a tombstone must shadow older SSTables).
+    /// Returns a `Vec<(Key, Value, RevisionID)>` containing the most recent
+    /// non-expired value (plus its revision) for every key, **including
+    /// tombstones** (needed for correctness when flushing to SSTable — a
+    /// tombstone must shadow older SSTables).
     ///
     /// Expired entries are flushed as tombstones so they remain visible to
     /// "show deleted" scans after the memtable is drained. Compaction will
     /// eventually garbage-collect them.
-    pub(crate) fn drain_latest(&mut self) -> Vec<(Key, Value)> {
+    pub(crate) fn drain_latest(&mut self) -> Vec<(Key, Value, RevisionID)> {
         let entries = std::mem::take(&mut self.entries);
         self.last_rev.clear();
         self.approximate_size = 0;
@@ -508,14 +537,15 @@ impl MemTable {
         let mut result = Vec::with_capacity(entries.len());
         for (key, revisions) in entries {
             if let Some(latest) = revisions.last() {
+                let rev = latest.revision;
                 if let Some(expires_at) = latest.expires_at {
                     if Instant::now() > expires_at {
                         // Expired → flush as tombstone so "show deleted" works
-                        result.push((key, Value::tombstone()));
+                        result.push((key, Value::tombstone(), rev));
                         continue;
                     }
                 }
-                result.push((key, latest.value.clone()));
+                result.push((key, latest.value.clone(), rev));
             }
         }
         result
@@ -995,9 +1025,12 @@ mod tests {
 
         let drained = mt.drain_latest();
         assert_eq!(drained.len(), 3);
-        assert_eq!(drained[0], (Key::Int(1), Value::from("a")));
-        assert_eq!(drained[1], (Key::Int(2), Value::from("b")));
-        assert_eq!(drained[2], (Key::Int(3), Value::from("c")));
+        assert_eq!(drained[0].0, Key::Int(1));
+        assert_eq!(drained[0].1, Value::from("a"));
+        assert_eq!(drained[1].0, Key::Int(2));
+        assert_eq!(drained[1].1, Value::from("b"));
+        assert_eq!(drained[2].0, Key::Int(3));
+        assert_eq!(drained[2].1, Value::from("c"));
     }
 
     #[test]

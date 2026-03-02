@@ -19,14 +19,22 @@ pub async fn get_key(
     let key = parse_key(&raw_key);
     let ns = state.namespace(&ns_name)?;
 
-    let value = match ns.get_raw(key.clone())? {
-        None => return Err(ServerError::from(crate::Error::KeyNotFound)),
-        Some(v) if v.is_tombstone() => return Ok(StatusCode::GONE.into_response()),
-        Some(v) => v,
+    let (value, rev) = match ns.get_with_revision(key.clone()) {
+        Ok(vr) => vr,
+        Err(crate::Error::KeyNotFound) => {
+            // Check if tombstoned via get_raw
+            return match ns.get_raw(key)? {
+                Some(v) if v.is_tombstone() => Ok(StatusCode::GONE.into_response()),
+                _ => Err(ServerError::from(crate::Error::KeyNotFound)),
+            };
+        }
+        Err(e) => return Err(ServerError::from(e)),
     };
 
     if value.is_null() {
         let mut resp = StatusCode::NO_CONTENT.into_response();
+        resp.headers_mut()
+            .insert("X-RKV-Revision", rev.to_string().parse().unwrap());
         append_ttl_header(&mut resp, &ns, &key);
         return Ok(resp);
     }
@@ -35,6 +43,8 @@ pub async fn get_key(
     let mut resp = (StatusCode::OK, body).into_response();
     resp.headers_mut()
         .insert("content-type", "application/json".parse().unwrap());
+    resp.headers_mut()
+        .insert("X-RKV-Revision", rev.to_string().parse().unwrap());
     append_ttl_header(&mut resp, &ns, &key);
     Ok(resp)
 }
