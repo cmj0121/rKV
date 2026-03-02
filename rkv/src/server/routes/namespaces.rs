@@ -26,6 +26,9 @@ pub async fn create_namespace(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateNamespaceRequest>,
 ) -> Result<StatusCode, ServerError> {
+    if state.db.is_replica() {
+        return Err(crate::Error::ReadOnlyReplica.into());
+    }
     state.db.namespace(&req.name, req.password.as_deref())?;
 
     // Cache password for subsequent CRUD requests
@@ -36,7 +39,7 @@ pub async fn create_namespace(
             .unwrap_or_else(|e| e.into_inner())
             .insert(req.name, pw);
     }
-    Ok(StatusCode::OK)
+    Ok(StatusCode::CREATED)
 }
 
 /// DELETE /api/{ns} -> drop namespace
@@ -44,6 +47,9 @@ pub async fn drop_namespace(
     State(state): State<Arc<AppState>>,
     Path(ns_name): Path<String>,
 ) -> Result<StatusCode, ServerError> {
+    if state.db.is_replica() {
+        return Err(crate::Error::ReadOnlyReplica.into());
+    }
     state.db.drop_namespace(&ns_name)?;
     state
         .ns_passwords

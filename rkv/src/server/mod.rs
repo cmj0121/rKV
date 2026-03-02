@@ -62,6 +62,17 @@ pub fn run(config: ServerConfig) {
         let mut db_config = Config::new(&path);
         db_config.create_if_missing = config.create;
 
+        // Replication config
+        match config.role.parse::<crate::Role>() {
+            Ok(role) => db_config.role = role,
+            Err(e) => {
+                tracing::error!("invalid --role: {e}");
+                std::process::exit(1);
+            }
+        }
+        db_config.repl_port = config.repl_port;
+        db_config.primary_addr = config.primary_addr.clone();
+
         let db = match DB::open(db_config) {
             Ok(db) => db,
             Err(e) => {
@@ -115,6 +126,7 @@ pub fn run(config: ServerConfig) {
             timeout = %timeout_info,
             allow_ip = %ip_info,
             ui = enable_ui,
+            role = %config.role,
             "rKV server listening"
         );
         axum::serve(
@@ -202,7 +214,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(body_string(resp.into_body()).await, "\"ok\"");
+        let body = body_string(resp.into_body()).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["role"], "standalone");
+        assert!(v["uptime_secs"].is_number());
     }
 
     #[tokio::test]
@@ -389,7 +405,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::CREATED);
 
         // Write a key so the namespace has a memtable entry
         let resp = app
@@ -1042,7 +1058,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::CREATED);
 
         // PUT a key in the encrypted namespace
         let resp = app
@@ -1118,6 +1134,192 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // -----------------------------------------------------------------------
+    // Primary-role tests
+    // -----------------------------------------------------------------------
+
+    fn primary_app() -> axum::Router {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::Config::new(dir.path());
+        config.create_if_missing = true;
+        config.role = crate::Role::Primary;
+        config.repl_bind = "127.0.0.1".to_owned();
+        config.repl_port = 0; // OS-assigned port
+        std::mem::forget(dir);
+        super::build_router(crate::DB::open(config).unwrap())
+    }
+
+    #[tokio::test]
+    async fn primary_create_namespace_returns_201() {
+        let app = primary_app();
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/namespaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{\"name\": \"myns\"}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Namespace should appear in the list
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/api/namespaces").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = body_string(resp.into_body()).await;
+        let ns_list: Vec<String> = serde_json::from_str(&body).unwrap();
+        assert!(ns_list.contains(&"myns".to_string()));
+    }
+
+    #[tokio::test]
+    async fn primary_crud_works() {
+        let app = primary_app();
+
+        // Create namespace
+        app.clone()
+            .oneshot(
+                Request::post("/api/namespaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{\"name\": \"pns\"}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // PUT
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::put("/api/pns/keys/hello")
+                    .header("content-type", "application/json")
+                    .body(Body::from("\"world\""))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // GET
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/pns/keys/hello")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_string(resp.into_body()).await, "\"world\"");
+    }
+
+    #[tokio::test]
+    async fn primary_health_shows_role() {
+        let app = primary_app();
+
+        let resp = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["role"], "primary");
+    }
+
+    // -----------------------------------------------------------------------
+    // Replica-role tests
+    // -----------------------------------------------------------------------
+
+    fn replica_app() -> axum::Router {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::Config::new(dir.path());
+        config.create_if_missing = true;
+        config.role = crate::Role::Replica;
+        // Use a dummy address — the receiver thread will retry in the background
+        config.primary_addr = Some("127.0.0.1:1".to_owned());
+        std::mem::forget(dir);
+        super::build_router(crate::DB::open(config).unwrap())
+    }
+
+    #[tokio::test]
+    async fn replica_rejects_create_namespace() {
+        let app = replica_app();
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/namespaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{\"name\": \"forbidden\"}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn replica_rejects_drop_namespace() {
+        let app = replica_app();
+
+        let resp = app
+            .oneshot(Request::delete("/api/_").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn replica_rejects_put() {
+        let app = replica_app();
+
+        let resp = app
+            .oneshot(
+                Request::put("/api/_/keys/blocked")
+                    .header("content-type", "application/json")
+                    .body(Body::from("\"nope\""))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn replica_allows_read() {
+        let app = replica_app();
+
+        // GET on missing key returns 404, not 403
+        let resp = app
+            .oneshot(
+                Request::get("/api/_/keys/anything")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn replica_health_shows_role() {
+        let app = replica_app();
+
+        let resp = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = body_string(resp.into_body()).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["role"], "replica");
     }
 
     // -----------------------------------------------------------------------

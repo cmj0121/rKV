@@ -305,7 +305,7 @@ fn print_command_help(cmd: &str) {
             println!("  View or modify runtime configuration. Changes take effect");
             println!("  immediately but are not persisted to disk.");
             println!();
-            println!("  Groups: storage, lsm, object, io, aol, revision");
+            println!("  Groups: storage, lsm, object, io, aol, revision, repl");
             println!();
             println!("  Examples:");
             println!("    config");
@@ -377,6 +377,16 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     if tokens.is_empty() {
         return Action::Continue;
+    }
+
+    if db.is_replica() {
+        match tokens[0] {
+            "put" | "del" | "wipe" | "drop" => {
+                eprintln!("error: read-only replica — writes are rejected");
+                return Action::Continue;
+            }
+            _ => {}
+        }
     }
 
     match tokens[0] {
@@ -647,6 +657,8 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("  op_deletes:        {}", s.op_deletes);
             println!("  cache_hits:        {}", s.cache_hits);
             println!("  cache_misses:      {}", s.cache_misses);
+            println!("Replication:");
+            println!("  role:              {}", s.role);
             println!("Uptime:");
             println!("  uptime:            {}", format_duration(s.uptime));
         }
@@ -757,6 +769,24 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                     c.cluster_id
                         .map(|id| format!("{id}"))
                         .unwrap_or_else(|| "none".to_owned()),
+                ),
+                ("", "", String::new()),
+                ("Replication", "", String::new()),
+                ("  repl.role", "node role", c.role.to_string()),
+                (
+                    "  repl.bind",
+                    "replication listen address",
+                    c.repl_bind.clone(),
+                ),
+                (
+                    "  repl.port",
+                    "replication listen port",
+                    c.repl_port.to_string(),
+                ),
+                (
+                    "  repl.primary_addr",
+                    "primary address (replica only)",
+                    c.primary_addr.clone().unwrap_or_else(|| "none".to_owned()),
                 ),
             ];
             for (key, desc, val) in items {
@@ -1035,6 +1065,32 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
             Err(_) => eprintln!("error: expected a number"),
         },
         "storage.path" => eprintln!("error: path cannot be changed at runtime"),
+        "repl.role" => match value.parse::<rkv::Role>() {
+            Ok(v) => {
+                c.role = v;
+                println!("OK (takes effect on next restart)");
+            }
+            Err(e) => eprintln!("error: {e}"),
+        },
+        "repl.bind" => {
+            c.repl_bind = value.to_owned();
+            println!("OK (takes effect on next restart)");
+        }
+        "repl.port" => match value.parse::<u16>() {
+            Ok(v) => {
+                c.repl_port = v;
+                println!("OK (takes effect on next restart)");
+            }
+            Err(_) => eprintln!("error: expected a number (0-65535)"),
+        },
+        "repl.primary_addr" => {
+            if value == "none" {
+                c.primary_addr = None;
+            } else {
+                c.primary_addr = Some(value.to_owned());
+            }
+            println!("OK (takes effect on next restart)");
+        }
         _ => eprintln!("error: unknown config key '{key}'"),
     }
 }
@@ -1043,13 +1099,17 @@ fn history_path() -> Option<PathBuf> {
     dirs_sys::home_dir().map(|h| h.join(".rkv_history"))
 }
 
-fn prompt(ns_name: &str, encrypted: bool) -> String {
+fn prompt(ns_name: &str, encrypted: bool, role: &str) -> String {
+    let prefix = match role {
+        "standalone" | "" => "rkv".to_owned(),
+        r => format!("rkv({r})"),
+    };
     if ns_name == DEFAULT_NAMESPACE {
-        "rkv> ".to_owned()
+        format!("{prefix}> ")
     } else if encrypted {
-        format!("rkv [{ns_name}+]> ")
+        format!("{prefix} [{ns_name}+]> ")
     } else {
-        format!("rkv [{ns_name}]> ")
+        format!("{prefix} [{ns_name}]> ")
     }
 }
 
@@ -1069,9 +1129,10 @@ fn run_repl(db: &mut DB, initial_ns: &str) {
     let mut ns_name = initial_ns.to_owned();
     let mut ns_password: Option<String> = None;
     let mut ns_encrypted = false;
+    let role = db.config().role.to_string();
 
     loop {
-        match rl.readline(&prompt(&ns_name, ns_encrypted)) {
+        match rl.readline(&prompt(&ns_name, ns_encrypted, &role)) {
             Ok(line) => {
                 let line = line.trim();
                 if line.is_empty() {
@@ -1082,7 +1143,11 @@ fn run_repl(db: &mut DB, initial_ns: &str) {
                 // Handle config set before creating namespace (needs &mut db)
                 let tokens: Vec<&str> = line.split_whitespace().collect();
                 if tokens[0] == "config" && tokens.len() == 3 {
-                    set_config(db, tokens[1], tokens[2]);
+                    if db.is_replica() {
+                        eprintln!("error: read-only replica — config changes are rejected");
+                    } else {
+                        set_config(db, tokens[1], tokens[2]);
+                    }
                     continue;
                 }
 

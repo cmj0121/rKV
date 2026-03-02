@@ -98,6 +98,9 @@ pub async fn delete_keys(
     Path(ns_name): Path<String>,
     Query(params): Query<DeleteParams>,
 ) -> Result<Response, ServerError> {
+    if state.db.is_replica() {
+        return Err(crate::Error::ReadOnlyReplica.into());
+    }
     let ns = state.namespace(&ns_name)?;
 
     if let Some(prefix) = params.prefix {

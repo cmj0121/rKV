@@ -44,6 +44,11 @@ impl IntoResponse for ServerError {
                 Error::NotImplemented(d) => {
                     (StatusCode::NOT_IMPLEMENTED, "not implemented", d.clone())
                 }
+                Error::ReadOnlyReplica => (
+                    StatusCode::FORBIDDEN,
+                    "read-only replica",
+                    "writes are rejected on replica nodes".to_string(),
+                ),
             },
         };
         (status, Json(json!({"error": msg, "detail": detail}))).into_response()
