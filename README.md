@@ -61,26 +61,32 @@ For architecture details, see [CONCEPTS.md](CONCEPTS.md#http-server).
 
 ## Replication
 
-rKV supports asynchronous primary-replica replication over TCP. A replica connects
-to a primary, receives a full data sync, then streams live writes in real time.
+rKV supports two replication modes over TCP:
+
+- **Primary-Replica**: One writer streams to read-only replicas (read scaling).
+- **Peer (Master-Master)**: Multiple writers sync bidirectionally with last-writer-wins (LWW).
 
 ```sh
-# Start a primary node (accepts reads + writes, streams to replicas)
+# Primary-Replica
 cargo run --features server -- serve --role primary --repl-port 8322
-
-# Start a replica node (read-only, connects to primary)
 cargo run --features server -- serve --role replica --primary-addr 127.0.0.1:8322
+
+# Peer-Peer
+cargo run --features server -- serve --role peer --repl-port 8322 \
+  --cluster-id 1 --peers 10.0.0.2:8322
+cargo run --features server -- serve --role peer --repl-port 8322 \
+  --cluster-id 2 --peers 10.0.0.1:8322
 ```
 
-Replicas reject all write operations (put, delete, drop namespace) with a
-`ReadOnlyReplica` error. Maintenance operations (flush, sync, compact) are allowed.
+Replicas reject all write operations with a `ReadOnlyReplica` error. Peers accept
+reads and writes; namespace creation, drops, and data changes propagate automatically.
 
-A `docker-compose.yml` is provided for a ready-made primary + replica topology:
+A `docker-compose.yml` provides a five-node topology (2 write peers + 3 read peers):
 
 ```sh
 docker compose up --build
-# Primary API: http://localhost:8321
-# Replica API: http://localhost:8323
+# Write nodes: http://localhost:8321, http://localhost:8323
+# Read nodes:  http://localhost:8324, http://localhost:8325, http://localhost:8326
 ```
 
 For protocol details and architecture, see [CONCEPTS.md](CONCEPTS.md#primary-replica-replication).
@@ -91,7 +97,7 @@ For protocol details and architecture, see [CONCEPTS.md](CONCEPTS.md#primary-rep
 - **Dual key types** — `Int(i64)` for ordered mode, `Str` for unordered; first Str key triggers irreversible auto-upgrade
 - **Namespace isolation** — isolated key spaces within one DB, created implicitly on first use
 - **Single-key operations** — every operation targets exactly one key
-- **Primary-replica replication** — async TCP streaming from primary to read-only replicas
+- **Replication** — primary-replica (read scaling) and peer-peer (multi-writer with LWW conflict resolution)
 
 The following features are intentionally **not supported**:
 

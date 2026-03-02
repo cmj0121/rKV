@@ -5,8 +5,7 @@
 **rKV** is a persistent, revision-aware key-value store built on LSM-tree architecture. It is designed to be embedded
 directly into Rust applications, accessed through FFI bindings (C/Python/Go), or used as a standalone CLI tool.
 
-Every write produces a new **revision**, enabling history queries and compare-and-swap (CAS) operations without
-external coordination.
+Every write produces a new **revision**, enabling history queries without external coordination.
 
 ## Architecture
 
@@ -372,9 +371,10 @@ The `Config` struct controls database behavior and LSM tuning parameters:
 | `default_max_size`  | `usize`          | 2 GB       | Default max size for L2+ levels            |
 | `bloom_prefix_len`  | `usize`          | 0          | Prefix bloom filter length (0 = disabled)  |
 | `role`              | `Role`           | Standalone | Replication role (see Replication below)   |
-| `repl_bind`         | `String`         | `0.0.0.0`  | Replication listen address (primary only)  |
-| `repl_port`         | `u16`            | 8322       | Replication listen port (primary only)     |
+| `repl_bind`         | `String`         | `0.0.0.0`  | Replication listen address                 |
+| `repl_port`         | `u16`            | 8322       | Replication listen port                    |
 | `primary_addr`      | `Option<String>` | `None`     | Primary address for replica to connect to  |
+| `peers`             | `Vec<String>`    | `[]`       | Peer addresses (peer mode only)            |
 
 The CLI uses dot-notation keys for `config <key> <value>`:
 
@@ -403,6 +403,7 @@ The CLI uses dot-notation keys for `config <key> <value>`:
 | `repl_bind`         | `repl.bind`                 |
 | `repl_port`         | `repl.port`                 |
 | `primary_addr`      | `repl.primary_addr`         |
+| `peers`             | `repl.peers`                |
 
 `Config::new(path)` initializes all fields to their defaults. Fields can be overridden before
 passing the config to `DB::open`.
@@ -453,6 +454,9 @@ I/O logic will be implemented when the storage layer is built.
 | `cache_hits`          | `u64`            | BlockCache (live)      | Block cache hits                        |
 | `cache_misses`        | `u64`            | BlockCache (live)      | Block cache misses                      |
 | `uptime`              | `Duration`       | Instant (live)         | Time since `DB::open`                   |
+| `role`                | `String`         | Config                 | Replication role                        |
+| `peer_count`          | `u64`            | PeerSessions (live)    | Connected peer sessions                 |
+| `conflicts_resolved`  | `u64`            | AtomicU64 (live)       | LWW conflicts resolved (peer mode)      |
 
 `LevelStat` contains `file_count: u64` and `size_bytes: u64`. The `level_stats` vector has
 `max_levels` entries; `level_stats[i]` aggregates all namespaces at level `i`.
@@ -1209,9 +1213,7 @@ message. A handshake exchange at connection start verifies cluster membership vi
 
 #### Read-Only Enforcement
 
-Replicas enforce read-only access through defense-in-depth across four layers:
-
-Replicas reject mutations at every layer to prevent silent failures:
+Replicas reject mutations at every layer (defense-in-depth):
 
 - **Engine**: `put`, `delete`, `delete_range`, `delete_prefix` return `ReadOnlyReplica`
 - **HTTP routes**: Guards on `PUT /keys`, `DELETE /keys`, `DELETE /scan`, namespace routes
