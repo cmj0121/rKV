@@ -51,7 +51,7 @@ function toast(msg, ok) {
 // API client
 // ---------------------------------------------------------------------------
 function api(method, path, body) {
-  var opts = { method: method, headers: {} };
+  var opts = { method: method, headers: {}, cache: "no-store" };
   if (body !== undefined) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
@@ -142,6 +142,7 @@ var state = {
   showDeleted: false,
   role: "standalone",
 };
+var renderGen = 0;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -313,6 +314,7 @@ function renderKeyRows() {
   var tbody = $("#keys-body");
   if (!tbody) return;
   tbody.innerHTML = "";
+  var gen = ++renderGen;
 
   if (state.keys.length === 0) {
     var row = el("tr", null, [
@@ -361,6 +363,7 @@ function renderKeyRows() {
   });
 
   Promise.all(promises).then(function (entries) {
+    if (gen !== renderGen) return;
     entries.forEach(function (entry) {
       var isDeleted = entry.status === 410;
       var binary =
