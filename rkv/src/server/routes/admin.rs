@@ -65,6 +65,17 @@ pub async fn compact(
     Ok(Json("ok"))
 }
 
+/// POST /api/admin/force-sync
+pub async fn force_sync(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<&'static str>, ServerError> {
+    if !state.db.is_replica() {
+        return Err(crate::Error::ReadOnlyReplica.into());
+    }
+    state.db.force_sync()?;
+    Ok(Json("ok"))
+}
+
 /// GET /api/admin/config
 pub async fn get_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let c = state.db.config();

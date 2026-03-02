@@ -7,6 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::error::{Error, Result};
+use super::io::IoBackend;
 use super::replication::{ReplMessage, Role};
 
 /// Messages broadcast from the primary engine to connected replicas.
@@ -17,6 +18,15 @@ pub(crate) enum BroadcastMsg {
     Aol(Vec<u8>),
     /// Instruction to drop a namespace.
     DropNamespace(String),
+}
+
+/// Shared configuration for the primary replication listener.
+#[allow(dead_code)]
+pub(crate) struct PrimaryConfig {
+    pub(crate) db_path: PathBuf,
+    pub(crate) cluster_id: u16,
+    pub(crate) max_levels: usize,
+    pub(crate) io_backend: Arc<dyn IoBackend>,
 }
 
 /// Manages the primary-side replication listener and connected replicas.
@@ -40,6 +50,7 @@ struct ReplicaCtx {
     max_levels: usize,
     aol_rx: mpsc::Receiver<BroadcastMsg>,
     stop: Arc<AtomicBool>,
+    io_backend: Arc<dyn IoBackend>,
 }
 
 #[allow(dead_code)]
@@ -51,9 +62,7 @@ impl ReplSender {
     pub(crate) fn start<F>(
         bind: &str,
         port: u16,
-        cluster_id: u16,
-        db_path: PathBuf,
-        max_levels: usize,
+        config: PrimaryConfig,
         flush_fn: F,
         stop: Arc<AtomicBool>,
     ) -> Result<Self>
@@ -71,15 +80,7 @@ impl ReplSender {
         let flush_fn = Arc::new(flush_fn);
 
         let listener_handle = thread::spawn(move || {
-            Self::listener_loop(
-                listener,
-                senders_clone,
-                stop_clone,
-                db_path,
-                cluster_id,
-                max_levels,
-                flush_fn,
-            );
+            Self::listener_loop(listener, senders_clone, stop_clone, config, flush_fn);
         });
 
         Ok(Self {
@@ -118,9 +119,7 @@ impl ReplSender {
         listener: TcpListener,
         aol_senders: Arc<Mutex<Vec<mpsc::SyncSender<BroadcastMsg>>>>,
         stop: Arc<AtomicBool>,
-        db_path: PathBuf,
-        cluster_id: u16,
-        max_levels: usize,
+        config: PrimaryConfig,
         flush_fn: Arc<dyn Fn() -> Result<()> + Send + Sync>,
     ) {
         while !stop.load(Ordering::Relaxed) {
@@ -133,15 +132,16 @@ impl ReplSender {
                         senders.push(tx);
                     }
 
-                    // Flush before full sync
+                    // Flush before sync (needed for both full and incremental)
                     let _ = flush_fn();
 
                     let ctx = ReplicaCtx {
-                        db_path: db_path.clone(),
-                        cluster_id,
-                        max_levels,
+                        db_path: config.db_path.clone(),
+                        cluster_id: config.cluster_id,
+                        max_levels: config.max_levels,
                         aol_rx: rx,
                         stop: Arc::clone(&stop),
+                        io_backend: Arc::clone(&config.io_backend),
                     };
 
                     thread::spawn(move || {
@@ -166,7 +166,7 @@ impl ReplSender {
         stream.set_nonblocking(false)?;
         stream.set_nodelay(true)?;
         let mut writer = BufWriter::new(stream.try_clone()?);
-        let mut reader = BufReader::new(stream);
+        let mut reader = BufReader::new(stream.try_clone()?);
 
         // --- Handshake ---
         ReplMessage::write_handshake_header(&mut writer)?;
@@ -194,11 +194,90 @@ impl ReplSender {
             }
         }
 
-        // --- Full sync ---
-        Self::send_full_sync(&mut writer, &ctx)?;
+        // --- Read SyncRequest (with timeout for old replicas) ---
+        let sync_req = Self::read_sync_request(&stream, &mut reader)?;
+
+        // --- Decide: incremental vs full sync ---
+        match sync_req {
+            Some(ReplMessage::SyncRequest {
+                last_revision,
+                force_full,
+            }) if !force_full && last_revision > 0 => {
+                // Try incremental sync
+                let records = super::aol::records_after_revision(
+                    &ctx.db_path,
+                    last_revision,
+                    ctx.io_backend.as_ref(),
+                );
+                if records.is_empty() {
+                    // AOL truncated or no matching records → fall back to full sync
+                    Self::send_full_sync(&mut writer, &ctx)?;
+                } else {
+                    Self::send_incremental_sync(&mut writer, &records)?;
+                }
+            }
+            _ => {
+                // force_full, revision=0, or no SyncRequest → full sync
+                Self::send_full_sync(&mut writer, &ctx)?;
+            }
+        }
 
         // --- Live streaming ---
         Self::live_stream(&mut writer, &ctx)
+    }
+
+    /// Read a SyncRequest from the replica with a 2-second timeout.
+    ///
+    /// Old replicas (pre-incremental-sync) don't send SyncRequest, so the
+    /// primary waits briefly and falls back to full sync on timeout.
+    fn read_sync_request<R: std::io::Read>(
+        stream: &TcpStream,
+        reader: &mut R,
+    ) -> Result<Option<ReplMessage>> {
+        // Set a short timeout to detect old replicas
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+
+        let result = ReplMessage::read_from(reader);
+
+        // Restore the original timeout (30s for live streaming)
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+
+        match result {
+            Ok(Some(msg @ ReplMessage::SyncRequest { .. })) => Ok(Some(msg)),
+            Ok(Some(other)) => {
+                // Got a message but not SyncRequest — unexpected
+                Err(Error::Corruption(format!(
+                    "expected SyncRequest, got {other:?}"
+                )))
+            }
+            Ok(None) => Ok(None), // EOF
+            Err(Error::Io(ref e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Timeout — old replica, proceed with full sync
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn send_incremental_sync<W: Write>(writer: &mut W, records: &[Vec<u8>]) -> Result<()> {
+        ReplMessage::IncrementalSyncStart {
+            record_count: records.len() as u32,
+        }
+        .write_to(writer)?;
+        writer.flush()?;
+
+        for payload in records {
+            ReplMessage::AolRecord {
+                payload: payload.clone(),
+            }
+            .write_to(writer)?;
+        }
+        writer.flush()?;
+
+        Ok(())
     }
 
     fn send_full_sync<W: Write>(writer: &mut W, ctx: &ReplicaCtx) -> Result<()> {
@@ -518,6 +597,7 @@ mod tests {
             max_levels: 3,
             aol_rx: mpsc::sync_channel(1).1,
             stop: Arc::new(AtomicBool::new(false)),
+            io_backend: Arc::new(super::super::io::BufferedIo),
         };
 
         let mut buf = Vec::new();
@@ -551,6 +631,7 @@ mod tests {
             max_levels: 3,
             aol_rx: mpsc::sync_channel(1).1,
             stop: Arc::new(AtomicBool::new(false)),
+            io_backend: Arc::new(super::super::io::BufferedIo),
         };
 
         let mut buf = Vec::new();

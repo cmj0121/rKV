@@ -74,6 +74,10 @@ const MSG_FULL_SYNC_END: u8 = 0x08;
 const MSG_ERROR: u8 = 0x09;
 #[allow(dead_code)]
 const MSG_DROP_NAMESPACE: u8 = 0x0A;
+#[allow(dead_code)]
+const MSG_SYNC_REQUEST: u8 = 0x0B;
+#[allow(dead_code)]
+const MSG_INCREMENTAL_SYNC_START: u8 = 0x0C;
 
 /// Role tags for handshake messages.
 #[allow(dead_code)]
@@ -125,6 +129,13 @@ pub(crate) enum ReplMessage {
     ErrorMsg { message: String },
     /// Primary instructs replica to drop a namespace and all its data.
     DropNamespace { namespace: String },
+    /// Replica requests sync from primary, optionally incremental.
+    SyncRequest {
+        last_revision: u128,
+        force_full: bool,
+    },
+    /// Primary signals the start of an incremental sync.
+    IncrementalSyncStart { record_count: u32 },
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +286,19 @@ impl ReplMessage {
                 buf.extend_from_slice(ns_bytes);
                 (MSG_DROP_NAMESPACE, buf)
             }
+            ReplMessage::SyncRequest {
+                last_revision,
+                force_full,
+            } => {
+                let mut buf = Vec::with_capacity(17);
+                buf.extend_from_slice(&last_revision.to_be_bytes());
+                buf.push(u8::from(*force_full));
+                (MSG_SYNC_REQUEST, buf)
+            }
+            ReplMessage::IncrementalSyncStart { record_count } => (
+                MSG_INCREMENTAL_SYNC_START,
+                record_count.to_be_bytes().to_vec(),
+            ),
         }
     }
 
@@ -401,6 +425,24 @@ impl ReplMessage {
                     .map_err(|e| Error::Corruption(format!("invalid namespace utf-8: {e}")))?
                     .to_owned();
                 Ok(ReplMessage::DropNamespace { namespace })
+            }
+            MSG_SYNC_REQUEST => {
+                if data.len() < 17 {
+                    return Err(Error::Corruption("truncated sync_request".into()));
+                }
+                let last_revision = u128::from_be_bytes(data[0..16].try_into().unwrap());
+                let force_full = data[16] != 0;
+                Ok(ReplMessage::SyncRequest {
+                    last_revision,
+                    force_full,
+                })
+            }
+            MSG_INCREMENTAL_SYNC_START => {
+                if data.len() < 4 {
+                    return Err(Error::Corruption("truncated incremental_sync_start".into()));
+                }
+                let record_count = u32::from_be_bytes(data[0..4].try_into().unwrap());
+                Ok(ReplMessage::IncrementalSyncStart { record_count })
             }
             _ => Err(Error::Corruption(format!(
                 "unknown replication message type: 0x{tag:02x}"
@@ -572,6 +614,36 @@ mod tests {
         let msg = ReplMessage::DropNamespace {
             namespace: "_".to_string(),
         };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn roundtrip_sync_request_incremental() {
+        let msg = ReplMessage::SyncRequest {
+            last_revision: 0xDEAD_BEEF_CAFE_1234_5678_9ABC_DEF0_1234,
+            force_full: false,
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn roundtrip_sync_request_force_full() {
+        let msg = ReplMessage::SyncRequest {
+            last_revision: 0,
+            force_full: true,
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn roundtrip_incremental_sync_start() {
+        let msg = ReplMessage::IncrementalSyncStart { record_count: 42 };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn roundtrip_incremental_sync_start_zero() {
+        let msg = ReplMessage::IncrementalSyncStart { record_count: 0 };
         assert_eq!(roundtrip(&msg), msg);
     }
 
