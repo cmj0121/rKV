@@ -4,7 +4,7 @@ use std::time::Duration;
 use super::crypto;
 use super::error::{Error, Result};
 use super::key::Key;
-use super::memtable::MemLookup;
+use super::memtable::{MemLookup, MemLookupRev};
 use super::revision::RevisionID;
 use super::value::Value;
 use super::DB;
@@ -138,6 +138,33 @@ impl<'db> Namespace<'db> {
 
         let value = self.db.resolve_value(&self.name, &value)?;
         self.decrypt_value(value)
+    }
+
+    /// Like `get()`, but also returns the `RevisionID` for the value.
+    pub fn get_with_revision(&self, key: impl Into<Key>) -> Result<(Value, RevisionID)> {
+        let key = key.into();
+        self.db.inc_op_gets();
+
+        let (value, rev) = {
+            let mt = self.db.get_or_create_memtable(&self.name);
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            match mt.lookup_with_revision(&key) {
+                MemLookupRev::Found(v, rev) => (v.clone(), rev),
+                MemLookupRev::Tombstone => return Err(Error::KeyNotFound),
+                MemLookupRev::NotFound => {
+                    drop(mt);
+                    match self.db.get_from_sstables(&self.name, &key)? {
+                        Some((v, _rev)) if v.is_tombstone() => return Err(Error::KeyNotFound),
+                        Some((v, rev)) => (v, rev),
+                        None => return Err(Error::KeyNotFound),
+                    }
+                }
+            }
+        };
+
+        let value = self.db.resolve_value(&self.name, &value)?;
+        let value = self.decrypt_value(value)?;
+        Ok((value, rev))
     }
 
     /// Like `get()`, but returns `Some(Value::Tombstone)` for deleted keys

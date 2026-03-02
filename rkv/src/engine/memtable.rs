@@ -24,6 +24,13 @@ pub(crate) enum MemLookup<'a> {
     NotFound,
 }
 
+/// Like `MemLookup` but also carries the revision for the found value.
+pub(crate) enum MemLookupRev<'a> {
+    Found(&'a Value, RevisionID),
+    Tombstone,
+    NotFound,
+}
+
 /// In-memory sorted write buffer (memtable).
 ///
 /// Holds all active writes for a namespace before they are flushed to disk.
@@ -180,6 +187,28 @@ impl MemTable {
         }
 
         MemLookup::Found(&latest.value)
+    }
+
+    /// Like `lookup` but also returns the revision for found values.
+    pub(crate) fn lookup_with_revision(&self, key: &Key) -> MemLookupRev<'_> {
+        let Some(entries) = self.entries.get(key) else {
+            return MemLookupRev::NotFound;
+        };
+        let Some(latest) = entries.last() else {
+            return MemLookupRev::NotFound;
+        };
+
+        if let Some(expires_at) = latest.expires_at {
+            if Instant::now() > expires_at {
+                return MemLookupRev::Tombstone;
+            }
+        }
+
+        if latest.value.is_tombstone() {
+            return MemLookupRev::Tombstone;
+        }
+
+        MemLookupRev::Found(&latest.value, latest.revision)
     }
 
     /// Check if a key exists (non-expired, non-tombstone).
