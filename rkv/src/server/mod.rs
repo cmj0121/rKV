@@ -72,6 +72,7 @@ pub fn run(config: ServerConfig) {
         }
         db_config.repl_port = config.repl_port;
         db_config.primary_addr = config.primary_addr.clone();
+        db_config.peers = config.peers.clone();
 
         let db = match DB::open(db_config) {
             Ok(db) => db,

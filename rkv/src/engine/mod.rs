@@ -187,6 +187,8 @@ pub struct Config {
     pub repl_port: u16,
     /// Primary address to connect to (replica only, e.g. "10.0.0.1:8322").
     pub primary_addr: Option<String>,
+    /// Peer addresses for master-master replication (peer only).
+    pub peers: Vec<String>,
 }
 
 impl Config {
@@ -215,6 +217,7 @@ impl Config {
             repl_bind: "0.0.0.0".to_owned(),
             repl_port: 8322,
             primary_addr: None,
+            peers: Vec::new(),
         }
     }
 }
@@ -488,6 +491,11 @@ impl DB {
     /// Returns true if this node is configured as a read-only replica.
     pub fn is_replica(&self) -> bool {
         self.config.role == replication::Role::Replica
+    }
+
+    /// Returns true if this node is configured as a peer (master-master).
+    pub fn is_peer(&self) -> bool {
+        self.config.role == replication::Role::Peer
     }
 
     /// Trigger a force-sync on the replica: wipe local state and perform
@@ -789,6 +797,9 @@ impl DB {
                     addr, cluster_id, db_path, max_levels, callbacks, stop,
                 )?;
                 self.repl_receiver = Some(receiver);
+            }
+            replication::Role::Peer => {
+                // Peer replication — wired in a later unit of work
             }
             replication::Role::Standalone => {
                 // No replication — nothing to start
