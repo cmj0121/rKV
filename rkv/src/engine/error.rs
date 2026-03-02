@@ -28,6 +28,9 @@ pub enum Error {
 
     #[error("not implemented: {0}")]
     NotImplemented(String),
+
+    #[error("read-only replica: writes are rejected")]
+    ReadOnlyReplica,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

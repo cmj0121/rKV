@@ -40,7 +40,7 @@ FROM busybox:musl
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /rkv /usr/local/bin/rkv
 
-EXPOSE 8321
+EXPOSE 8321 8322
 VOLUME /data
 
 ENTRYPOINT ["rkv"]

@@ -1,13 +1,56 @@
 services:
-  rkv:
+  primary:
     build: .
     platform: linux/amd64
     ports:
       - "8321:8321"
     volumes:
-      - .data:/data
+      - .data/primary:/data
     command:
-      ["serve", "--bind", "0.0.0.0", "--db", "/data", "--allow-all", "--ui"]
+      [
+        "serve",
+        "--bind",
+        "0.0.0.0",
+        "--db",
+        "/data",
+        "--allow-all",
+        "--ui",
+        "--role",
+        "primary",
+        "--repl-port",
+        "8322",
+      ]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  replica:
+    build: .
+    platform: linux/amd64
+    ports:
+      - "8323:8321"
+    volumes:
+      - .data/replica:/data
+    command:
+      [
+        "serve",
+        "--bind",
+        "0.0.0.0",
+        "--db",
+        "/data",
+        "--allow-all",
+        "--ui",
+        "--role",
+        "replica",
+        "--primary-addr",
+        "primary:8322",
+      ]
+    depends_on:
+      primary:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
       interval: 10s

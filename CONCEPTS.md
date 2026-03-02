@@ -263,7 +263,9 @@ SSTable cache. This covers namespaces created at runtime, replayed from the AOL,
 
 Constraints:
 
-- The default namespace `_` cannot be dropped → `InvalidNamespace` error
+- The default namespace `_` **can** be dropped. It is automatically re-created (empty) on the next access,
+  so the database always has a usable default namespace. This is useful for clearing all data without
+  dropping individual keys.
 - Dropping a non-existent namespace → `InvalidNamespace` error
 - **CLI**: dropping the current namespace auto-switches the prompt back to `_`
 
@@ -348,27 +350,31 @@ one character before it. Use `help wipe` for detailed usage.
 
 The `Config` struct controls database behavior and LSM tuning parameters:
 
-| Field               | Type          | Default    | Description                                |
-| ------------------- | ------------- | ---------- | ------------------------------------------ |
-| `path`              | `PathBuf`     | (required) | Database directory path                    |
-| `create_if_missing` | `bool`        | `true`     | Create the directory if it doesn't exist   |
-| `write_buffer_size` | `usize`       | 4 MB       | In-memory write buffer size before flush   |
-| `max_levels`        | `usize`       | 3          | Maximum number of LSM levels               |
-| `block_size`        | `usize`       | 4 KB       | SSTable block size                         |
-| `cache_size`        | `usize`       | 8 MB       | Block cache size for decompressed blocks   |
-| `object_size`       | `usize`       | 1 KB       | Bin object size threshold (see above)      |
-| `compress`          | `bool`        | `true`     | LZ4-compress bin objects on disk           |
-| `bloom_bits`        | `usize`       | 10         | Bloom filter bits per key (0 = disabled)   |
-| `verify_checksums`  | `bool`        | `true`     | Verify checksums on read (see below)       |
-| `compression`       | `Compression` | `LZ4`      | SSTable block compression (see above)      |
-| `io_model`          | `IoModel`     | `Mmap`     | File I/O strategy (see I/O Modes below)    |
-| `cluster_id`        | `Option<u16>` | `None`     | Cluster ID for RevisionID (random if None) |
-| `aol_buffer_size`   | `usize`       | 128        | AOL flush threshold in records (0 = every) |
-| `l0_max_count`      | `usize`       | 4          | Max L0 SSTable count before compaction     |
-| `l0_max_size`       | `usize`       | 64 MB      | Max total L0 size before compaction        |
-| `l1_max_size`       | `usize`       | 256 MB     | Max L1 size before merge to L2             |
-| `default_max_size`  | `usize`       | 2 GB       | Default max size for L2+ levels            |
-| `bloom_prefix_len`  | `usize`       | 0          | Prefix bloom filter length (0 = disabled)  |
+| Field               | Type             | Default    | Description                                |
+| ------------------- | ---------------- | ---------- | ------------------------------------------ |
+| `path`              | `PathBuf`        | (required) | Database directory path                    |
+| `create_if_missing` | `bool`           | `true`     | Create the directory if it doesn't exist   |
+| `write_buffer_size` | `usize`          | 4 MB       | In-memory write buffer size before flush   |
+| `max_levels`        | `usize`          | 3          | Maximum number of LSM levels               |
+| `block_size`        | `usize`          | 4 KB       | SSTable block size                         |
+| `cache_size`        | `usize`          | 8 MB       | Block cache size for decompressed blocks   |
+| `object_size`       | `usize`          | 1 KB       | Bin object size threshold (see above)      |
+| `compress`          | `bool`           | `true`     | LZ4-compress bin objects on disk           |
+| `bloom_bits`        | `usize`          | 10         | Bloom filter bits per key (0 = disabled)   |
+| `verify_checksums`  | `bool`           | `true`     | Verify checksums on read (see below)       |
+| `compression`       | `Compression`    | `LZ4`      | SSTable block compression (see above)      |
+| `io_model`          | `IoModel`        | `Mmap`     | File I/O strategy (see I/O Modes below)    |
+| `cluster_id`        | `Option<u16>`    | `None`     | Cluster ID for RevisionID (random if None) |
+| `aol_buffer_size`   | `usize`          | 128        | AOL flush threshold in records (0 = every) |
+| `l0_max_count`      | `usize`          | 4          | Max L0 SSTable count before compaction     |
+| `l0_max_size`       | `usize`          | 64 MB      | Max total L0 size before compaction        |
+| `l1_max_size`       | `usize`          | 256 MB     | Max L1 size before merge to L2             |
+| `default_max_size`  | `usize`          | 2 GB       | Default max size for L2+ levels            |
+| `bloom_prefix_len`  | `usize`          | 0          | Prefix bloom filter length (0 = disabled)  |
+| `role`              | `Role`           | Standalone | Replication role (see Replication below)   |
+| `repl_bind`         | `String`         | `0.0.0.0`  | Replication listen address (primary only)  |
+| `repl_port`         | `u16`            | 8322       | Replication listen port (primary only)     |
+| `primary_addr`      | `Option<String>` | `None`     | Primary address for replica to connect to  |
 
 The CLI uses dot-notation keys for `config <key> <value>`:
 
@@ -393,6 +399,10 @@ The CLI uses dot-notation keys for `config <key> <value>`:
 | `l1_max_size`       | `lsm.l1_max_size`           |
 | `default_max_size`  | `lsm.default_max_size`      |
 | `bloom_prefix_len`  | `lsm.bloom_prefix_len`      |
+| `role`              | `repl.role`                 |
+| `repl_bind`         | `repl.bind`                 |
+| `repl_port`         | `repl.port`                 |
+| `primary_addr`      | `repl.primary_addr`         |
 
 `Config::new(path)` initializes all fields to their defaults. Fields can be overridden before
 passing the config to `DB::open`.
@@ -1115,6 +1125,105 @@ method to detect tombstones.
 returning tombstoned keys alongside live ones. Without `deleted=true`, tombstoned keys are hidden (default).
 
 See the [README](README.md#http-server) for startup examples and curl recipes.
+
+### Primary-Replica Replication
+
+rKV supports asynchronous primary-replica replication over TCP, enabling read scaling and basic high
+availability. The replication subsystem uses `std::net` (no Tokio dependency), running on dedicated
+background threads alongside the existing flush and compaction threads.
+
+#### Roles
+
+Each node operates in one of three roles, configured at startup:
+
+- **Standalone** (default): No replication. The node accepts reads and writes independently.
+- **Primary**: Accepts all reads and writes. Streams every write to connected replicas in real time.
+- **Replica**: Connects to a primary, receives data, and serves reads. Rejects all local writes with
+  a `ReadOnlyReplica` error.
+
+#### How It Works
+
+When a replica connects to a primary, replication proceeds in two phases:
+
+1. **Full sync**: The primary flushes its write buffer, then streams all SSTable and bin-object files
+   to the replica. The replica writes these files to its local storage, bringing it up to the primary's
+   baseline state.
+2. **Live streaming**: After full sync, the primary forwards every AOL (append-only log) record to the
+   replica as it is written. The replica applies each record to its local AOL and in-memory write buffer,
+   staying current with the primary's writes.
+
+#### Wire Protocol
+
+Messages are framed as `[type: 1 byte][payload length: 4 bytes BE][payload][checksum: 5 bytes CRC32C]`.
+The checksum covers the type, length, and payload bytes, providing integrity verification on every
+message. A handshake exchange at connection start verifies cluster membership via matching cluster IDs.
+
+#### Failure Handling
+
+- **Replica reconnection**: If the connection to the primary drops, the replica automatically reconnects
+  with exponential backoff (1 second to 30 seconds). On reconnection, a fresh full sync is performed
+  to ensure consistency.
+- **Primary tolerance**: The primary accepts multiple concurrent replicas. If a replica disconnects,
+  the primary cleans up its resources without affecting other replicas or write throughput.
+
+#### Read-Only Enforcement
+
+Replicas enforce read-only access through defense-in-depth across four layers:
+
+Replicas reject mutations at every layer to prevent silent failures:
+
+- **Engine**: `put`, `delete`, `delete_range`, `delete_prefix` return `ReadOnlyReplica`
+- **HTTP routes**: Guards on `PUT /keys`, `DELETE /keys`, `DELETE /scan`, namespace routes
+- **REPL**: Commands `put`, `del`, `wipe`, `drop`, `config set` blocked with error message
+- **Web UI**: Mutation buttons disabled; role badge shown in header
+
+Maintenance operations (`flush`, `sync`, `compact`) are **not** writes — they reorganize local
+storage and are allowed on replicas.
+
+#### Namespace Synchronization
+
+When a primary node creates a new namespace (via `db.namespace(name, pw)`), it broadcasts a
+**sentinel record** — an AOL entry with an empty key (`Key::Str("")`) and `Value::Null` — to
+all connected replicas. This ensures replicas learn about new namespaces immediately, even before
+any data is written to them. The sentinel is detected and skipped during replay (no key is
+inserted); only the namespace registration side-effect is applied.
+
+#### Post-Sync Memory Safety
+
+After a full sync, the replica reloads its SSTable index via `post_sync_fn`. This callback resets
+each in-memory MemTable **in-place** (replacing the contents of each `Mutex<MemTable>` without
+removing map entries) and registers any new namespace entries. The HashMap of namespace data only
+grows and is never shrunk, preserving the safety invariant that raw pointers returned by
+`get_or_create_memtable()` remain valid for the lifetime of the `DB`.
+
+#### Observability
+
+The node's role is exposed through multiple channels:
+
+- **Stats**: `stats` command (CLI) and `GET /api/admin/stats` include a `role` field.
+- **Health**: `GET /health` returns JSON with `status`, `role`, and `uptime_secs`.
+- **Config**: `config` command shows the current replication settings.
+- **REPL prompt**: Shows `[primary]>` or `[replica]>` when not in standalone mode.
+- **Web UI**: A role badge appears next to the logo; the admin stats grid includes the role.
+
+#### CLI Arguments
+
+| Flag             | Default      | Description                                          |
+| ---------------- | ------------ | ---------------------------------------------------- |
+| `--role`         | `standalone` | Node role: `standalone`, `primary`, or `replica`     |
+| `--repl-port`    | `8322`       | TCP port for replica connections (primary only)      |
+| `--primary-addr` | _(none)_     | Primary address (replica only, e.g. `10.0.0.1:8322`) |
+
+#### Docker Compose Topology
+
+A `docker-compose.yml` in the project root defines a two-node topology:
+
+- **primary** — `rkv serve --role primary --repl-port 8322`, API on port 8321,
+  healthcheck via `/health`
+- **replica** — `rkv serve --role replica --primary-addr primary:8322`, API on
+  port 8323 (mapped to container 8321), depends on primary healthy
+
+Data is bind-mounted to `.data/primary/` and `.data/replica/` respectively.
 
 ## Design Decisions
 

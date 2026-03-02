@@ -59,12 +59,39 @@ a browser-based dashboard at `http://localhost:8321/ui`.
 
 For architecture details, see [CONCEPTS.md](CONCEPTS.md#http-server).
 
+## Replication
+
+rKV supports asynchronous primary-replica replication over TCP. A replica connects
+to a primary, receives a full data sync, then streams live writes in real time.
+
+```sh
+# Start a primary node (accepts reads + writes, streams to replicas)
+cargo run --features server -- serve --role primary --repl-port 8322
+
+# Start a replica node (read-only, connects to primary)
+cargo run --features server -- serve --role replica --primary-addr 127.0.0.1:8322
+```
+
+Replicas reject all write operations (put, delete, drop namespace) with a
+`ReadOnlyReplica` error. Maintenance operations (flush, sync, compact) are allowed.
+
+A `docker-compose.yml` is provided for a ready-made primary + replica topology:
+
+```sh
+docker compose up --build
+# Primary API: http://localhost:8321
+# Replica API: http://localhost:8323
+```
+
+For protocol details and architecture, see [CONCEPTS.md](CONCEPTS.md#primary-replica-replication).
+
 ## Concept
 
 - **Revision-aware** — every write produces a unique RevisionID; query history with `rev_get`/`rev_count`
 - **Dual key types** — `Int(i64)` for ordered mode, `Str` for unordered; first Str key triggers irreversible auto-upgrade
 - **Namespace isolation** — isolated key spaces within one DB, created implicitly on first use
 - **Single-key operations** — every operation targets exactly one key
+- **Primary-replica replication** — async TCP streaming from primary to read-only replicas
 
 The following features are intentionally **not supported**:
 

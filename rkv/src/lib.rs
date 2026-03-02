@@ -5,5 +5,5 @@ pub mod server;
 
 pub use engine::{
     Compression, Config, Error, IoModel, Key, LevelStat, Namespace, RecoveryReport, Result,
-    RevisionID, Stats, Value, DB, DEFAULT_NAMESPACE,
+    RevisionID, Role, Stats, Value, DB, DEFAULT_NAMESPACE,
 };

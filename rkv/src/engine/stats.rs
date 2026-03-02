@@ -27,4 +27,6 @@ pub struct Stats {
     pub cache_misses: u64,
     // Uptime
     pub uptime: Duration,
+    // Replication
+    pub role: String,
 }

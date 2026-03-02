@@ -46,6 +46,9 @@ pub async fn put_key(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ServerError> {
+    if state.db.is_replica() {
+        return Err(crate::Error::ReadOnlyReplica.into());
+    }
     let key = parse_key(&raw_key);
     let ns = state.namespace(&ns_name)?;
     let ttl = parse_expires_header(&headers).or_else(|| parse_ttl_header(&headers));
@@ -63,6 +66,9 @@ pub async fn delete_key(
     State(state): State<Arc<AppState>>,
     Path((ns_name, raw_key)): Path<(String, String)>,
 ) -> Result<StatusCode, ServerError> {
+    if state.db.is_replica() {
+        return Err(crate::Error::ReadOnlyReplica.into());
+    }
     let key = parse_key(&raw_key);
     let ns = state.namespace(&ns_name)?;
     ns.delete(key)?;

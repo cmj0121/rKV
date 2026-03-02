@@ -51,7 +51,7 @@ function toast(msg, ok) {
 // API client
 // ---------------------------------------------------------------------------
 function api(method, path, body) {
-  var opts = { method: method, headers: {} };
+  var opts = { method: method, headers: {}, cache: "no-store" };
   if (body !== undefined) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
@@ -140,7 +140,9 @@ var state = {
   offset: 0,
   prefix: "",
   showDeleted: false,
+  role: "standalone",
 };
+var renderGen = 0;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -245,13 +247,13 @@ function renderKeys(app) {
     ]),
   );
 
-  toolbar.appendChild(
-    el("button", {
-      className: "btn-blue",
-      textContent: "+ New Key",
-      onClick: openCreateDialog,
-    }),
-  );
+  var newKeyBtn = el("button", {
+    className: "btn-blue",
+    textContent: "+ New Key",
+    onClick: openCreateDialog,
+  });
+  if (state.role === "replica") newKeyBtn.disabled = true;
+  toolbar.appendChild(newKeyBtn);
 
   app.appendChild(toolbar);
 
@@ -312,6 +314,7 @@ function renderKeyRows() {
   var tbody = $("#keys-body");
   if (!tbody) return;
   tbody.innerHTML = "";
+  var gen = ++renderGen;
 
   if (state.keys.length === 0) {
     var row = el("tr", null, [
@@ -360,6 +363,7 @@ function renderKeyRows() {
   });
 
   Promise.all(promises).then(function (entries) {
+    if (gen !== renderGen) return;
     entries.forEach(function (entry) {
       var isDeleted = entry.status === 410;
       var binary =
@@ -422,29 +426,29 @@ function renderKeyRows() {
             (function () {
               if (isDeleted) return [];
               var btns = [];
-              btns.push(
-                el("button", {
-                  className: "btn-green",
-                  textContent: "Edit",
-                  onClick: function () {
-                    openEditDialog(
-                      entry.key,
-                      entry.value,
-                      entry.status === 204,
-                      entry.expires,
-                    );
-                  },
-                }),
-              );
-              btns.push(
-                el("button", {
-                  className: "btn-red",
-                  textContent: "Del",
-                  onClick: function () {
-                    deleteKey(entry.key);
-                  },
-                }),
-              );
+              var editBtn = el("button", {
+                className: "btn-green",
+                textContent: "Edit",
+                onClick: function () {
+                  openEditDialog(
+                    entry.key,
+                    entry.value,
+                    entry.status === 204,
+                    entry.expires,
+                  );
+                },
+              });
+              if (state.role === "replica") editBtn.disabled = true;
+              btns.push(editBtn);
+              var delBtn = el("button", {
+                className: "btn-red",
+                textContent: "Del",
+                onClick: function () {
+                  deleteKey(entry.key);
+                },
+              });
+              if (state.role === "replica") delBtn.disabled = true;
+              btns.push(delBtn);
               return btns;
             })(),
           ),
@@ -548,15 +552,26 @@ function openRevDialog(key, revCount) {
     (function (idx) {
       api("GET", nsPath + "/revisions/" + idx)
         .then(function (r) {
-          var isDeleted = r.status === 410;
-          var isRevNull = !isDeleted && (r.status === 204 || r.data === null);
+          var isExpired =
+            r.status === 410 &&
+            r.headers &&
+            r.headers.get("X-RKV-Expired") === "true";
+          var isDeleted = r.status === 410 && !isExpired;
+          var isRevNull =
+            !isDeleted && !isExpired && (r.status === 204 || r.data === null);
+          var ttlSecs =
+            r.headers && r.headers.get("X-RKV-TTL")
+              ? parseInt(r.headers.get("X-RKV-TTL"), 10)
+              : null;
           var revBinary =
             !isDeleted &&
+            !isExpired &&
             !isRevNull &&
             r.data != null &&
             isBinary(String(r.data));
           var valText;
           if (isDeleted) valText = "(deleted)";
+          else if (isExpired) valText = "(expired)";
           else if (isRevNull) valText = "(null)";
           else if (revBinary) valText = "(binary)";
           else valText = String(r.data);
@@ -588,6 +603,13 @@ function openRevDialog(key, revCount) {
                 textContent: "(deleted)",
               }),
             );
+          } else if (isExpired) {
+            valChildren.push(
+              el("span", {
+                className: "val-deleted",
+                textContent: "(expired)",
+              }),
+            );
           } else if (revBinary) {
             valChildren.push(
               el("span", { className: "val-binary", textContent: "(binary)" }),
@@ -603,6 +625,24 @@ function openRevDialog(key, revCount) {
             );
           } else {
             valChildren.push(document.createTextNode(valText));
+          }
+
+          // Show TTL badge if the revision has a TTL
+          if (ttlSecs !== null && !isExpired && !isDeleted) {
+            var ttlText =
+              ttlSecs >= 86400
+                ? Math.floor(ttlSecs / 86400) + "d"
+                : ttlSecs >= 3600
+                  ? Math.floor(ttlSecs / 3600) + "h"
+                  : ttlSecs >= 60
+                    ? Math.floor(ttlSecs / 60) + "m"
+                    : ttlSecs + "s";
+            valChildren.push(
+              el("span", {
+                className: "rev-ttl",
+                textContent: "TTL " + ttlText,
+              }),
+            );
           }
 
           var row = el("div", { className: "rev-row" }, [
@@ -890,28 +930,31 @@ function renderAdmin(app) {
   app.appendChild(statsGrid);
 
   // Action buttons
+  var flushBtn = el("button", {
+    className: "btn-yellow",
+    textContent: "Flush",
+    onClick: function () {
+      adminAction("flush");
+    },
+  });
+  var syncBtn = el("button", {
+    className: "btn-yellow",
+    textContent: "Sync",
+    onClick: function () {
+      adminAction("sync");
+    },
+  });
+  var compactBtn = el("button", {
+    className: "btn-yellow",
+    textContent: "Compact",
+    onClick: function () {
+      adminAction("compact");
+    },
+  });
   var actions = el("div", { className: "toolbar" }, [
-    el("button", {
-      className: "btn-yellow",
-      textContent: "Flush",
-      onClick: function () {
-        adminAction("flush");
-      },
-    }),
-    el("button", {
-      className: "btn-yellow",
-      textContent: "Sync",
-      onClick: function () {
-        adminAction("sync");
-      },
-    }),
-    el("button", {
-      className: "btn-yellow",
-      textContent: "Compact",
-      onClick: function () {
-        adminAction("compact");
-      },
-    }),
+    flushBtn,
+    syncBtn,
+    compactBtn,
     el("button", { textContent: "Refresh", onClick: loadStats }),
   ]);
   app.appendChild(actions);
@@ -935,6 +978,7 @@ function loadStats() {
       grid.innerHTML = "";
       var s = r.data;
       var items = [
+        ["Role", s.role || "standalone"],
         ["Total Keys", s.total_keys],
         ["Data Size", formatBytes(s.data_size_bytes)],
         ["Namespaces", s.namespace_count],
@@ -1010,12 +1054,14 @@ function formatBytes(b) {
 function renderNamespaces(app) {
   app.appendChild(el("h2", { textContent: "Namespaces" }));
 
+  var newNsBtn = el("button", {
+    className: "btn-blue",
+    textContent: "+ New Namespace",
+    onClick: openNsDialog,
+  });
+  if (state.role === "replica") newNsBtn.disabled = true;
   var toolbar = el("div", { className: "toolbar" }, [
-    el("button", {
-      className: "btn-blue",
-      textContent: "+ New Namespace",
-      onClick: openNsDialog,
-    }),
+    newNsBtn,
     el("button", {
       textContent: "Refresh",
       onClick: function () {
@@ -1045,16 +1091,18 @@ function loadNsList() {
         return;
       }
       ns.forEach(function (name) {
+        var dropBtn = el("button", {
+          className: "btn-red",
+          textContent: "Drop",
+          onClick: function () {
+            dropNs(name);
+          },
+        });
+        if (state.role === "replica") dropBtn.disabled = true;
         list.appendChild(
           el("div", { className: "ns-item" }, [
             el("span", { className: "ns-name", textContent: name }),
-            el("button", {
-              className: "btn-red",
-              textContent: "Drop",
-              onClick: function () {
-                dropNs(name);
-              },
-            }),
+            dropBtn,
           ]),
         );
       });
@@ -1143,5 +1191,27 @@ function dropNs(name) {
 // Init
 // ---------------------------------------------------------------------------
 document.addEventListener("DOMContentLoaded", function () {
-  route();
+  // Fetch health to set role before rendering views
+  fetch("/health")
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (h) {
+      var role = h.role || "standalone";
+      state.role = role;
+      if (role !== "standalone") {
+        var logo = $(".logo");
+        if (logo) {
+          var badge = el("span", {
+            className: "role-badge role-" + role,
+            textContent: role,
+          });
+          logo.appendChild(badge);
+        }
+      }
+    })
+    .catch(function () {})
+    .then(function () {
+      route();
+    });
 });

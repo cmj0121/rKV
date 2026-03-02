@@ -1,7 +1,19 @@
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::Json;
+
+use crate::server::AppState;
+
 pub async fn root() -> &'static str {
     "\"\""
 }
 
-pub async fn health() -> &'static str {
-    "\"ok\""
+pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let s = state.db.stats();
+    Json(serde_json::json!({
+        "status": "ok",
+        "role": s.role,
+        "uptime_secs": s.uptime.as_secs(),
+    }))
 }

@@ -832,6 +832,9 @@ impl SSTableReader {
     /// prefix might be present (or no prefix bloom exists), `false` if it
     /// is definitely absent.
     pub(crate) fn may_contain_prefix(&self, prefix_bytes: &[u8]) -> bool {
+        if prefix_bytes.is_empty() {
+            return true; // empty prefix matches everything
+        }
         match &self.prefix_bloom {
             Some(pf) => {
                 let query =

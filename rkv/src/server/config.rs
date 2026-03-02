@@ -37,6 +37,18 @@ pub struct ServerConfig {
     /// Enable embedded web UI at /ui
     #[arg(long, default_value_t = false)]
     pub ui: bool,
+
+    /// Replication role (standalone, primary, replica)
+    #[arg(long, default_value = "standalone")]
+    pub role: String,
+
+    /// Replication listen port (primary only)
+    #[arg(long, default_value_t = 8322)]
+    pub repl_port: u16,
+
+    /// Primary address to connect to (replica only, e.g. "10.0.0.1:8322")
+    #[arg(long)]
+    pub primary_addr: Option<String>,
 }
 
 /// Parse a human-readable size string into bytes.

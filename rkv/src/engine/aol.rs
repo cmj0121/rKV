@@ -134,6 +134,29 @@ impl Aol {
         Ok(())
     }
 
+    /// Append a pre-encoded payload to the log.
+    ///
+    /// Used by the replication receiver to write AOL records received from
+    /// the primary without re-encoding.
+    pub(crate) fn append_encoded(&mut self, payload: &[u8]) -> Result<()> {
+        let checksum = Checksum::compute(payload);
+
+        self.writer
+            .write_all(&(payload.len() as u32).to_be_bytes())?;
+        self.writer.write_all(payload)?;
+        self.writer.write_all(&checksum.to_bytes())?;
+
+        self.append_count += 1;
+        self.dirty = true;
+        if self.buffer_size == 0 || self.append_count >= self.buffer_size {
+            self.writer.flush()?;
+            self.append_count = 0;
+            self.dirty = false;
+        }
+
+        Ok(())
+    }
+
     /// Replay the AOL file and return all decoded records plus a count of
     /// skipped (corrupted/truncated) records.
     ///
@@ -279,7 +302,13 @@ fn write_header(writer: &mut BufWriter<File>) -> Result<()> {
 }
 
 /// Encode a record payload (without length prefix or checksum).
-fn encode_payload(ns: &str, rev: u128, expires_at_ms: u64, key: &Key, value: &Value) -> Vec<u8> {
+pub(crate) fn encode_payload(
+    ns: &str,
+    rev: u128,
+    expires_at_ms: u64,
+    key: &Key,
+    value: &Value,
+) -> Vec<u8> {
     let key_bytes = key.to_bytes();
     let value_data_vec;
     let value_data: &[u8] = match value {
@@ -328,7 +357,7 @@ fn encode_payload(ns: &str, rev: u128, expires_at_ms: u64, key: &Key, value: &Va
 const MAX_NAMESPACE_LEN: usize = 256;
 
 /// Decode a record payload.
-fn decode_payload(data: &[u8]) -> Result<AolRecord> {
+pub(crate) fn decode_payload(data: &[u8]) -> Result<AolRecord> {
     let mut pos = 0;
 
     // namespace

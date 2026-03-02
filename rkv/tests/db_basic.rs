@@ -66,17 +66,30 @@ fn list_namespaces_empty_db() {
     let db = DB::open(config).unwrap();
 
     let names = db.list_namespaces().unwrap();
-    assert!(names.is_empty());
+    assert_eq!(
+        names,
+        vec!["_"],
+        "fresh DB should contain only the default namespace"
+    );
 }
 
 #[test]
-fn drop_default_namespace_rejected() {
+fn drop_default_namespace_clears_and_recreates() {
     let tmp = tempfile::tempdir().unwrap();
     let config = Config::new(tmp.path());
     let db = DB::open(config).unwrap();
 
-    let err = db.drop_namespace(DEFAULT_NAMESPACE).unwrap_err();
-    assert!(matches!(err, Error::InvalidNamespace(_)));
+    // Write a key, then drop the default namespace
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns.put("x", "1", None).unwrap();
+    assert_eq!(ns.count().unwrap(), 1);
+
+    db.drop_namespace(DEFAULT_NAMESPACE).unwrap();
+
+    // Default namespace is auto-recreated (empty)
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    assert_eq!(ns.count().unwrap(), 0);
+    assert!(db.list_namespaces().unwrap().contains(&"_".to_string()));
 }
 
 #[test]
@@ -502,7 +515,7 @@ fn stats_returns_default_counters() {
 
     assert_eq!(s.total_keys, 0);
     assert_eq!(s.data_size_bytes, 0);
-    assert_eq!(s.namespace_count, 0);
+    assert_eq!(s.namespace_count, 1);
     assert_eq!(s.sstable_count, 0);
     assert_eq!(s.op_puts, 0);
     assert_eq!(s.op_gets, 0);
@@ -1265,7 +1278,7 @@ fn dump_empty_db() {
     std::fs::remove_dir_all(&db_path).unwrap();
     let db2 = DB::load(&dump_path).unwrap();
     let names = db2.list_namespaces().unwrap();
-    assert!(names.is_empty());
+    assert_eq!(names, vec!["_"]);
 }
 
 #[test]
@@ -3581,7 +3594,7 @@ fn list_namespaces_after_put() {
     ns2.put("order1", "x", None).unwrap();
 
     let names = db.list_namespaces().unwrap();
-    assert_eq!(names, vec!["orders", "users"]);
+    assert_eq!(names, vec!["_", "orders", "users"]);
 }
 
 #[test]
@@ -3748,7 +3761,7 @@ fn list_namespaces_sorted() {
     }
 
     let names = db.list_namespaces().unwrap();
-    assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    assert_eq!(names, vec!["_", "alpha", "mid", "zeta"]);
 }
 
 // --- Merged scan: MemTable + SSTable ---

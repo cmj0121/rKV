@@ -26,16 +26,33 @@ pub async fn rev_get(
 ) -> Result<Response, ServerError> {
     let key = parse_key(&raw_key);
     let ns = state.namespace(&ns_name)?;
-    let value = ns.rev_get(key, index)?;
+    let (value, expired, remaining) = ns.rev_get_with_ttl(key, index)?;
 
     if value.is_tombstone() {
         return Ok(StatusCode::GONE.into_response());
+    }
+
+    if expired {
+        let mut resp = StatusCode::GONE.into_response();
+        resp.headers_mut()
+            .insert("X-RKV-Expired", "true".parse().unwrap());
+        return Ok(resp);
     }
 
     let body = super::keys::value_to_json_bytes(&value);
     let mut resp = (StatusCode::OK, body).into_response();
     resp.headers_mut()
         .insert("content-type", "application/json".parse().unwrap());
+    if let Some(ttl) = remaining {
+        if let Some(expires) = std::time::SystemTime::now().checked_add(ttl) {
+            let datetime = httpdate::fmt_http_date(expires);
+            if let Ok(val) = datetime.parse() {
+                resp.headers_mut().insert("Expires", val);
+            }
+        }
+        resp.headers_mut()
+            .insert("X-RKV-TTL", ttl.as_secs().to_string().parse().unwrap());
+    }
     Ok(resp)
 }
 

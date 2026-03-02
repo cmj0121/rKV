@@ -236,31 +236,39 @@ impl MemTable {
         }
     }
 
-    /// Return all raw `(Key, Value)` pairs matching a prefix, including tombstones.
+    /// Return all raw `(Key, Value)` pairs matching a prefix, including
+    /// tombstones and expired entries (surfaced as tombstones).
     ///
     /// No limit/offset — returns everything. Used by the merged scan to
     /// overlay MemTable entries on top of SSTable results.
     pub(crate) fn scan_all_raw(&self, prefix: &Key) -> Vec<(Key, Value)> {
         if self.ordered_mode {
-            self.entries
-                .range(prefix..)
-                .filter(|(_, entries)| self.is_not_expired(entries))
-                .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
-                .collect()
+            // In ordered mode, range(Key::Str("")..) misses all Int keys
+            // because Key::Int < Key::Str. An empty Str prefix means
+            // "scan everything", so iterate all entries.
+            if *prefix == Key::Str(String::new()) {
+                self.entries
+                    .iter()
+                    .map(|(k, entries)| (k.clone(), Self::latest_or_tombstone(entries)))
+                    .collect()
+            } else {
+                self.entries
+                    .range(prefix..)
+                    .map(|(k, entries)| (k.clone(), Self::latest_or_tombstone(entries)))
+                    .collect()
+            }
         } else {
             let prefix_str = prefix.to_string();
             self.entries
                 .iter()
-                .filter(|(k, entries)| {
-                    k.to_string().starts_with(&prefix_str) && self.is_not_expired(entries)
-                })
-                .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
+                .filter(|(k, _)| k.to_string().starts_with(&prefix_str))
+                .map(|(k, entries)| (k.clone(), Self::latest_or_tombstone(entries)))
                 .collect()
         }
     }
 
     /// Return all raw `(Key, Value)` pairs matching a prefix in reverse,
-    /// including tombstones.
+    /// including tombstones and expired entries (surfaced as tombstones).
     ///
     /// For ordered mode: returns keys <= prefix. For unordered mode: prefix
     /// matching (same as forward). Used by merged rscan.
@@ -268,17 +276,14 @@ impl MemTable {
         if self.ordered_mode {
             self.entries
                 .range(..=prefix.clone())
-                .filter(|(_, entries)| self.is_not_expired(entries))
-                .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
+                .map(|(k, entries)| (k.clone(), Self::latest_or_tombstone(entries)))
                 .collect()
         } else {
             let prefix_str = prefix.to_string();
             self.entries
                 .iter()
-                .filter(|(k, entries)| {
-                    k.to_string().starts_with(&prefix_str) && self.is_not_expired(entries)
-                })
-                .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
+                .filter(|(k, _)| k.to_string().starts_with(&prefix_str))
+                .map(|(k, entries)| (k.clone(), Self::latest_or_tombstone(entries)))
                 .collect()
         }
     }
@@ -361,6 +366,32 @@ impl MemTable {
         entries.get(index as usize).map(|e| &e.value)
     }
 
+    /// Returns the value and remaining TTL at a specific revision index.
+    ///
+    /// Returns `(value, expired, remaining_ttl)`:
+    /// - `expired`: true if the revision had a TTL that has elapsed
+    /// - `remaining_ttl`: `Some(duration)` if TTL is set and not expired, `None` otherwise
+    pub(crate) fn rev_get_with_ttl(
+        &self,
+        key: &Key,
+        index: u64,
+    ) -> Option<(&Value, bool, Option<Duration>)> {
+        let entries = self.entries.get(key)?;
+        let entry = entries.get(index as usize)?;
+        let (expired, remaining) = match entry.expires_at {
+            Some(expires_at) => {
+                let now = Instant::now();
+                if now > expires_at {
+                    (true, None)
+                } else {
+                    (false, Some(expires_at - now))
+                }
+            }
+            None => (false, None),
+        };
+        Some((&entry.value, expired, remaining))
+    }
+
     /// Returns the remaining TTL for a key.
     ///
     /// - `None` — key not found or expired
@@ -426,8 +457,9 @@ impl MemTable {
     /// value for every key, **including tombstones** (needed for correctness
     /// when flushing to SSTable — a tombstone must shadow older SSTables).
     ///
-    /// Expired entries are skipped entirely. After draining, the MemTable's
-    /// entries and bookkeeping are cleared, but `ordered_mode` is preserved.
+    /// Expired entries are flushed as tombstones so they remain visible to
+    /// "show deleted" scans after the memtable is drained. Compaction will
+    /// eventually garbage-collect them.
     pub(crate) fn drain_latest(&mut self) -> Vec<(Key, Value)> {
         let entries = std::mem::take(&mut self.entries);
         self.last_rev.clear();
@@ -436,9 +468,10 @@ impl MemTable {
         let mut result = Vec::with_capacity(entries.len());
         for (key, revisions) in entries {
             if let Some(latest) = revisions.last() {
-                // Skip expired entries
                 if let Some(expires_at) = latest.expires_at {
                     if Instant::now() > expires_at {
+                        // Expired → flush as tombstone so "show deleted" works
+                        result.push((key, Value::tombstone()));
                         continue;
                     }
                 }
@@ -448,7 +481,19 @@ impl MemTable {
         result
     }
 
+    /// Return the latest value, or a tombstone if the entry is expired.
+    fn latest_or_tombstone(entries: &[MemEntry]) -> Value {
+        let latest = entries.last().expect("non-empty entries");
+        if let Some(expires_at) = latest.expires_at {
+            if Instant::now() > expires_at {
+                return Value::tombstone();
+            }
+        }
+        latest.value.clone()
+    }
+
     /// Check if the latest entry for a key is not expired (may be a tombstone).
+    #[cfg(test)]
     fn is_not_expired(&self, entries: &[MemEntry]) -> bool {
         let Some(latest) = entries.last() else {
             return false;
@@ -677,6 +722,20 @@ mod tests {
     }
 
     // --- Scan ---
+
+    #[test]
+    fn scan_all_raw_ordered_empty_prefix_includes_int_keys() {
+        let mut mt = MemTable::new();
+        mt.put(Key::Int(1), Value::from("a"), RevisionID::from(1u128), None);
+        mt.put(Key::Int(2), Value::from("b"), RevisionID::from(2u128), None);
+        assert!(mt.is_ordered());
+
+        // Empty Str prefix = "scan everything" — must include Int keys
+        let entries = mt.scan_all_raw(&Key::Str(String::new()));
+        assert_eq!(entries.len(), 2, "Int keys must be visible: {entries:?}");
+        assert_eq!(entries[0].0, Key::Int(1));
+        assert_eq!(entries[1].0, Key::Int(2));
+    }
 
     #[test]
     fn scan_ordered_mode() {
@@ -934,7 +993,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_latest_skips_expired() {
+    fn drain_latest_converts_expired_to_tombstone() {
         let mut mt = MemTable::new();
         mt.put(
             Key::Int(1),
@@ -947,8 +1006,19 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
 
         let drained = mt.drain_latest();
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].0, Key::Int(2));
+        // Expired entry is flushed as tombstone (not skipped) so
+        // "show deleted" scans work after flush.
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].0, Key::Int(1));
+        assert!(
+            drained[0].1.is_tombstone(),
+            "expired entry should be a tombstone"
+        );
+        assert_eq!(drained[1].0, Key::Int(2));
+        assert!(
+            !drained[1].1.is_tombstone(),
+            "live entry should not be a tombstone"
+        );
     }
 
     #[test]
