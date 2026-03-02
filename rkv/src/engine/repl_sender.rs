@@ -408,7 +408,10 @@ impl ReplSender {
 /// Enumerate all SSTable files under `<db>/sst/`.
 /// Returns `(namespace, level, sst_id, path)` tuples.
 #[allow(dead_code)]
-fn enumerate_sst_files(db_path: &Path, max_levels: usize) -> Vec<(String, u8, u64, PathBuf)> {
+pub(crate) fn enumerate_sst_files(
+    db_path: &Path,
+    max_levels: usize,
+) -> Vec<(String, u8, u64, PathBuf)> {
     let sst_root = db_path.join("sst");
     let mut results = Vec::new();
 
@@ -448,7 +451,7 @@ fn enumerate_sst_files(db_path: &Path, max_levels: usize) -> Vec<(String, u8, u6
 /// Enumerate all bin object files under `<db>/objects/`.
 /// Returns `(namespace, hex_hash, path)` tuples.
 #[allow(dead_code)]
-fn enumerate_object_files(db_path: &Path) -> Vec<(String, String, PathBuf)> {
+pub(crate) fn enumerate_object_files(db_path: &Path) -> Vec<(String, String, PathBuf)> {
     let obj_root = db_path.join("objects");
     let mut results = Vec::new();
 
@@ -494,7 +497,7 @@ fn enumerate_object_files(db_path: &Path) -> Vec<(String, String, PathBuf)> {
 
 /// Decode a hex string to bytes.
 #[allow(dead_code)]
-fn hex_to_bytes(hex: &str) -> std::result::Result<Vec<u8>, ()> {
+pub(crate) fn hex_to_bytes(hex: &str) -> std::result::Result<Vec<u8>, ()> {
     if !hex.len().is_multiple_of(2) {
         return Err(());
     }

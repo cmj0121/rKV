@@ -11,6 +11,7 @@ mod memtable;
 mod namespace;
 mod objects;
 mod recovery;
+mod repl_peer;
 mod repl_receiver;
 mod repl_sender;
 pub(crate) mod replication;
