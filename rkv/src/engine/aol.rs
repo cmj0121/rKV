@@ -447,6 +447,82 @@ pub(crate) fn decode_payload(data: &[u8]) -> Result<AolRecord> {
     })
 }
 
+/// Extract the revision from a raw AOL payload without fully decoding it.
+///
+/// Payload layout: `[ns_len:2B][namespace][revision:16B]...`
+fn extract_revision(payload: &[u8]) -> Option<u128> {
+    if payload.len() < 2 {
+        return None;
+    }
+    let ns_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+    let rev_start = 2 + ns_len;
+    if rev_start + 16 > payload.len() {
+        return None;
+    }
+    Some(u128::from_be_bytes(
+        payload[rev_start..rev_start + 16].try_into().ok()?,
+    ))
+}
+
+/// Read the AOL file and return raw payloads for records whose revision exceeds
+/// `after_revision`. Returns an empty Vec if the AOL file does not exist or
+/// contains no matching records.
+///
+/// This is used by the primary to serve incremental sync — the raw payloads
+/// are sent as `AolRecord { payload }` messages to the replica.
+pub(crate) fn records_after_revision(
+    db_dir: &Path,
+    after_revision: u128,
+    io: &dyn super::io::IoBackend,
+) -> Vec<Vec<u8>> {
+    let path = aol_path(db_dir);
+    let data = match io.read_file(&path) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+
+    if data.len() < HEADER_SIZE {
+        return Vec::new();
+    }
+
+    // Validate header
+    if data[0..4] != MAGIC {
+        return Vec::new();
+    }
+
+    let mut pos = HEADER_SIZE;
+    let mut results = Vec::new();
+
+    while pos < data.len() {
+        // payload_len (4 bytes)
+        if pos + 4 > data.len() {
+            break;
+        }
+        let payload_len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        // payload + checksum
+        if pos + payload_len + Checksum::encoded_size() > data.len() {
+            break;
+        }
+
+        let payload = &data[pos..pos + payload_len];
+        pos += payload_len;
+
+        // Skip checksum (5 bytes)
+        pos += Checksum::encoded_size();
+
+        // Extract revision and filter
+        if let Some(rev) = extract_revision(payload) {
+            if rev > after_revision {
+                results.push(payload.to_vec());
+            }
+        }
+    }
+
+    results
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -505,12 +505,16 @@ impl DB {
                     Ok(())
                 };
 
+                let primary_config = repl_sender::PrimaryConfig {
+                    db_path,
+                    cluster_id,
+                    max_levels,
+                    io_backend: Arc::clone(&self.io_backend),
+                };
                 let sender = repl_sender::ReplSender::start(
                     &self.config.repl_bind,
                     self.config.repl_port,
-                    cluster_id,
-                    db_path,
-                    max_levels,
+                    primary_config,
                     flush_fn,
                     stop,
                 )?;
