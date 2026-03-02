@@ -10,6 +10,13 @@ use super::error::{Error, Result};
 use super::io::IoBackend;
 use super::replication::{ReplMessage, Role};
 
+/// Callback invoked after a full sync completes — reloads SSTable index,
+/// resets memtables, truncates AOL, and registers new namespaces.
+pub(crate) type PeerPostSyncFn = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
+/// Callback to flush the AOL buffer before reading it for incremental sync.
+pub(crate) type PeerFlushFn = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
 /// Messages sent between peer sessions.
 #[derive(Debug)]
 pub(crate) enum PeerMsg {
@@ -33,6 +40,9 @@ pub(crate) struct PeerSessionConfig {
     pub(crate) io_backend: Arc<dyn IoBackend>,
     pub(crate) replay_fn: PeerReplayFn,
     pub(crate) broadcast_fn: PeerBroadcastFn,
+    pub(crate) post_sync_fn: PeerPostSyncFn,
+    pub(crate) last_revision: Arc<std::sync::Mutex<u128>>,
+    pub(crate) flush_fn: PeerFlushFn,
 }
 
 /// A symmetric bidirectional peer session.
@@ -104,12 +114,20 @@ impl PeerSession {
         };
 
         // --- Initial sync ---
+        let post_sync_fn = Arc::clone(&config.post_sync_fn);
+        let last_revision_tracker = Arc::clone(&config.last_revision);
+
         if is_connector {
-            // Connector sends SyncRequest, listener responds
-            // For now, always request full sync (revision=0, force_full=false)
-            // to get the peer's current state
+            // Read current last_revision for incremental sync
+            let current_rev = {
+                let lr = last_revision_tracker
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                *lr
+            };
+
             ReplMessage::SyncRequest {
-                last_revision: 0,
+                last_revision: current_rev,
                 force_full: false,
             }
             .write_to(&mut writer)?;
@@ -126,17 +144,41 @@ impl PeerSession {
             };
 
             match first_msg {
-                ReplMessage::FullSyncStart { .. } => {
-                    // Receive full sync — apply records via replay_fn
+                ReplMessage::FullSyncStart {
+                    sst_count,
+                    object_count,
+                    ..
+                } => {
+                    let has_data = sst_count > 0 || object_count > 0;
+                    // Receive full sync — SST files written to disk
                     Self::receive_full_sync_as_peer(
-                        first_msg,
+                        ReplMessage::FullSyncStart {
+                            namespace_count: 0, // not used by receiver
+                            sst_count,
+                            object_count,
+                        },
                         &mut reader,
                         db_path,
                         max_levels,
                         &stop,
                     )?;
+                    // Only reload when the peer actually sent SST/object data.
+                    // An empty full sync means "I have nothing" — no reason to
+                    // wipe local state.
+                    if has_data {
+                        // Reset revision after full sync (SSTs replace everything)
+                        {
+                            let mut lr = last_revision_tracker
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            *lr = 0;
+                        }
+                        // Reload SST index, reset memtables, truncate AOL
+                        (post_sync_fn)()?;
+                    }
                 }
                 ReplMessage::IncrementalSyncStart { record_count } => {
+                    // Incremental sync — replay_fn already updates memtable + AOL
                     Self::receive_incremental_as_peer(
                         &mut reader,
                         record_count,
@@ -155,12 +197,27 @@ impl PeerSession {
             let sync_req = Self::read_sync_request_with_timeout(&stream, &mut reader)?;
 
             match sync_req {
-                Some(ReplMessage::SyncRequest { .. }) => {
-                    // Send full sync from our data
-                    Self::send_full_sync(&mut writer, db_path, max_levels, &io_backend, &stop)?;
+                Some(ReplMessage::SyncRequest {
+                    last_revision,
+                    force_full,
+                }) if !force_full && last_revision > 0 => {
+                    // Flush AOL buffer so records_after_revision sees latest data
+                    let _ = (config.flush_fn)();
+                    // Try incremental sync
+                    let records = super::aol::records_after_revision(
+                        db_path,
+                        last_revision,
+                        io_backend.as_ref(),
+                    );
+                    if records.is_empty() {
+                        // AOL truncated or no matching records → full sync
+                        Self::send_full_sync(&mut writer, db_path, max_levels, &io_backend, &stop)?;
+                    } else {
+                        Self::send_incremental_sync(&mut writer, &records)?;
+                    }
                 }
                 _ => {
-                    // No sync request (old peer?) — send empty full sync
+                    // force_full, revision=0, or no SyncRequest → full sync
                     Self::send_full_sync(&mut writer, db_path, max_levels, &io_backend, &stop)?;
                 }
             }
@@ -488,6 +545,24 @@ impl PeerSession {
         }
         Ok(())
     }
+
+    fn send_incremental_sync<W: Write>(writer: &mut W, records: &[Vec<u8>]) -> Result<()> {
+        ReplMessage::IncrementalSyncStart {
+            record_count: records.len() as u32,
+        }
+        .write_to(writer)?;
+        writer.flush()?;
+
+        for payload in records {
+            ReplMessage::AolRecord {
+                payload: payload.clone(),
+            }
+            .write_to(writer)?;
+        }
+        writer.flush()?;
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -615,6 +690,17 @@ impl PeerConnector {
         sessions: &std::sync::Mutex<Vec<PeerSession>>,
         stop: &Arc<AtomicBool>,
     ) {
+        // Load checkpoint from previous run
+        if let Some(rev) = load_peer_checkpoint(&config.db_path) {
+            let mut lr = config
+                .last_revision
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if rev > *lr {
+                *lr = rev;
+            }
+        }
+
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(30);
 
@@ -638,6 +724,12 @@ impl PeerConnector {
                             // Wait for the session to die before reconnecting
                             loop {
                                 if stop.load(Ordering::Relaxed) {
+                                    // Clean exit — save checkpoint
+                                    let rev = *config
+                                        .last_revision
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    save_peer_checkpoint(&config.db_path, rev);
                                     return;
                                 }
                                 thread::sleep(Duration::from_secs(1));
@@ -661,6 +753,15 @@ impl PeerConnector {
                 }
             }
 
+            // Save checkpoint on session death before backoff
+            {
+                let rev = *config
+                    .last_revision
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                save_peer_checkpoint(&config.db_path, rev);
+            }
+
             // Backoff before reconnecting
             let sleep_end = std::time::Instant::now() + backoff;
             while std::time::Instant::now() < sleep_end {
@@ -671,6 +772,32 @@ impl PeerConnector {
             }
             backoff = (backoff * 2).min(max_backoff);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Peer checkpoint persistence
+// ---------------------------------------------------------------------------
+
+const PEER_CHECKPOINT_FILE: &str = "peer_checkpoint";
+
+/// Load the peer last-revision checkpoint from disk. Returns `None` if the
+/// file doesn't exist or is malformed.
+pub(crate) fn load_peer_checkpoint(db_path: &Path) -> Option<u128> {
+    let path = db_path.join(PEER_CHECKPOINT_FILE);
+    let data = std::fs::read(&path).ok()?;
+    if data.len() < 16 {
+        return None;
+    }
+    Some(u128::from_be_bytes(data[0..16].try_into().ok()?))
+}
+
+/// Persist the peer last-revision checkpoint to disk. Best-effort — errors
+/// are logged but not propagated.
+pub(crate) fn save_peer_checkpoint(db_path: &Path, revision: u128) {
+    let path = db_path.join(PEER_CHECKPOINT_FILE);
+    if let Err(e) = std::fs::write(&path, revision.to_be_bytes()) {
+        eprintln!("peer: failed to save checkpoint: {e}");
     }
 }
 

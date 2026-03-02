@@ -273,6 +273,8 @@ pub struct DB {
     peer_sessions: Arc<Mutex<Vec<repl_peer::PeerSession>>>,
     peer_listener: Option<repl_peer::PeerListener>,
     peer_connectors: Vec<repl_peer::PeerConnector>,
+    /// Peer last-revision tracker for checkpoint persistence on close.
+    peer_last_revision: Option<Arc<Mutex<u128>>>,
 }
 
 impl DB {
@@ -468,6 +470,7 @@ impl DB {
             peer_sessions: Arc::new(Mutex::new(Vec::new())),
             peer_listener: None,
             peer_connectors: Vec::new(),
+            peer_last_revision: None,
         };
 
         // Eagerly register the default namespace so it always appears in
@@ -820,6 +823,10 @@ impl DB {
                 let max_levels = self.config.max_levels;
                 let stop = Arc::new(AtomicBool::new(false));
 
+                // Shared revision tracker for incremental sync
+                let last_revision = Arc::new(Mutex::new(0u128));
+                let rev_tracker = Arc::clone(&last_revision);
+
                 // Build a peer replay callback using LWW
                 let db_ns_data = Arc::clone(&self.namespace_data);
                 let db_aol = Arc::clone(&self.aol);
@@ -884,6 +891,13 @@ impl DB {
                     };
 
                     if applied {
+                        // Track highest revision for incremental sync
+                        {
+                            let mut lr = rev_tracker.lock().unwrap_or_else(|e| e.into_inner());
+                            if record.revision > *lr {
+                                *lr = record.revision;
+                            }
+                        }
                         let mut aol = db_aol.lock().unwrap_or_else(|e| e.into_inner());
                         aol.append_encoded(payload)?;
                     } else {
@@ -908,6 +922,69 @@ impl DB {
                         }
                     });
 
+                // Build a post-sync callback to reload SSTable index (same as replica)
+                let sync_sstables = Arc::clone(&self.sstables);
+                let sync_sst_seq = Arc::clone(&self.sst_sequence);
+                let sync_db_path = self.config.path.clone();
+                let sync_max_levels = self.config.max_levels;
+                let sync_cache = self.block_cache.clone();
+                let sync_io = Arc::clone(&self.io_backend);
+                let sync_ns_data = Arc::clone(&self.namespace_data);
+                let sync_aol = Arc::clone(&self.aol);
+                let post_sync_fn: repl_peer::PeerPostSyncFn = Arc::new(move || {
+                    let (new_sst, new_seq) = Self::scan_sstables(
+                        &sync_db_path,
+                        sync_max_levels,
+                        &sync_cache,
+                        sync_io.as_ref(),
+                    )?;
+
+                    // Reset memtables in-place and register new namespaces
+                    {
+                        let mut ns_map = sync_ns_data.write().unwrap_or_else(|e| e.into_inner());
+                        for mt_mutex in ns_map.values() {
+                            let mut mt = mt_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                            *mt = memtable::MemTable::new();
+                        }
+                        for ns_name in new_sst.keys() {
+                            ns_map
+                                .entry(ns_name.clone())
+                                .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
+                        }
+                        ns_map
+                            .entry(DEFAULT_NAMESPACE.to_owned())
+                            .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
+                    }
+
+                    // Truncate local AOL so stale records don't reappear on restart
+                    {
+                        let mut aol = sync_aol.lock().unwrap_or_else(|e| e.into_inner());
+                        aol.truncate(&sync_db_path)?;
+                    }
+
+                    // Replace SSTable index
+                    {
+                        let mut sst = sync_sstables.write().unwrap_or_else(|e| e.into_inner());
+                        *sst = new_sst;
+                    }
+
+                    // Update sequence counter
+                    let old_seq = sync_sst_seq.load(Ordering::Relaxed);
+                    if new_seq > old_seq {
+                        sync_sst_seq.store(new_seq, Ordering::Relaxed);
+                    }
+
+                    Ok(())
+                });
+
+                // Build a flush callback for AOL (needed before incremental sync)
+                let flush_aol = Arc::clone(&self.aol);
+                let flush_fn: repl_peer::PeerFlushFn = Arc::new(move || {
+                    let mut aol = flush_aol.lock().unwrap_or_else(|e| e.into_inner());
+                    aol.flush_if_dirty()?;
+                    Ok(())
+                });
+
                 let peer_config = Arc::new(repl_peer::PeerSessionConfig {
                     local_cluster_id: cluster_id,
                     db_path: db_path.clone(),
@@ -915,6 +992,9 @@ impl DB {
                     io_backend: Arc::clone(&self.io_backend),
                     replay_fn,
                     broadcast_fn,
+                    post_sync_fn,
+                    last_revision: Arc::clone(&last_revision),
+                    flush_fn,
                 });
 
                 // Start listener
@@ -937,6 +1017,9 @@ impl DB {
                     );
                     self.peer_connectors.push(connector);
                 }
+
+                // Store revision tracker for checkpoint persistence on close
+                self.peer_last_revision = Some(last_revision);
             }
             replication::Role::Standalone => {
                 // No replication — nothing to start
@@ -954,6 +1037,12 @@ impl DB {
             receiver.stop();
         }
         self.repl_receiver = None;
+
+        // Save peer checkpoint before stopping sessions
+        if let Some(ref lr) = self.peer_last_revision {
+            let rev = *lr.lock().unwrap_or_else(|e| e.into_inner());
+            repl_peer::save_peer_checkpoint(&self.config.path, rev);
+        }
 
         // Stop peer replication components
         if let Some(ref mut listener) = self.peer_listener {
