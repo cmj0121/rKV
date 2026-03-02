@@ -7,7 +7,6 @@ use super::value::Value;
 
 /// A single revision record stored in the MemTable.
 pub(crate) struct MemEntry {
-    #[allow(dead_code)]
     pub revision: RevisionID,
     pub value: Value,
     pub expires_at: Option<Instant>,

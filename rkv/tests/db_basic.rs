@@ -4660,6 +4660,103 @@ fn revision_survives_reopen() {
     db.close().unwrap();
 }
 
+/// Delete → flush → re-put: revision should be correct both in memtable and after flush.
+#[test]
+fn revision_correct_after_delete_flush_reput() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("rev_del_flush_reput");
+
+    let mut config = Config::new(&db_path);
+    config.write_buffer_size = 1024 * 1024; // prevent auto-flush
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // 1. put → delete → flush (tombstone on disk)
+    let _rev_a = ns.put("foo", "bar", None).unwrap();
+    ns.delete("foo").unwrap();
+    db.flush().unwrap();
+
+    // 2. Re-put the same key — new value in memtable
+    let rev_b = ns.put("foo", "baz", None).unwrap();
+
+    // 3. Should be correct from memtable
+    let (val, rev) = ns.get_with_revision("foo").unwrap();
+    assert_eq!(val, Value::from("baz"));
+    assert_eq!(rev, rev_b, "revision wrong from memtable");
+
+    // 4. Flush again — new value moves to SSTable (tombstone is in older SSTable)
+    db.flush().unwrap();
+
+    // 5. Should still be correct from SSTable
+    let (val, rev) = ns.get_with_revision("foo").unwrap();
+    assert_eq!(val, Value::from("baz"));
+    assert_eq!(
+        rev, rev_b,
+        "revision wrong from SSTable after delete+flush+reput"
+    );
+
+    // 6. Compact — merge SSTable with tombstone and newer value
+    db.compact().unwrap();
+
+    // 7. Still correct after compaction
+    let (val, rev) = ns.get_with_revision("foo").unwrap();
+    assert_eq!(val, Value::from("baz"));
+    assert_eq!(rev, rev_b, "revision wrong after compaction over tombstone");
+
+    db.close().unwrap();
+}
+
+/// Delete → flush → re-put → flush → reopen: revision must survive the full lifecycle.
+#[test]
+fn revision_survives_delete_flush_reput_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("rev_del_reopen");
+
+    let rev_b;
+    {
+        let mut config = Config::new(&db_path);
+        config.write_buffer_size = 1024 * 1024;
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        let _rev_a = ns.put("foo", "bar", None).unwrap();
+        ns.delete("foo").unwrap();
+        db.flush().unwrap();
+
+        // Tombstone is on SSTable; get should fail
+        assert!(ns.get_with_revision("foo").is_err());
+
+        // Re-put same key
+        rev_b = ns.put("foo", "baz", None).unwrap();
+
+        // From memtable
+        let (val, rev) = ns.get_with_revision("foo").unwrap();
+        assert_eq!(val, Value::from("baz"));
+        assert_eq!(rev, rev_b, "wrong rev from memtable");
+
+        // Flush new value to SSTable
+        db.flush().unwrap();
+
+        // From SSTable
+        let (val, rev) = ns.get_with_revision("foo").unwrap();
+        assert_eq!(val, Value::from("baz"));
+        assert_eq!(rev, rev_b, "wrong rev from SSTable");
+
+        db.close().unwrap();
+    }
+
+    // Reopen and verify
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let (val, rev) = ns.get_with_revision("foo").unwrap();
+    assert_eq!(val, Value::from("baz"));
+    assert_eq!(rev, rev_b, "wrong rev after reopen");
+
+    db.close().unwrap();
+}
+
 /// V2 SSTables written by flush survive close/reopen — format upgrade is transparent.
 #[test]
 fn format_version_upgrade_transparent() {
