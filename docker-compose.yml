@@ -57,3 +57,63 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+
+  peer-a:
+    build: .
+    platform: linux/amd64
+    ports:
+      - "8324:8321"
+    volumes:
+      - .data/peer-a:/data
+    command:
+      [
+        "serve",
+        "--bind",
+        "0.0.0.0",
+        "--db",
+        "/data",
+        "--allow-all",
+        "--ui",
+        "--role",
+        "peer",
+        "--repl-port",
+        "8322",
+        "--peers",
+        "peer-b:8322",
+      ]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  peer-b:
+    build: .
+    platform: linux/amd64
+    ports:
+      - "8325:8321"
+    volumes:
+      - .data/peer-b:/data
+    command:
+      [
+        "serve",
+        "--bind",
+        "0.0.0.0",
+        "--db",
+        "/data",
+        "--allow-all",
+        "--ui",
+        "--role",
+        "peer",
+        "--repl-port",
+        "8322",
+        "--peers",
+        "peer-a:8322",
+      ]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
