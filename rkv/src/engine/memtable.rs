@@ -447,8 +447,9 @@ impl MemTable {
     /// value for every key, **including tombstones** (needed for correctness
     /// when flushing to SSTable — a tombstone must shadow older SSTables).
     ///
-    /// Expired entries are skipped entirely. After draining, the MemTable's
-    /// entries and bookkeeping are cleared, but `ordered_mode` is preserved.
+    /// Expired entries are flushed as tombstones so they remain visible to
+    /// "show deleted" scans after the memtable is drained. Compaction will
+    /// eventually garbage-collect them.
     pub(crate) fn drain_latest(&mut self) -> Vec<(Key, Value)> {
         let entries = std::mem::take(&mut self.entries);
         self.last_rev.clear();
@@ -457,9 +458,10 @@ impl MemTable {
         let mut result = Vec::with_capacity(entries.len());
         for (key, revisions) in entries {
             if let Some(latest) = revisions.last() {
-                // Skip expired entries
                 if let Some(expires_at) = latest.expires_at {
                     if Instant::now() > expires_at {
+                        // Expired → flush as tombstone so "show deleted" works
+                        result.push((key, Value::tombstone()));
                         continue;
                     }
                 }
@@ -967,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_latest_skips_expired() {
+    fn drain_latest_converts_expired_to_tombstone() {
         let mut mt = MemTable::new();
         mt.put(
             Key::Int(1),
@@ -980,8 +982,19 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
 
         let drained = mt.drain_latest();
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].0, Key::Int(2));
+        // Expired entry is flushed as tombstone (not skipped) so
+        // "show deleted" scans work after flush.
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].0, Key::Int(1));
+        assert!(
+            drained[0].1.is_tombstone(),
+            "expired entry should be a tombstone"
+        );
+        assert_eq!(drained[1].0, Key::Int(2));
+        assert!(
+            !drained[1].1.is_tombstone(),
+            "live entry should not be a tombstone"
+        );
     }
 
     #[test]

@@ -501,3 +501,118 @@ fn first_key_on_pure_db_visible_on_replica() {
     replica.close().unwrap();
     primary.close().unwrap();
 }
+
+/// Reproduces user report: first key with TTL=1s on a pure primary is
+/// invisible on the replica even with "show deleted" toggled on.
+#[test]
+fn first_key_with_ttl_visible_then_deleted_on_replica() {
+    let tmp_primary = tempfile::tempdir().unwrap();
+    let tmp_replica = tempfile::tempdir().unwrap();
+    let port = free_port();
+
+    // Both DBs start completely empty
+    let primary = open_primary(tmp_primary.path(), port);
+    thread::sleep(Duration::from_millis(100));
+
+    let replica = open_replica(tmp_replica.path(), &format!("127.0.0.1:{port}"));
+    thread::sleep(Duration::from_millis(1500));
+
+    // Write the FIRST key with TTL=1s on primary
+    let ns = primary.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns.put("ttl_first", "ttl_value", Some(Duration::from_secs(1)))
+        .unwrap();
+    drop(ns);
+
+    // Wait for live-stream propagation (key should still be alive)
+    thread::sleep(Duration::from_millis(300));
+
+    // --- While TTL is active: key should be visible on both ---
+    let ns = primary.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    let val = ns.get("ttl_first");
+    assert!(
+        val.is_ok(),
+        "key should be live on primary within TTL, got: {:?}",
+        val.err()
+    );
+    drop(ns);
+
+    let ns = replica.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    let val = ns.get("ttl_first");
+    assert!(
+        val.is_ok(),
+        "key should be live on replica within TTL, got: {:?}",
+        val.err()
+    );
+    drop(ns);
+
+    // --- Wait for TTL to expire ---
+    thread::sleep(Duration::from_millis(1200));
+
+    // --- After TTL: key should be invisible via get, visible via scan(deleted) ---
+    let prefix = Key::from("");
+
+    // Primary
+    let ns = primary.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    assert!(
+        ns.get(Key::from("ttl_first")).is_err(),
+        "expired key should be invisible via get on primary"
+    );
+    let deleted_keys = ns.scan(&prefix, 100, 0, true).unwrap();
+    assert!(
+        deleted_keys.contains(&Key::from("ttl_first")),
+        "expired key should appear in primary 'show deleted' scan, got: {deleted_keys:?}"
+    );
+    drop(ns);
+
+    // Replica
+    let ns = replica.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    assert!(
+        ns.get(Key::from("ttl_first")).is_err(),
+        "expired key should be invisible via get on replica"
+    );
+    let deleted_keys = ns.scan(&prefix, 100, 0, true).unwrap();
+    assert!(
+        deleted_keys.contains(&Key::from("ttl_first")),
+        "expired key should appear in replica 'show deleted' scan, got: {deleted_keys:?}"
+    );
+    drop(ns);
+
+    replica.close().unwrap();
+    primary.close().unwrap();
+}
+
+/// Expired keys must survive a flush and remain visible in 'show deleted' scans.
+/// This tests that `drain_latest` preserves expired entries as tombstones in SSTables.
+#[test]
+fn expired_key_visible_after_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let primary = open_primary(tmp.path(), port);
+
+    let ns = primary.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns.put("ek", "ev", Some(Duration::from_millis(200)))
+        .unwrap();
+    drop(ns);
+
+    // Wait for TTL to expire
+    thread::sleep(Duration::from_millis(500));
+
+    // Flush the memtable to SSTables
+    primary.flush().unwrap();
+
+    // The expired key should still appear in scan(include_deleted=true)
+    let ns = primary.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    assert!(
+        ns.get(Key::from("ek")).is_err(),
+        "expired key should be invisible via get"
+    );
+    let prefix = Key::from("");
+    let deleted_keys = ns.scan(&prefix, 100, 0, true).unwrap();
+    assert!(
+        deleted_keys.contains(&Key::from("ek")),
+        "expired key should appear in 'show deleted' scan after flush, got: {deleted_keys:?}"
+    );
+    drop(ns);
+
+    primary.close().unwrap();
+}
