@@ -21,6 +21,19 @@ pub(crate) type ReplayFn = Box<dyn Fn(&[u8]) -> Result<()> + Send + Sync>;
 /// data received during full sync is immediately queryable.
 pub(crate) type PostSyncFn = Box<dyn Fn() -> Result<()> + Send + Sync>;
 
+/// Callback invoked when the primary drops a namespace.
+///
+/// The replica's DB uses this to clear local in-memory state (memtable,
+/// SSTables, object store) and delete on-disk files for the dropped namespace.
+pub(crate) type DropNsFn = Box<dyn Fn(&str) -> Result<()> + Send + Sync>;
+
+/// Bundles all replica callbacks to avoid too-many-arguments.
+pub(crate) struct ReplicaCallbacks {
+    pub(crate) replay_fn: ReplayFn,
+    pub(crate) post_sync_fn: PostSyncFn,
+    pub(crate) drop_ns_fn: DropNsFn,
+}
+
 /// Manages the replica-side replication connection to a primary.
 ///
 /// The receiver connects to the primary, performs a handshake, receives a
@@ -44,8 +57,7 @@ impl ReplReceiver {
         cluster_id: u16,
         db_path: PathBuf,
         max_levels: usize,
-        replay_fn: ReplayFn,
-        post_sync_fn: PostSyncFn,
+        callbacks: ReplicaCallbacks,
         stop: Arc<AtomicBool>,
     ) -> Result<Self> {
         let addr = addr.to_owned();
@@ -57,8 +69,7 @@ impl ReplReceiver {
                 cluster_id,
                 &db_path,
                 max_levels,
-                &replay_fn,
-                &post_sync_fn,
+                &callbacks,
                 &stop_clone,
             );
         });
@@ -83,8 +94,7 @@ impl ReplReceiver {
         cluster_id: u16,
         db_path: &Path,
         max_levels: usize,
-        replay_fn: &ReplayFn,
-        post_sync_fn: &PostSyncFn,
+        callbacks: &ReplicaCallbacks,
         stop: &Arc<AtomicBool>,
     ) {
         let mut backoff = Duration::from_secs(1);
@@ -92,13 +102,7 @@ impl ReplReceiver {
 
         while !stop.load(Ordering::Relaxed) {
             match Self::connect_and_replicate(
-                addr,
-                cluster_id,
-                db_path,
-                max_levels,
-                replay_fn,
-                post_sync_fn,
-                stop,
+                addr, cluster_id, db_path, max_levels, callbacks, stop,
             ) {
                 Ok(()) => {
                     // Clean exit (stop signal)
@@ -126,8 +130,7 @@ impl ReplReceiver {
         cluster_id: u16,
         db_path: &Path,
         max_levels: usize,
-        replay_fn: &ReplayFn,
-        post_sync_fn: &PostSyncFn,
+        callbacks: &ReplicaCallbacks,
         stop: &Arc<AtomicBool>,
     ) -> Result<()> {
         let stream = TcpStream::connect(addr)?;
@@ -169,10 +172,15 @@ impl ReplReceiver {
         Self::receive_full_sync(&mut reader, db_path, max_levels, stop)?;
 
         // Reload SSTable index so synced files are queryable
-        post_sync_fn()?;
+        (callbacks.post_sync_fn)()?;
 
         // --- Live streaming ---
-        Self::receive_live_stream(&mut reader, replay_fn, stop)
+        Self::receive_live_stream(
+            &mut reader,
+            &callbacks.replay_fn,
+            &callbacks.drop_ns_fn,
+            stop,
+        )
     }
 
     fn receive_full_sync<R: std::io::Read>(
@@ -266,6 +274,7 @@ impl ReplReceiver {
     fn receive_live_stream<R: std::io::Read>(
         reader: &mut R,
         replay_fn: &ReplayFn,
+        drop_ns_fn: &DropNsFn,
         stop: &Arc<AtomicBool>,
     ) -> Result<()> {
         loop {
@@ -295,6 +304,9 @@ impl ReplReceiver {
             match msg {
                 ReplMessage::AolRecord { payload } => {
                     replay_fn(&payload)?;
+                }
+                ReplMessage::DropNamespace { namespace } => {
+                    drop_ns_fn(&namespace)?;
                 }
                 ReplMessage::Heartbeat { .. } => {
                     // Heartbeat — connection is alive, nothing to do
@@ -499,6 +511,10 @@ mod tests {
         assert!(matches!(err, Error::Corruption(_)));
     }
 
+    fn noop_drop_ns_fn() -> DropNsFn {
+        Box::new(|_| Ok(()))
+    }
+
     #[test]
     fn receive_live_stream_aol_records() {
         let mut buf = Vec::new();
@@ -529,7 +545,8 @@ mod tests {
         let mut cursor = Cursor::new(buf);
 
         // The stream will end with EOF → ConnectionReset error
-        let result = ReplReceiver::receive_live_stream(&mut cursor, &replay_fn, &stop);
+        let result =
+            ReplReceiver::receive_live_stream(&mut cursor, &replay_fn, &noop_drop_ns_fn(), &stop);
         assert!(result.is_err()); // EOF → connection reset
 
         let records = received.lock().unwrap();
@@ -562,7 +579,8 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let mut cursor = Cursor::new(buf);
 
-        let result = ReplReceiver::receive_live_stream(&mut cursor, &replay_fn, &stop);
+        let result =
+            ReplReceiver::receive_live_stream(&mut cursor, &replay_fn, &noop_drop_ns_fn(), &stop);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("primary shutting down"));
 
@@ -579,8 +597,37 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(true));
         let mut cursor = Cursor::new(buf);
 
-        let result = ReplReceiver::receive_live_stream(&mut cursor, &replay_fn, &stop);
+        let result =
+            ReplReceiver::receive_live_stream(&mut cursor, &replay_fn, &noop_drop_ns_fn(), &stop);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn receive_live_stream_drop_namespace() {
+        let mut buf = Vec::new();
+        ReplMessage::DropNamespace {
+            namespace: "myns".to_string(),
+        }
+        .write_to(&mut buf)
+        .unwrap();
+
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let dropped_clone = Arc::clone(&dropped);
+        let drop_ns_fn: DropNsFn = Box::new(move |ns: &str| {
+            dropped_clone.lock().unwrap().push(ns.to_owned());
+            Ok(())
+        });
+        let replay_fn: ReplayFn = Box::new(|_| Ok(()));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut cursor = Cursor::new(buf);
+
+        // EOF after DropNamespace → ConnectionReset
+        let _ = ReplReceiver::receive_live_stream(&mut cursor, &replay_fn, &drop_ns_fn, &stop);
+
+        let ns_list = dropped.lock().unwrap();
+        assert_eq!(ns_list.len(), 1);
+        assert_eq!(ns_list[0], "myns");
     }
 
     use std::sync::Mutex;

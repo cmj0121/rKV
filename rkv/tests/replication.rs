@@ -581,6 +581,63 @@ fn first_key_with_ttl_visible_then_deleted_on_replica() {
     primary.close().unwrap();
 }
 
+/// Dropping a namespace on the primary must sync to the replica — the replica
+/// should no longer list the namespace or return data from it.
+#[test]
+fn drop_namespace_syncs_to_replica() {
+    let tmp_primary = tempfile::tempdir().unwrap();
+    let tmp_replica = tempfile::tempdir().unwrap();
+    let port = free_port();
+
+    let primary = open_primary(tmp_primary.path(), port);
+    thread::sleep(Duration::from_millis(100));
+
+    let replica = open_replica(tmp_replica.path(), &format!("127.0.0.1:{port}"));
+    // Wait for full sync
+    thread::sleep(Duration::from_millis(1500));
+
+    // Create a custom namespace on primary and write data
+    let ns = primary.namespace("drop_me", None).unwrap();
+    ns.put("k1", "v1", None).unwrap();
+    drop(ns);
+
+    // Wait for live-stream propagation
+    thread::sleep(Duration::from_millis(500));
+
+    // Verify the namespace exists on the replica
+    let ns_list = replica.list_namespaces().unwrap();
+    assert!(
+        ns_list.contains(&"drop_me".to_string()),
+        "expected 'drop_me' on replica before drop, got: {ns_list:?}"
+    );
+    let ns = replica.namespace("drop_me", None).unwrap();
+    let val = ns.get("k1").unwrap();
+    assert_eq!(val.as_bytes(), Some(b"v1".as_slice()));
+    drop(ns);
+
+    // Drop the namespace on primary
+    primary.drop_namespace("drop_me").unwrap();
+
+    // Wait for drop to propagate
+    thread::sleep(Duration::from_millis(500));
+
+    // Verify the namespace is gone from the replica
+    let ns_list = replica.list_namespaces().unwrap();
+    assert!(
+        !ns_list.contains(&"drop_me".to_string()),
+        "namespace 'drop_me' should be gone from replica after drop, got: {ns_list:?}"
+    );
+
+    // The default namespace should still exist
+    assert!(
+        ns_list.contains(&"_".to_string()),
+        "default namespace '_' should still exist, got: {ns_list:?}"
+    );
+
+    replica.close().unwrap();
+    primary.close().unwrap();
+}
+
 /// Expired keys must survive a flush and remain visible in 'show deleted' scans.
 /// This tests that `drain_latest` preserves expired entries as tombstones in SSTables.
 #[test]

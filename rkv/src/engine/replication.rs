@@ -72,6 +72,8 @@ const MSG_ACK: u8 = 0x07;
 const MSG_FULL_SYNC_END: u8 = 0x08;
 #[allow(dead_code)]
 const MSG_ERROR: u8 = 0x09;
+#[allow(dead_code)]
+const MSG_DROP_NAMESPACE: u8 = 0x0A;
 
 /// Role tags for handshake messages.
 #[allow(dead_code)]
@@ -121,6 +123,8 @@ pub(crate) enum ReplMessage {
     FullSyncEnd,
     /// Error message — signals a protocol-level error.
     ErrorMsg { message: String },
+    /// Primary instructs replica to drop a namespace and all its data.
+    DropNamespace { namespace: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +268,13 @@ impl ReplMessage {
                 buf.extend_from_slice(bytes);
                 (MSG_ERROR, buf)
             }
+            ReplMessage::DropNamespace { namespace } => {
+                let ns_bytes = namespace.as_bytes();
+                let mut buf = Vec::with_capacity(2 + ns_bytes.len());
+                buf.extend_from_slice(&(ns_bytes.len() as u16).to_be_bytes());
+                buf.extend_from_slice(ns_bytes);
+                (MSG_DROP_NAMESPACE, buf)
+            }
         }
     }
 
@@ -377,6 +388,19 @@ impl ReplMessage {
                     .map_err(|e| Error::Corruption(format!("invalid error msg utf-8: {e}")))?
                     .to_owned();
                 Ok(ReplMessage::ErrorMsg { message })
+            }
+            MSG_DROP_NAMESPACE => {
+                if data.len() < 2 {
+                    return Err(Error::Corruption("truncated drop_namespace ns_len".into()));
+                }
+                let ns_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+                if 2 + ns_len > data.len() {
+                    return Err(Error::Corruption("truncated drop_namespace body".into()));
+                }
+                let namespace = std::str::from_utf8(&data[2..2 + ns_len])
+                    .map_err(|e| Error::Corruption(format!("invalid namespace utf-8: {e}")))?
+                    .to_owned();
+                Ok(ReplMessage::DropNamespace { namespace })
             }
             _ => Err(Error::Corruption(format!(
                 "unknown replication message type: 0x{tag:02x}"
@@ -531,6 +555,22 @@ mod tests {
     fn roundtrip_error_msg() {
         let msg = ReplMessage::ErrorMsg {
             message: "something went wrong".to_string(),
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn roundtrip_drop_namespace() {
+        let msg = ReplMessage::DropNamespace {
+            namespace: "myns".to_string(),
+        };
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn roundtrip_drop_namespace_default() {
+        let msg = ReplMessage::DropNamespace {
+            namespace: "_".to_string(),
         };
         assert_eq!(roundtrip(&msg), msg);
     }
