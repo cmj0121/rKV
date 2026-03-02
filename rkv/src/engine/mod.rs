@@ -266,6 +266,8 @@ pub struct DB {
     repl_receiver: Option<repl_receiver::ReplReceiver>,
     /// Set to trigger a force-sync on the replica receiver thread.
     repl_force_sync: Option<Arc<AtomicBool>>,
+    /// Counter for LWW conflict resolutions (peer replication).
+    conflicts_resolved: AtomicU64,
 }
 
 impl DB {
@@ -457,6 +459,7 @@ impl DB {
             repl_sender: None,
             repl_receiver: None,
             repl_force_sync: None,
+            conflicts_resolved: AtomicU64::new(0),
         };
 
         // Eagerly register the default namespace so it always appears in
@@ -904,6 +907,8 @@ impl DB {
             cache_misses,
             uptime: self.opened_at.elapsed(),
             role: self.config.role.to_string(),
+            peer_count: 0, // updated in Unit 5 when peer sessions are tracked
+            conflicts_resolved: self.conflicts_resolved.load(Ordering::Relaxed),
         }
     }
 
@@ -1956,6 +1961,81 @@ impl DB {
             sender.broadcast_aol(&payload);
         }
         Ok(())
+    }
+
+    /// Replay an AOL record from a peer using LWW conflict resolution.
+    #[allow(dead_code)]
+    ///
+    /// Decodes the payload, checks if the incoming revision is newer than
+    /// the current revision for that key, and applies the write only if so.
+    /// Records originating from this node (same `cluster_id`) are skipped
+    /// to prevent loops.
+    ///
+    /// Returns `true` if the record was applied, `false` if skipped.
+    pub(crate) fn replay_peer_record(&self, payload: &[u8]) -> Result<bool> {
+        let record = aol::decode_payload(payload)?;
+
+        // Loop prevention: skip records originating from this node
+        let incoming_rev = RevisionID::from(record.revision);
+        if incoming_rev.cluster_id() == self.revision_gen.cluster_id() {
+            return Ok(false);
+        }
+
+        // Skip expired records
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if record.expires_at_ms > 0 && record.expires_at_ms <= now_ms {
+            return Ok(false);
+        }
+
+        // Namespace-creation sentinel: empty key + Null value
+        let is_sentinel = record.key == Key::Str(String::new()) && record.value.is_null();
+
+        // LWW check: apply only if incoming revision > current revision for key
+        let applied = if is_sentinel {
+            // Sentinel just creates the namespace — always accept
+            self.get_or_create_memtable(&record.namespace);
+            true
+        } else {
+            let ttl = if record.expires_at_ms > 0 {
+                let remaining_ms = record.expires_at_ms.saturating_sub(now_ms);
+                Some(Duration::from_millis(remaining_ms))
+            } else {
+                None
+            };
+
+            let map = self
+                .namespace_data
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(mt_mutex) = map.get(&record.namespace) {
+                let mut mt = mt_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                mt.put_if_newer(record.key.clone(), record.value.clone(), incoming_rev, ttl)
+            } else {
+                drop(map);
+                let mut map = self
+                    .namespace_data
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner());
+                let mt = map
+                    .entry(record.namespace.clone())
+                    .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
+                let mt = mt.get_mut().unwrap_or_else(|e| e.into_inner());
+                mt.put_if_newer(record.key.clone(), record.value.clone(), incoming_rev, ttl)
+            }
+        };
+
+        if applied {
+            // Write to local AOL for crash recovery
+            let mut aol = self.aol.lock().unwrap_or_else(|e| e.into_inner());
+            aol.append_encoded(payload)?;
+        } else {
+            self.conflicts_resolved.fetch_add(1, Ordering::Relaxed);
+        }
+
+        Ok(applied)
     }
 
     pub(crate) fn get_or_create_object_store(&self, ns: &str) -> Result<&objects::ObjectStore> {
