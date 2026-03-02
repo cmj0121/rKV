@@ -1352,3 +1352,83 @@ fn peer_fallback_to_full_sync() {
     peer_b.close().unwrap();
     peer_a.close().unwrap();
 }
+
+#[test]
+fn peer_namespace_creation_syncs() {
+    let tmp_a = tempfile::tempdir().unwrap();
+    let tmp_b = tempfile::tempdir().unwrap();
+    let port_a = free_port();
+    let port_b = free_port();
+
+    let peer_a = open_peer(tmp_a.path(), port_a, vec![format!("127.0.0.1:{port_b}")], 1);
+    thread::sleep(Duration::from_millis(100));
+    let peer_b = open_peer(tmp_b.path(), port_b, vec![format!("127.0.0.1:{port_a}")], 2);
+    thread::sleep(Duration::from_millis(1500));
+
+    // Create a new namespace on A and write data
+    let ns_a = peer_a.namespace("sync_ns", None).unwrap();
+    ns_a.put("nskey", "nsval", None).unwrap();
+    drop(ns_a);
+
+    thread::sleep(Duration::from_millis(1000));
+
+    // B should see the namespace and its data
+    let namespaces_b = peer_b.list_namespaces().unwrap();
+    assert!(
+        namespaces_b.contains(&"sync_ns".to_owned()),
+        "peer B should list 'sync_ns', got: {namespaces_b:?}"
+    );
+
+    let ns_b = peer_b.namespace("sync_ns", None).unwrap();
+    let val = ns_b.get("nskey");
+    assert!(
+        val.is_ok(),
+        "peer B should see data in 'sync_ns': {:?}",
+        val.err()
+    );
+    assert_eq!(val.unwrap().as_bytes(), Some(b"nsval".as_slice()));
+    drop(ns_b);
+
+    peer_b.close().unwrap();
+    peer_a.close().unwrap();
+}
+
+#[test]
+fn peer_namespace_drop_syncs() {
+    let tmp_a = tempfile::tempdir().unwrap();
+    let tmp_b = tempfile::tempdir().unwrap();
+    let port_a = free_port();
+    let port_b = free_port();
+
+    let peer_a = open_peer(tmp_a.path(), port_a, vec![format!("127.0.0.1:{port_b}")], 1);
+    thread::sleep(Duration::from_millis(100));
+    let peer_b = open_peer(tmp_b.path(), port_b, vec![format!("127.0.0.1:{port_a}")], 2);
+    thread::sleep(Duration::from_millis(1500));
+
+    // Create namespace + data on A, wait for sync to B
+    let ns_a = peer_a.namespace("drop_ns", None).unwrap();
+    ns_a.put("dk", "dv", None).unwrap();
+    drop(ns_a);
+    thread::sleep(Duration::from_millis(1000));
+
+    // Verify B has it
+    let namespaces_b = peer_b.list_namespaces().unwrap();
+    assert!(
+        namespaces_b.contains(&"drop_ns".to_owned()),
+        "peer B should have 'drop_ns' before drop"
+    );
+
+    // Drop the namespace on A
+    peer_a.drop_namespace("drop_ns").unwrap();
+    thread::sleep(Duration::from_millis(1000));
+
+    // B should no longer list the namespace
+    let namespaces_b = peer_b.list_namespaces().unwrap();
+    assert!(
+        !namespaces_b.contains(&"drop_ns".to_owned()),
+        "peer B should not list 'drop_ns' after drop, got: {namespaces_b:?}"
+    );
+
+    peer_b.close().unwrap();
+    peer_a.close().unwrap();
+}
