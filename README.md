@@ -73,9 +73,9 @@ cargo run --features server -- serve --role replica --primary-addr 127.0.0.1:832
 
 # Peer-Peer
 cargo run --features server -- serve --role peer --repl-port 8322 \
-  --peers 10.0.0.2:8322
+  --cluster-id 1 --peers 10.0.0.2:8322
 cargo run --features server -- serve --role peer --repl-port 8322 \
-  --peers 10.0.0.1:8322
+  --cluster-id 2 --peers 10.0.0.1:8322
 ```
 
 Replicas reject all write operations with a `ReadOnlyReplica` error. Peers accept

@@ -135,17 +135,18 @@ The node's role is exposed through multiple channels:
 | `--repl-port`    | `8322`       | TCP port for replication connections                     |
 | `--primary-addr` | _(none)_     | Primary address (replica only, e.g. `10.0.0.1:8322`)     |
 | `--peers`        | _(none)_     | Comma-separated peer addresses (peer only)               |
+| `--cluster-id`   | _(random)_   | Cluster ID for RevisionID generation (0–65535)           |
 
 ### Docker Compose Topology
 
 A `docker-compose.yml` in the project root defines a five-node topology with two write nodes
 and three read nodes, all using peer replication:
 
-- **primary** (port 8321): Peer, connects to peer
-- **peer** (port 8323): Peer, connects to primary
-- **replica-01** (port 8324): Peer, connects to both write nodes
-- **replica-02** (port 8325): Peer, connects to both write nodes (no volume)
-- **replica-03** (port 8326): Peer, connects to both write nodes (no volume)
+- **primary** (port 8321): Peer, cluster-id 1, connects to peer
+- **peer** (port 8323): Peer, cluster-id 2, connects to primary
+- **replica-01** (port 8324): Peer, cluster-id 3, connects to both write nodes
+- **replica-02** (port 8325): Peer, cluster-id 4, connects to both write nodes (no volume)
+- **replica-03** (port 8326): Peer, cluster-id 5, connects to both write nodes (no volume)
 
 All nodes are technically peers (can accept writes), but the replica nodes are designated
 for read traffic. Writes on any node propagate to all others via peer replication.

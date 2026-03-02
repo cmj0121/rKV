@@ -53,6 +53,10 @@ pub struct ServerConfig {
     /// Peer addresses for master-master replication (repeatable, e.g. --peers "10.0.0.2:8322")
     #[arg(long)]
     pub peers: Vec<String>,
+
+    /// Cluster ID for RevisionID generation (0–65535, omit for random)
+    #[arg(long)]
+    pub cluster_id: Option<u16>,
 }
 
 /// Parse a human-readable size string into bytes.
