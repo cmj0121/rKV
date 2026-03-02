@@ -89,7 +89,7 @@ docker compose up --build
 # Read nodes:  http://localhost:8324, http://localhost:8325, http://localhost:8326
 ```
 
-For protocol details and architecture, see [CONCEPTS.md](CONCEPTS.md#primary-replica-replication).
+For protocol details and architecture, see [Replication](docs/replication.md#primary-replica-replication).
 
 ## Concept
 
