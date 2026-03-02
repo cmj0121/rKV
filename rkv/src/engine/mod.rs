@@ -268,7 +268,11 @@ pub struct DB {
     /// Set to trigger a force-sync on the replica receiver thread.
     repl_force_sync: Option<Arc<AtomicBool>>,
     /// Counter for LWW conflict resolutions (peer replication).
-    conflicts_resolved: AtomicU64,
+    conflicts_resolved: Arc<AtomicU64>,
+    // Peer replication
+    peer_sessions: Arc<Mutex<Vec<repl_peer::PeerSession>>>,
+    peer_listener: Option<repl_peer::PeerListener>,
+    peer_connectors: Vec<repl_peer::PeerConnector>,
 }
 
 impl DB {
@@ -460,7 +464,10 @@ impl DB {
             repl_sender: None,
             repl_receiver: None,
             repl_force_sync: None,
-            conflicts_resolved: AtomicU64::new(0),
+            conflicts_resolved: Arc::new(AtomicU64::new(0)),
+            peer_sessions: Arc::new(Mutex::new(Vec::new())),
+            peer_listener: None,
+            peer_connectors: Vec::new(),
         };
 
         // Eagerly register the default namespace so it always appears in
@@ -803,7 +810,133 @@ impl DB {
                 self.repl_receiver = Some(receiver);
             }
             replication::Role::Peer => {
-                // Peer replication — wired in a later unit of work
+                if self.config.peers.is_empty() {
+                    return Err(Error::InvalidConfig(
+                        "peers list is required when role is peer".into(),
+                    ));
+                }
+                let cluster_id = self.revision_gen.cluster_id();
+                let db_path = self.config.path.clone();
+                let max_levels = self.config.max_levels;
+                let stop = Arc::new(AtomicBool::new(false));
+
+                // Build a peer replay callback using LWW
+                let db_ns_data = Arc::clone(&self.namespace_data);
+                let db_aol = Arc::clone(&self.aol);
+                let db_rev_gen_cluster = self.revision_gen.cluster_id();
+                let db_conflicts = Arc::clone(&self.conflicts_resolved);
+                let replay_fn: repl_peer::PeerReplayFn = Arc::new(move |payload: &[u8]| {
+                    let record = aol::decode_payload(payload)?;
+                    let incoming_rev = RevisionID::from(record.revision);
+
+                    // Loop prevention
+                    if incoming_rev.cluster_id() == db_rev_gen_cluster {
+                        return Ok(false);
+                    }
+
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    if record.expires_at_ms > 0 && record.expires_at_ms <= now_ms {
+                        return Ok(false);
+                    }
+
+                    let is_sentinel =
+                        record.key == Key::Str(String::new()) && record.value.is_null();
+
+                    let applied = if is_sentinel {
+                        let mut map = db_ns_data.write().unwrap_or_else(|e| e.into_inner());
+                        map.entry(record.namespace.clone())
+                            .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
+                        true
+                    } else {
+                        let ttl = if record.expires_at_ms > 0 {
+                            let remaining_ms = record.expires_at_ms.saturating_sub(now_ms);
+                            Some(Duration::from_millis(remaining_ms))
+                        } else {
+                            None
+                        };
+
+                        let map = db_ns_data.read().unwrap_or_else(|e| e.into_inner());
+                        if let Some(mt_mutex) = map.get(&record.namespace) {
+                            let mut mt = mt_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                            mt.put_if_newer(
+                                record.key.clone(),
+                                record.value.clone(),
+                                incoming_rev,
+                                ttl,
+                            )
+                        } else {
+                            drop(map);
+                            let mut map = db_ns_data.write().unwrap_or_else(|e| e.into_inner());
+                            let mt = map
+                                .entry(record.namespace.clone())
+                                .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
+                            let mt = mt.get_mut().unwrap_or_else(|e| e.into_inner());
+                            mt.put_if_newer(
+                                record.key.clone(),
+                                record.value.clone(),
+                                incoming_rev,
+                                ttl,
+                            )
+                        }
+                    };
+
+                    if applied {
+                        let mut aol = db_aol.lock().unwrap_or_else(|e| e.into_inner());
+                        aol.append_encoded(payload)?;
+                    } else {
+                        db_conflicts.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    Ok(applied)
+                });
+
+                // Build broadcast callback
+                let peer_sessions_for_broadcast = Arc::clone(&self.peer_sessions);
+                let broadcast_fn: repl_peer::PeerBroadcastFn =
+                    Arc::new(move |payload: &[u8], from_cluster: u16| {
+                        let sessions = peer_sessions_for_broadcast
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        for session in sessions.iter() {
+                            // Don't send back to the source peer
+                            if session.remote_cluster_id() != from_cluster {
+                                session.send(payload);
+                            }
+                        }
+                    });
+
+                let peer_config = Arc::new(repl_peer::PeerSessionConfig {
+                    local_cluster_id: cluster_id,
+                    db_path: db_path.clone(),
+                    max_levels,
+                    io_backend: Arc::clone(&self.io_backend),
+                    replay_fn,
+                    broadcast_fn,
+                });
+
+                // Start listener
+                let listener = repl_peer::PeerListener::start(
+                    &self.config.repl_bind,
+                    self.config.repl_port,
+                    Arc::clone(&peer_config),
+                    Arc::clone(&self.peer_sessions),
+                    Arc::clone(&stop),
+                )?;
+                self.peer_listener = Some(listener);
+
+                // Start connectors for each peer
+                for peer_addr in &self.config.peers {
+                    let connector = repl_peer::PeerConnector::start(
+                        peer_addr.clone(),
+                        Arc::clone(&peer_config),
+                        Arc::clone(&self.peer_sessions),
+                        Arc::clone(&stop),
+                    );
+                    self.peer_connectors.push(connector);
+                }
             }
             replication::Role::Standalone => {
                 // No replication — nothing to start
@@ -821,6 +954,22 @@ impl DB {
             receiver.stop();
         }
         self.repl_receiver = None;
+
+        // Stop peer replication components
+        if let Some(ref mut listener) = self.peer_listener {
+            listener.stop();
+        }
+        self.peer_listener = None;
+        for connector in &mut self.peer_connectors {
+            connector.stop();
+        }
+        self.peer_connectors.clear();
+        {
+            let mut sessions = self.peer_sessions.lock().unwrap_or_else(|e| e.into_inner());
+            for session in sessions.iter_mut() {
+                session.stop();
+            }
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -908,7 +1057,11 @@ impl DB {
             cache_misses,
             uptime: self.opened_at.elapsed(),
             role: self.config.role.to_string(),
-            peer_count: 0, // updated in Unit 5 when peer sessions are tracked
+            peer_count: self
+                .peer_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len() as u64,
             conflicts_resolved: self.conflicts_resolved.load(Ordering::Relaxed),
         }
     }
@@ -1960,6 +2113,28 @@ impl DB {
             };
             let payload = aol::encode_payload(ns, rev, expires_at_ms, key, value);
             sender.broadcast_aol(&payload);
+        }
+
+        // Broadcast to peers if this node is a peer (master-master)
+        if self.config.role == replication::Role::Peer {
+            let expires_at_ms = match ttl {
+                Some(d) => {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    now + d.as_millis() as u64
+                }
+                None => 0,
+            };
+            let payload = aol::encode_payload(ns, rev, expires_at_ms, key, value);
+            let local_cluster = self.revision_gen.cluster_id();
+            let sessions = self.peer_sessions.lock().unwrap_or_else(|e| e.into_inner());
+            for session in sessions.iter() {
+                if session.remote_cluster_id() != local_cluster {
+                    session.send(&payload);
+                }
+            }
         }
         Ok(())
     }
