@@ -22,6 +22,8 @@ pub(crate) type PeerFlushFn = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 pub(crate) enum PeerMsg {
     /// Raw AOL record payload to forward to the peer.
     Aol(Vec<u8>),
+    /// Instruct the peer to drop a namespace.
+    DropNamespace(String),
 }
 
 /// Callback signature for replaying a peer record with LWW resolution.
@@ -31,6 +33,9 @@ pub(crate) type PeerReplayFn = Arc<dyn Fn(&[u8]) -> Result<bool> + Send + Sync>;
 /// Callback to broadcast an accepted record to other peer sessions.
 /// Arguments: `(payload, from_cluster_id)`.
 pub(crate) type PeerBroadcastFn = Arc<dyn Fn(&[u8], u16) + Send + Sync>;
+
+/// Callback invoked when a peer sends a DropNamespace message.
+pub(crate) type PeerDropNsFn = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
 
 /// Configuration for starting a peer session.
 pub(crate) struct PeerSessionConfig {
@@ -43,6 +48,7 @@ pub(crate) struct PeerSessionConfig {
     pub(crate) post_sync_fn: PeerPostSyncFn,
     pub(crate) last_revision: Arc<std::sync::Mutex<u128>>,
     pub(crate) flush_fn: PeerFlushFn,
+    pub(crate) drop_ns_fn: PeerDropNsFn,
 }
 
 /// A symmetric bidirectional peer session.
@@ -234,11 +240,13 @@ impl PeerSession {
 
         // Reader thread: reads incoming messages from the peer
         let stop_clone2 = Arc::clone(&stop);
+        let drop_ns_fn = Arc::clone(&config.drop_ns_fn);
         let reader_handle = thread::spawn(move || {
             if let Err(e) = Self::reader_loop(
                 &mut reader,
                 &replay_fn,
                 &broadcast_to_others,
+                &drop_ns_fn,
                 remote_cluster_id,
                 &stop_clone2,
             ) {
@@ -261,6 +269,13 @@ impl PeerSession {
     pub(crate) fn send(&self, payload: &[u8]) -> bool {
         self.writer_tx
             .try_send(PeerMsg::Aol(payload.to_vec()))
+            .is_ok()
+    }
+
+    /// Send a drop-namespace command to this peer.
+    pub(crate) fn send_drop_namespace(&self, namespace: &str) -> bool {
+        self.writer_tx
+            .try_send(PeerMsg::DropNamespace(namespace.to_owned()))
             .is_ok()
     }
 
@@ -301,15 +316,13 @@ impl PeerSession {
             }
 
             match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(PeerMsg::Aol(payload)) => {
-                    let msg = ReplMessage::AolRecord { payload };
-                    if msg.write_to(writer).is_err() {
+                Ok(peer_msg) => {
+                    if Self::write_peer_msg(writer, peer_msg).is_err() {
                         return;
                     }
                     // Drain pending
-                    while let Ok(PeerMsg::Aol(payload)) = rx.try_recv() {
-                        let msg = ReplMessage::AolRecord { payload };
-                        if msg.write_to(writer).is_err() {
+                    while let Ok(queued) = rx.try_recv() {
+                        if Self::write_peer_msg(writer, queued).is_err() {
                             return;
                         }
                     }
@@ -342,10 +355,23 @@ impl PeerSession {
         }
     }
 
+    fn write_peer_msg<W: Write>(writer: &mut W, msg: PeerMsg) -> Result<()> {
+        match msg {
+            PeerMsg::Aol(payload) => {
+                ReplMessage::AolRecord { payload }.write_to(writer)?;
+            }
+            PeerMsg::DropNamespace(namespace) => {
+                ReplMessage::DropNamespace { namespace }.write_to(writer)?;
+            }
+        }
+        Ok(())
+    }
+
     fn reader_loop<R: std::io::Read>(
         reader: &mut R,
         replay_fn: &PeerReplayFn,
         broadcast_to_others: &PeerBroadcastFn,
+        drop_ns_fn: &PeerDropNsFn,
         remote_cluster_id: u16,
         stop: &Arc<AtomicBool>,
     ) -> Result<()> {
@@ -385,6 +411,11 @@ impl PeerSession {
                         Err(e) => {
                             eprintln!("peer({remote_cluster_id}): replay error: {e}");
                         }
+                    }
+                }
+                ReplMessage::DropNamespace { namespace } => {
+                    if let Err(e) = drop_ns_fn(&namespace) {
+                        eprintln!("peer({remote_cluster_id}): drop namespace error: {e}");
                     }
                 }
                 ReplMessage::Heartbeat { .. } => {
@@ -854,11 +885,13 @@ mod tests {
                     .push((payload.to_vec(), from));
             });
 
+        let drop_ns_fn: PeerDropNsFn = Arc::new(|_| Ok(()));
         let stop = Arc::new(AtomicBool::new(false));
         let mut cursor = Cursor::new(buf);
 
         // Will hit EOF → ConnectionReset
-        let result = PeerSession::reader_loop(&mut cursor, &replay_fn, &broadcast, 42, &stop);
+        let result =
+            PeerSession::reader_loop(&mut cursor, &replay_fn, &broadcast, &drop_ns_fn, 42, &stop);
         assert!(result.is_err());
 
         let records = received.lock().unwrap();
@@ -888,10 +921,12 @@ mod tests {
                 forwarded_clone.lock().unwrap().push(payload.to_vec());
             });
 
+        let drop_ns_fn: PeerDropNsFn = Arc::new(|_| Ok(()));
         let stop = Arc::new(AtomicBool::new(false));
         let mut cursor = Cursor::new(buf);
 
-        let _ = PeerSession::reader_loop(&mut cursor, &replay_fn, &broadcast, 99, &stop);
+        let _ =
+            PeerSession::reader_loop(&mut cursor, &replay_fn, &broadcast, &drop_ns_fn, 99, &stop);
 
         // Should not forward rejected records
         let fwd = forwarded.lock().unwrap();
@@ -910,11 +945,13 @@ mod tests {
         let replay_fn: PeerReplayFn = Arc::new(|_| Ok(true));
         let broadcast: Arc<dyn Fn(&[u8], u16) + Send + Sync> = Arc::new(|_, _| {});
 
+        let drop_ns_fn: PeerDropNsFn = Arc::new(|_| Ok(()));
         let stop = Arc::new(AtomicBool::new(false));
         let mut cursor = Cursor::new(buf);
 
         // Should process heartbeat and then EOF
-        let result = PeerSession::reader_loop(&mut cursor, &replay_fn, &broadcast, 1, &stop);
+        let result =
+            PeerSession::reader_loop(&mut cursor, &replay_fn, &broadcast, &drop_ns_fn, 1, &stop);
         assert!(result.is_err()); // EOF
     }
 
@@ -924,10 +961,59 @@ mod tests {
         let replay_fn: PeerReplayFn = Arc::new(|_| Ok(true));
         let broadcast: Arc<dyn Fn(&[u8], u16) + Send + Sync> = Arc::new(|_, _| {});
 
+        let drop_ns_fn: PeerDropNsFn = Arc::new(|_| Ok(()));
         let stop = Arc::new(AtomicBool::new(true)); // already stopped
         let mut cursor = Cursor::new(buf);
 
-        let result = PeerSession::reader_loop(&mut cursor, &replay_fn, &broadcast, 1, &stop);
+        let result =
+            PeerSession::reader_loop(&mut cursor, &replay_fn, &broadcast, &drop_ns_fn, 1, &stop);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn writer_loop_sends_drop_namespace() {
+        let (tx, rx) = mpsc::sync_channel(16);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        tx.send(PeerMsg::DropNamespace("myns".to_owned())).unwrap();
+        drop(tx);
+
+        let mut buf = Vec::new();
+        PeerSession::writer_loop(&mut buf, rx, &stop);
+
+        let mut cursor = Cursor::new(buf);
+        let msg = ReplMessage::read_from(&mut cursor).unwrap().unwrap();
+        assert!(matches!(msg, ReplMessage::DropNamespace { ref namespace } if namespace == "myns"));
+    }
+
+    #[test]
+    fn reader_loop_handles_drop_namespace() {
+        let mut buf = Vec::new();
+        ReplMessage::DropNamespace {
+            namespace: "test_ns".to_owned(),
+        }
+        .write_to(&mut buf)
+        .unwrap();
+
+        let replay_fn: PeerReplayFn = Arc::new(|_| Ok(true));
+        let broadcast: Arc<dyn Fn(&[u8], u16) + Send + Sync> = Arc::new(|_, _| {});
+
+        let dropped = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let dropped_clone = Arc::clone(&dropped);
+        let drop_ns_fn: PeerDropNsFn = Arc::new(move |ns: &str| {
+            dropped_clone.lock().unwrap().push(ns.to_owned());
+            Ok(())
+        });
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut cursor = Cursor::new(buf);
+
+        // Will hit EOF after processing
+        let _ =
+            PeerSession::reader_loop(&mut cursor, &replay_fn, &broadcast, &drop_ns_fn, 7, &stop);
+
+        let ns_list = dropped.lock().unwrap();
+        assert_eq!(ns_list.len(), 1);
+        assert_eq!(ns_list[0], "test_ns");
     }
 }

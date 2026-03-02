@@ -985,6 +985,46 @@ impl DB {
                     Ok(())
                 });
 
+                // Build a drop-namespace callback for peer DropNamespace messages
+                let drop_ns_data = Arc::clone(&self.namespace_data);
+                let drop_sstables = Arc::clone(&self.sstables);
+                let drop_obj_stores = Arc::clone(&self.object_stores);
+                let drop_db_path = self.config.path.clone();
+                let drop_ns_fn: repl_peer::PeerDropNsFn = Arc::new(move |namespace: &str| {
+                    // 1. Remove from in-memory maps
+                    {
+                        let mut map = drop_ns_data.write().unwrap_or_else(|e| e.into_inner());
+                        map.remove(namespace);
+                    }
+                    {
+                        let mut map = drop_sstables.write().unwrap_or_else(|e| e.into_inner());
+                        map.remove(namespace);
+                    }
+                    {
+                        let mut map = drop_obj_stores.write().unwrap_or_else(|e| e.into_inner());
+                        map.remove(namespace);
+                    }
+
+                    // 2. Delete on-disk files
+                    let sst_dir = drop_db_path.join("sst").join(namespace);
+                    if sst_dir.exists() {
+                        fs::remove_dir_all(&sst_dir)?;
+                    }
+                    let obj_dir = drop_db_path.join("objects").join(namespace);
+                    if obj_dir.exists() {
+                        fs::remove_dir_all(&obj_dir)?;
+                    }
+
+                    // 3. Re-create default namespace if it was dropped
+                    if namespace == DEFAULT_NAMESPACE {
+                        let mut map = drop_ns_data.write().unwrap_or_else(|e| e.into_inner());
+                        map.entry(DEFAULT_NAMESPACE.to_owned())
+                            .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
+                    }
+
+                    Ok(())
+                });
+
                 let peer_config = Arc::new(repl_peer::PeerSessionConfig {
                     local_cluster_id: cluster_id,
                     db_path: db_path.clone(),
@@ -995,6 +1035,7 @@ impl DB {
                     post_sync_fn,
                     last_revision: Arc::clone(&last_revision),
                     flush_fn,
+                    drop_ns_fn,
                 });
 
                 // Start listener
@@ -1201,9 +1242,11 @@ impl DB {
             // appears in `list_namespaces` immediately (not only after a write).
             self.get_or_create_memtable(name);
 
-            // On primary nodes, broadcast a Null sentinel so replicas learn
-            // about the new namespace immediately (even if no data is written).
-            if self.config.role == replication::Role::Primary {
+            // On primary/peer nodes, broadcast a Null sentinel so other nodes
+            // learn about the new namespace immediately (even if no data is written).
+            if self.config.role == replication::Role::Primary
+                || self.config.role == replication::Role::Peer
+            {
                 let rev = self.revision_gen.generate();
                 self.append_to_aol(
                     name,
@@ -1320,9 +1363,15 @@ impl DB {
             fs::remove_file(&salt_path)?;
         }
 
-        // 3. Broadcast to replicas before AOL truncation
+        // 3. Broadcast to replicas/peers before AOL truncation
         if let Some(ref sender) = self.repl_sender {
             sender.broadcast_drop_namespace(name);
+        }
+        {
+            let sessions = self.peer_sessions.lock().unwrap_or_else(|e| e.into_inner());
+            for session in sessions.iter() {
+                session.send_drop_namespace(name);
+            }
         }
 
         // 4. Flush remaining namespaces + truncate AOL so the dropped
