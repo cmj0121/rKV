@@ -9,6 +9,16 @@ use std::time::Duration;
 use super::error::{Error, Result};
 use super::replication::{ReplMessage, Role};
 
+/// Messages broadcast from the primary engine to connected replicas.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum BroadcastMsg {
+    /// Raw AOL record payload.
+    Aol(Vec<u8>),
+    /// Instruction to drop a namespace.
+    DropNamespace(String),
+}
+
 /// Manages the primary-side replication listener and connected replicas.
 ///
 /// The sender listens on a TCP port and accepts replica connections. For each
@@ -18,8 +28,8 @@ use super::replication::{ReplMessage, Role};
 pub(crate) struct ReplSender {
     listener_handle: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
-    /// Per-replica channels for broadcasting AOL record payloads.
-    aol_senders: Arc<Mutex<Vec<mpsc::SyncSender<Vec<u8>>>>>,
+    /// Per-replica channels for broadcasting messages.
+    aol_senders: Arc<Mutex<Vec<mpsc::SyncSender<BroadcastMsg>>>>,
 }
 
 /// Context passed to each replica handler thread.
@@ -28,7 +38,7 @@ struct ReplicaCtx {
     db_path: PathBuf,
     cluster_id: u16,
     max_levels: usize,
-    aol_rx: mpsc::Receiver<Vec<u8>>,
+    aol_rx: mpsc::Receiver<BroadcastMsg>,
     stop: Arc<AtomicBool>,
 }
 
@@ -54,7 +64,7 @@ impl ReplSender {
         let listener = TcpListener::bind(&addr)?;
         listener.set_nonblocking(true)?;
 
-        let aol_senders: Arc<Mutex<Vec<mpsc::SyncSender<Vec<u8>>>>> =
+        let aol_senders: Arc<Mutex<Vec<mpsc::SyncSender<BroadcastMsg>>>> =
             Arc::new(Mutex::new(Vec::new()));
         let senders_clone = Arc::clone(&aol_senders);
         let stop_clone = Arc::clone(&stop);
@@ -84,7 +94,16 @@ impl ReplSender {
     /// Dead channels (disconnected replicas) are pruned automatically.
     pub(crate) fn broadcast_aol(&self, payload: &[u8]) {
         let mut senders = self.aol_senders.lock().unwrap_or_else(|e| e.into_inner());
-        senders.retain(|tx| tx.try_send(payload.to_vec()).is_ok());
+        senders.retain(|tx| tx.try_send(BroadcastMsg::Aol(payload.to_vec())).is_ok());
+    }
+
+    /// Broadcast a namespace-drop instruction to all connected replicas.
+    pub(crate) fn broadcast_drop_namespace(&self, namespace: &str) {
+        let mut senders = self.aol_senders.lock().unwrap_or_else(|e| e.into_inner());
+        senders.retain(|tx| {
+            tx.try_send(BroadcastMsg::DropNamespace(namespace.to_owned()))
+                .is_ok()
+        });
     }
 
     /// Stop the listener and all replica handler threads.
@@ -97,7 +116,7 @@ impl ReplSender {
 
     fn listener_loop(
         listener: TcpListener,
-        aol_senders: Arc<Mutex<Vec<mpsc::SyncSender<Vec<u8>>>>>,
+        aol_senders: Arc<Mutex<Vec<mpsc::SyncSender<BroadcastMsg>>>>,
         stop: Arc<AtomicBool>,
         db_path: PathBuf,
         cluster_id: u16,
@@ -108,7 +127,7 @@ impl ReplSender {
             match listener.accept() {
                 Ok((stream, addr)) => {
                     // Create a bounded channel for this replica
-                    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(4096);
+                    let (tx, rx) = mpsc::sync_channel::<BroadcastMsg>(4096);
                     {
                         let mut senders = aol_senders.lock().unwrap_or_else(|e| e.into_inner());
                         senders.push(tx);
@@ -251,6 +270,18 @@ impl ReplSender {
         Ok(())
     }
 
+    fn write_broadcast_msg<W: Write>(writer: &mut W, msg: BroadcastMsg) -> Result<()> {
+        match msg {
+            BroadcastMsg::Aol(payload) => {
+                ReplMessage::AolRecord { payload }.write_to(writer)?;
+            }
+            BroadcastMsg::DropNamespace(namespace) => {
+                ReplMessage::DropNamespace { namespace }.write_to(writer)?;
+            }
+        }
+        Ok(())
+    }
+
     fn live_stream<W: Write>(writer: &mut W, ctx: &ReplicaCtx) -> Result<()> {
         let mut heartbeat_tick = 0u32;
         loop {
@@ -258,13 +289,13 @@ impl ReplSender {
                 return Ok(());
             }
 
-            // Try to receive AOL records (non-blocking with timeout)
+            // Try to receive broadcast messages (non-blocking with timeout)
             match ctx.aol_rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(payload) => {
-                    ReplMessage::AolRecord { payload }.write_to(writer)?;
-                    // Drain any additional pending records
-                    while let Ok(payload) = ctx.aol_rx.try_recv() {
-                        ReplMessage::AolRecord { payload }.write_to(writer)?;
+                Ok(msg) => {
+                    Self::write_broadcast_msg(writer, msg)?;
+                    // Drain any additional pending messages
+                    while let Ok(msg) = ctx.aol_rx.try_recv() {
+                        Self::write_broadcast_msg(writer, msg)?;
                     }
                     writer.flush()?;
                     heartbeat_tick = 0;
@@ -575,10 +606,10 @@ mod tests {
         sender.broadcast_aol(b"record1");
         sender.broadcast_aol(b"record2");
 
-        assert_eq!(rx1.try_recv().unwrap(), b"record1");
-        assert_eq!(rx1.try_recv().unwrap(), b"record2");
-        assert_eq!(rx2.try_recv().unwrap(), b"record1");
-        assert_eq!(rx2.try_recv().unwrap(), b"record2");
+        assert!(matches!(rx1.try_recv().unwrap(), BroadcastMsg::Aol(ref p) if p == b"record1"));
+        assert!(matches!(rx1.try_recv().unwrap(), BroadcastMsg::Aol(ref p) if p == b"record2"));
+        assert!(matches!(rx2.try_recv().unwrap(), BroadcastMsg::Aol(ref p) if p == b"record1"));
+        assert!(matches!(rx2.try_recv().unwrap(), BroadcastMsg::Aol(ref p) if p == b"record2"));
     }
 
     #[test]
@@ -598,10 +629,29 @@ mod tests {
         sender.broadcast_aol(b"record");
 
         // rx1 should receive it
-        assert_eq!(rx1.try_recv().unwrap(), b"record");
+        assert!(matches!(rx1.try_recv().unwrap(), BroadcastMsg::Aol(ref p) if p == b"record"));
 
         // Dead channel should be pruned
         let count = sender.aol_senders.lock().unwrap().len();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn broadcast_drop_namespace_to_receivers() {
+        let (tx1, rx1) = mpsc::sync_channel(16);
+
+        let senders = Arc::new(Mutex::new(vec![tx1]));
+        let sender = ReplSender {
+            listener_handle: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            aol_senders: senders,
+        };
+
+        sender.broadcast_drop_namespace("myns");
+
+        match rx1.try_recv().unwrap() {
+            BroadcastMsg::DropNamespace(ns) => assert_eq!(ns, "myns"),
+            other => panic!("expected DropNamespace, got: {other:?}"),
+        }
     }
 }

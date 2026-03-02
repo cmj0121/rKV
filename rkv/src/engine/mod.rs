@@ -656,14 +656,53 @@ impl DB {
                     Ok(())
                 });
 
-                let receiver = repl_receiver::ReplReceiver::start(
-                    addr,
-                    cluster_id,
-                    db_path,
-                    max_levels,
+                // Build a drop-namespace callback for live-stream drops
+                let drop_ns_data = Arc::clone(&self.namespace_data);
+                let drop_sstables = Arc::clone(&self.sstables);
+                let drop_obj_stores = Arc::clone(&self.object_stores);
+                let drop_db_path = self.config.path.clone();
+                let drop_ns_fn: repl_receiver::DropNsFn = Box::new(move |namespace: &str| {
+                    // 1. Remove from in-memory maps (matches primary behavior)
+                    {
+                        let mut map = drop_ns_data.write().unwrap_or_else(|e| e.into_inner());
+                        map.remove(namespace);
+                    }
+                    {
+                        let mut map = drop_sstables.write().unwrap_or_else(|e| e.into_inner());
+                        map.remove(namespace);
+                    }
+                    {
+                        let mut map = drop_obj_stores.write().unwrap_or_else(|e| e.into_inner());
+                        map.remove(namespace);
+                    }
+
+                    // 2. Delete on-disk files
+                    let sst_dir = drop_db_path.join("sst").join(namespace);
+                    if sst_dir.exists() {
+                        fs::remove_dir_all(&sst_dir)?;
+                    }
+                    let obj_dir = drop_db_path.join("objects").join(namespace);
+                    if obj_dir.exists() {
+                        fs::remove_dir_all(&obj_dir)?;
+                    }
+
+                    // 3. Re-create default namespace if it was dropped
+                    if namespace == DEFAULT_NAMESPACE {
+                        let mut map = drop_ns_data.write().unwrap_or_else(|e| e.into_inner());
+                        map.entry(DEFAULT_NAMESPACE.to_owned())
+                            .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
+                    }
+
+                    Ok(())
+                });
+
+                let callbacks = repl_receiver::ReplicaCallbacks {
                     replay_fn,
                     post_sync_fn,
-                    stop,
+                    drop_ns_fn,
+                };
+                let receiver = repl_receiver::ReplReceiver::start(
+                    addr, cluster_id, db_path, max_levels, callbacks, stop,
                 )?;
                 self.repl_receiver = Some(receiver);
             }
@@ -938,7 +977,12 @@ impl DB {
             fs::remove_file(&salt_path)?;
         }
 
-        // 3. Flush remaining namespaces + truncate AOL so the dropped
+        // 3. Broadcast to replicas before AOL truncation
+        if let Some(ref sender) = self.repl_sender {
+            sender.broadcast_drop_namespace(name);
+        }
+
+        // 4. Flush remaining namespaces + truncate AOL so the dropped
         //    namespace's records don't resurrect on restart.
         //    flush() only truncates when it actually writes SSTables, so we
         //    force-truncate afterwards to cover the case where no other
