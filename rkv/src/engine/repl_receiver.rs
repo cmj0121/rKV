@@ -30,14 +30,21 @@ pub(crate) type PostSyncFn = Box<dyn Fn() -> Result<()> + Send + Sync>;
 /// SSTables, object store) and delete on-disk files for the dropped namespace.
 pub(crate) type DropNsFn = Box<dyn Fn(&str) -> Result<()> + Send + Sync>;
 
+/// Callback invoked during force-sync to wipe all local state (memtables,
+/// SSTables, objects, AOL, checkpoint) before performing a fresh full sync.
+pub(crate) type CleanupFn = Box<dyn Fn() -> Result<()> + Send + Sync>;
+
 /// Bundles all replica callbacks and shared state to avoid too-many-arguments.
 pub(crate) struct ReplicaCallbacks {
     pub(crate) replay_fn: ReplayFn,
     pub(crate) post_sync_fn: PostSyncFn,
     pub(crate) drop_ns_fn: DropNsFn,
+    pub(crate) cleanup_fn: CleanupFn,
     /// Tracks the highest revision seen by the replica. Updated by `replay_fn`
     /// in mod.rs; read here when building `SyncRequest`.
     pub(crate) last_revision: Arc<Mutex<u128>>,
+    /// Set by `DB::force_sync()` to trigger a wipe-and-resync.
+    pub(crate) force_sync: Arc<AtomicBool>,
 }
 
 /// Manages the replica-side replication connection to a primary.
@@ -118,6 +125,25 @@ impl ReplReceiver {
         let max_backoff = Duration::from_secs(30);
 
         while !stop.load(Ordering::Relaxed) {
+            // Check force-sync flag — wipe local state and reconnect
+            if callbacks.force_sync.load(Ordering::Relaxed) {
+                eprintln!("replication: force-sync triggered — wiping local state");
+                if let Err(e) = (callbacks.cleanup_fn)() {
+                    eprintln!("replication: cleanup failed: {e}");
+                }
+                {
+                    let mut lr = callbacks
+                        .last_revision
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    *lr = 0;
+                }
+                delete_checkpoint(db_path);
+                callbacks.force_sync.store(false, Ordering::Relaxed);
+                backoff = Duration::from_secs(1);
+                // Fall through to reconnect immediately
+            }
+
             match Self::connect_and_replicate(
                 addr, cluster_id, db_path, max_levels, callbacks, stop,
             ) {
@@ -143,8 +169,10 @@ impl ReplReceiver {
                     // Wait with backoff before retrying
                     let sleep_end = std::time::Instant::now() + backoff;
                     while std::time::Instant::now() < sleep_end {
-                        if stop.load(Ordering::Relaxed) {
-                            return;
+                        if stop.load(Ordering::Relaxed)
+                            || callbacks.force_sync.load(Ordering::Relaxed)
+                        {
+                            break;
                         }
                         thread::sleep(Duration::from_millis(200));
                     }
@@ -198,13 +226,18 @@ impl ReplReceiver {
         .write_to(&mut writer)?;
 
         // Send SyncRequest with last known revision
-        let last_rev = *callbacks
-            .last_revision
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let force_full = callbacks.force_sync.load(Ordering::Relaxed);
+        let last_rev = if force_full {
+            0
+        } else {
+            *callbacks
+                .last_revision
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        };
         ReplMessage::SyncRequest {
             last_revision: last_rev,
-            force_full: false,
+            force_full,
         }
         .write_to(&mut writer)?;
         writer.flush()?;
@@ -262,6 +295,7 @@ impl ReplReceiver {
             &callbacks.replay_fn,
             &callbacks.drop_ns_fn,
             stop,
+            Some(&callbacks.force_sync),
         )
     }
 
@@ -436,10 +470,20 @@ impl ReplReceiver {
         replay_fn: &ReplayFn,
         drop_ns_fn: &DropNsFn,
         stop: &Arc<AtomicBool>,
+        force_sync: Option<&Arc<AtomicBool>>,
     ) -> Result<()> {
         loop {
             if stop.load(Ordering::Relaxed) {
                 return Ok(());
+            }
+            if let Some(fs) = force_sync {
+                if fs.load(Ordering::Relaxed) {
+                    // Force-sync requested — disconnect so run_loop handles it
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "force-sync requested",
+                    )));
+                }
             }
 
             let msg = match ReplMessage::read_from(reader) {
@@ -538,6 +582,12 @@ fn load_checkpoint(db_path: &Path) -> Option<u128> {
         return None;
     }
     Some(u128::from_be_bytes(data[0..16].try_into().ok()?))
+}
+
+/// Delete the checkpoint file (used during force-sync).
+fn delete_checkpoint(db_path: &Path) {
+    let path = db_path.join(CHECKPOINT_FILE);
+    let _ = std::fs::remove_file(&path);
 }
 
 /// Persist the last-revision checkpoint to disk. Best-effort — errors are
@@ -729,8 +779,13 @@ mod tests {
         let mut cursor = Cursor::new(buf);
 
         // The stream will end with EOF → ConnectionReset error
-        let result =
-            ReplReceiver::receive_live_stream(&mut cursor, &replay_fn, &noop_drop_ns_fn(), &stop);
+        let result = ReplReceiver::receive_live_stream(
+            &mut cursor,
+            &replay_fn,
+            &noop_drop_ns_fn(),
+            &stop,
+            None,
+        );
         assert!(result.is_err()); // EOF → connection reset
 
         let records = received.lock().unwrap();
@@ -763,8 +818,13 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let mut cursor = Cursor::new(buf);
 
-        let result =
-            ReplReceiver::receive_live_stream(&mut cursor, &replay_fn, &noop_drop_ns_fn(), &stop);
+        let result = ReplReceiver::receive_live_stream(
+            &mut cursor,
+            &replay_fn,
+            &noop_drop_ns_fn(),
+            &stop,
+            None,
+        );
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("primary shutting down"));
 
@@ -781,8 +841,13 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(true));
         let mut cursor = Cursor::new(buf);
 
-        let result =
-            ReplReceiver::receive_live_stream(&mut cursor, &replay_fn, &noop_drop_ns_fn(), &stop);
+        let result = ReplReceiver::receive_live_stream(
+            &mut cursor,
+            &replay_fn,
+            &noop_drop_ns_fn(),
+            &stop,
+            None,
+        );
         assert!(result.is_ok());
     }
 
@@ -807,7 +872,8 @@ mod tests {
         let mut cursor = Cursor::new(buf);
 
         // EOF after DropNamespace → ConnectionReset
-        let _ = ReplReceiver::receive_live_stream(&mut cursor, &replay_fn, &drop_ns_fn, &stop);
+        let _ =
+            ReplReceiver::receive_live_stream(&mut cursor, &replay_fn, &drop_ns_fn, &stop, None);
 
         let ns_list = dropped.lock().unwrap();
         assert_eq!(ns_list.len(), 1);

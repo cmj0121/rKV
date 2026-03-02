@@ -261,6 +261,8 @@ pub struct DB {
     // Replication
     repl_sender: Option<repl_sender::ReplSender>,
     repl_receiver: Option<repl_receiver::ReplReceiver>,
+    /// Set to trigger a force-sync on the replica receiver thread.
+    repl_force_sync: Option<Arc<AtomicBool>>,
 }
 
 impl DB {
@@ -451,6 +453,7 @@ impl DB {
             op_deletes: AtomicU64::new(op_deletes),
             repl_sender: None,
             repl_receiver: None,
+            repl_force_sync: None,
         };
 
         // Eagerly register the default namespace so it always appears in
@@ -485,6 +488,21 @@ impl DB {
     /// Returns true if this node is configured as a read-only replica.
     pub fn is_replica(&self) -> bool {
         self.config.role == replication::Role::Replica
+    }
+
+    /// Trigger a force-sync on the replica: wipe local state and perform
+    /// a fresh full sync from the primary. No-op if not a replica.
+    pub fn force_sync(&self) -> Result<()> {
+        if !self.is_replica() {
+            return Err(Error::ReadOnlyReplica);
+        }
+        match self.repl_force_sync {
+            Some(ref flag) => {
+                flag.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+            None => Err(Error::InvalidConfig("replica receiver not running".into())),
+        }
     }
 
     /// Start replication based on the configured role.
@@ -712,11 +730,60 @@ impl DB {
                     Ok(())
                 });
 
+                // Build a cleanup callback for force-sync
+                let cleanup_ns_data = Arc::clone(&self.namespace_data);
+                let cleanup_sstables = Arc::clone(&self.sstables);
+                let cleanup_obj_stores = Arc::clone(&self.object_stores);
+                let cleanup_aol = Arc::clone(&self.aol);
+                let cleanup_db_path = self.config.path.clone();
+                let cleanup_fn: repl_receiver::CleanupFn = Box::new(move || {
+                    // Reset all memtables in-place (SAFETY: HashMap only grows)
+                    {
+                        let map = cleanup_ns_data.read().unwrap_or_else(|e| e.into_inner());
+                        for mt_mutex in map.values() {
+                            let mut mt = mt_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                            *mt = memtable::MemTable::new();
+                        }
+                    }
+                    // Clear SSTables
+                    {
+                        let mut sst = cleanup_sstables.write().unwrap_or_else(|e| e.into_inner());
+                        sst.clear();
+                    }
+                    // Clear object stores
+                    {
+                        let mut obj = cleanup_obj_stores
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner());
+                        obj.clear();
+                    }
+                    // Delete on-disk sst/ and objects/ directories
+                    let sst_root = cleanup_db_path.join("sst");
+                    if sst_root.exists() {
+                        fs::remove_dir_all(&sst_root)?;
+                    }
+                    let obj_root = cleanup_db_path.join("objects");
+                    if obj_root.exists() {
+                        fs::remove_dir_all(&obj_root)?;
+                    }
+                    // Truncate AOL
+                    {
+                        let mut aol = cleanup_aol.lock().unwrap_or_else(|e| e.into_inner());
+                        aol.truncate(&cleanup_db_path)?;
+                    }
+                    Ok(())
+                });
+
+                let force_sync = Arc::new(AtomicBool::new(false));
+                self.repl_force_sync = Some(Arc::clone(&force_sync));
+
                 let callbacks = repl_receiver::ReplicaCallbacks {
                     replay_fn,
                     post_sync_fn,
                     drop_ns_fn,
+                    cleanup_fn,
                     last_revision,
+                    force_sync,
                 };
                 let receiver = repl_receiver::ReplReceiver::start(
                     addr, cluster_id, db_path, max_levels, callbacks, stop,

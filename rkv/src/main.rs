@@ -335,6 +335,12 @@ fn print_command_help(cmd: &str) {
             println!();
             println!("  See also: flush, sync");
         }
+        "force-sync" => {
+            println!("force-sync");
+            println!();
+            println!("  (Replica only) Wipe local state and perform a fresh full sync");
+            println!("  from the primary.");
+        }
         "destroy" => {
             println!("destroy <path>");
             println!();
@@ -813,6 +819,16 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             Ok(()) => println!("OK"),
             Err(e) => eprintln!("error: {e}"),
         },
+        "force-sync" => {
+            if !db.is_replica() {
+                eprintln!("error: force-sync is only available on replicas");
+            } else {
+                match db.force_sync() {
+                    Ok(()) => println!("force-sync triggered"),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+        }
         "destroy" => {
             if tokens.len() < 2 {
                 eprintln!("usage: destroy <path>");
