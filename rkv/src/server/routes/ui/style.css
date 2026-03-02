@@ -407,6 +407,14 @@ dialog .dialog-actions {
   margin-top: 20px;
 }
 
+.rev-id {
+  display: block;
+  font-size: 10px;
+  color: var(--text-dim);
+  word-break: break-all;
+  margin-bottom: 2px;
+}
+
 /* ---- Revision button & dialog ---- */
 .btn-rev {
   color: var(--accent);

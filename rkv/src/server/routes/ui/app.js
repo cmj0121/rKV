@@ -339,10 +339,11 @@ function renderKeyRows() {
           value: r.data,
           status: r.status,
           expires: r.headers.get("Expires"),
+          revision: r.headers.get("X-RKV-Revision"),
         };
       })
       .catch(function () {
-        return { value: null, status: 0, expires: null };
+        return { value: null, status: 0, expires: null, revision: null };
       });
     var revP = api("GET", keyPath + "/revisions")
       .then(function (r) {
@@ -357,6 +358,7 @@ function renderKeyRows() {
         value: pair[0].value,
         status: pair[0].status,
         expires: pair[0].expires,
+        revision: pair[0].revision,
         revCount: pair[1],
       };
     });
@@ -404,15 +406,25 @@ function renderKeyRows() {
         valCell.textContent = valText;
       }
 
-      var revCell = el("td", null, [
+      var revChildren = [];
+      if (entry.revision) {
+        revChildren.push(
+          el("span", {
+            className: "rev-id",
+            textContent: entry.revision,
+          }),
+        );
+      }
+      revChildren.push(
         el("button", {
           className: "btn-rev",
-          textContent: String(entry.revCount),
+          textContent: entry.revCount + " rev",
           onClick: function () {
             openRevDialog(entry.key, entry.revCount);
           },
         }),
-      ]);
+      );
+      var revCell = el("td", null, revChildren);
 
       var tr = el("tr", null, [
         el("td", { textContent: entry.key }),
