@@ -1143,6 +1143,35 @@ Each node operates in one of four roles, configured at startup:
 - **Peer**: Master-master replication. Each node accepts reads and writes. Writes propagate
   bidirectionally using last-writer-wins (LWW) conflict resolution (see Peer Replication below).
 
+#### Replication Flow (Primary-Replica)
+
+```text
+  Primary                              Replica
+    |                                    |
+    |<--- TCP connect -------------------|
+    |                                    |
+    |---- Handshake (cluster_id) ------->|
+    |<--- Handshake (cluster_id) --------|
+    |                                    |
+    |<--- SyncRequest (last_rev) --------|
+    |                                    |
+    |  [if incremental possible]         |
+    |---- IncrementalSyncStart --------->|
+    |---- AolRecord × N --------------->|  replay_fn()
+    |                                    |
+    |  [else full sync]                  |
+    |---- FullSyncStart ---------------->|
+    |---- SstChunk × N ---------------->|  write to disk
+    |---- ObjectChunk × N -------------->|  write to disk
+    |---- FullSyncEnd ------------------>|  post_sync_fn()
+    |                                    |
+    |  [live streaming]                  |
+    |---- AolRecord -------------------->|  replay to memtable + AOL
+    |---- DropNamespace ---------------->|  remove ns data + files
+    |---- Heartbeat -------------------->|
+    |                                    |
+```
+
 #### How It Works
 
 When a replica connects to a primary, replication proceeds in two phases:
@@ -1194,11 +1223,15 @@ storage and are allowed on replicas.
 
 #### Namespace Synchronization
 
-When a primary node creates a new namespace (via `db.namespace(name, pw)`), it broadcasts a
+When a primary or peer node creates a new namespace (via `db.namespace(name, pw)`), it broadcasts a
 **sentinel record** — an AOL entry with an empty key (`Key::Str("")`) and `Value::Null` — to
-all connected replicas. This ensures replicas learn about new namespaces immediately, even before
-any data is written to them. The sentinel is detected and skipped during replay (no key is
-inserted); only the namespace registration side-effect is applied.
+all connected replicas or peers. This ensures other nodes learn about new namespaces immediately,
+even before any data is written to them. The sentinel is detected and skipped during replay (no key
+is inserted); only the namespace registration side-effect is applied.
+
+When a primary or peer node drops a namespace (via `db.drop_namespace(name)`), it broadcasts a
+`DropNamespace` message to all connected replicas and peers. The receiving node removes the
+namespace from in-memory maps (memtable, SSTables, object stores) and deletes on-disk files.
 
 #### Post-Sync Memory Safety
 
@@ -1230,13 +1263,17 @@ The node's role is exposed through multiple channels:
 
 #### Docker Compose Topology
 
-A `docker-compose.yml` in the project root defines a two-node topology (supports both
-primary-replica and peer modes):
+A `docker-compose.yml` in the project root defines a five-node topology with two write nodes
+and three read nodes, all using peer replication:
 
-- **Primary-replica**: primary on port 8321/8322, replica on port 8323
-- **Peer**: peer-a on port 8321/8322, peer-b on port 8323/8324, each configured with
-  `--peers` pointing to the other
+- **write-1** (port 8321, cluster-id 1): Peer, connects to write-2
+- **write-2** (port 8323, cluster-id 2): Peer, connects to write-1
+- **read-1** (port 8324, cluster-id 3): Peer, connects to both write nodes
+- **read-2** (port 8325, cluster-id 4): Peer, connects to both write nodes
+- **read-3** (port 8326, cluster-id 5): Peer, connects to both write nodes
 
+All nodes are technically peers (can accept writes), but the read nodes are designated
+for read traffic. Writes on any node propagate to all others via peer replication.
 Data is bind-mounted to `.data/` subdirectories.
 
 ### Peer Replication
@@ -1265,6 +1302,44 @@ the same incremental-or-full strategy as primary-replica:
      the memtable and appends to the local AOL.
 
 After initial sync, both sides enter **bidirectional live streaming**.
+
+#### Replication Flow (Peer-Peer)
+
+```text
+  Peer A (connector)                   Peer B (listener)
+    |                                    |
+    |--- TCP connect ------------------->|
+    |                                    |
+    |--- Handshake (cluster=1, Peer) --->|
+    |<-- Handshake (cluster=2, Peer) ----|
+    |                                    |
+    |--- SyncRequest (last_rev) -------->|
+    |                                    |
+    |  [full or incremental sync]        |
+    |<-- sync response (SSTs/records) ---|
+    |                                    |
+    |  [bidirectional live stream]       |
+    |--- AolRecord --------------------->|  replay_fn (LWW)
+    |<-- AolRecord ----------------------|  replay_fn (LWW)
+    |--- DropNamespace ----------------->|  drop_ns_fn
+    |<-- DropNamespace ------------------|  drop_ns_fn
+    |--- Heartbeat --------------------->|
+    |<-- Heartbeat ----------------------|
+    |                                    |
+
+  Meanwhile, Peer B also connects to Peer A (reverse direction):
+
+  Peer B (connector)                   Peer A (listener)
+    |--- TCP connect ------------------->|
+    |--- Handshake + SyncRequest ------->|
+    |<-- sync response ------------------|
+    |  [bidirectional live stream]       |
+    |<=> AolRecord / DropNamespace /<===>|
+```
+
+Each peer broadcasts accepted records to all other connected peers
+(excluding the sender) for N-node mesh topologies. Loop prevention
+uses the cluster ID embedded in each revision.
 
 #### Conflict Resolution
 
