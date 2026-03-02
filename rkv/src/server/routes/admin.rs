@@ -24,6 +24,8 @@ pub async fn get_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         "cache_misses": s.cache_misses,
         "uptime_secs": s.uptime.as_secs(),
         "role": s.role,
+        "peer_count": s.peer_count,
+        "conflicts_resolved": s.conflicts_resolved,
         "level_stats": s.level_stats.iter().map(|l| {
             serde_json::json!({"file_count": l.file_count, "size_bytes": l.size_bytes})
         }).collect::<Vec<_>>(),

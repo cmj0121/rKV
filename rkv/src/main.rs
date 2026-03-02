@@ -665,6 +665,8 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("  cache_misses:      {}", s.cache_misses);
             println!("Replication:");
             println!("  role:              {}", s.role);
+            println!("  peer_count:        {}", s.peer_count);
+            println!("  conflicts:         {}", s.conflicts_resolved);
             println!("Uptime:");
             println!("  uptime:            {}", format_duration(s.uptime));
         }
