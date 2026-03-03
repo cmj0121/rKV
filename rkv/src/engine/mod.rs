@@ -2729,6 +2729,72 @@ impl DB {
         Ok(None)
     }
 
+    /// Count all non-expired revisions for a key across all SSTable levels.
+    #[allow(dead_code)]
+    pub(crate) fn count_revisions_from_sstables(&self, ns: &str, key: &Key) -> Result<u64> {
+        let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
+        let mut count = 0u64;
+        if let Some(levels) = sst.get(ns) {
+            for level_readers in levels {
+                for reader in level_readers {
+                    for (_, _, expires_at_ms) in
+                        reader.get_all_revisions(key, self.config.verify_checksums)?
+                    {
+                        if !is_expired(expires_at_ms) {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Retrieve a specific revision by index from SSTables.
+    ///
+    /// Collects all non-expired revisions in chronological order:
+    /// deepest level first (L_max → L1 → L0 oldest-to-newest).
+    /// Index 0 = oldest revision across all SSTables.
+    #[allow(dead_code)]
+    pub(crate) fn get_revision_from_sstables(
+        &self,
+        ns: &str,
+        key: &Key,
+        index: u64,
+    ) -> Result<Option<(Value, revision::RevisionID, u64)>> {
+        let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
+        let mut all_revisions = Vec::new();
+        if let Some(levels) = sst.get(ns) {
+            // Deepest levels first (oldest data), then shallower levels
+            for (level_idx, level_readers) in levels.iter().enumerate().rev() {
+                if level_idx == 0 {
+                    // L0: readers are newest-first, iterate in reverse for oldest-first
+                    for reader in level_readers.iter().rev() {
+                        for (value, rev, expires_at_ms) in
+                            reader.get_all_revisions(key, self.config.verify_checksums)?
+                        {
+                            if !is_expired(expires_at_ms) {
+                                all_revisions.push((value, rev, expires_at_ms));
+                            }
+                        }
+                    }
+                } else {
+                    for reader in level_readers {
+                        for (value, rev, expires_at_ms) in
+                            reader.get_all_revisions(key, self.config.verify_checksums)?
+                        {
+                            if !is_expired(expires_at_ms) {
+                                all_revisions.push((value, rev, expires_at_ms));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(all_revisions.into_iter().nth(index as usize))
+    }
+
     /// SSTable directory for a namespace: `<db>/sst/<namespace>/`.
     fn sst_namespace_dir(&self, ns: &str) -> PathBuf {
         self.config.path.join("sst").join(ns)
