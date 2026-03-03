@@ -611,12 +611,14 @@ impl SSTableReader {
         Ok(entries)
     }
 
-    /// Look up a key in the SSTable.
+    /// Look up a key in the SSTable, returning the LATEST revision.
     ///
-    /// Returns `Some((value, revision))` if found, `None` if the key is not
-    /// present. Uses the bloom filter for fast negative answers, binary search
-    /// for block selection, and linear scan within the block for final key
-    /// decoding.
+    /// Returns `Some((value, revision, expires_at_ms))` if found, `None` if
+    /// the key is not present. When multiple entries exist for the same key
+    /// (oldest-first order), returns the last match (latest revision).
+    ///
+    /// Uses the bloom filter for fast negative answers, binary search
+    /// for block selection, and linear scan within the block.
     pub(crate) fn get(
         &self,
         key: &Key,
@@ -647,17 +649,102 @@ impl SSTableReader {
             }
         };
 
-        let ie = &self.index[block_idx];
-        let entries = self.read_block(ie, block_idx, verify_checksums)?;
+        let mut last_match: Option<(Value, RevisionID, u64)> = None;
 
-        // Linear scan entries within the block
-        for (kb, revision, expires_at_ms, value_tag, value_data) in entries {
-            if kb == key_bytes {
-                let value = Value::from_tag(value_tag, &value_data)?;
-                return Ok(Some((value, RevisionID::from(revision), expires_at_ms)));
+        // Scan starting block and continue to subsequent blocks that may
+        // contain more entries for the same key.
+        for bi in block_idx..self.index.len() {
+            let ie = &self.index[bi];
+            let entries = self.read_block(ie, bi, verify_checksums)?;
+
+            let mut found_in_block = false;
+            for (kb, revision, expires_at_ms, value_tag, value_data) in entries {
+                if kb == key_bytes {
+                    let value = Value::from_tag(value_tag, &value_data)?;
+                    last_match = Some((value, RevisionID::from(revision), expires_at_ms));
+                    found_in_block = true;
+                } else if found_in_block {
+                    // Past the matching key entries in this block
+                    return Ok(last_match);
+                }
+            }
+
+            // If we found matches in this block but the block's last key is
+            // our target, more entries may span into the next block.
+            if found_in_block {
+                if ie.last_key.as_slice() != key_bytes {
+                    return Ok(last_match);
+                }
+                // last_key == target → entries may continue in next block
+            } else {
+                // No match in this block and we started at the right block
+                break;
             }
         }
-        Ok(None)
+
+        Ok(last_match)
+    }
+
+    /// Look up ALL revisions for a key in the SSTable.
+    ///
+    /// Returns all matching entries in oldest-first order (the natural
+    /// SSTable storage order). Uses bloom filter and binary search for
+    /// fast block selection.
+    pub(crate) fn get_all_revisions(
+        &self,
+        key: &Key,
+        verify_checksums: bool,
+    ) -> Result<Vec<(Value, RevisionID, u64)>> {
+        if self.index.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let key_bytes = key.to_bytes();
+
+        if !self.bloom.may_contain(&key_bytes) {
+            return Ok(Vec::new());
+        }
+
+        let block_idx = match self
+            .index
+            .binary_search_by(|e| e.last_key.as_slice().cmp(&key_bytes))
+        {
+            Ok(i) => i,
+            Err(i) => {
+                if i >= self.index.len() {
+                    return Ok(Vec::new());
+                }
+                i
+            }
+        };
+
+        let mut result = Vec::new();
+
+        for bi in block_idx..self.index.len() {
+            let ie = &self.index[bi];
+            let entries = self.read_block(ie, bi, verify_checksums)?;
+
+            let mut found_in_block = false;
+            for (kb, revision, expires_at_ms, value_tag, value_data) in entries {
+                if kb == key_bytes {
+                    let value = Value::from_tag(value_tag, &value_data)?;
+                    result.push((value, RevisionID::from(revision), expires_at_ms));
+                    found_in_block = true;
+                } else if found_in_block {
+                    return Ok(result);
+                }
+            }
+
+            if found_in_block {
+                if ie.last_key.as_slice() != key_bytes {
+                    return Ok(result);
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok(result)
     }
 
     /// Parse all entries from a decompressed block.

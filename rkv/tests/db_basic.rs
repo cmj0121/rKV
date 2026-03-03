@@ -3457,8 +3457,8 @@ fn gc_overwrite_removes_orphaned_object() {
 
     db.compact().unwrap();
 
-    // Only the new object should survive
-    assert_eq!(count_object_files(tmp.path(), "_"), 1);
+    // Both objects survive — revision history preserves both values
+    assert_eq!(count_object_files(tmp.path(), "_"), 2);
     assert_eq!(ns.get(1).unwrap(), Value::from("b".repeat(100).as_str()));
 }
 
@@ -3554,8 +3554,8 @@ fn gc_after_cascade_compaction() {
 
     db.compact().unwrap();
 
-    // After cascade + GC, only the new object survives
-    assert_eq!(count_object_files(tmp.path(), "_"), 1);
+    // After cascade + GC, both objects survive (revision history preserved)
+    assert_eq!(count_object_files(tmp.path(), "_"), 2);
     assert_eq!(ns.get(1).unwrap(), Value::from("new".repeat(50).as_str()));
 }
 
@@ -5039,6 +5039,142 @@ fn ttl_survives_compaction() {
     assert_eq!(ns.get("c").unwrap(), Value::from("v3"));
     assert_eq!(ns.get("d").unwrap(), Value::from("v4"));
     assert_eq!(ns.count().unwrap(), 4);
+
+    db.close().unwrap();
+}
+
+// --- Revision persistence across flush/compaction ---
+
+#[test]
+fn rev_count_preserved_after_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path().join("rev_flush"));
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put(1, "v1", None).unwrap();
+    ns.put(1, "v2", None).unwrap();
+    ns.put(1, "v3", None).unwrap();
+    assert_eq!(ns.rev_count(1).unwrap(), 3);
+
+    db.flush().unwrap();
+
+    assert_eq!(ns.rev_count(1).unwrap(), 3);
+    db.close().unwrap();
+}
+
+#[test]
+fn rev_get_preserved_after_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path().join("rev_get_flush"));
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put(1, "v1", None).unwrap();
+    ns.put(1, "v2", None).unwrap();
+    ns.put(1, "v3", None).unwrap();
+
+    db.flush().unwrap();
+
+    assert_eq!(ns.rev_get(1, 0).unwrap(), Value::from("v1"));
+    assert_eq!(ns.rev_get(1, 1).unwrap(), Value::from("v2"));
+    assert_eq!(ns.rev_get(1, 2).unwrap(), Value::from("v3"));
+    assert!(ns.rev_get(1, 3).is_err());
+
+    db.close().unwrap();
+}
+
+#[test]
+fn rev_count_spans_flush_and_memtable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path().join("rev_span"));
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put(1, "v1", None).unwrap();
+    ns.put(1, "v2", None).unwrap();
+    db.flush().unwrap();
+
+    ns.put(1, "v3", None).unwrap();
+
+    assert_eq!(ns.rev_count(1).unwrap(), 3);
+    assert_eq!(ns.rev_get(1, 0).unwrap(), Value::from("v1"));
+    assert_eq!(ns.rev_get(1, 1).unwrap(), Value::from("v2"));
+    assert_eq!(ns.rev_get(1, 2).unwrap(), Value::from("v3"));
+
+    db.close().unwrap();
+}
+
+#[test]
+fn rev_count_after_multiple_flushes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path().join("rev_multi"));
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put(1, "v1", None).unwrap();
+    db.flush().unwrap();
+
+    ns.put(1, "v2", None).unwrap();
+    db.flush().unwrap();
+
+    assert_eq!(ns.rev_count(1).unwrap(), 2);
+    assert_eq!(ns.rev_get(1, 0).unwrap(), Value::from("v1"));
+    assert_eq!(ns.rev_get(1, 1).unwrap(), Value::from("v2"));
+
+    db.close().unwrap();
+}
+
+#[test]
+fn rev_count_preserved_after_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path().join("rev_compact"));
+    config.max_levels = 2;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put(1, "v1", None).unwrap();
+    ns.put(1, "v2", None).unwrap();
+    db.flush().unwrap();
+
+    ns.put(1, "v3", None).unwrap();
+    db.flush().unwrap();
+
+    db.compact().unwrap();
+
+    assert_eq!(ns.rev_count(1).unwrap(), 3);
+    assert_eq!(ns.rev_get(1, 0).unwrap(), Value::from("v1"));
+    assert_eq!(ns.rev_get(1, 1).unwrap(), Value::from("v2"));
+    assert_eq!(ns.rev_get(1, 2).unwrap(), Value::from("v3"));
+
+    db.close().unwrap();
+}
+
+#[test]
+fn compaction_merges_revision_chains() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path().join("rev_merge"));
+    config.max_levels = 3;
+    config.l1_max_size = 1; // force cascade
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // Put 2 revisions, flush to L0
+    ns.put(1, "a", None).unwrap();
+    ns.put(1, "b", None).unwrap();
+    db.flush().unwrap();
+
+    // Put 1 more, flush to another L0
+    ns.put(1, "c", None).unwrap();
+    db.flush().unwrap();
+
+    // Compact: L0→L1→L2 cascade
+    db.compact().unwrap();
+
+    assert_eq!(ns.rev_count(1).unwrap(), 3);
+    assert_eq!(ns.rev_get(1, 0).unwrap(), Value::from("a"));
+    assert_eq!(ns.rev_get(1, 1).unwrap(), Value::from("b"));
+    assert_eq!(ns.rev_get(1, 2).unwrap(), Value::from("c"));
 
     db.close().unwrap();
 }

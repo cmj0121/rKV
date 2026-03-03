@@ -582,7 +582,7 @@ impl DB {
                     if mt.is_empty() {
                         continue;
                     }
-                    mt.drain_latest()
+                    mt.drain_all()
                 };
 
                 if entries.is_empty() {
@@ -1571,7 +1571,7 @@ impl DB {
                 if mt.is_empty() {
                     continue;
                 }
-                mt.drain_latest()
+                mt.drain_all()
             };
 
             if entries.is_empty() {
@@ -2190,17 +2190,19 @@ impl DB {
                 return Ok(0);
             }
 
-            // Merge all entries: process oldest-to-newest so newer values
-            // overwrite older ones in the BTreeMap.
+            // Merge all entries preserving all revisions per key.
             let mut merged =
-                std::collections::BTreeMap::<Key, (Value, revision::RevisionID, u64)>::new();
+                std::collections::BTreeMap::<Key, Vec<(Value, revision::RevisionID, u64)>>::new();
 
             // Target entries are oldest
             for reader in target {
                 for (key, value, rev, expires_at_ms) in
                     reader.iter_entries(config.verify_checksums)?
                 {
-                    merged.insert(key, (value, rev, expires_at_ms));
+                    merged
+                        .entry(key)
+                        .or_default()
+                        .push((value, rev, expires_at_ms));
                 }
             }
 
@@ -2211,7 +2213,10 @@ impl DB {
                     for (key, value, rev, expires_at_ms) in
                         reader.iter_entries(config.verify_checksums)?
                     {
-                        merged.insert(key, (value, rev, expires_at_ms));
+                        merged
+                            .entry(key)
+                            .or_default()
+                            .push((value, rev, expires_at_ms));
                     }
                 }
             } else {
@@ -2219,14 +2224,34 @@ impl DB {
                     for (key, value, rev, expires_at_ms) in
                         reader.iter_entries(config.verify_checksums)?
                     {
-                        merged.insert(key, (value, rev, expires_at_ms));
+                        merged
+                            .entry(key)
+                            .or_default()
+                            .push((value, rev, expires_at_ms));
                     }
                 }
             }
 
+            // Sort revisions within each key by revision ID
+            for revisions in merged.values_mut() {
+                revisions.sort_by_key(|(_, rev, _)| *rev);
+            }
+
             if drop_tombstones {
-                merged.retain(|_, (v, _, expires_at_ms)| {
-                    !v.is_tombstone() && !is_expired(*expires_at_ms)
+                // At the bottom level, drop entire keys whose latest revision
+                // is a tombstone or expired — that key is fully deleted.
+                // For other keys, remove only individual expired entries.
+                merged.retain(|_, revisions| {
+                    if let Some((v, _, expires_at_ms)) = revisions.last() {
+                        if v.is_tombstone() || is_expired(*expires_at_ms) {
+                            return false; // drop entire key
+                        }
+                    }
+                    // Remove individual expired entries (intermediate revisions)
+                    revisions.retain(|(v, _, expires_at_ms)| {
+                        !v.is_tombstone() && !is_expired(*expires_at_ms)
+                    });
+                    !revisions.is_empty()
                 });
             }
 
@@ -2289,8 +2314,10 @@ impl DB {
             config.bloom_prefix_len,
             &**io,
         )?;
-        for (key, (value, rev, expires_at_ms)) in &merged {
-            writer.add(key, value, *rev, *expires_at_ms)?;
+        for (key, revisions) in &merged {
+            for (value, rev, expires_at_ms) in revisions {
+                writer.add(key, value, *rev, *expires_at_ms)?;
+            }
         }
         writer.finish()?;
 
@@ -2727,6 +2754,70 @@ impl DB {
             }
         }
         Ok(None)
+    }
+
+    /// Count all non-expired revisions for a key across all SSTable levels.
+    pub(crate) fn count_revisions_from_sstables(&self, ns: &str, key: &Key) -> Result<u64> {
+        let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
+        let mut count = 0u64;
+        if let Some(levels) = sst.get(ns) {
+            for level_readers in levels {
+                for reader in level_readers {
+                    for (_, _, expires_at_ms) in
+                        reader.get_all_revisions(key, self.config.verify_checksums)?
+                    {
+                        if !is_expired(expires_at_ms) {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Retrieve a specific revision by index from SSTables.
+    ///
+    /// Collects all non-expired revisions in chronological order:
+    /// deepest level first (L_max → L1 → L0 oldest-to-newest).
+    /// Index 0 = oldest revision across all SSTables.
+    pub(crate) fn get_revision_from_sstables(
+        &self,
+        ns: &str,
+        key: &Key,
+        index: u64,
+    ) -> Result<Option<(Value, revision::RevisionID, u64)>> {
+        let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
+        let mut all_revisions = Vec::new();
+        if let Some(levels) = sst.get(ns) {
+            // Deepest levels first (oldest data), then shallower levels
+            for (level_idx, level_readers) in levels.iter().enumerate().rev() {
+                if level_idx == 0 {
+                    // L0: readers are newest-first, iterate in reverse for oldest-first
+                    for reader in level_readers.iter().rev() {
+                        for (value, rev, expires_at_ms) in
+                            reader.get_all_revisions(key, self.config.verify_checksums)?
+                        {
+                            if !is_expired(expires_at_ms) {
+                                all_revisions.push((value, rev, expires_at_ms));
+                            }
+                        }
+                    }
+                } else {
+                    for reader in level_readers {
+                        for (value, rev, expires_at_ms) in
+                            reader.get_all_revisions(key, self.config.verify_checksums)?
+                        {
+                            if !is_expired(expires_at_ms) {
+                                all_revisions.push((value, rev, expires_at_ms));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(all_revisions.into_iter().nth(index as usize))
     }
 
     /// SSTable directory for a namespace: `<db>/sst/<namespace>/`.
