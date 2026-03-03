@@ -142,6 +142,7 @@ impl MemTable {
     }
 
     /// Get the latest non-expired, non-tombstone value for a key.
+    #[cfg(test)]
     pub(crate) fn get(&self, key: &Key) -> Option<&Value> {
         let entries = self.entries.get(key)?;
         let latest = entries.last()?;
@@ -211,6 +212,7 @@ impl MemTable {
     }
 
     /// Check if a key exists (non-expired, non-tombstone).
+    #[cfg(test)]
     pub(crate) fn exists(&self, key: &Key) -> bool {
         self.get(key).is_some()
     }
@@ -529,23 +531,41 @@ impl MemTable {
     /// Expired entries are flushed as tombstones so they remain visible to
     /// "show deleted" scans after the memtable is drained. Compaction will
     /// eventually garbage-collect them.
-    pub(crate) fn drain_latest(&mut self) -> Vec<(Key, Value, RevisionID)> {
+    /// Drain the latest value for each key in sorted order.
+    ///
+    /// Returns `Vec<(Key, Value, RevisionID, expires_at_ms)>` where
+    /// `expires_at_ms` is the absolute epoch time (0 = no expiration).
+    ///
+    /// Expired entries are flushed as tombstones so they remain visible to
+    /// "show deleted" scans after the memtable is drained. Compaction will
+    /// eventually garbage-collect them.
+    pub(crate) fn drain_latest(&mut self) -> Vec<(Key, Value, RevisionID, u64)> {
         let entries = std::mem::take(&mut self.entries);
         self.last_rev.clear();
         self.approximate_size = 0;
 
+        let now = Instant::now();
         let mut result = Vec::with_capacity(entries.len());
         for (key, revisions) in entries {
             if let Some(latest) = revisions.last() {
                 let rev = latest.revision;
                 if let Some(expires_at) = latest.expires_at {
-                    if Instant::now() > expires_at {
+                    if now > expires_at {
                         // Expired → flush as tombstone so "show deleted" works
-                        result.push((key, Value::tombstone(), rev));
+                        result.push((key, Value::tombstone(), rev, 0));
                         continue;
                     }
+                    // Convert remaining Instant TTL to absolute epoch ms
+                    let remaining = expires_at - now;
+                    let epoch_now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let epoch_expires = epoch_now + remaining.as_millis() as u64;
+                    result.push((key, latest.value.clone(), rev, epoch_expires));
+                } else {
+                    result.push((key, latest.value.clone(), rev, 0));
                 }
-                result.push((key, latest.value.clone(), rev));
             }
         }
         result

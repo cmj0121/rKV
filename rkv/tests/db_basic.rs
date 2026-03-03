@@ -4816,3 +4816,229 @@ fn revision_count_spans_memtable_and_sstable() {
 
     db.close().unwrap();
 }
+
+// --- Phase 1 correctness fixes ---
+
+#[test]
+fn count_after_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path().join("count_flush"));
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 1..=5_i64 {
+        ns.put(i, format!("v{i}"), None).unwrap();
+    }
+    assert_eq!(ns.count().unwrap(), 5);
+
+    db.flush().unwrap();
+
+    // count() must still return 5 after flush
+    assert_eq!(ns.count().unwrap(), 5);
+
+    // Add more keys after flush and verify merged count
+    ns.put(6_i64, "v6", None).unwrap();
+    assert_eq!(ns.count().unwrap(), 6);
+
+    // Delete a flushed key and verify count decreases
+    ns.delete(3_i64).unwrap();
+    assert_eq!(ns.count().unwrap(), 5);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn exists_after_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path().join("exists_flush"));
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("key1", "val1", None).unwrap();
+    ns.put("key2", "val2", None).unwrap();
+    assert!(ns.exists("key1").unwrap());
+
+    db.flush().unwrap();
+
+    // exists() must still return true after flush
+    assert!(ns.exists("key1").unwrap());
+    assert!(ns.exists("key2").unwrap());
+
+    // Non-existent key should still return false
+    assert!(!ns.exists("nope").unwrap());
+
+    // Deleted key should return false
+    ns.delete("key1").unwrap();
+    assert!(!ns.exists("key1").unwrap());
+
+    db.close().unwrap();
+}
+
+#[test]
+fn delete_range_after_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path().join("delrange_flush"));
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 1..=10_i64 {
+        ns.put(i, format!("v{i}"), None).unwrap();
+    }
+    db.flush().unwrap();
+
+    // Delete range [3, 7) on flushed keys — should delete 3, 4, 5, 6
+    let deleted = ns.delete_range(3_i64, 7_i64, false).unwrap();
+    assert_eq!(deleted, 4);
+    assert_eq!(ns.count().unwrap(), 6);
+
+    // Verify individual keys
+    assert!(ns.exists(2_i64).unwrap());
+    assert!(!ns.exists(3_i64).unwrap());
+    assert!(!ns.exists(6_i64).unwrap());
+    assert!(ns.exists(7_i64).unwrap());
+
+    db.close().unwrap();
+}
+
+#[test]
+fn delete_prefix_after_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path().join("delprefix_flush"));
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("user:alice", "a", None).unwrap();
+    ns.put("user:bob", "b", None).unwrap();
+    ns.put("post:1", "p1", None).unwrap();
+    ns.put("post:2", "p2", None).unwrap();
+    db.flush().unwrap();
+
+    // Delete all keys with prefix "user:" — should delete 2
+    let deleted = ns.delete_prefix("user:").unwrap();
+    assert_eq!(deleted, 2);
+    assert_eq!(ns.count().unwrap(), 2);
+
+    assert!(!ns.exists("user:alice").unwrap());
+    assert!(!ns.exists("user:bob").unwrap());
+    assert!(ns.exists("post:1").unwrap());
+    assert!(ns.exists("post:2").unwrap());
+
+    db.close().unwrap();
+}
+
+#[test]
+fn encrypted_namespace_requires_password_after_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("enc_restart");
+
+    // Open DB and create an encrypted namespace
+    {
+        let config = Config::new(&db_path);
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("secret", Some("mypassword")).unwrap();
+        ns.put("key", "classified", None).unwrap();
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+
+    // Reopen DB and try to open the encrypted namespace without a password
+    {
+        let config = Config::new(&db_path);
+        let db = DB::open(config).unwrap();
+        let err = db.namespace("secret", None).unwrap_err();
+        assert!(
+            matches!(err, Error::EncryptionRequired(_)),
+            "expected EncryptionRequired, got {err:?}"
+        );
+
+        // Opening with password should work
+        let ns = db.namespace("secret", Some("mypassword")).unwrap();
+        assert!(ns.exists("key").unwrap());
+        db.close().unwrap();
+    }
+}
+
+// --- TTL in SSTables (Phase 3) ---
+
+#[test]
+fn ttl_survives_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path().join("ttl_flush"));
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // Put a key with a long TTL (10 seconds)
+    ns.put("ttl_key", "value", Some(Duration::from_secs(10)))
+        .unwrap();
+    // Put a key without TTL
+    ns.put("no_ttl", "value2", None).unwrap();
+
+    db.flush().unwrap();
+
+    // Both should still be accessible after flush
+    assert_eq!(ns.get("ttl_key").unwrap(), Value::from("value"));
+    assert_eq!(ns.get("no_ttl").unwrap(), Value::from("value2"));
+    assert!(ns.exists("ttl_key").unwrap());
+    assert_eq!(ns.count().unwrap(), 2);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn ttl_expires_after_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path().join("ttl_expire"));
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // Put a key with a very short TTL (100ms)
+    ns.put("ephemeral", "gone", Some(Duration::from_millis(100)))
+        .unwrap();
+    ns.put("permanent", "stays", None).unwrap();
+
+    db.flush().unwrap();
+
+    // Wait for expiration
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Expired key should not be found
+    assert!(ns.get("ephemeral").is_err());
+    assert!(!ns.exists("ephemeral").unwrap());
+
+    // Permanent key should still work
+    assert_eq!(ns.get("permanent").unwrap(), Value::from("stays"));
+    assert_eq!(ns.count().unwrap(), 1);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn ttl_survives_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path().join("ttl_compact"));
+    config.write_buffer_size = 256; // Small buffer to force multiple flushes
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // Write keys with TTL and flush twice to create multiple L0 SSTables
+    ns.put("a", "v1", Some(Duration::from_secs(30))).unwrap();
+    ns.put("b", "v2", None).unwrap();
+    db.flush().unwrap();
+
+    ns.put("c", "v3", Some(Duration::from_secs(30))).unwrap();
+    ns.put("d", "v4", None).unwrap();
+    db.flush().unwrap();
+
+    // Compact L0 → L1
+    db.compact().unwrap();
+    db.wait_for_compaction();
+
+    // All keys should still be accessible
+    assert_eq!(ns.get("a").unwrap(), Value::from("v1"));
+    assert_eq!(ns.get("b").unwrap(), Value::from("v2"));
+    assert_eq!(ns.get("c").unwrap(), Value::from("v3"));
+    assert_eq!(ns.get("d").unwrap(), Value::from("v4"));
+    assert_eq!(ns.count().unwrap(), 4);
+
+    db.close().unwrap();
+}

@@ -3,8 +3,8 @@ use std::collections::HashMap;
 /// Cache key: (SSTable ID, block index within the SSTable).
 type CacheKey = (u64, u32);
 
-/// Raw entry parsed from a data block: (key_bytes, revision, value_tag, value_data).
-pub(crate) type RawEntry = (Vec<u8>, u128, u8, Vec<u8>);
+/// Raw entry parsed from a data block: (key_bytes, revision, expires_at_ms, value_tag, value_data).
+pub(crate) type RawEntry = (Vec<u8>, u128, u64, u8, Vec<u8>);
 
 /// Node in the slab-backed doubly-linked LRU list.
 struct LruNode {
@@ -227,12 +227,12 @@ impl BlockCache {
 
 /// Estimate the in-memory size of a block's raw entries.
 ///
-/// Per entry: key_bytes.len() + 16 (revision) + 1 (tag) + value_data.len() + 48 (Vec overhead).
+/// Per entry: key_bytes.len() + 16 (revision) + 8 (expires_at_ms) + 1 (tag) + value_data.len() + 48 (Vec overhead).
 /// Plus 64 bytes for the Vec<RawEntry> itself and node overhead.
 pub(crate) fn estimate_block_size(entries: &[RawEntry]) -> usize {
     let mut size = 64; // Vec + node overhead
-    for (key_bytes, _, _, value_data) in entries {
-        size += key_bytes.len() + 16 + 1 + value_data.len() + 48;
+    for (key_bytes, _, _, _, value_data) in entries {
+        size += key_bytes.len() + 16 + 8 + 1 + value_data.len() + 48;
     }
     size
 }
@@ -243,7 +243,7 @@ mod tests {
 
     fn make_entries(n: usize) -> Vec<RawEntry> {
         (0..n)
-            .map(|i| (vec![i as u8], 0u128, 0x00, vec![i as u8; 10]))
+            .map(|i| (vec![i as u8], 0u128, 0u64, 0x00, vec![i as u8; 10]))
             .collect()
     }
 
@@ -366,8 +366,8 @@ mod tests {
     fn estimate_block_size_works() {
         let entries = make_entries(2);
         let size = estimate_block_size(&entries);
-        // 64 + 2 * (1 + 16 + 1 + 10 + 48) = 64 + 152 = 216
-        assert_eq!(size, 216);
+        // 64 + 2 * (1 + 16 + 8 + 1 + 10 + 48) = 64 + 168 = 232
+        assert_eq!(size, 232);
     }
 
     #[test]

@@ -99,15 +99,20 @@ impl<'db> Namespace<'db> {
         let rev = self.db.generate_revision();
         self.db
             .append_to_aol(&self.name, rev.as_u128(), &key, &value, ttl)?;
-        let (actual_rev, should_flush) = {
+        let (actual_rev, should_flush, should_stall) = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mut mt = mt.lock().unwrap_or_else(|e| e.into_inner());
             let actual_rev = mt.put(key, value, rev, ttl);
             self.db.inc_op_puts();
             let size = mt.approximate_size();
-            (actual_rev, size >= self.db.config().write_buffer_size)
+            let config = self.db.config();
+            let stall = config.write_stall_size > 0 && size >= config.write_stall_size;
+            (actual_rev, size >= config.write_buffer_size, stall)
         };
-        if should_flush {
+        if should_stall {
+            // Backpressure: flush synchronously and block the writer
+            self.db.flush()?;
+        } else if should_flush {
             let _ = self.db.flush(); // best-effort; data is safe in AOL
         }
         Ok(actual_rev)
@@ -231,12 +236,40 @@ impl<'db> Namespace<'db> {
         let start = start.into();
         let end = end.into();
 
-        // Collect keys to delete while holding the memtable lock briefly
-        let keys = {
+        // Collect keys from memtable
+        let (mt_keys, ordered_mode) = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
-            mt.keys_in_range(&start, &end, inclusive)
+            (mt.keys_in_range(&start, &end, inclusive), mt.is_ordered())
         };
+
+        // Collect keys from SSTables in the same range
+        let empty_prefix = Key::Str(String::new());
+        let sst_entries = self
+            .db
+            .scan_from_sstables(&self.name, &empty_prefix, ordered_mode)?;
+
+        // Union memtable + SSTable keys, filtering to range and excluding tombstones
+        let mut keys: std::collections::BTreeSet<Key> = mt_keys.into_iter().collect();
+        for (key, value) in sst_entries {
+            if value.is_tombstone() {
+                continue;
+            }
+            let in_range = if inclusive {
+                key >= start && key <= end
+            } else {
+                key >= start && key < end
+            };
+            if in_range {
+                keys.insert(key);
+            }
+        }
+        // Remove keys that the memtable already knows are tombstoned
+        {
+            let mt = self.db.get_or_create_memtable(&self.name);
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            keys.retain(|k| !matches!(mt.lookup(k), MemLookup::Tombstone));
+        }
 
         let count = keys.len() as u64;
         for key in keys {
@@ -261,11 +294,34 @@ impl<'db> Namespace<'db> {
         if self.db.is_replica() {
             return Err(Error::ReadOnlyReplica);
         }
-        let keys = {
+        let (mt_keys, ordered_mode) = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
-            mt.keys_with_prefix(prefix)
+            (mt.keys_with_prefix(prefix), mt.is_ordered())
         };
+
+        // Scan SSTables for matching prefix keys
+        let prefix_key = Key::Str(prefix.to_owned());
+        let sst_entries = self
+            .db
+            .scan_from_sstables(&self.name, &prefix_key, ordered_mode)?;
+
+        // Union memtable + SSTable keys, filtering by prefix and excluding tombstones
+        let mut keys: std::collections::BTreeSet<Key> = mt_keys.into_iter().collect();
+        for (key, value) in sst_entries {
+            if value.is_tombstone() {
+                continue;
+            }
+            if key.to_string().starts_with(prefix) {
+                keys.insert(key);
+            }
+        }
+        // Remove keys that the memtable already knows are tombstoned
+        {
+            let mt = self.db.get_or_create_memtable(&self.name);
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            keys.retain(|k| !matches!(mt.lookup(k), MemLookup::Tombstone));
+        }
 
         let count = keys.len() as u64;
         for key in keys {
@@ -287,7 +343,18 @@ impl<'db> Namespace<'db> {
         let key = key.into();
         let mt = self.db.get_or_create_memtable(&self.name);
         let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(mt.exists(&key))
+        match mt.lookup(&key) {
+            MemLookup::Found(_) => return Ok(true),
+            MemLookup::Tombstone => return Ok(false),
+            MemLookup::NotFound => {}
+        }
+        drop(mt);
+        // Fall through to SSTables
+        match self.db.get_from_sstables(&self.name, &key)? {
+            Some((v, _rev)) if v.is_tombstone() => Ok(false),
+            Some(_) => Ok(true),
+            None => Ok(false),
+        }
     }
 
     pub fn scan(
@@ -352,9 +419,25 @@ impl<'db> Namespace<'db> {
     }
 
     pub fn count(&self) -> Result<u64> {
-        let mt = self.db.get_or_create_memtable(&self.name);
-        let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(mt.count())
+        let (mt_entries, ordered_mode) = {
+            let mt = self.db.get_or_create_memtable(&self.name);
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            (mt.scan_all_raw(&Key::Str(String::new())), mt.is_ordered())
+        };
+
+        // Merge SSTable entries with memtable entries (memtable wins)
+        let empty_prefix = Key::Str(String::new());
+        let mut merged = self
+            .db
+            .scan_from_sstables(&self.name, &empty_prefix, ordered_mode)?;
+        for (key, value) in mt_entries {
+            merged.insert(key, value);
+        }
+
+        Ok(merged
+            .into_iter()
+            .filter(|(_, v)| !v.is_tombstone())
+            .count() as u64)
     }
 
     /// Returns the total number of revisions for a key.
