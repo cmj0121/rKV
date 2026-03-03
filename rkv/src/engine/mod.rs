@@ -39,6 +39,20 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Current time as epoch milliseconds.
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Check if an `expires_at_ms` timestamp has passed.
+/// Returns `false` for 0 (no expiration).
+fn is_expired(expires_at_ms: u64) -> bool {
+    expires_at_ms != 0 && now_epoch_ms() >= expires_at_ms
+}
+
 /// Default namespace name.
 pub const DEFAULT_NAMESPACE: &str = "_";
 
@@ -190,6 +204,11 @@ pub struct Config {
     pub primary_addr: Option<String>,
     /// Peer addresses for master-master replication (peer only).
     pub peers: Vec<String>,
+    /// Write stall threshold in bytes (default: 2 * write_buffer_size).
+    /// When a namespace's memtable exceeds this size, `put()` blocks until
+    /// the flush thread drains it below `write_buffer_size`.
+    /// Set to 0 to disable write stalling.
+    pub write_stall_size: usize,
 }
 
 impl Config {
@@ -219,6 +238,7 @@ impl Config {
             repl_port: 8322,
             primary_addr: None,
             peers: Vec::new(),
+            write_stall_size: 8 * 1024 * 1024,
         }
     }
 }
@@ -582,8 +602,8 @@ impl DB {
                     bloom_prefix_len,
                     &*io_backend,
                 )?;
-                for (key, value, revision) in &entries {
-                    writer.add(key, value, *revision)?;
+                for (key, value, revision, expires_at_ms) in &entries {
+                    writer.add(key, value, *revision, *expires_at_ms)?;
                 }
                 writer.finish()?;
 
@@ -1010,9 +1030,11 @@ impl DB {
                 let peer_sessions_for_broadcast = Arc::clone(&self.peer_sessions);
                 let broadcast_fn: repl_peer::PeerBroadcastFn =
                     Arc::new(move |payload: &[u8], from_cluster: u16| {
-                        let sessions = peer_sessions_for_broadcast
+                        let mut sessions = peer_sessions_for_broadcast
                             .lock()
                             .unwrap_or_else(|e| e.into_inner());
+                        // Clean up dead sessions before broadcasting
+                        sessions.retain(|s| s.is_alive());
                         for session in sessions.iter() {
                             // Don't send back to the source peer
                             if session.remote_cluster_id() != from_cluster {
@@ -1338,6 +1360,24 @@ impl DB {
                 )));
             }
         } else {
+            // Check on-disk encryption marker for namespaces not yet seen
+            // this session. This handles the case where the DB is reopened
+            // and the in-memory map is empty.
+            let meta_path = self.sst_namespace_dir(name).join("ns.meta");
+            let persisted_encrypted = meta_path.exists();
+            if persisted_encrypted && !encrypted {
+                map.insert(name.to_owned(), true);
+                return Err(Error::EncryptionRequired(format!(
+                    "namespace '{name}' requires a password"
+                )));
+            }
+            if !persisted_encrypted && encrypted {
+                // Write encryption marker to disk
+                let ns_dir = self.sst_namespace_dir(name);
+                fs::create_dir_all(&ns_dir)?;
+                fs::write(&meta_path, b"encrypted")?;
+            }
+
             map.insert(name.to_owned(), encrypted);
             drop(map);
 
@@ -1552,8 +1592,8 @@ impl DB {
                 self.config.bloom_prefix_len,
                 &*self.io_backend,
             )?;
-            for (key, value, revision) in &entries {
-                writer.add(key, value, *revision)?;
+            for (key, value, revision, expires_at_ms) in &entries {
+                writer.add(key, value, *revision, *expires_at_ms)?;
             }
             writer.finish()?;
 
@@ -1871,7 +1911,7 @@ impl DB {
                     if level_idx == 0 {
                         // L0: reverse (oldest-to-newest within L0)
                         for reader in level_readers.iter().rev() {
-                            for (key, value, _rev) in
+                            for (key, value, _rev, _exp) in
                                 reader.iter_entries(self.config.verify_checksums)?
                             {
                                 merged.insert(key, value);
@@ -1879,7 +1919,7 @@ impl DB {
                         }
                     } else {
                         for reader in level_readers {
-                            for (key, value, _rev) in
+                            for (key, value, _rev, _exp) in
                                 reader.iter_entries(self.config.verify_checksums)?
                             {
                                 merged.insert(key, value);
@@ -1991,16 +2031,28 @@ impl DB {
         *done = false;
     }
 
-    /// Check if any namespace's L0 level exceeds the compaction thresholds.
+    /// Check if any namespace's L0 level exceeds the compaction thresholds,
+    /// or if any L1+ level exceeds its max size.
     fn check_should_compact(sstables: &RwLock<LeveledSSTables>, config: &Config) -> bool {
         let sst = sstables.read().unwrap_or_else(|e| e.into_inner());
         for (_ns, levels) in sst.iter() {
+            // L0: check count and size thresholds
             if let Some(l0_readers) = levels.first() {
                 if l0_readers.len() >= config.l0_max_count {
                     return true;
                 }
                 let l0_size: usize = l0_readers.iter().map(|r| r.size_bytes()).sum();
                 if l0_size >= config.l0_max_size {
+                    return true;
+                }
+            }
+            // L1+: check if any level exceeds its max size
+            for level in 1..config.max_levels {
+                let total_size: usize = levels
+                    .get(level)
+                    .map(|readers| readers.iter().map(|r| r.size_bytes()).sum())
+                    .unwrap_or(0);
+                if total_size >= Self::do_level_max_size(config, level) {
                     return true;
                 }
             }
@@ -2141,12 +2193,14 @@ impl DB {
             // Merge all entries: process oldest-to-newest so newer values
             // overwrite older ones in the BTreeMap.
             let mut merged =
-                std::collections::BTreeMap::<Key, (Value, revision::RevisionID)>::new();
+                std::collections::BTreeMap::<Key, (Value, revision::RevisionID, u64)>::new();
 
             // Target entries are oldest
             for reader in target {
-                for (key, value, rev) in reader.iter_entries(config.verify_checksums)? {
-                    merged.insert(key, (value, rev));
+                for (key, value, rev, expires_at_ms) in
+                    reader.iter_entries(config.verify_checksums)?
+                {
+                    merged.insert(key, (value, rev, expires_at_ms));
                 }
             }
 
@@ -2154,20 +2208,26 @@ impl DB {
             // L1+ iterate in natural order.
             if source_level == 0 {
                 for reader in source.iter().rev() {
-                    for (key, value, rev) in reader.iter_entries(config.verify_checksums)? {
-                        merged.insert(key, (value, rev));
+                    for (key, value, rev, expires_at_ms) in
+                        reader.iter_entries(config.verify_checksums)?
+                    {
+                        merged.insert(key, (value, rev, expires_at_ms));
                     }
                 }
             } else {
                 for reader in source {
-                    for (key, value, rev) in reader.iter_entries(config.verify_checksums)? {
-                        merged.insert(key, (value, rev));
+                    for (key, value, rev, expires_at_ms) in
+                        reader.iter_entries(config.verify_checksums)?
+                    {
+                        merged.insert(key, (value, rev, expires_at_ms));
                     }
                 }
             }
 
             if drop_tombstones {
-                merged.retain(|_, (v, _)| !v.is_tombstone());
+                merged.retain(|_, (v, _, expires_at_ms)| {
+                    !v.is_tombstone() && !is_expired(*expires_at_ms)
+                });
             }
 
             // Collect source file paths for cleanup by scanning disk
@@ -2229,8 +2289,8 @@ impl DB {
             config.bloom_prefix_len,
             &**io,
         )?;
-        for (key, (value, rev)) in &merged {
-            writer.add(key, value, *rev)?;
+        for (key, (value, rev, expires_at_ms)) in &merged {
+            writer.add(key, value, *rev, *expires_at_ms)?;
         }
         writer.finish()?;
 
@@ -2303,7 +2363,9 @@ impl DB {
             if let Some(levels) = sst.get(ns) {
                 for level_readers in levels {
                     for reader in level_readers {
-                        for (_key, value, _rev) in reader.iter_entries(config.verify_checksums)? {
+                        for (_key, value, _rev, _exp) in
+                            reader.iter_entries(config.verify_checksums)?
+                        {
                             if let Value::Pointer(vp) = value {
                                 hashes.insert(vp.hex_hash());
                             }
@@ -2543,21 +2605,31 @@ impl DB {
                 if level_idx == 0 {
                     // L0: reverse (oldest-to-newest within L0)
                     for reader in level_readers.iter().rev() {
-                        for (key, value, _rev) in reader.scan_entries(
+                        for (key, value, _rev, expires_at_ms) in reader.scan_entries(
                             &prefix_bytes,
                             effective_ordered,
                             self.config.verify_checksums,
                         )? {
+                            let value = if is_expired(expires_at_ms) {
+                                Value::tombstone()
+                            } else {
+                                value
+                            };
                             merged.insert(key, value);
                         }
                     }
                 } else {
                     for reader in level_readers {
-                        for (key, value, _rev) in reader.scan_entries(
+                        for (key, value, _rev, expires_at_ms) in reader.scan_entries(
                             &prefix_bytes,
                             effective_ordered,
                             self.config.verify_checksums,
                         )? {
+                            let value = if is_expired(expires_at_ms) {
+                                Value::tombstone()
+                            } else {
+                                value
+                            };
                             merged.insert(key, value);
                         }
                     }
@@ -2591,21 +2663,31 @@ impl DB {
             for (level_idx, level_readers) in levels.iter().enumerate().rev() {
                 if level_idx == 0 {
                     for reader in level_readers.iter().rev() {
-                        for (key, value, _rev) in reader.rscan_entries(
+                        for (key, value, _rev, expires_at_ms) in reader.rscan_entries(
                             &prefix_bytes,
                             ordered_mode,
                             self.config.verify_checksums,
                         )? {
+                            let value = if is_expired(expires_at_ms) {
+                                Value::tombstone()
+                            } else {
+                                value
+                            };
                             merged.insert(key, value);
                         }
                     }
                 } else {
                     for reader in level_readers {
-                        for (key, value, _rev) in reader.rscan_entries(
+                        for (key, value, _rev, expires_at_ms) in reader.rscan_entries(
                             &prefix_bytes,
                             ordered_mode,
                             self.config.verify_checksums,
                         )? {
+                            let value = if is_expired(expires_at_ms) {
+                                Value::tombstone()
+                            } else {
+                                value
+                            };
                             merged.insert(key, value);
                         }
                     }
@@ -2621,6 +2703,9 @@ impl DB {
     /// Searches L0 (newest-first), then L1, L2, etc. Returns:
     /// - `Ok(Some((value, revision)))` if found (may be `Tombstone`)
     /// - `Ok(None)` if not found in any SSTable
+    ///
+    /// Expired entries (non-zero `expires_at_ms` <= now) are treated as
+    /// tombstones.
     pub(crate) fn get_from_sstables(
         &self,
         ns: &str,
@@ -2630,8 +2715,13 @@ impl DB {
         if let Some(levels) = sst.get(ns) {
             for level_readers in levels {
                 for reader in level_readers {
-                    if let Some(vr) = reader.get(key, self.config.verify_checksums)? {
-                        return Ok(Some(vr));
+                    if let Some((value, rev, expires_at_ms)) =
+                        reader.get(key, self.config.verify_checksums)?
+                    {
+                        if is_expired(expires_at_ms) {
+                            return Ok(Some((Value::tombstone(), rev)));
+                        }
+                        return Ok(Some((value, rev)));
                     }
                 }
             }

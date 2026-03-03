@@ -746,6 +746,11 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                     "L2+ default size cap",
                     format_bytes(c.default_max_size),
                 ),
+                (
+                    "  lsm.write_stall_size",
+                    "backpressure threshold",
+                    format_bytes(c.write_stall_size),
+                ),
                 ("", "", String::new()),
                 ("Objects", "", String::new()),
                 (
@@ -1090,6 +1095,13 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
         "lsm.default_max_size" => match value.parse::<usize>() {
             Ok(v) => {
                 c.default_max_size = v;
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected a number"),
+        },
+        "lsm.write_stall_size" => match value.parse::<usize>() {
+            Ok(v) => {
+                c.write_stall_size = v;
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected a number"),

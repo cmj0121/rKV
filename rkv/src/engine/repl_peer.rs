@@ -274,22 +274,58 @@ impl PeerSession {
     }
 
     /// Send an AOL record to this peer.
+    ///
+    /// Returns `true` if the message was enqueued. When the channel is full,
+    /// the session is disconnected (triggering a full re-sync on reconnect)
+    /// and `false` is returned.
     pub(crate) fn send(&self, payload: &[u8]) -> bool {
-        self.writer_tx
-            .try_send(PeerMsg::Aol(payload.to_vec()))
-            .is_ok()
+        match self.writer_tx.try_send(PeerMsg::Aol(payload.to_vec())) {
+            Ok(()) => true,
+            Err(mpsc::TrySendError::Full(_)) => {
+                eprintln!(
+                    "[rkv] peer {} channel full — disconnecting to trigger re-sync",
+                    self.remote_cluster_id
+                );
+                self.stop.store(true, Ordering::Relaxed);
+                false
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => false,
+        }
     }
 
     /// Send a flush notification to this peer.
     pub(crate) fn send_flush(&self) -> bool {
-        self.writer_tx.try_send(PeerMsg::Flush).is_ok()
+        match self.writer_tx.try_send(PeerMsg::Flush) {
+            Ok(()) => true,
+            Err(mpsc::TrySendError::Full(_)) => {
+                eprintln!(
+                    "[rkv] peer {} channel full (flush) — disconnecting to trigger re-sync",
+                    self.remote_cluster_id
+                );
+                self.stop.store(true, Ordering::Relaxed);
+                false
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => false,
+        }
     }
 
     /// Send a drop-namespace command to this peer.
     pub(crate) fn send_drop_namespace(&self, namespace: &str) -> bool {
-        self.writer_tx
+        match self
+            .writer_tx
             .try_send(PeerMsg::DropNamespace(namespace.to_owned()))
-            .is_ok()
+        {
+            Ok(()) => true,
+            Err(mpsc::TrySendError::Full(_)) => {
+                eprintln!(
+                    "[rkv] peer {} channel full (drop_ns) — disconnecting to trigger re-sync",
+                    self.remote_cluster_id
+                );
+                self.stop.store(true, Ordering::Relaxed);
+                false
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => false,
+        }
     }
 
     /// Returns the remote peer's cluster ID.
