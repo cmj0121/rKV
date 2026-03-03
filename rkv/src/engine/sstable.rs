@@ -690,7 +690,6 @@ impl SSTableReader {
     /// Returns all matching entries in oldest-first order (the natural
     /// SSTable storage order). Uses bloom filter and binary search for
     /// fast block selection.
-    #[allow(dead_code)]
     pub(crate) fn get_all_revisions(
         &self,
         key: &Key,

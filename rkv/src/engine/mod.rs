@@ -2730,7 +2730,6 @@ impl DB {
     }
 
     /// Count all non-expired revisions for a key across all SSTable levels.
-    #[allow(dead_code)]
     pub(crate) fn count_revisions_from_sstables(&self, ns: &str, key: &Key) -> Result<u64> {
         let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
         let mut count = 0u64;
@@ -2755,7 +2754,6 @@ impl DB {
     /// Collects all non-expired revisions in chronological order:
     /// deepest level first (L_max → L1 → L0 oldest-to-newest).
     /// Index 0 = oldest revision across all SSTables.
-    #[allow(dead_code)]
     pub(crate) fn get_revision_from_sstables(
         &self,
         ns: &str,
