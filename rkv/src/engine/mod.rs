@@ -582,7 +582,7 @@ impl DB {
                     if mt.is_empty() {
                         continue;
                     }
-                    mt.drain_latest()
+                    mt.drain_all()
                 };
 
                 if entries.is_empty() {
@@ -1571,7 +1571,7 @@ impl DB {
                 if mt.is_empty() {
                     continue;
                 }
-                mt.drain_latest()
+                mt.drain_all()
             };
 
             if entries.is_empty() {

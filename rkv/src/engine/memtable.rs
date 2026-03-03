@@ -529,6 +529,7 @@ impl MemTable {
     /// Expired entries are flushed as tombstones so they remain visible to
     /// "show deleted" scans after the memtable is drained. Compaction will
     /// eventually garbage-collect them.
+    #[cfg(test)]
     pub(crate) fn drain_latest(&mut self) -> Vec<(Key, Value, RevisionID, u64)> {
         let entries = std::mem::take(&mut self.entries);
         self.last_rev.clear();
@@ -570,7 +571,6 @@ impl MemTable {
     /// Expired entries are flushed as tombstones so they remain visible to
     /// "show deleted" scans after the memtable is drained. Compaction will
     /// eventually garbage-collect them.
-    #[allow(dead_code)]
     pub(crate) fn drain_all(&mut self) -> Vec<(Key, Value, RevisionID, u64)> {
         let entries = std::mem::take(&mut self.entries);
         self.last_rev.clear();
