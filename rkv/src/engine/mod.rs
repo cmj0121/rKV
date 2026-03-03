@@ -2190,17 +2190,19 @@ impl DB {
                 return Ok(0);
             }
 
-            // Merge all entries: process oldest-to-newest so newer values
-            // overwrite older ones in the BTreeMap.
+            // Merge all entries preserving all revisions per key.
             let mut merged =
-                std::collections::BTreeMap::<Key, (Value, revision::RevisionID, u64)>::new();
+                std::collections::BTreeMap::<Key, Vec<(Value, revision::RevisionID, u64)>>::new();
 
             // Target entries are oldest
             for reader in target {
                 for (key, value, rev, expires_at_ms) in
                     reader.iter_entries(config.verify_checksums)?
                 {
-                    merged.insert(key, (value, rev, expires_at_ms));
+                    merged
+                        .entry(key)
+                        .or_default()
+                        .push((value, rev, expires_at_ms));
                 }
             }
 
@@ -2211,7 +2213,10 @@ impl DB {
                     for (key, value, rev, expires_at_ms) in
                         reader.iter_entries(config.verify_checksums)?
                     {
-                        merged.insert(key, (value, rev, expires_at_ms));
+                        merged
+                            .entry(key)
+                            .or_default()
+                            .push((value, rev, expires_at_ms));
                     }
                 }
             } else {
@@ -2219,14 +2224,34 @@ impl DB {
                     for (key, value, rev, expires_at_ms) in
                         reader.iter_entries(config.verify_checksums)?
                     {
-                        merged.insert(key, (value, rev, expires_at_ms));
+                        merged
+                            .entry(key)
+                            .or_default()
+                            .push((value, rev, expires_at_ms));
                     }
                 }
             }
 
+            // Sort revisions within each key by revision ID
+            for revisions in merged.values_mut() {
+                revisions.sort_by_key(|(_, rev, _)| *rev);
+            }
+
             if drop_tombstones {
-                merged.retain(|_, (v, _, expires_at_ms)| {
-                    !v.is_tombstone() && !is_expired(*expires_at_ms)
+                // At the bottom level, drop entire keys whose latest revision
+                // is a tombstone or expired — that key is fully deleted.
+                // For other keys, remove only individual expired entries.
+                merged.retain(|_, revisions| {
+                    if let Some((v, _, expires_at_ms)) = revisions.last() {
+                        if v.is_tombstone() || is_expired(*expires_at_ms) {
+                            return false; // drop entire key
+                        }
+                    }
+                    // Remove individual expired entries (intermediate revisions)
+                    revisions.retain(|(v, _, expires_at_ms)| {
+                        !v.is_tombstone() && !is_expired(*expires_at_ms)
+                    });
+                    !revisions.is_empty()
                 });
             }
 
@@ -2289,8 +2314,10 @@ impl DB {
             config.bloom_prefix_len,
             &**io,
         )?;
-        for (key, (value, rev, expires_at_ms)) in &merged {
-            writer.add(key, value, *rev, *expires_at_ms)?;
+        for (key, revisions) in &merged {
+            for (value, rev, expires_at_ms) in revisions {
+                writer.add(key, value, *rev, *expires_at_ms)?;
+            }
         }
         writer.finish()?;
 
