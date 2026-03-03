@@ -523,16 +523,6 @@ impl MemTable {
 
     /// Drain the latest value for each key in sorted order.
     ///
-    /// Returns a `Vec<(Key, Value, RevisionID)>` containing the most recent
-    /// non-expired value (plus its revision) for every key, **including
-    /// tombstones** (needed for correctness when flushing to SSTable — a
-    /// tombstone must shadow older SSTables).
-    ///
-    /// Expired entries are flushed as tombstones so they remain visible to
-    /// "show deleted" scans after the memtable is drained. Compaction will
-    /// eventually garbage-collect them.
-    /// Drain the latest value for each key in sorted order.
-    ///
     /// Returns `Vec<(Key, Value, RevisionID, expires_at_ms)>` where
     /// `expires_at_ms` is the absolute epoch time (0 = no expiration).
     ///
@@ -565,6 +555,46 @@ impl MemTable {
                     result.push((key, latest.value.clone(), rev, epoch_expires));
                 } else {
                     result.push((key, latest.value.clone(), rev, 0));
+                }
+            }
+        }
+        result
+    }
+
+    /// Drain ALL revision entries for each key in sorted order.
+    ///
+    /// Returns `Vec<(Key, Value, RevisionID, expires_at_ms)>` containing
+    /// every revision (oldest first within each key), preserving full
+    /// history for SSTable persistence. Keys are sorted by BTreeMap order.
+    ///
+    /// Expired entries are flushed as tombstones so they remain visible to
+    /// "show deleted" scans after the memtable is drained. Compaction will
+    /// eventually garbage-collect them.
+    #[allow(dead_code)]
+    pub(crate) fn drain_all(&mut self) -> Vec<(Key, Value, RevisionID, u64)> {
+        let entries = std::mem::take(&mut self.entries);
+        self.last_rev.clear();
+        self.approximate_size = 0;
+
+        let now = Instant::now();
+        let mut result = Vec::new();
+        for (key, revisions) in entries {
+            for entry in revisions {
+                let rev = entry.revision;
+                if let Some(expires_at) = entry.expires_at {
+                    if now > expires_at {
+                        result.push((key.clone(), Value::tombstone(), rev, 0));
+                        continue;
+                    }
+                    let remaining = expires_at - now;
+                    let epoch_now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let epoch_expires = epoch_now + remaining.as_millis() as u64;
+                    result.push((key.clone(), entry.value.clone(), rev, epoch_expires));
+                } else {
+                    result.push((key.clone(), entry.value.clone(), rev, 0));
                 }
             }
         }
@@ -1388,5 +1418,97 @@ mod tests {
         assert!(!mt.exists(&Key::Int(1)));
         assert_eq!(mt.ttl(&Key::Int(1)), None);
         assert_eq!(mt.count(), 0);
+    }
+
+    #[test]
+    fn drain_all_returns_all_revisions() {
+        let mut mt = MemTable::new();
+        mt.put(
+            Key::Int(1),
+            Value::from("v1"),
+            RevisionID::from(1u128),
+            None,
+        );
+        mt.put(
+            Key::Int(1),
+            Value::from("v2"),
+            RevisionID::from(2u128),
+            None,
+        );
+        mt.put(
+            Key::Int(1),
+            Value::from("v3"),
+            RevisionID::from(3u128),
+            None,
+        );
+
+        let entries = mt.drain_all();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].1, Value::from("v1"));
+        assert_eq!(entries[1].1, Value::from("v2"));
+        assert_eq!(entries[2].1, Value::from("v3"));
+    }
+
+    #[test]
+    fn drain_all_preserves_order() {
+        let mut mt = MemTable::new();
+        mt.put(Key::Int(1), Value::from("a"), RevisionID::from(1u128), None);
+        mt.put(Key::Int(2), Value::from("b"), RevisionID::from(2u128), None);
+        mt.put(Key::Int(1), Value::from("c"), RevisionID::from(3u128), None);
+
+        let entries = mt.drain_all();
+        // Key 1 entries first (sorted by key), then key 2
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].0, Key::Int(1));
+        assert_eq!(entries[0].1, Value::from("a"));
+        assert_eq!(entries[1].0, Key::Int(1));
+        assert_eq!(entries[1].1, Value::from("c"));
+        assert_eq!(entries[2].0, Key::Int(2));
+        assert_eq!(entries[2].1, Value::from("b"));
+    }
+
+    #[test]
+    fn drain_all_converts_expired() {
+        let mut mt = MemTable::new();
+        mt.put(
+            Key::Int(1),
+            Value::from("alive"),
+            RevisionID::from(1u128),
+            None,
+        );
+        mt.put(
+            Key::Int(1),
+            Value::from("will_expire"),
+            RevisionID::from(2u128),
+            Some(Duration::from_millis(1)),
+        );
+        std::thread::sleep(Duration::from_millis(5));
+
+        let entries = mt.drain_all();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].1, Value::from("alive"));
+        assert!(entries[1].1.is_tombstone()); // expired → tombstone
+    }
+
+    #[test]
+    fn drain_all_clears_memtable() {
+        let mut mt = MemTable::new();
+        mt.put(
+            Key::Int(1),
+            Value::from("v1"),
+            RevisionID::from(1u128),
+            None,
+        );
+        mt.put(
+            Key::Int(1),
+            Value::from("v2"),
+            RevisionID::from(2u128),
+            None,
+        );
+
+        let entries = mt.drain_all();
+        assert_eq!(entries.len(), 2);
+        assert!(mt.is_empty());
+        assert_eq!(mt.approximate_size(), 0);
     }
 }
