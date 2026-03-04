@@ -90,6 +90,20 @@ fn bench_get(n: usize) -> std::time::Duration {
     let mut indices: Vec<i64> = (0..n as i64).collect();
     fastrand::shuffle(&mut indices);
 
+    // Verify all keys exist before timing
+    let mut missing = 0;
+    for &i in &indices {
+        if ns.get(i).is_err() {
+            if missing == 0 {
+                eprintln!("  MISSING key: {i}");
+            }
+            missing += 1;
+        }
+    }
+    if missing > 0 {
+        panic!("{missing} keys missing out of {n}");
+    }
+
     let start = Instant::now();
     for &i in &indices {
         ns.get(i).unwrap();

@@ -5178,3 +5178,73 @@ fn compaction_merges_revision_chains() {
 
     db.close().unwrap();
 }
+
+/// Regression test: large datasets with auto-flush should not lose keys.
+/// Reproduces a bug where SSTableReader::get() fails to find keys after
+/// auto-flush creates multiple L0 SSTables.
+#[test]
+fn get_after_auto_flush_large_dataset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.write_buffer_size = 4096; // tiny buffer -> many auto-flushes
+    config.l0_max_count = 10000; // disable compaction
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let n = 10_000;
+    let value = "x".repeat(64);
+    for i in 0..n {
+        ns.put(i as i64, value.as_str(), None).unwrap();
+    }
+
+    // Verify all keys are readable
+    let mut missing = Vec::new();
+    for i in 0..n {
+        if ns.get(i as i64).is_err() {
+            missing.push(i);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "{} keys missing out of {n}: first 10 = {:?}",
+        missing.len(),
+        &missing[..missing.len().min(10)]
+    );
+
+    db.close().unwrap();
+}
+
+/// Same test but WITH compaction enabled to check merge correctness.
+#[test]
+fn get_after_auto_flush_with_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.write_buffer_size = 4096;
+    // default l0_max_count allows compaction
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let n = 10_000;
+    let value = "x".repeat(64);
+    for i in 0..n {
+        ns.put(i as i64, value.as_str(), None).unwrap();
+    }
+
+    // Wait for compaction to finish
+    db.wait_for_compaction();
+
+    let mut missing = Vec::new();
+    for i in 0..n {
+        if ns.get(i as i64).is_err() {
+            missing.push(i);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "{} keys missing out of {n}: first 10 = {:?}",
+        missing.len(),
+        &missing[..missing.len().min(10)]
+    );
+
+    db.close().unwrap();
+}

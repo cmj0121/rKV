@@ -406,6 +406,7 @@ impl DB {
             let sst_sequence = Arc::clone(&sst_sequence);
             let block_cache = block_cache.clone();
             let io = Arc::clone(&io_backend);
+            let ns_data = Arc::clone(&namespace_data);
 
             Some(thread::spawn(move || {
                 loop {
@@ -443,8 +444,14 @@ impl DB {
                         if !DB::check_should_compact(&sstables, &config) {
                             break;
                         }
-                        let _ =
-                            DB::do_compact(&config, &sstables, &sst_sequence, &block_cache, &io);
+                        let _ = DB::do_compact(
+                            &config,
+                            &sstables,
+                            &sst_sequence,
+                            &block_cache,
+                            &io,
+                            &ns_data,
+                        );
                     }
 
                     // Signal wait_for_compaction() callers
@@ -2000,6 +2007,7 @@ impl DB {
             &self.sst_sequence,
             &self.block_cache,
             &self.io_backend,
+            &self.namespace_data,
         )
     }
 
@@ -2067,6 +2075,7 @@ impl DB {
         sst_sequence: &AtomicU64,
         block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
         io: &Arc<dyn io::IoBackend>,
+        namespace_data: &RwLock<HashMap<String, Mutex<memtable::MemTable>>>,
     ) -> Result<()> {
         let namespaces: Vec<String> = {
             let sst = sstables.read().unwrap_or_else(|e| e.into_inner());
@@ -2074,7 +2083,15 @@ impl DB {
         };
 
         for ns_name in &namespaces {
-            Self::do_compact_namespace(ns_name, config, sstables, sst_sequence, block_cache, io)?;
+            Self::do_compact_namespace(
+                ns_name,
+                config,
+                sstables,
+                sst_sequence,
+                block_cache,
+                io,
+                namespace_data,
+            )?;
         }
 
         Ok(())
@@ -2088,6 +2105,7 @@ impl DB {
         sst_sequence: &AtomicU64,
         block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
         io: &Arc<dyn io::IoBackend>,
+        namespace_data: &RwLock<HashMap<String, Mutex<memtable::MemTable>>>,
     ) -> Result<()> {
         let max_levels = config.max_levels;
 
@@ -2143,7 +2161,7 @@ impl DB {
         }
 
         // Step 3: garbage-collect orphaned bin objects
-        Self::do_gc_orphaned_objects(ns, config, sstables, io)?;
+        Self::do_gc_orphaned_objects(ns, config, sstables, io, namespace_data)?;
 
         Ok(())
     }
@@ -2170,7 +2188,7 @@ impl DB {
         block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
         io: &Arc<dyn io::IoBackend>,
     ) -> Result<usize> {
-        let (source_paths, merged) = {
+        let (merged_sst_ids, source_paths, merged) = {
             let sst = sstables.read().unwrap_or_else(|e| e.into_inner());
             let levels = match sst.get(ns) {
                 Some(l) => l,
@@ -2188,6 +2206,25 @@ impl DB {
 
             if source.is_empty() {
                 return Ok(0);
+            }
+
+            // Record the sst_ids of readers being merged so we only clean up
+            // exactly these files/readers (not ones added by concurrent flush).
+            let mut merged_sst_ids: Vec<u64> = Vec::with_capacity(source.len() + target.len());
+            for r in source.iter().chain(target.iter()) {
+                merged_sst_ids.push(r.sst_id());
+            }
+
+            // Build file paths from known sst_ids instead of scanning directories
+            // to avoid picking up files from concurrent auto-flush.
+            let mut source_paths = Vec::with_capacity(merged_sst_ids.len());
+            let source_dir = Self::static_sst_level_dir(&config.path, ns, source_level);
+            for r in source {
+                source_paths.push(source_dir.join(format!("{:06}.sst", r.sst_id())));
+            }
+            let target_dir_path = Self::static_sst_level_dir(&config.path, ns, target_level);
+            for r in target {
+                source_paths.push(target_dir_path.join(format!("{:06}.sst", r.sst_id())));
             }
 
             // Merge all entries preserving all revisions per key.
@@ -2255,22 +2292,7 @@ impl DB {
                 });
             }
 
-            // Collect source file paths for cleanup by scanning disk
-            let mut source_paths = Vec::new();
-            for level in [source_level, target_level] {
-                let level_dir = Self::static_sst_level_dir(&config.path, ns, level);
-                if level_dir.exists() {
-                    for entry in fs::read_dir(&level_dir)? {
-                        let entry = entry?;
-                        let fname = entry.file_name().to_string_lossy().to_string();
-                        if fname.ends_with(".sst") {
-                            source_paths.push(entry.path());
-                        }
-                    }
-                }
-            }
-
-            (source_paths, merged)
+            (merged_sst_ids, source_paths, merged)
         };
 
         if merged.is_empty() {
@@ -2282,19 +2304,16 @@ impl DB {
             if let Some(levels) = sst.get_mut(ns) {
                 if let Some(ref bc) = block_cache {
                     let mut cache = bc.lock().unwrap_or_else(|e| e.into_inner());
-                    for level in [source_level, target_level] {
-                        if let Some(readers) = levels.get(level) {
-                            for r in readers {
-                                cache.evict_sst(r.sst_id());
-                            }
-                        }
+                    for id in &merged_sst_ids {
+                        cache.evict_sst(*id);
                     }
                 }
+                // Only remove readers that were part of this merge
                 if let Some(s) = levels.get_mut(source_level) {
-                    s.clear();
+                    s.retain(|r| !merged_sst_ids.contains(&r.sst_id()));
                 }
                 if let Some(t) = levels.get_mut(target_level) {
-                    t.clear();
+                    t.retain(|r| !merged_sst_ids.contains(&r.sst_id()));
                 }
             }
             return Ok(0);
@@ -2332,26 +2351,26 @@ impl DB {
         let mut sst = sstables.write().unwrap_or_else(|e| e.into_inner());
         let levels = sst.entry(ns.to_owned()).or_insert_with(|| vec![Vec::new()]);
 
-        // Evict old SSTable blocks from the cache before dropping readers
+        // Evict only the merged readers' blocks from the cache
         if let Some(ref bc) = block_cache {
             let mut cache = bc.lock().unwrap_or_else(|e| e.into_inner());
-            for level in [source_level, target_level] {
-                if let Some(readers) = levels.get(level) {
-                    for r in readers {
-                        cache.evict_sst(r.sst_id());
-                    }
-                }
+            for id in &merged_sst_ids {
+                cache.evict_sst(*id);
             }
         }
 
+        // Only remove readers that were part of this merge (not ones added
+        // by concurrent auto-flush).
         if let Some(s) = levels.get_mut(source_level) {
-            s.clear();
+            s.retain(|r| !merged_sst_ids.contains(&r.sst_id()));
         }
 
         while levels.len() <= target_level {
             levels.push(Vec::new());
         }
-        levels[target_level] = vec![reader];
+        // Remove merged target readers and append the new merged output
+        levels[target_level].retain(|r| !merged_sst_ids.contains(&r.sst_id()));
+        levels[target_level].push(reader);
 
         Ok(output_size)
     }
@@ -2378,10 +2397,26 @@ impl DB {
         config: &Config,
         sstables: &RwLock<LeveledSSTables>,
         io: &Arc<dyn io::IoBackend>,
+        namespace_data: &RwLock<HashMap<String, Mutex<memtable::MemTable>>>,
     ) -> Result<()> {
         let obj_dir = config.path.join("objects").join(ns);
         if !obj_dir.exists() {
             return Ok(());
+        }
+
+        // Skip GC if the memtable has entries. Object files are written
+        // before the ValuePointer is inserted into the memtable (no lock
+        // held during file I/O), so concurrent puts could create objects
+        // that aren't yet reflected in the memtable. Deferring GC until
+        // the memtable is empty avoids deleting live objects.
+        {
+            let ns_map = namespace_data.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(mt_mutex) = ns_map.get(ns) {
+                let mt = mt_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                if !mt.is_empty() {
+                    return Ok(());
+                }
+            }
         }
 
         let live_hashes: std::collections::HashSet<String> = {
