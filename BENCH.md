@@ -11,7 +11,7 @@
 | Cores  | 2                               |
 | Memory | 7 GB                            |
 | Rust   | 1.93.1 (01f6ddf75 2026-02-11)   |
-| Date   | 2026-02-26                      |
+| Date   | 2026-03-04                      |
 
 ## Methodology
 
@@ -33,14 +33,14 @@ Wall-clock time is measured via `std::time::Instant`.
 
 | Operation | 1K       | 8K        | 16K       | 1M        |
 | --------- | -------- | --------- | --------- | --------- |
-| put       | 685 µs   | 7.14 ms   | 13.71 ms  | 909.07 ms |
-| get       | 197 µs   | 2.09 ms   | 4.74 ms   | 700.01 ms |
-| delete    | 372 µs   | 3.06 ms   | 6.17 ms   | 555.23 ms |
-| scan      | 165 µs   | 2.34 ms   | 4.89 ms   | 329.60 ms |
-| flush     | 618 µs   | 3.16 ms   | 5.51 ms   | 463.91 ms |
-| get_sst   | 4.22 ms  | 33.70 ms  | 67.72 ms  | 15.27 s   |
-| put_obj   | 58.32 ms | 440.27 ms | 888.74 ms | 148.92 s  |
-| get_obj   | 12.88 ms | 104.78 ms | 210.07 ms | 195.77 s  |
+| put       | 647 µs   | 6.93 ms   | 13.90 ms  | 2.60 s    |
+| get       | 158 µs   | 1.57 ms   | 3.31 ms   | 10.33 s   |
+| delete    | 372 µs   | 3.12 ms   | 5.75 ms   | 1.09 s    |
+| scan      | 154 µs   | 1.31 ms   | 2.68 ms   | 601.99 ms |
+| flush     | 3.67 ms  | 3.81 ms   | 6.53 ms   | 8.40 ms   |
+| get_sst   | 3.68 ms  | 26.86 ms  | 54.37 ms  | 11.67 s   |
+| put_obj   | 55.63 ms | 407.43 ms | 877.21 ms | 151.18 s  |
+| get_obj   | 20.60 ms | 170.43 ms | 341.64 ms | 226.91 s  |
 
 ## Reproduce
 
