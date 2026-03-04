@@ -24,6 +24,9 @@ const PACK_HEADER_SIZE: usize = 6;
 /// Pack record header size: hash (32) + original_size (4) + flags (1) + data_len (4).
 const PACK_RECORD_HEADER_SIZE: usize = 41;
 
+/// Maximum pack file size before rotation (256 MB).
+const PACK_MAX_SIZE: u64 = 256 * 1024 * 1024;
+
 // --- Pack index structures ---
 
 /// Location of an object within a pack file.
@@ -32,7 +35,7 @@ struct PackEntry {
     pack_seq: u64,
     offset: u64,
     data_len: u32,
-    #[allow(dead_code)] // used in repack_gc (Unit 3)
+    #[allow(dead_code)] // preserved in pack format for future use
     original_size: u32,
     flags: u8,
 }
@@ -45,8 +48,6 @@ struct PackState {
     writer: Option<PackWriter>,
     /// Next pack sequence number.
     next_seq: u64,
-    /// Hashes marked for deletion (pending GC repack).
-    dead: HashSet<[u8; 32]>,
 }
 
 /// Active pack file writer — appends records to a single pack file.
@@ -96,6 +97,7 @@ impl PackWriter {
         self.file.write_all(&payload)?;
         self.file.write_all(&checksum.to_bytes())?;
         self.file.flush()?;
+        self.file.get_ref().sync_all()?;
 
         let record_len = payload_len + Checksum::encoded_size();
         self.offset += record_len as u64;
@@ -271,7 +273,6 @@ impl ObjectStore {
                 index,
                 writer: None,
                 next_seq,
-                dead: HashSet::new(),
             }),
         })
     }
@@ -311,6 +312,20 @@ impl ObjectStore {
         } else {
             (0u8, data.to_vec())
         };
+
+        // Guard: compressed payload must also fit in u32
+        if payload.len() > u32::MAX as usize {
+            return Err(Error::Corruption(
+                "compressed payload too large for pack format (>4 GB)".into(),
+            ));
+        }
+
+        // Rotate pack file if current one exceeds size threshold
+        if let Some(ref w) = state.writer {
+            if w.offset >= PACK_MAX_SIZE {
+                state.writer = None;
+            }
+        }
 
         // Ensure writer is open
         if state.writer.is_none() {
@@ -445,9 +460,7 @@ impl ObjectStore {
         {
             let state = self.packs.lock().unwrap_or_else(|e| e.into_inner());
             for hash in state.index.keys() {
-                if !state.dead.contains(hash) {
-                    hashes.insert(hex_encode(hash));
-                }
+                hashes.insert(hex_encode(hash));
             }
         }
 
@@ -476,12 +489,10 @@ impl ObjectStore {
     /// For loose files, the file is removed immediately. For packed objects,
     /// the hash is marked dead for removal during the next GC repack.
     pub(crate) fn delete_object(&self, hex_hash: &str) -> Result<()> {
-        // Try to mark dead in pack index
+        // Try to remove from pack index
         if let Some(hash_bytes) = hex_decode_hash(hex_hash) {
             let mut state = self.packs.lock().unwrap_or_else(|e| e.into_inner());
-            if state.index.contains_key(&hash_bytes) {
-                state.dead.insert(hash_bytes);
-                state.index.remove(&hash_bytes);
+            if state.index.remove(&hash_bytes).is_some() {
                 return Ok(());
             }
         }
@@ -495,36 +506,57 @@ impl ObjectStore {
         Ok(())
     }
 
-    /// Repack all pack files, removing dead objects.
+    /// Repack all pack files, removing objects not in `live_hashes`.
     ///
-    /// Reads every live object from existing packs and writes them to a
-    /// single new pack file. Old pack files are deleted. Returns the number
-    /// of dead objects removed.
+    /// Scans pack files on disk (not the in-memory index) to find all
+    /// records. Live records are written to a new pack file. Old pack
+    /// files are deleted. Returns the number of dead records removed.
     pub(crate) fn repack_gc(&self, live_hashes: &HashSet<String>) -> Result<u64> {
         let mut state = self.packs.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Collect entries to keep (in live set and not dead)
-        let mut keep: Vec<([u8; 32], PackEntry)> = Vec::new();
-        let mut dead_count = 0u64;
+        // Close the active writer so all data is on disk
+        state.writer = None;
 
-        for (hash, entry) in &state.index {
-            let hex = hex_encode(hash);
-            if live_hashes.contains(&hex) && !state.dead.contains(hash) {
-                keep.push((*hash, entry.clone()));
-            } else {
-                dead_count += 1;
-            }
-        }
-
-        if dead_count == 0 && state.dead.is_empty() {
+        // Scan pack files on disk to find all records (not the in-memory
+        // index, which may have had entries removed by delete_object)
+        let old_packs: Vec<PathBuf> = self.list_pack_files();
+        if old_packs.is_empty() {
             return Ok(0);
         }
 
-        // Close the active writer
-        state.writer = None;
+        let mut keep: Vec<([u8; 32], PackEntry)> = Vec::new();
+        let mut dead_count = 0u64;
 
-        // Collect old pack file paths to delete
-        let old_packs: Vec<PathBuf> = self.list_pack_files();
+        for pack_path in &old_packs {
+            let name = pack_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let seq = match parse_pack_filename(&name) {
+                Some(s) => s,
+                None => continue,
+            };
+            match scan_pack_file(pack_path, seq) {
+                Ok(entries) => {
+                    for (hash, entry) in entries {
+                        let hex = hex_encode(&hash);
+                        if live_hashes.contains(&hex) {
+                            keep.push((hash, entry));
+                        } else {
+                            dead_count += 1;
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Corrupted pack — will be removed
+                }
+            }
+        }
+
+        if dead_count == 0 {
+            return Ok(0);
+        }
 
         if keep.is_empty() {
             // No live objects — just delete all packs
@@ -532,8 +564,6 @@ impl ObjectStore {
                 let _ = fs::remove_file(path);
             }
             state.index.clear();
-            state.dead.clear();
-            // Reset sequence
             state.next_seq = 1;
             return Ok(dead_count);
         }
@@ -559,7 +589,6 @@ impl ObjectStore {
         // as harmless leftovers that get re-scanned on next open; if we deleted
         // first and crashed, live objects could be lost).
         state.index = new_index;
-        state.dead.clear();
         // Leave writer as None — next write will create a new pack
 
         // Now safe to delete old packs — index already points to new pack
@@ -570,12 +599,13 @@ impl ObjectStore {
         Ok(dead_count)
     }
 
-    /// Flush the pack writer's buffer to disk.
+    /// Flush the pack writer's buffer and fsync to disk.
     #[allow(dead_code)] // consumed in Unit 3 (close/sync integration)
     pub(crate) fn flush(&self) -> Result<()> {
         let mut state = self.packs.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref mut writer) = state.writer {
             writer.file.flush()?;
+            writer.file.get_ref().sync_all()?;
         }
         Ok(())
     }
@@ -1024,6 +1054,35 @@ mod tests {
         // Direct read should fail with corruption error
         let err = store2.read(&vp, false).unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
+    }
+
+    #[test]
+    fn pack_rotation_at_size_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+
+        // Write enough data to trigger rotation.
+        // Each object: ~1 KB data + 46 bytes overhead ≈ 1070 bytes.
+        // PACK_MAX_SIZE = 256 MB. Use a smaller trick: override the writer offset.
+        let vp1 = store.write(b"first pack object", false).unwrap();
+
+        // Manually set offset past threshold to trigger rotation on next write
+        {
+            let mut state = store.packs.lock().unwrap();
+            if let Some(ref mut w) = state.writer {
+                w.offset = PACK_MAX_SIZE;
+            }
+        }
+
+        let vp2 = store.write(b"second pack object", false).unwrap();
+
+        // Should now have 2 pack files
+        let packs = store.list_pack_files();
+        assert_eq!(packs.len(), 2);
+
+        // Both objects still readable
+        assert_eq!(store.read(&vp1, true).unwrap(), b"first pack object");
+        assert_eq!(store.read(&vp2, true).unwrap(), b"second pack object");
     }
 
     #[test]
