@@ -148,7 +148,7 @@ impl FromStr for Compression {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     pub path: PathBuf,
     pub create_if_missing: bool,
@@ -211,6 +211,21 @@ pub struct Config {
     /// the flush thread drains it below `write_buffer_size`.
     /// Set to 0 to disable write stalling.
     pub write_stall_size: usize,
+    /// Optional event listener for flush/compaction lifecycle hooks.
+    pub event_listener: Option<Arc<dyn metrics::EventListener>>,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("path", &self.path)
+            .field("write_buffer_size", &self.write_buffer_size)
+            .field("max_levels", &self.max_levels)
+            .field("block_size", &self.block_size)
+            .field("cache_size", &self.cache_size)
+            .field("event_listener", &self.event_listener.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Config {
@@ -241,6 +256,7 @@ impl Config {
             primary_addr: None,
             peers: Vec::new(),
             write_stall_size: 8 * 1024 * 1024,
+            event_listener: None,
         }
     }
 }
@@ -416,7 +432,7 @@ impl DB {
             let io = Arc::clone(&io_backend);
             let ns_data = Arc::clone(&namespace_data);
             let bg_metrics = Arc::clone(&metrics_arc);
-            let bg_listener: Option<Arc<dyn metrics::EventListener>> = None;
+            let bg_listener = config.event_listener.clone();
 
             Some(thread::spawn(move || {
                 loop {
@@ -479,6 +495,7 @@ impl DB {
 
         // Load persisted operation counters
         let (op_puts, op_gets, op_deletes) = Self::load_stats_meta(&config.path);
+        let event_listener = config.event_listener.clone();
 
         let mut db = Self {
             config,
@@ -503,7 +520,7 @@ impl DB {
             op_gets: AtomicU64::new(op_gets),
             op_deletes: AtomicU64::new(op_deletes),
             metrics: metrics_arc,
-            event_listener: None,
+            event_listener,
             repl_sender: None,
             repl_receiver: None,
             repl_force_sync: None,
@@ -1672,9 +1689,6 @@ impl DB {
             self.metrics
                 .flush
                 .observe(flush_start.elapsed().as_secs_f64());
-        }
-
-        if flushed_any {
             let mut aol = self.aol.lock().unwrap_or_else(|e| e.into_inner());
             aol.truncate(&self.config.path)?;
         }

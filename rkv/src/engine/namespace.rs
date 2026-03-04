@@ -150,6 +150,7 @@ impl<'db> Namespace<'db> {
 
     /// Like `get()`, but also returns the `RevisionID` for the value.
     pub fn get_with_revision(&self, key: impl Into<Key>) -> Result<(Value, RevisionID)> {
+        let _timer = metrics::Timer::start(&self.db.metrics().op_get);
         let key = key.into();
         self.db.inc_op_gets();
 
@@ -179,6 +180,7 @@ impl<'db> Namespace<'db> {
     /// instead of `Err(KeyNotFound)`. Returns `None` when the key never existed.
     #[allow(dead_code)] // used by server feature (routes/keys.rs)
     pub(crate) fn get_raw(&self, key: impl Into<Key>) -> Result<Option<Value>> {
+        let _timer = metrics::Timer::start(&self.db.metrics().op_get);
         let key = key.into();
         self.db.inc_op_gets();
 
@@ -399,6 +401,7 @@ impl<'db> Namespace<'db> {
         offset: usize,
         include_deleted: bool,
     ) -> Result<Vec<Key>> {
+        let _timer = metrics::Timer::start(&self.db.metrics().op_scan);
         let (mt_entries, ordered_mode) = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
