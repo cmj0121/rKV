@@ -1021,19 +1021,17 @@ impl SSTableReader {
         Ok(pos)
     }
 
-    /// Parse a single full entry at `pos`, returning (next_pos, RawEntry).
-    fn parse_one_entry(entry_data: &[u8], pos: usize, version: u16) -> Result<(usize, RawEntry)> {
+    /// Parse only the value portion of an entry (revision, expires, tag, data).
+    ///
+    /// `pos` should point right after the key bytes (i.e. the `after_key`
+    /// position from `key_at_offset`). Returns `(next_pos, revision,
+    /// expires_at_ms, value)`.
+    fn parse_entry_value(
+        entry_data: &[u8],
+        pos: usize,
+        version: u16,
+    ) -> Result<(usize, u128, u64, Value)> {
         let mut p = pos;
-        if p + 2 > entry_data.len() {
-            return Err(Error::Corruption("entry truncated at key_len".into()));
-        }
-        let kl = u16::from_be_bytes(entry_data[p..p + 2].try_into().unwrap()) as usize;
-        p += 2;
-        if p + kl > entry_data.len() {
-            return Err(Error::Corruption("entry truncated at key".into()));
-        }
-        let key_bytes = entry_data[p..p + kl].to_vec();
-        p += kl;
 
         let revision = if version >= 3 {
             if p + 16 > entry_data.len() {
@@ -1072,13 +1070,11 @@ impl SSTableReader {
         if p + vl > entry_data.len() {
             return Err(Error::Corruption("entry truncated at value_data".into()));
         }
-        let value_data = entry_data[p..p + vl].to_vec();
+        let value_data = &entry_data[p..p + vl];
         p += vl;
 
-        Ok((
-            p,
-            (key_bytes, revision, expires_at_ms, value_tag, value_data),
-        ))
+        let value = Value::from_tag(value_tag, value_data)?;
+        Ok((p, revision, expires_at_ms, value))
     }
 
     /// Search restart point keys via binary search.
@@ -1129,10 +1125,10 @@ impl SSTableReader {
             let (key, after_key) = Self::key_at_offset(entry_data, pos)?;
 
             if key == key_bytes {
-                // Parse full entry (need value data)
-                let (next_pos, entry) = Self::parse_one_entry(entry_data, pos, version)?;
-                let value = Value::from_tag(entry.3, &entry.4)?;
-                last_match = Some((value, RevisionID::from(entry.1), entry.2));
+                // Parse value portion only (key already read above — no redundant alloc)
+                let (next_pos, rev, expires, value) =
+                    Self::parse_entry_value(entry_data, after_key, version)?;
+                last_match = Some((value, RevisionID::from(rev), expires));
                 pos = next_pos;
             } else if key > key_bytes {
                 break;
@@ -1164,9 +1160,9 @@ impl SSTableReader {
             let (key, after_key) = Self::key_at_offset(entry_data, pos)?;
 
             if key == key_bytes {
-                let (next_pos, entry) = Self::parse_one_entry(entry_data, pos, version)?;
-                let value = Value::from_tag(entry.3, &entry.4)?;
-                result.push((value, RevisionID::from(entry.1), entry.2));
+                let (next_pos, rev, expires, value) =
+                    Self::parse_entry_value(entry_data, after_key, version)?;
+                result.push((value, RevisionID::from(rev), expires));
                 pos = next_pos;
             } else if key > key_bytes {
                 break;
