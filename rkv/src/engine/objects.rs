@@ -1,7 +1,10 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{Read as IoRead, Seek, SeekFrom, Write as IoWrite};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use super::checksum::Checksum;
 use super::error::{Error, Result};
 use super::io::IoBackend;
 use super::value::ValuePointer;
@@ -9,46 +12,293 @@ use super::value::ValuePointer;
 /// Object file flags — bit 0 indicates LZ4 compression.
 const FLAG_LZ4: u8 = 0x01;
 
+/// Pack file magic bytes: "rKVO" (rKV Objects).
+const PACK_MAGIC: [u8; 4] = *b"rKVO";
+
+/// Pack file format version.
+const PACK_VERSION: u16 = 1;
+
+/// Pack file header size in bytes: magic (4) + version (2).
+const PACK_HEADER_SIZE: usize = 6;
+
+/// Pack record header size: hash (32) + original_size (4) + flags (1) + data_len (4).
+const PACK_RECORD_HEADER_SIZE: usize = 41;
+
+// --- Pack index structures ---
+
+/// Location of an object within a pack file.
+#[derive(Clone, Debug)]
+struct PackEntry {
+    pack_seq: u64,
+    offset: u64,
+    data_len: u32,
+    #[allow(dead_code)] // used in repack_gc (Unit 3)
+    original_size: u32,
+    flags: u8,
+}
+
+/// Mutable pack state behind a Mutex.
+struct PackState {
+    /// Hash → pack entry mapping for all packed objects.
+    index: HashMap<[u8; 32], PackEntry>,
+    /// Active pack file writer (lazy-created on first write).
+    writer: Option<PackWriter>,
+    /// Next pack sequence number.
+    next_seq: u64,
+    /// Hashes marked for deletion (pending GC repack).
+    dead: HashSet<[u8; 32]>,
+}
+
+/// Active pack file writer — appends records to a single pack file.
+struct PackWriter {
+    file: std::io::BufWriter<fs::File>,
+    seq: u64,
+    offset: u64,
+}
+
+impl PackWriter {
+    /// Create a new pack file and write the header.
+    fn create(path: &Path, seq: u64) -> Result<Self> {
+        let file = fs::File::create(path)?;
+        let mut bw = std::io::BufWriter::new(file);
+        bw.write_all(&PACK_MAGIC)?;
+        bw.write_all(&PACK_VERSION.to_be_bytes())?;
+        bw.flush()?;
+        Ok(Self {
+            file: bw,
+            seq,
+            offset: PACK_HEADER_SIZE as u64,
+        })
+    }
+
+    /// Append a record to the pack file, returning its index entry.
+    fn append(
+        &mut self,
+        hash: &[u8; 32],
+        original_size: u32,
+        flags: u8,
+        data: &[u8],
+    ) -> Result<PackEntry> {
+        let record_offset = self.offset;
+        let data_len = data.len() as u32;
+
+        // Build checksummed payload: [hash][original_size][flags][data_len][data]
+        let payload_len = PACK_RECORD_HEADER_SIZE + data.len();
+        let mut payload = Vec::with_capacity(payload_len);
+        payload.extend_from_slice(hash);
+        payload.extend_from_slice(&original_size.to_be_bytes());
+        payload.push(flags);
+        payload.extend_from_slice(&data_len.to_be_bytes());
+        payload.extend_from_slice(data);
+
+        let checksum = Checksum::compute(&payload);
+
+        self.file.write_all(&payload)?;
+        self.file.write_all(&checksum.to_bytes())?;
+        self.file.flush()?;
+
+        let record_len = payload_len + Checksum::encoded_size();
+        self.offset += record_len as u64;
+
+        Ok(PackEntry {
+            pack_seq: self.seq,
+            offset: record_offset,
+            data_len,
+            original_size,
+            flags,
+        })
+    }
+}
+
+/// Scan a pack file and return all valid entries for index rebuild.
+///
+/// Stops at EOF or the first corrupted/truncated record (crash recovery).
+fn scan_pack_file(path: &Path, seq: u64) -> Result<Vec<([u8; 32], PackEntry)>> {
+    let data = fs::read(path)?;
+    if data.len() < PACK_HEADER_SIZE {
+        return Err(Error::Corruption(format!(
+            "pack file too small: {}",
+            path.display()
+        )));
+    }
+
+    // Verify header
+    if data[..4] != PACK_MAGIC {
+        return Err(Error::Corruption(format!(
+            "pack file bad magic: {}",
+            path.display()
+        )));
+    }
+    let version = u16::from_be_bytes(data[4..6].try_into().unwrap());
+    if version != PACK_VERSION {
+        return Err(Error::Corruption(format!(
+            "pack file unsupported version {version}: {}",
+            path.display()
+        )));
+    }
+
+    let mut entries = Vec::new();
+    let mut pos = PACK_HEADER_SIZE;
+
+    while pos < data.len() {
+        // Need at least header + checksum
+        let min_record = PACK_RECORD_HEADER_SIZE + Checksum::encoded_size();
+        if pos + min_record > data.len() {
+            break; // truncated tail — stop
+        }
+
+        // Parse record header
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&data[pos..pos + 32]);
+        let original_size = u32::from_be_bytes(data[pos + 32..pos + 36].try_into().unwrap());
+        let flags = data[pos + 36];
+        let data_len = u32::from_be_bytes(data[pos + 37..pos + 41].try_into().unwrap());
+
+        let record_end = pos + PACK_RECORD_HEADER_SIZE + data_len as usize;
+        let checksum_end = record_end + Checksum::encoded_size();
+
+        if checksum_end > data.len() {
+            break; // truncated record — stop
+        }
+
+        // Verify checksum
+        let payload = &data[pos..record_end];
+        let checksum = Checksum::from_bytes(&data[record_end..checksum_end])?;
+        if checksum.verify(payload).is_err() {
+            break; // corrupted record — stop
+        }
+
+        entries.push((
+            hash,
+            PackEntry {
+                pack_seq: seq,
+                offset: pos as u64,
+                data_len,
+                original_size,
+                flags,
+            },
+        ));
+
+        pos = checksum_end;
+    }
+
+    Ok(entries)
+}
+
+/// Read a single packed object from a pack file by offset.
+fn read_pack_record(path: &Path, entry: &PackEntry) -> Result<Vec<u8>> {
+    let mut file = fs::File::open(path)?;
+    file.seek(SeekFrom::Start(entry.offset))?;
+
+    let total = PACK_RECORD_HEADER_SIZE + entry.data_len as usize + Checksum::encoded_size();
+    let mut buf = vec![0u8; total];
+    file.read_exact(&mut buf)?;
+
+    // Verify checksum
+    let payload_end = PACK_RECORD_HEADER_SIZE + entry.data_len as usize;
+    let checksum = Checksum::from_bytes(&buf[payload_end..])?;
+    checksum.verify(&buf[..payload_end])?;
+
+    // Extract data payload (after the 41-byte header)
+    Ok(buf[PACK_RECORD_HEADER_SIZE..payload_end].to_vec())
+}
+
+// --- ObjectStore ---
+
 /// Content-addressable object store for bin objects.
 ///
-/// Large values are stored as standalone files identified by their BLAKE3
-/// content hash. The directory layout uses a fan-out prefix (first byte of
-/// the hash) to avoid excessive entries per directory.
+/// Objects can be stored as:
+/// 1. **Pack files** — multiple objects batched into append-only pack files
+///    for reduced I/O syscalls (default for new writes).
+/// 2. **Loose files** — one file per object in fan-out directories
+///    (legacy format, still readable).
 pub(crate) struct ObjectStore {
     base: PathBuf,
     io: Arc<dyn IoBackend>,
+    packs: Mutex<PackState>,
 }
 
 impl ObjectStore {
     /// Open (or create) the object store directory for a namespace under `db_dir`.
+    ///
+    /// Scans existing pack files to rebuild the in-memory index.
     pub(crate) fn open(db_dir: &Path, ns: &str, io: Arc<dyn IoBackend>) -> Result<Self> {
         let base = db_dir.join("objects").join(ns);
         fs::create_dir_all(&base)?;
-        Ok(Self { base, io })
+
+        // Scan for existing pack files and build index
+        let mut index = HashMap::new();
+        let mut max_seq = 0u64;
+
+        let mut pack_files: Vec<(u64, PathBuf)> = Vec::new();
+        for entry in fs::read_dir(&base)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(seq) = parse_pack_filename(&name) {
+                pack_files.push((seq, entry.path()));
+                if seq > max_seq {
+                    max_seq = seq;
+                }
+            }
+        }
+
+        // Sort by sequence so later packs overwrite earlier entries (if any dups)
+        pack_files.sort_by_key(|(seq, _)| *seq);
+
+        for (seq, path) in &pack_files {
+            match scan_pack_file(path, *seq) {
+                Ok(entries) => {
+                    for (hash, pack_entry) in entries {
+                        index.insert(hash, pack_entry);
+                    }
+                }
+                Err(_) => {
+                    // Skip corrupted pack files — repair will handle them
+                }
+            }
+        }
+
+        let next_seq = if pack_files.is_empty() {
+            1
+        } else {
+            max_seq + 1
+        };
+
+        Ok(Self {
+            base,
+            io,
+            packs: Mutex::new(PackState {
+                index,
+                writer: None,
+                next_seq,
+                dead: HashSet::new(),
+            }),
+        })
     }
 
     /// Write a value to the object store, returning a `ValuePointer`.
     ///
-    /// If an object with the same hash already exists (dedup), the write is
-    /// skipped and the existing pointer is returned.
+    /// New objects are appended to a pack file. If an object with the same
+    /// hash already exists (dedup), the write is skipped.
     pub(crate) fn write(&self, data: &[u8], compress: bool) -> Result<ValuePointer> {
         let hash: [u8; 32] = blake3::hash(data).into();
         let size = data.len() as u32;
         let vp = ValuePointer::new(hash, size);
 
-        let path = self.object_path(&vp);
+        let mut state = self.packs.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Dedup: skip if file already exists
-        if path.exists() {
+        // Dedup: skip if already in pack index
+        if state.index.contains_key(&hash) {
             return Ok(vp);
         }
 
-        // Ensure fan-out directory exists
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+        // Also check loose files for dedup (backward compat)
+        let loose_path = self.loose_object_path(&vp);
+        if loose_path.exists() {
+            return Ok(vp);
         }
 
-        // Build object file: [flags: 1][payload]
+        // Compress if requested
         let (flags, payload) = if compress {
             let compressed = lz4_flex::compress_prepend_size(data);
             (FLAG_LZ4, compressed)
@@ -56,25 +306,84 @@ impl ObjectStore {
             (0u8, data.to_vec())
         };
 
-        let mut content = Vec::with_capacity(1 + payload.len());
-        content.push(flags);
-        content.extend_from_slice(&payload);
+        // Ensure writer is open
+        if state.writer.is_none() {
+            let seq = state.next_seq;
+            state.next_seq += 1;
+            let path = self.pack_path(seq);
+            state.writer = Some(PackWriter::create(&path, seq)?);
+        }
 
-        // Atomic write via IoBackend
-        self.io.write_file_atomic(&path, &content)?;
+        let writer = state.writer.as_mut().unwrap();
+        let entry = writer.append(&hash, size, flags, &payload)?;
+        state.index.insert(hash, entry);
 
         Ok(vp)
     }
 
     /// Read a value from the object store, decompressing if needed.
     ///
+    /// Checks the pack index first, then falls back to loose files.
     /// When `verify` is true, the BLAKE3 hash is recomputed and checked.
     pub(crate) fn read(&self, vp: &ValuePointer, verify: bool) -> Result<Vec<u8>> {
-        let path = self.object_path(vp);
+        // Check pack index (hold lock briefly, copy entry)
+        let pack_entry = {
+            let state = self.packs.lock().unwrap_or_else(|e| e.into_inner());
+            state.index.get(&vp.hash).cloned()
+        };
+
+        if let Some(entry) = pack_entry {
+            return self.read_from_pack(&entry, vp, verify);
+        }
+
+        // Fall back to loose file
+        self.read_from_loose(vp, verify)
+    }
+
+    /// Read from a pack file at the given entry offset.
+    fn read_from_pack(
+        &self,
+        entry: &PackEntry,
+        vp: &ValuePointer,
+        verify: bool,
+    ) -> Result<Vec<u8>> {
+        let pack_path = self.pack_path(entry.pack_seq);
+        let raw_data = read_pack_record(&pack_path, entry).map_err(|e| {
+            Error::Corruption(format!(
+                "failed to read packed object {}: {e}",
+                vp.hex_hash()
+            ))
+        })?;
+
+        // Decompress
+        let data = if entry.flags & FLAG_LZ4 != 0 {
+            lz4_flex::decompress_size_prepended(&raw_data)
+                .map_err(|e| Error::Corruption(format!("LZ4 decompression failed: {e}")))?
+        } else {
+            raw_data
+        };
+
+        if verify {
+            let actual_hash: [u8; 32] = blake3::hash(&data).into();
+            if actual_hash != vp.hash {
+                return Err(Error::Corruption(format!(
+                    "object hash mismatch: expected {}, got {}",
+                    vp.hex_hash(),
+                    hex_encode(&actual_hash)
+                )));
+            }
+        }
+
+        Ok(data)
+    }
+
+    /// Read from a loose object file (legacy format).
+    fn read_from_loose(&self, vp: &ValuePointer, verify: bool) -> Result<Vec<u8>> {
+        let path = self.loose_object_path(vp);
 
         let content = self.io.read_file(&path).map_err(|e| {
             if matches!(e, Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound) {
-                Error::Corruption(format!("object file missing: {}", path.display()))
+                Error::Corruption(format!("object file missing: {}", vp.hex_hash()))
             } else {
                 e
             }
@@ -103,10 +412,7 @@ impl ObjectStore {
                 return Err(Error::Corruption(format!(
                     "object hash mismatch: expected {}, got {}",
                     vp.hex_hash(),
-                    actual_hash
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<String>()
+                    hex_encode(&actual_hash)
                 )));
             }
         }
@@ -114,40 +420,67 @@ impl ObjectStore {
         Ok(data)
     }
 
-    /// Check if an object file exists.
+    /// Check if an object exists (in packs or loose files).
     #[cfg(test)]
     pub(crate) fn exists(&self, vp: &ValuePointer) -> bool {
-        self.object_path(vp).exists()
+        let state = self.packs.lock().unwrap_or_else(|e| e.into_inner());
+        if state.index.contains_key(&vp.hash) {
+            return true;
+        }
+        drop(state);
+        self.loose_object_path(vp).exists()
     }
 
-    /// List all object hex hashes present on disk.
-    ///
-    /// Walks the fan-out directories and returns the set of 64-char hex
-    /// hash strings for every object file found.
-    pub(crate) fn list_object_hashes(&self) -> Result<std::collections::HashSet<String>> {
-        let mut hashes = std::collections::HashSet::new();
-        if !self.base.exists() {
-            return Ok(hashes);
-        }
-        for fan_entry in fs::read_dir(&self.base)? {
-            let fan_entry = fan_entry?;
-            if !fan_entry.file_type()?.is_dir() {
-                continue;
-            }
-            for obj_entry in fs::read_dir(fan_entry.path())? {
-                let obj_entry = obj_entry?;
-                let name = obj_entry.file_name().to_string_lossy().to_string();
-                // Object files are 64-char hex hashes (no extension)
-                if name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()) {
-                    hashes.insert(name);
+    /// List all object hex hashes present on disk (packs + loose files).
+    pub(crate) fn list_object_hashes(&self) -> Result<HashSet<String>> {
+        let mut hashes = HashSet::new();
+
+        // Hashes from pack index
+        {
+            let state = self.packs.lock().unwrap_or_else(|e| e.into_inner());
+            for hash in state.index.keys() {
+                if !state.dead.contains(hash) {
+                    hashes.insert(hex_encode(hash));
                 }
             }
         }
+
+        // Hashes from loose files
+        if self.base.exists() {
+            for fan_entry in fs::read_dir(&self.base)? {
+                let fan_entry = fan_entry?;
+                if !fan_entry.file_type()?.is_dir() {
+                    continue;
+                }
+                for obj_entry in fs::read_dir(fan_entry.path())? {
+                    let obj_entry = obj_entry?;
+                    let name = obj_entry.file_name().to_string_lossy().to_string();
+                    if name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()) {
+                        hashes.insert(name);
+                    }
+                }
+            }
+        }
+
         Ok(hashes)
     }
 
-    /// Delete an object file by its hex hash string.
+    /// Delete an object by its hex hash string.
+    ///
+    /// For loose files, the file is removed immediately. For packed objects,
+    /// the hash is marked dead for removal during the next GC repack.
     pub(crate) fn delete_object(&self, hex_hash: &str) -> Result<()> {
+        // Try to mark dead in pack index
+        if let Some(hash_bytes) = hex_decode_hash(hex_hash) {
+            let mut state = self.packs.lock().unwrap_or_else(|e| e.into_inner());
+            if state.index.contains_key(&hash_bytes) {
+                state.dead.insert(hash_bytes);
+                state.index.remove(&hash_bytes);
+                return Ok(());
+            }
+        }
+
+        // Fall back to deleting loose file
         let fan_out = &hex_hash[..2];
         let path = self.base.join(fan_out).join(hex_hash);
         if path.exists() {
@@ -156,9 +489,155 @@ impl ObjectStore {
         Ok(())
     }
 
-    /// Compute the file path for an object: `<base>/<fan_out>/<hex_hash>`.
-    fn object_path(&self, vp: &ValuePointer) -> PathBuf {
+    /// Repack all pack files, removing dead objects.
+    ///
+    /// Reads every live object from existing packs and writes them to a
+    /// single new pack file. Old pack files are deleted. Returns the number
+    /// of dead objects removed.
+    pub(crate) fn repack_gc(&self, live_hashes: &HashSet<String>) -> Result<u64> {
+        let mut state = self.packs.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Collect entries to keep (in live set and not dead)
+        let mut keep: Vec<([u8; 32], PackEntry)> = Vec::new();
+        let mut dead_count = 0u64;
+
+        for (hash, entry) in &state.index {
+            let hex = hex_encode(hash);
+            if live_hashes.contains(&hex) && !state.dead.contains(hash) {
+                keep.push((*hash, entry.clone()));
+            } else {
+                dead_count += 1;
+            }
+        }
+
+        if dead_count == 0 && state.dead.is_empty() {
+            return Ok(0);
+        }
+
+        // Close the active writer
+        state.writer = None;
+
+        // Collect old pack file paths to delete
+        let old_packs: Vec<PathBuf> = self.list_pack_files();
+
+        if keep.is_empty() {
+            // No live objects — just delete all packs
+            for path in &old_packs {
+                let _ = fs::remove_file(path);
+            }
+            state.index.clear();
+            state.dead.clear();
+            // Reset sequence
+            state.next_seq = 1;
+            return Ok(dead_count);
+        }
+
+        // Write a new pack file with only live entries
+        let new_seq = state.next_seq;
+        state.next_seq += 1;
+        let new_path = self.pack_path(new_seq);
+        let mut writer = PackWriter::create(&new_path, new_seq)?;
+
+        let mut new_index = HashMap::with_capacity(keep.len());
+
+        for (hash, old_entry) in &keep {
+            let old_path = self.pack_path(old_entry.pack_seq);
+            let raw_data = read_pack_record(&old_path, old_entry)?;
+            let new_entry =
+                writer.append(hash, old_entry.original_size, old_entry.flags, &raw_data)?;
+            new_index.insert(*hash, new_entry);
+        }
+
+        // Delete old packs
+        for path in &old_packs {
+            let _ = fs::remove_file(path);
+        }
+
+        state.index = new_index;
+        state.dead.clear();
+        // Leave writer as None — next write will create a new pack
+
+        Ok(dead_count)
+    }
+
+    /// Flush the pack writer's buffer to disk.
+    #[allow(dead_code)] // consumed in Unit 3 (close/sync integration)
+    pub(crate) fn flush(&self) -> Result<()> {
+        let mut state = self.packs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref mut writer) = state.writer {
+            writer.file.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Number of objects in the pack index.
+    #[cfg(test)]
+    pub(crate) fn pack_count(&self) -> usize {
+        self.packs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .index
+            .len()
+    }
+
+    // --- Path helpers ---
+
+    /// Compute the file path for a loose object: `<base>/<fan_out>/<hex_hash>`.
+    fn loose_object_path(&self, vp: &ValuePointer) -> PathBuf {
         self.base.join(vp.fan_out_prefix()).join(vp.hex_hash())
+    }
+
+    /// Compute the file path for a pack file: `<base>/pack-NNNNNN.pack`.
+    fn pack_path(&self, seq: u64) -> PathBuf {
+        self.base.join(format!("pack-{seq:06}.pack"))
+    }
+
+    /// List all pack file paths on disk.
+    fn list_pack_files(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        if let Ok(entries) = fs::read_dir(&self.base) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if parse_pack_filename(&name).is_some() {
+                    paths.push(entry.path());
+                }
+            }
+        }
+        paths
+    }
+}
+
+/// Parse a pack filename like "pack-000001.pack" → Some(1).
+fn parse_pack_filename(name: &str) -> Option<u64> {
+    let name = name.strip_prefix("pack-")?.strip_suffix(".pack")?;
+    name.parse().ok()
+}
+
+/// Encode a 32-byte hash as a 64-character hex string.
+fn hex_encode(hash: &[u8; 32]) -> String {
+    hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Decode a 64-character hex string to a 32-byte hash.
+fn hex_decode_hash(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut hash = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        hash[i] = (hi << 4) | lo;
+    }
+    Some(hash)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -206,6 +685,7 @@ mod tests {
         let vp2 = store.write(data, true).unwrap();
 
         assert_eq!(vp1, vp2);
+        assert_eq!(store.pack_count(), 1); // only one entry
     }
 
     #[test]
@@ -229,26 +709,11 @@ mod tests {
     }
 
     #[test]
-    fn read_missing_file_error() {
+    fn read_missing_object_error() {
         let tmp = tempfile::tempdir().unwrap();
         let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
 
         let vp = ValuePointer::new([0xFFu8; 32], 100);
-        let err = store.read(&vp, false).unwrap_err();
-        assert!(matches!(err, Error::Corruption(_)));
-    }
-
-    #[test]
-    fn read_empty_file_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
-
-        // Create an empty file at the object path
-        let vp = ValuePointer::new([0xAAu8; 32], 100);
-        let path = store.object_path(&vp);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, &[]).unwrap();
-
         let err = store.read(&vp, false).unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
     }
@@ -261,40 +726,44 @@ mod tests {
         let data = b"test data for verification";
         let vp = store.write(data, false).unwrap();
 
-        // Corrupt the file content (but keep the flags byte valid)
-        let path = store.object_path(&vp);
-        let mut content = fs::read(&path).unwrap();
-        content[1] ^= 0xFF;
-        fs::write(&path, &content).unwrap();
+        // Corrupt the pack file data
+        let pack_path = store.pack_path(1);
+        let mut content = fs::read(&pack_path).unwrap();
+        // Corrupt a byte in the data portion (after header + record header)
+        let data_offset = PACK_HEADER_SIZE + PACK_RECORD_HEADER_SIZE;
+        content[data_offset] ^= 0xFF;
+        // Also fix the checksum to match the corrupted data so the record
+        // checksum passes but BLAKE3 fails
+        let payload_end = PACK_HEADER_SIZE + PACK_RECORD_HEADER_SIZE + data.len();
+        let payload = &content[PACK_HEADER_SIZE..payload_end];
+        let new_cksum = Checksum::compute(payload);
+        content[payload_end..payload_end + 5].copy_from_slice(&new_cksum.to_bytes());
+        fs::write(&pack_path, &content).unwrap();
 
-        let err = store.read(&vp, true).unwrap_err();
+        // Re-open to rebuild index
+        let store2 = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let err = store2.read(&vp, true).unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
     }
 
     #[test]
-    fn fan_out_directory_created() {
+    fn list_object_hashes_includes_packed() {
         let tmp = tempfile::tempdir().unwrap();
         let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
 
-        let data = b"test data";
-        let vp = store.write(data, false).unwrap();
+        let vp1 = store.write(b"data1", false).unwrap();
+        let vp2 = store.write(b"data2", false).unwrap();
 
-        let fan_out_dir = tmp
-            .path()
-            .join("objects")
-            .join("_")
-            .join(vp.fan_out_prefix());
-        assert!(fan_out_dir.is_dir());
+        let hashes = store.list_object_hashes().unwrap();
+        assert_eq!(hashes.len(), 2);
+        assert!(hashes.contains(&vp1.hex_hash()));
+        assert!(hashes.contains(&vp2.hex_hash()));
     }
 
     #[test]
     fn list_object_hashes_nonexistent_base() {
         let tmp = tempfile::tempdir().unwrap();
-        // Don't create the ObjectStore — just instantiate with a non-existent base
-        let store = ObjectStore {
-            base: tmp.path().join("nonexistent"),
-            io: test_io(),
-        };
+        let store = ObjectStore::open(tmp.path(), "nonexistent_ns", test_io()).unwrap();
         let hashes = store.list_object_hashes().unwrap();
         assert!(hashes.is_empty());
     }
@@ -304,17 +773,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
 
-        // Create a regular file in the base dir (not a directory)
+        // Create a regular file in the base dir (not a dir, not a pack)
         let non_dir = store.base.join("not_a_dir");
         fs::write(&non_dir, b"data").unwrap();
 
-        // Also write a real object
-        let data = b"test data for list";
-        let _vp = store.write(data, false).unwrap();
+        let vp = store.write(b"test data for list", false).unwrap();
 
         let hashes = store.list_object_hashes().unwrap();
-        // Should find exactly 1 hash (the real object), skipping the regular file
         assert_eq!(hashes.len(), 1);
+        assert!(hashes.contains(&vp.hex_hash()));
     }
 
     #[test]
@@ -329,5 +796,186 @@ mod tests {
 
         let result = store.read(&vp, true).unwrap();
         assert_eq!(result, data);
+    }
+
+    #[test]
+    fn pack_survives_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let vp;
+        {
+            let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+            vp = store.write(b"persistent data", true).unwrap();
+            assert_eq!(store.pack_count(), 1);
+        }
+
+        // Re-open and verify
+        let store2 = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        assert_eq!(store2.pack_count(), 1);
+        let data = store2.read(&vp, true).unwrap();
+        assert_eq!(data, b"persistent data");
+    }
+
+    #[test]
+    fn multiple_objects_in_one_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+
+        let mut vps = Vec::new();
+        for i in 0..100u32 {
+            let data = format!("object_{i}");
+            let vp = store.write(data.as_bytes(), i % 2 == 0).unwrap();
+            vps.push((vp, data));
+        }
+
+        assert_eq!(store.pack_count(), 100);
+
+        // Verify all readable
+        for (vp, expected) in &vps {
+            let data = store.read(vp, true).unwrap();
+            assert_eq!(data, expected.as_bytes());
+        }
+
+        // Only one pack file on disk
+        let packs = store.list_pack_files();
+        assert_eq!(packs.len(), 1);
+    }
+
+    #[test]
+    fn delete_packed_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+
+        let vp = store.write(b"deleteme", false).unwrap();
+        assert!(store.exists(&vp));
+
+        store.delete_object(&vp.hex_hash()).unwrap();
+        // Should no longer appear in hash list
+        let hashes = store.list_object_hashes().unwrap();
+        assert!(!hashes.contains(&vp.hex_hash()));
+    }
+
+    #[test]
+    fn repack_gc_removes_dead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+
+        let vp_keep = store.write(b"keep this", false).unwrap();
+        let vp_dead = store.write(b"remove this", false).unwrap();
+        assert_eq!(store.pack_count(), 2);
+
+        // Only vp_keep is live
+        let mut live = HashSet::new();
+        live.insert(vp_keep.hex_hash());
+
+        let removed = store.repack_gc(&live).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(store.pack_count(), 1);
+
+        // vp_keep still readable
+        let data = store.read(&vp_keep, true).unwrap();
+        assert_eq!(data, b"keep this");
+
+        // vp_dead is gone
+        assert!(!store.exists(&vp_dead));
+    }
+
+    #[test]
+    fn backward_compat_reads_loose_files() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Manually create a loose object file (old format)
+        let data = b"legacy loose object data";
+        let hash: [u8; 32] = blake3::hash(data).into();
+        let vp = ValuePointer::new(hash, data.len() as u32);
+
+        let base = tmp.path().join("objects").join("_");
+        let fan_out_dir = base.join(vp.fan_out_prefix());
+        fs::create_dir_all(&fan_out_dir).unwrap();
+
+        // Loose format: [flags: 1][payload]
+        let mut content = vec![0u8]; // no compression
+        content.extend_from_slice(data);
+        fs::write(fan_out_dir.join(vp.hex_hash()), &content).unwrap();
+
+        // Open store — should find the loose object
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        assert_eq!(store.pack_count(), 0); // not in pack index
+
+        let result = store.read(&vp, true).unwrap();
+        assert_eq!(result, data.as_slice());
+
+        // Should appear in list
+        let hashes = store.list_object_hashes().unwrap();
+        assert!(hashes.contains(&vp.hex_hash()));
+    }
+
+    #[test]
+    fn dedup_across_loose_and_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a loose object first
+        let data = b"dedup test data across formats";
+        let hash: [u8; 32] = blake3::hash(data).into();
+        let vp = ValuePointer::new(hash, data.len() as u32);
+
+        let base = tmp.path().join("objects").join("_");
+        let fan_out_dir = base.join(vp.fan_out_prefix());
+        fs::create_dir_all(&fan_out_dir).unwrap();
+        let mut content = vec![0u8];
+        content.extend_from_slice(data);
+        fs::write(fan_out_dir.join(vp.hex_hash()), &content).unwrap();
+
+        // Open store and try to write same data — should dedup
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let vp2 = store.write(data, false).unwrap();
+        assert_eq!(vp, vp2);
+        assert_eq!(store.pack_count(), 0); // not added to pack (dedup via loose)
+    }
+
+    #[test]
+    fn scan_pack_truncated_tail_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+
+        let vp1 = store.write(b"first object", false).unwrap();
+        let _vp2 = store.write(b"second object", false).unwrap();
+        assert_eq!(store.pack_count(), 2);
+
+        // Truncate the pack file to corrupt the second record
+        let pack_path = store.pack_path(1);
+        let content = fs::read(&pack_path).unwrap();
+        // Keep header + first record, truncate partway through second
+        let first_record_size = PACK_RECORD_HEADER_SIZE + 12 + Checksum::encoded_size();
+        let truncate_at = PACK_HEADER_SIZE + first_record_size + 10;
+        fs::write(&pack_path, &content[..truncate_at]).unwrap();
+
+        // Re-open — should recover first object, skip truncated second
+        let store2 = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        assert_eq!(store2.pack_count(), 1);
+        let data = store2.read(&vp1, true).unwrap();
+        assert_eq!(data, b"first object");
+    }
+
+    #[test]
+    fn parse_pack_filename_valid() {
+        assert_eq!(parse_pack_filename("pack-000001.pack"), Some(1));
+        assert_eq!(parse_pack_filename("pack-000042.pack"), Some(42));
+        assert_eq!(parse_pack_filename("pack-999999.pack"), Some(999999));
+    }
+
+    #[test]
+    fn parse_pack_filename_invalid() {
+        assert_eq!(parse_pack_filename("pack-abc.pack"), None);
+        assert_eq!(parse_pack_filename("not_a_pack"), None);
+        assert_eq!(parse_pack_filename("pack-000001.dat"), None);
+    }
+
+    #[test]
+    fn hex_roundtrip() {
+        let hash = [0xAB_u8; 32];
+        let hex = hex_encode(&hash);
+        let decoded = hex_decode_hash(&hex).unwrap();
+        assert_eq!(hash, decoded);
     }
 }
