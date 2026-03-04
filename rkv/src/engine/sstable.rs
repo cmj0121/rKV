@@ -771,7 +771,8 @@ impl SSTableReader {
     ///
     /// Returns all matching entries in oldest-first order (the natural
     /// SSTable storage order). Uses bloom filter and binary search for
-    /// fast block selection.
+    /// fast block selection, with binary search within blocks via restart
+    /// points or `partition_point` on cached entries.
     pub(crate) fn get_all_revisions(
         &self,
         key: &Key,
@@ -804,18 +805,8 @@ impl SSTableReader {
 
         for bi in block_idx..self.index.len() {
             let ie = &self.index[bi];
-            let entries = self.read_block(ie, bi, verify_checksums)?;
-
-            let mut found_in_block = false;
-            for (kb, revision, expires_at_ms, value_tag, value_data) in entries {
-                if kb == key_bytes {
-                    let value = Value::from_tag(value_tag, &value_data)?;
-                    result.push((value, RevisionID::from(revision), expires_at_ms));
-                    found_in_block = true;
-                } else if found_in_block {
-                    return Ok(result);
-                }
-            }
+            let found_in_block =
+                self.get_all_from_block(ie, bi, &key_bytes, verify_checksums, &mut result)?;
 
             if found_in_block {
                 if ie.last_key.as_slice() != key_bytes {
@@ -827,6 +818,60 @@ impl SSTableReader {
         }
 
         Ok(result)
+    }
+
+    /// Search a single block for all revisions of a key, appending to `result`.
+    /// Returns `true` if any match was found.
+    fn get_all_from_block(
+        &self,
+        ie: &IndexEntry,
+        block_index: usize,
+        key_bytes: &[u8],
+        verify_checksums: bool,
+        result: &mut Vec<(Value, RevisionID, u64)>,
+    ) -> Result<bool> {
+        // 1. Cache hit → binary search on parsed entries
+        if let Some(ref c) = self.cache {
+            let mut cache = c.lock().unwrap();
+            if let Some(entries) = cache.get(self.sst_id, block_index as u32) {
+                drop(cache);
+                return Self::binary_search_all_entries(&entries, key_bytes, result);
+            }
+        }
+
+        // 2. Cache miss, no cache, restart points → targeted parse
+        if self.has_restarts && self.cache.is_none() {
+            let block_data = self.decompress_raw_block(ie, verify_checksums)?;
+            let (entry_data, restarts) = Self::strip_restart_trailer(&block_data)?;
+            let found = Self::find_all_in_block(entry_data, &restarts, key_bytes, self.version)?;
+            let any = !found.is_empty();
+            result.extend(found);
+            return Ok(any);
+        }
+
+        // 3. Cache miss with cache enabled → full parse + cache insert + binary search
+        let entries = self.read_block(ie, block_index, verify_checksums)?;
+        Self::binary_search_all_entries(&entries, key_bytes, result)
+    }
+
+    /// Binary search on parsed entries for all revisions of a target key.
+    fn binary_search_all_entries(
+        entries: &[RawEntry],
+        key_bytes: &[u8],
+        result: &mut Vec<(Value, RevisionID, u64)>,
+    ) -> Result<bool> {
+        let start = entries.partition_point(|e| e.0.as_slice() < key_bytes);
+        let mut found = false;
+        for entry in &entries[start..] {
+            if entry.0.as_slice() == key_bytes {
+                let value = Value::from_tag(entry.3, &entry.4)?;
+                result.push((value, RevisionID::from(entry.1), entry.2));
+                found = true;
+            } else {
+                break;
+            }
+        }
+        Ok(found)
     }
 
     /// Parse all entries from a decompressed block.
@@ -1101,7 +1146,6 @@ impl SSTableReader {
     }
 
     /// Find all revisions of a key within a decompressed block using restart points.
-    #[allow(dead_code)] // consumed in get_all_revisions() rewrite (next commit)
     fn find_all_in_block(
         entry_data: &[u8],
         restarts: &[u32],
