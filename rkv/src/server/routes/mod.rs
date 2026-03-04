@@ -53,6 +53,8 @@ pub fn router(state: Arc<AppState>, enable_ui: bool) -> Router {
         .route("/api/admin/compact", post(admin::compact))
         .route("/api/admin/config", get(admin::get_config))
         .route("/api/admin/force-sync", post(admin::force_sync))
+        // Prometheus metrics endpoint
+        .route("/metrics", get(admin::prometheus_metrics))
         .with_state(state);
 
     if enable_ui {
