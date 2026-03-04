@@ -2477,4 +2477,107 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn restart_single_entry_block() {
+        // A block with exactly 1 entry should have 1 restart point at offset 0
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("single.sst");
+        // Very large block size so all entries fit in one block
+        let mut w = SSTableWriter::new(&path, 1_000_000, Compression::None, 10, 0, &io()).unwrap();
+        w.add(&Key::Int(42), &Value::from("only"), RevisionID::ZERO, 0)
+            .unwrap();
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
+        assert!(r.has_restarts);
+        assert_eq!(r.block_count(), 1);
+        let result = r.get(&Key::Int(42), true).unwrap();
+        assert_eq!(result, Some((Value::from("only"), RevisionID::ZERO, 0)));
+        // Missing key returns None
+        assert_eq!(r.get(&Key::Int(99), true).unwrap(), None);
+    }
+
+    #[test]
+    fn restart_exactly_interval_entries() {
+        // Exactly RESTART_INTERVAL entries in a single block — 1 restart point
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("exact.sst");
+        let mut w = SSTableWriter::new(&path, 1_000_000, Compression::None, 10, 0, &io()).unwrap();
+        for i in 0..RESTART_INTERVAL {
+            w.add(&Key::Int(i as i64), &Value::from("v"), RevisionID::ZERO, 0)
+                .unwrap();
+        }
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
+        assert!(r.has_restarts);
+        // All keys findable
+        for i in 0..RESTART_INTERVAL {
+            assert!(
+                r.get(&Key::Int(i as i64), true).unwrap().is_some(),
+                "key {i} missing"
+            );
+        }
+    }
+
+    #[test]
+    fn restart_multi_revision_single_key() {
+        // Multiple revisions of the same key in one block
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("multirev.sst");
+        let mut w = SSTableWriter::new(&path, 1_000_000, Compression::None, 10, 0, &io()).unwrap();
+        for rev in 1..=5u128 {
+            w.add(
+                &Key::Int(1),
+                &Value::from(format!("r{rev}").as_str()),
+                RevisionID::from(rev),
+                0,
+            )
+            .unwrap();
+        }
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
+        // get() returns latest (last) revision
+        let result = r.get(&Key::Int(1), true).unwrap().unwrap();
+        assert_eq!(result.0, Value::from("r5"));
+        assert_eq!(result.1, RevisionID::from(5));
+
+        // get_all_revisions() returns all 5
+        let all = r.get_all_revisions(&Key::Int(1), true).unwrap();
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0].1, RevisionID::from(1));
+        assert_eq!(all[4].1, RevisionID::from(5));
+    }
+
+    #[test]
+    fn restart_str_keys() {
+        // Verify restart points work with Str keys (variable length, different ordering)
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("strkeys.sst");
+        let mut w = SSTableWriter::new(&path, 128, Compression::None, 10, 0, &io()).unwrap();
+        let keys: Vec<String> = (0..60).map(|i| format!("key_{i:04}")).collect();
+        for k in &keys {
+            w.add(
+                &Key::Str(k.clone()),
+                &Value::from(k.as_str()),
+                RevisionID::ZERO,
+                0,
+            )
+            .unwrap();
+        }
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
+        assert!(r.has_restarts);
+        // Verify all keys readable
+        for k in &keys {
+            let result = r.get(&Key::Str(k.clone()), true).unwrap();
+            assert!(result.is_some(), "key {k} missing");
+            assert_eq!(result.unwrap().0, Value::from(k.as_str()));
+        }
+        // Non-existent key
+        assert_eq!(r.get(&Key::Str("zzz_missing".into()), true).unwrap(), None);
+    }
 }
