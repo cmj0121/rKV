@@ -30,8 +30,14 @@ const V1_FOOTER_SIZE: usize = 48;
 /// V2 footer size in bytes (adds features bitmask + reserved).
 pub(crate) const V2_FOOTER_SIZE: usize = 56;
 
+/// Feature flag: blocks contain restart point trailers for binary search.
+const FEATURE_RESTART_POINTS: u32 = 0x01;
+
 /// Known feature flags bitmask. Unknown bits trigger a reject.
-const KNOWN_FEATURES: u32 = 0;
+const KNOWN_FEATURES: u32 = FEATURE_RESTART_POINTS;
+
+/// Number of entries between restart points within a data block.
+const RESTART_INTERVAL: u32 = 16;
 
 /// Compression tag stored per block on disk.
 const COMPRESS_NONE: u8 = 0x00;
@@ -71,6 +77,8 @@ pub(crate) struct SSTableWriter {
     prefix_bloom: Option<BloomFilter>,
     /// Prefix length for prefix bloom (0 = disabled).
     bloom_prefix_len: usize,
+    /// Restart point byte offsets within the current block.
+    restarts: Vec<u32>,
 }
 
 impl SSTableWriter {
@@ -105,6 +113,7 @@ impl SSTableWriter {
             bloom: BloomFilter::new(bloom_bits),
             prefix_bloom,
             bloom_prefix_len,
+            restarts: Vec::new(),
         })
     }
 
@@ -130,6 +139,11 @@ impl SSTableWriter {
 
         let value_data = value_to_data(value);
         let value_tag = value.to_tag();
+
+        // Record restart point at every RESTART_INTERVAL entries
+        if self.block_entry_count.is_multiple_of(RESTART_INTERVAL) {
+            self.restarts.push(self.block_buf.len() as u32);
+        }
 
         // V4 entry: [key_len: u16 BE][key_bytes][revision: u128 BE][expires_at_ms: u64 BE][value_tag: u8][value_len: u32 BE][value_data]
         let key_len = key_bytes.len() as u16;
@@ -209,6 +223,7 @@ impl SSTableWriter {
             filter_offset,
             filter_size,
             filter_format,
+            FEATURE_RESTART_POINTS,
         );
         self.file.write_all(&footer)?;
 
@@ -220,6 +235,14 @@ impl SSTableWriter {
     /// Flush the current block to disk: compress, checksum, write.
     fn flush_block(&mut self) -> Result<()> {
         let block_offset = self.offset;
+
+        // Append restart point trailer: [restart_0: u32 LE]...[num_restarts: u32 LE]
+        for &offset in &self.restarts {
+            self.block_buf.extend_from_slice(&offset.to_le_bytes());
+        }
+        self.block_buf
+            .extend_from_slice(&(self.restarts.len() as u32).to_le_bytes());
+        self.restarts.clear();
 
         let (tag, payload) = compress_block(&self.block_buf, &self.compression);
 
@@ -279,6 +302,7 @@ impl SSTableWriter {
         filter_offset: u64,
         filter_size: u32,
         filter_format: u8,
+        features: u32,
     ) -> Vec<u8> {
         let mut buf = Vec::with_capacity(V2_FOOTER_SIZE);
         buf.extend_from_slice(&MAGIC);
@@ -291,7 +315,7 @@ impl SSTableWriter {
         buf.extend_from_slice(&filter_size.to_be_bytes());
         buf.push(filter_format);
         // V2 fields: features bitmask + 4 reserved bytes
-        buf.extend_from_slice(&0u32.to_be_bytes()); // features = 0
+        buf.extend_from_slice(&features.to_be_bytes());
         buf.extend_from_slice(&[0u8; 4]); // reserved
                                           // Checksum covers first 51 bytes (56 − 5)
         let checksum = Checksum::compute(&buf);
@@ -385,6 +409,8 @@ pub(crate) struct SSTableReader {
     features: u32,
     /// Format version from the footer (1, 2, or 3).
     version: u16,
+    /// Whether blocks contain restart point trailers.
+    has_restarts: bool,
 }
 
 impl SSTableReader {
@@ -556,6 +582,8 @@ impl SSTableReader {
             None
         };
 
+        let has_restarts = features & FEATURE_RESTART_POINTS != 0;
+
         Ok(Self {
             data,
             index,
@@ -568,6 +596,7 @@ impl SSTableReader {
             cache,
             features,
             version,
+            has_restarts,
         })
     }
 
@@ -829,6 +858,34 @@ impl SSTableReader {
         Ok(entries)
     }
 
+    /// Strip the restart point trailer from a decompressed block.
+    ///
+    /// Returns the entry data slice (without trailer) and the restart offsets.
+    /// Trailer format: `[restart_0: u32 LE]...[num_restarts: u32 LE]`
+    fn strip_restart_trailer(block: &[u8]) -> Result<(&[u8], Vec<u32>)> {
+        if block.len() < 4 {
+            return Err(Error::Corruption(
+                "block too small for restart trailer".into(),
+            ));
+        }
+        let num_restarts =
+            u32::from_le_bytes(block[block.len() - 4..].try_into().unwrap()) as usize;
+        let trailer_size = (num_restarts + 1) * 4;
+        if trailer_size > block.len() {
+            return Err(Error::Corruption(format!(
+                "restart trailer exceeds block: {num_restarts} restarts, block size {}",
+                block.len()
+            )));
+        }
+        let entry_end = block.len() - trailer_size;
+        let mut restarts = Vec::with_capacity(num_restarts);
+        for i in 0..num_restarts {
+            let off = entry_end + i * 4;
+            restarts.push(u32::from_le_bytes(block[off..off + 4].try_into().unwrap()));
+        }
+        Ok((&block[..entry_end], restarts))
+    }
+
     /// Scan entries matching a prefix/range.
     ///
     /// Uses the block index to skip blocks that cannot contain matching keys.
@@ -1037,7 +1094,13 @@ impl SSTableReader {
         let compressed_payload = &block_on_disk[1..cksum_start];
         let block_data = decompress_block(compression_tag, compressed_payload)?;
 
-        let entries = Self::parse_block_entries(&block_data, self.version)?;
+        let entry_data = if self.has_restarts {
+            let (entries_slice, _restarts) = Self::strip_restart_trailer(&block_data)?;
+            entries_slice
+        } else {
+            &block_data
+        };
+        let entries = Self::parse_block_entries(entry_data, self.version)?;
 
         // 3. Cache insert (brief lock)
         if let Some(ref c) = self.cache {
@@ -1884,7 +1947,7 @@ mod tests {
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
-        assert_eq!(r.features(), 0);
+        assert_eq!(r.features(), FEATURE_RESTART_POINTS);
         for i in 0..10 {
             assert_eq!(
                 r.get(&Key::Int(i), true).unwrap(),
@@ -1977,8 +2040,8 @@ mod tests {
         let mut data = fs::read(&path).unwrap();
         let footer_start = data.len() - V2_FOOTER_SIZE;
 
-        // Patch features at footer[43..47] to 0x0000_0001 (unknown bit)
-        data[footer_start + 43..footer_start + 47].copy_from_slice(&1u32.to_be_bytes());
+        // Patch features at footer[43..47] to 0x8000_0000 (unknown bit)
+        data[footer_start + 43..footer_start + 47].copy_from_slice(&0x8000_0000u32.to_be_bytes());
 
         // Recompute checksum over first 51 bytes of footer
         let cksum = Checksum::compute(&data[footer_start..footer_start + 51]);
@@ -2021,5 +2084,84 @@ mod tests {
         };
         let msg = format!("{err}");
         assert!(msg.contains("unsupported version"), "{msg}");
+    }
+
+    #[test]
+    fn restart_points_written_and_readable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("restart.sst");
+        // Small block size to get multiple blocks with restart points
+        let mut w = SSTableWriter::new(&path, 64, Compression::None, 10, 0, &io()).unwrap();
+        for i in 0..50 {
+            w.add(
+                &Key::Int(i),
+                &Value::from(format!("v{i}").as_str()),
+                RevisionID::ZERO,
+                0,
+            )
+            .unwrap();
+        }
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
+        assert!(r.has_restarts);
+        assert_eq!(r.features(), FEATURE_RESTART_POINTS);
+        assert_eq!(r.entry_count(), 50);
+        assert!(r.block_count() > 1);
+
+        // Verify all keys are readable
+        for i in 0..50 {
+            let result = r.get(&Key::Int(i), true).unwrap();
+            assert_eq!(
+                result,
+                Some((Value::from(format!("v{i}").as_str()), RevisionID::ZERO, 0)),
+                "key {i} mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn restart_trailer_roundtrip() {
+        // Manually build a restart trailer and verify strip_restart_trailer
+        let mut block = Vec::new();
+        // Fake entry data (just some bytes)
+        block.extend_from_slice(b"entry_data_here");
+        let entry_end = block.len();
+
+        // Write 3 restart offsets: 0, 5, 10
+        block.extend_from_slice(&0u32.to_le_bytes());
+        block.extend_from_slice(&5u32.to_le_bytes());
+        block.extend_from_slice(&10u32.to_le_bytes());
+        block.extend_from_slice(&3u32.to_le_bytes()); // num_restarts
+
+        let (entries, restarts) = SSTableReader::strip_restart_trailer(&block).unwrap();
+        assert_eq!(entries, &block[..entry_end]);
+        assert_eq!(restarts, vec![0, 5, 10]);
+    }
+
+    #[test]
+    fn restart_points_with_compression() {
+        for compression in [Compression::LZ4, Compression::Zstd] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("compressed_restart.sst");
+            let mut w = SSTableWriter::new(&path, 128, compression.clone(), 10, 0, &io()).unwrap();
+            for i in 0..100 {
+                w.add(
+                    &Key::Int(i),
+                    &Value::from(format!("val{i}").as_str()),
+                    RevisionID::ZERO,
+                    0,
+                )
+                .unwrap();
+            }
+            w.finish().unwrap();
+
+            let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
+            assert!(r.has_restarts);
+            for i in 0..100 {
+                let result = r.get(&Key::Int(i), true).unwrap();
+                assert!(result.is_some(), "key {i} missing with {compression:?}");
+            }
+        }
     }
 }
