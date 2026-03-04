@@ -647,7 +647,8 @@ impl SSTableReader {
     /// (oldest-first order), returns the last match (latest revision).
     ///
     /// Uses the bloom filter for fast negative answers, binary search
-    /// for block selection, and linear scan within the block.
+    /// for block selection, and binary search within blocks via restart
+    /// points (or `partition_point` on cached entries).
     pub(crate) fn get(
         &self,
         key: &Key,
@@ -684,34 +685,86 @@ impl SSTableReader {
         // contain more entries for the same key.
         for bi in block_idx..self.index.len() {
             let ie = &self.index[bi];
-            let entries = self.read_block(ie, bi, verify_checksums)?;
+            let found_in_block =
+                self.get_from_block(ie, bi, &key_bytes, verify_checksums, &mut last_match)?;
 
-            let mut found_in_block = false;
-            for (kb, revision, expires_at_ms, value_tag, value_data) in entries {
-                if kb == key_bytes {
-                    let value = Value::from_tag(value_tag, &value_data)?;
-                    last_match = Some((value, RevisionID::from(revision), expires_at_ms));
-                    found_in_block = true;
-                } else if found_in_block {
-                    // Past the matching key entries in this block
-                    return Ok(last_match);
-                }
-            }
-
-            // If we found matches in this block but the block's last key is
-            // our target, more entries may span into the next block.
             if found_in_block {
                 if ie.last_key.as_slice() != key_bytes {
                     return Ok(last_match);
                 }
                 // last_key == target → entries may continue in next block
             } else {
-                // No match in this block and we started at the right block
                 break;
             }
         }
 
         Ok(last_match)
+    }
+
+    /// Search a single block for a key, updating `last_match` with the latest
+    /// revision found. Returns `true` if any match was found in this block.
+    ///
+    /// On cache hit: binary search via `partition_point`.
+    /// On cache miss (no cache) with restart points: targeted parse via
+    ///   `find_key_in_block` — skips full entry parsing for non-matching entries.
+    /// On cache miss (cache enabled): full parse + cache insert + binary search.
+    fn get_from_block(
+        &self,
+        ie: &IndexEntry,
+        block_index: usize,
+        key_bytes: &[u8],
+        verify_checksums: bool,
+        last_match: &mut Option<(Value, RevisionID, u64)>,
+    ) -> Result<bool> {
+        // 1. Cache hit → binary search on parsed entries
+        if let Some(ref c) = self.cache {
+            let mut cache = c.lock().unwrap();
+            if let Some(entries) = cache.get(self.sst_id, block_index as u32) {
+                drop(cache);
+                return Self::binary_search_entries(&entries, key_bytes, last_match);
+            }
+        }
+
+        // 2. Cache miss, no cache, restart points → targeted parse (fastest cold path)
+        if self.has_restarts && self.cache.is_none() {
+            let block_data = self.decompress_raw_block(ie, verify_checksums)?;
+            let (entry_data, restarts) = Self::strip_restart_trailer(&block_data)?;
+            if let Some(found) =
+                Self::find_key_in_block(entry_data, &restarts, key_bytes, self.version)?
+            {
+                *last_match = Some(found);
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
+        // 3. Cache miss with cache enabled → full parse + cache insert + binary search
+        let entries = self.read_block(ie, block_index, verify_checksums)?;
+        Self::binary_search_entries(&entries, key_bytes, last_match)
+    }
+
+    /// Binary search on parsed entries for a target key.
+    ///
+    /// Updates `last_match` with the latest revision (last entry) for the key.
+    /// Returns `true` if any match was found.
+    fn binary_search_entries(
+        entries: &[RawEntry],
+        key_bytes: &[u8],
+        last_match: &mut Option<(Value, RevisionID, u64)>,
+    ) -> Result<bool> {
+        // partition_point: first index where key >= target
+        let start = entries.partition_point(|e| e.0.as_slice() < key_bytes);
+        let mut found = false;
+        for entry in &entries[start..] {
+            if entry.0.as_slice() == key_bytes {
+                let value = Value::from_tag(entry.3, &entry.4)?;
+                *last_match = Some((value, RevisionID::from(entry.1), entry.2));
+                found = true;
+            } else {
+                break;
+            }
+        }
+        Ok(found)
     }
 
     /// Look up ALL revisions for a key in the SSTable.
@@ -884,6 +937,226 @@ impl SSTableReader {
             restarts.push(u32::from_le_bytes(block[off..off + 4].try_into().unwrap()));
         }
         Ok((&block[..entry_end], restarts))
+    }
+
+    /// Read the key at a given byte offset within entry data (no allocation).
+    ///
+    /// Returns `(key_slice, position_after_key)`.
+    fn key_at_offset(entry_data: &[u8], pos: usize) -> Result<(&[u8], usize)> {
+        if pos + 2 > entry_data.len() {
+            return Err(Error::Corruption("restart: truncated at key_len".into()));
+        }
+        let kl = u16::from_be_bytes(entry_data[pos..pos + 2].try_into().unwrap()) as usize;
+        let key_end = pos + 2 + kl;
+        if key_end > entry_data.len() {
+            return Err(Error::Corruption("restart: truncated at key".into()));
+        }
+        Ok((&entry_data[pos + 2..key_end], key_end))
+    }
+
+    /// Skip past the value portion of an entry (after the key has been read).
+    ///
+    /// `pos` should point to the revision field (V3+) or value_tag (V1/V2).
+    fn skip_entry_value(entry_data: &[u8], mut pos: usize, version: u16) -> Result<usize> {
+        if version >= 3 {
+            pos += 16; // revision: u128
+        }
+        if version >= 4 {
+            pos += 8; // expires_at_ms: u64
+        }
+        pos += 1; // value_tag
+        if pos + 4 > entry_data.len() {
+            return Err(Error::Corruption("restart: truncated at value_len".into()));
+        }
+        let vl = u32::from_be_bytes(entry_data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4 + vl;
+        if pos > entry_data.len() {
+            return Err(Error::Corruption("restart: truncated at value_data".into()));
+        }
+        Ok(pos)
+    }
+
+    /// Parse a single full entry at `pos`, returning (next_pos, RawEntry).
+    fn parse_one_entry(entry_data: &[u8], pos: usize, version: u16) -> Result<(usize, RawEntry)> {
+        let mut p = pos;
+        if p + 2 > entry_data.len() {
+            return Err(Error::Corruption("entry truncated at key_len".into()));
+        }
+        let kl = u16::from_be_bytes(entry_data[p..p + 2].try_into().unwrap()) as usize;
+        p += 2;
+        if p + kl > entry_data.len() {
+            return Err(Error::Corruption("entry truncated at key".into()));
+        }
+        let key_bytes = entry_data[p..p + kl].to_vec();
+        p += kl;
+
+        let revision = if version >= 3 {
+            if p + 16 > entry_data.len() {
+                return Err(Error::Corruption("entry truncated at revision".into()));
+            }
+            let rev = u128::from_be_bytes(entry_data[p..p + 16].try_into().unwrap());
+            p += 16;
+            rev
+        } else {
+            0u128
+        };
+
+        let expires_at_ms = if version >= 4 {
+            if p + 8 > entry_data.len() {
+                return Err(Error::Corruption("entry truncated at expires_at_ms".into()));
+            }
+            let ms = u64::from_be_bytes(entry_data[p..p + 8].try_into().unwrap());
+            p += 8;
+            ms
+        } else {
+            0u64
+        };
+
+        if p + 1 > entry_data.len() {
+            return Err(Error::Corruption("entry truncated at value_tag".into()));
+        }
+        let value_tag = entry_data[p];
+        p += 1;
+
+        if p + 4 > entry_data.len() {
+            return Err(Error::Corruption("entry truncated at value_len".into()));
+        }
+        let vl = u32::from_be_bytes(entry_data[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+
+        if p + vl > entry_data.len() {
+            return Err(Error::Corruption("entry truncated at value_data".into()));
+        }
+        let value_data = entry_data[p..p + vl].to_vec();
+        p += vl;
+
+        Ok((
+            p,
+            (key_bytes, revision, expires_at_ms, value_tag, value_data),
+        ))
+    }
+
+    /// Search restart point keys via binary search.
+    ///
+    /// Returns the index of the last restart point whose key <= `target`.
+    fn search_restart_keys(entry_data: &[u8], restarts: &[u32], target: &[u8]) -> Result<usize> {
+        let n = restarts.len();
+        if n == 0 {
+            return Err(Error::Corruption("no restart points in block".into()));
+        }
+
+        let mut lo = 0usize;
+        let mut hi = n - 1;
+
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            let (key, _) = Self::key_at_offset(entry_data, restarts[mid] as usize)?;
+            if key <= target {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+
+        Ok(lo)
+    }
+
+    /// Find a key within a decompressed block using restart points.
+    ///
+    /// Binary-searches restart keys to locate the interval, then parses
+    /// only entries in that interval. Returns the latest revision match
+    /// (last entry with matching key, since entries are oldest-first).
+    fn find_key_in_block(
+        entry_data: &[u8],
+        restarts: &[u32],
+        key_bytes: &[u8],
+        version: u16,
+    ) -> Result<Option<(Value, RevisionID, u64)>> {
+        if restarts.is_empty() || entry_data.is_empty() {
+            return Ok(None);
+        }
+
+        let ri = Self::search_restart_keys(entry_data, restarts, key_bytes)?;
+        let mut pos = restarts[ri] as usize;
+        let mut last_match: Option<(Value, RevisionID, u64)> = None;
+
+        while pos < entry_data.len() {
+            let (key, after_key) = Self::key_at_offset(entry_data, pos)?;
+
+            if key == key_bytes {
+                // Parse full entry (need value data)
+                let (next_pos, entry) = Self::parse_one_entry(entry_data, pos, version)?;
+                let value = Value::from_tag(entry.3, &entry.4)?;
+                last_match = Some((value, RevisionID::from(entry.1), entry.2));
+                pos = next_pos;
+            } else if key > key_bytes {
+                break;
+            } else {
+                // Skip this non-matching entry (zero allocation)
+                pos = Self::skip_entry_value(entry_data, after_key, version)?;
+            }
+        }
+
+        Ok(last_match)
+    }
+
+    /// Find all revisions of a key within a decompressed block using restart points.
+    #[allow(dead_code)] // consumed in get_all_revisions() rewrite (next commit)
+    fn find_all_in_block(
+        entry_data: &[u8],
+        restarts: &[u32],
+        key_bytes: &[u8],
+        version: u16,
+    ) -> Result<Vec<(Value, RevisionID, u64)>> {
+        if restarts.is_empty() || entry_data.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ri = Self::search_restart_keys(entry_data, restarts, key_bytes)?;
+        let mut pos = restarts[ri] as usize;
+        let mut result = Vec::new();
+
+        while pos < entry_data.len() {
+            let (key, after_key) = Self::key_at_offset(entry_data, pos)?;
+
+            if key == key_bytes {
+                let (next_pos, entry) = Self::parse_one_entry(entry_data, pos, version)?;
+                let value = Value::from_tag(entry.3, &entry.4)?;
+                result.push((value, RevisionID::from(entry.1), entry.2));
+                pos = next_pos;
+            } else if key > key_bytes {
+                break;
+            } else {
+                pos = Self::skip_entry_value(entry_data, after_key, version)?;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Decompress a raw block from disk, verify checksum if requested.
+    fn decompress_raw_block(&self, ie: &IndexEntry, verify_checksums: bool) -> Result<Vec<u8>> {
+        let block_start = ie.offset as usize;
+        let block_end = block_start + ie.size as usize;
+
+        if block_end > self.data.len() {
+            return Err(Error::Corruption(format!(
+                "SSTable block out of bounds: {block_start}..{block_end} (file size {})",
+                self.data.len()
+            )));
+        }
+
+        let block_on_disk = &self.data[block_start..block_end];
+        let cksum_start = block_on_disk.len() - Checksum::encoded_size();
+
+        if verify_checksums {
+            let checksum = Checksum::from_bytes(&block_on_disk[cksum_start..])?;
+            checksum.verify(&block_on_disk[..cksum_start])?;
+        }
+
+        let compression_tag = block_on_disk[0];
+        let compressed_payload = &block_on_disk[1..cksum_start];
+        decompress_block(compression_tag, compressed_payload)
     }
 
     /// Scan entries matching a prefix/range.
