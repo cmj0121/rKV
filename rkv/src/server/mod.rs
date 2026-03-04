@@ -1976,4 +1976,45 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_prometheus_format() {
+        let db = temp_db();
+        // Put a key so we have some ops to observe
+        let ns = db.namespace("_", None).unwrap();
+        ns.put("k1", "v1", None).unwrap();
+        ns.get("k1").unwrap();
+        drop(ns);
+
+        let app = super::build_router(db);
+        let resp = app
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.contains("text/plain"), "expected text/plain, got {ct}");
+
+        let body = body_string(resp.into_body()).await;
+        // Counters
+        assert!(body.contains("rkv_ops_total{op=\"put\"}"));
+        assert!(body.contains("rkv_ops_total{op=\"get\"}"));
+        // Gauges
+        assert!(body.contains("rkv_keys"));
+        assert!(body.contains("rkv_uptime_seconds"));
+        // Histograms
+        assert!(body.contains("rkv_op_duration_seconds_bucket{op=\"put\""));
+        assert!(body.contains("rkv_op_duration_seconds_count{op=\"put\"} 1"));
+        assert!(body.contains("rkv_op_duration_seconds_count{op=\"get\"} 1"));
+        // TYPE declarations
+        assert!(body.contains("# TYPE rkv_ops_total counter"));
+        assert!(body.contains("# TYPE rkv_keys gauge"));
+        assert!(body.contains("# TYPE rkv_op_duration_seconds histogram"));
+    }
 }

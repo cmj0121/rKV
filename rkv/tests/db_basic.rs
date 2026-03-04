@@ -5306,3 +5306,53 @@ fn rev_count_after_flush_with_restart_points() {
 
     db.close().unwrap();
 }
+
+// --- Prometheus metrics ---
+
+#[test]
+fn prometheus_metrics_includes_op_counts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("a", "1", None).unwrap();
+    ns.put("b", "2", None).unwrap();
+    ns.get("a").unwrap();
+
+    let output = db.prometheus_metrics();
+    assert!(output.contains("rkv_ops_total{op=\"put\"} 2"));
+    assert!(output.contains("rkv_ops_total{op=\"get\"} 1"));
+    assert!(output.contains("# TYPE rkv_op_duration_seconds histogram"));
+    // Histogram should record 2 put observations
+    assert!(output.contains("rkv_op_duration_seconds_count{op=\"put\"} 2"));
+    // Histogram should record 1 get observation
+    assert!(output.contains("rkv_op_duration_seconds_count{op=\"get\"} 1"));
+
+    db.close().unwrap();
+}
+
+#[test]
+fn prometheus_metrics_tracks_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("k", "v", None).unwrap();
+    db.flush().unwrap();
+
+    let output = db.prometheus_metrics();
+    assert!(
+        output.contains("rkv_flush_total 1"),
+        "expected flush_total 1"
+    );
+    assert!(
+        output.contains("rkv_bytes_flushed_total"),
+        "expected bytes_flushed_total"
+    );
+    // Flush duration histogram should have 1 observation
+    assert!(output.contains("rkv_flush_duration_seconds_count 1"));
+
+    db.close().unwrap();
+}
