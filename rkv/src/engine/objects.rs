@@ -281,6 +281,12 @@ impl ObjectStore {
     /// New objects are appended to a pack file. If an object with the same
     /// hash already exists (dedup), the write is skipped.
     pub(crate) fn write(&self, data: &[u8], compress: bool) -> Result<ValuePointer> {
+        if data.len() > u32::MAX as usize {
+            return Err(Error::Corruption(
+                "object too large for pack format (>4 GB)".into(),
+            ));
+        }
+
         let hash: [u8; 32] = blake3::hash(data).into();
         let size = data.len() as u32;
         let vp = ValuePointer::new(hash, size);
@@ -548,14 +554,18 @@ impl ObjectStore {
             new_index.insert(*hash, new_entry);
         }
 
-        // Delete old packs
-        for path in &old_packs {
-            let _ = fs::remove_file(path);
-        }
-
+        // Update index BEFORE deleting old packs (crash safety: if we crash
+        // after index update but before deletion, the old packs remain on disk
+        // as harmless leftovers that get re-scanned on next open; if we deleted
+        // first and crashed, live objects could be lost).
         state.index = new_index;
         state.dead.clear();
         // Leave writer as None — next write will create a new pack
+
+        // Now safe to delete old packs — index already points to new pack
+        for path in &old_packs {
+            let _ = fs::remove_file(path);
+        }
 
         Ok(dead_count)
     }
@@ -977,5 +987,61 @@ mod tests {
         let hex = hex_encode(&hash);
         let decoded = hex_decode_hash(&hex).unwrap();
         assert_eq!(hash, decoded);
+    }
+
+    #[test]
+    fn empty_data_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+
+        let data = b"";
+        let vp = store.write(data, false).unwrap();
+        assert_eq!(vp.size, 0);
+
+        let result = store.read(&vp, true).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn pack_crc32c_corruption_detected_on_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+
+        let vp = store.write(b"checksum test", false).unwrap();
+
+        // Corrupt the CRC32C checksum in the pack file
+        let pack_path = store.pack_path(1);
+        let mut content = fs::read(&pack_path).unwrap();
+        // Flip a bit in the checksum (last 5 bytes of the first record)
+        let cksum_offset = content.len() - 1;
+        content[cksum_offset] ^= 0xFF;
+        fs::write(&pack_path, &content).unwrap();
+
+        // Re-open — scan should skip the corrupted record
+        let store2 = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        assert_eq!(store2.pack_count(), 0);
+
+        // Direct read should fail with corruption error
+        let err = store2.read(&vp, false).unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)));
+    }
+
+    #[test]
+    fn repack_gc_all_dead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+
+        store.write(b"obj1", false).unwrap();
+        store.write(b"obj2", false).unwrap();
+        assert_eq!(store.pack_count(), 2);
+
+        // No live hashes — everything is dead
+        let live = HashSet::new();
+        let removed = store.repack_gc(&live).unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(store.pack_count(), 0);
+
+        // Pack files should be deleted from disk
+        assert!(store.list_pack_files().is_empty());
     }
 }
