@@ -14,13 +14,15 @@ use std::sync::{Arc, RwLock};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
-use crate::{Config, Namespace, DB};
+use crate::{Config, Namespace, RoutingTable, ShardGroup, DB};
 
 pub struct AppState {
     pub db: DB,
     /// Cached passwords for encrypted namespaces.
     /// Populated by POST /api/namespaces, lost on restart.
     ns_passwords: RwLock<HashMap<String, String>>,
+    /// Cluster routing table (empty in standalone mode).
+    pub routing_table: RwLock<RoutingTable>,
 }
 
 impl AppState {
@@ -44,6 +46,7 @@ pub fn build_router_with_ui(db: DB, enable_ui: bool) -> axum::Router {
     let state = Arc::new(AppState {
         db,
         ns_passwords: RwLock::new(HashMap::new()),
+        routing_table: RwLock::new(RoutingTable::new(ShardGroup::new(0))),
     });
     routes::router(state, enable_ui)
 }
@@ -75,6 +78,10 @@ pub fn run(config: ServerConfig) {
         db_config.peers = config.peers.clone();
         db_config.cluster_id = config.cluster_id;
 
+        // Cluster config
+        db_config.shard_group = config.shard_group.unwrap_or(0);
+        db_config.owned_namespaces = config.owned_namespaces.clone();
+
         let db = match DB::open(db_config) {
             Ok(db) => db,
             Err(e) => {
@@ -87,11 +94,20 @@ pub fn run(config: ServerConfig) {
         let timeout_secs = config.timeout;
         let enable_ui = config.ui;
 
+        // Read shard config from the opened DB
+        let shard_group = db.config().shard_group;
+        let owned_namespaces = db.config().owned_namespaces.clone();
+
+        let default_group = ShardGroup::new(shard_group);
+        let routing_table = RoutingTable::new(default_group);
+
         let state = Arc::new(AppState {
             db,
             ns_passwords: RwLock::new(HashMap::new()),
+            routing_table: RwLock::new(routing_table),
         });
         let ip_layer = middleware::IpFilterLayer::new(config.allow_all, &config.allow_ip);
+        let shard_layer = middleware::ShardFilterLayer::new(shard_group, &owned_namespaces);
         let mut app = routes::router(state.clone(), enable_ui)
             .layer(axum::extract::DefaultBodyLimit::max(body_limit));
         if timeout_secs > 0 {
@@ -100,7 +116,10 @@ pub fn run(config: ServerConfig) {
                 std::time::Duration::from_secs(timeout_secs),
             ));
         }
-        let app = app.layer(TraceLayer::new_for_http()).layer(ip_layer);
+        let app = app
+            .layer(TraceLayer::new_for_http())
+            .layer(ip_layer)
+            .layer(shard_layer);
 
         let addr = format!("{}:{}", config.bind, config.port);
         let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -1094,6 +1113,9 @@ mod tests {
         let state = std::sync::Arc::new(super::AppState {
             db,
             ns_passwords: std::sync::RwLock::new(std::collections::HashMap::new()),
+            routing_table: std::sync::RwLock::new(crate::RoutingTable::new(
+                crate::ShardGroup::new(0),
+            )),
         });
 
         // Build router with IP filter allowing only 10.0.0.1

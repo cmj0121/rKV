@@ -115,5 +115,63 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> Json<serde_json::
         "l0_max_size": c.l0_max_size,
         "l1_max_size": c.l1_max_size,
         "default_max_size": c.default_max_size,
+        "shard_group": c.shard_group,
+        "owned_namespaces": c.owned_namespaces,
     }))
+}
+
+/// GET /api/admin/cluster — cluster routing table and shard info
+pub async fn get_cluster(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let c = state.db.config();
+    let rt = state
+        .routing_table
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let routes: serde_json::Map<String, serde_json::Value> = rt
+        .routes
+        .iter()
+        .map(|(ns, sg)| (ns.clone(), serde_json::json!(sg.id)))
+        .collect();
+    Json(serde_json::json!({
+        "shard_group": c.shard_group,
+        "owned_namespaces": c.owned_namespaces,
+        "routing_table": {
+            "version": rt.version,
+            "routes": routes,
+            "default_group": rt.default_group.id,
+        },
+    }))
+}
+
+/// Request body for `POST /api/admin/route`.
+#[derive(serde::Deserialize)]
+pub(crate) struct SetRouteRequest {
+    namespace: String,
+    shard_group: u16,
+}
+
+/// POST /api/admin/route — update a namespace-to-shard mapping
+///
+/// Request body: `{"namespace": "users", "shard_group": 2}`
+pub async fn set_route(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SetRouteRequest>,
+) -> Result<Json<serde_json::Value>, ServerError> {
+    let namespace = body.namespace;
+    let group_id = body.shard_group;
+
+    let mut rt = state
+        .routing_table
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    rt.set_route(namespace.clone(), crate::ShardGroup::new(group_id));
+    let version = rt.version;
+    drop(rt);
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "namespace": namespace,
+        "shard_group": group_id,
+        "version": version,
+    })))
 }

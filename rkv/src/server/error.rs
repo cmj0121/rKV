@@ -46,6 +46,16 @@ impl IntoResponse for ServerError {
                     "read-only replica",
                     "writes are rejected on replica nodes".to_string(),
                 ),
+                Error::NotMyShard(ns, group) => (
+                    StatusCode::MISDIRECTED_REQUEST,
+                    "not my shard",
+                    format!("namespace '{ns}' is owned by shard group {group}"),
+                ),
+                Error::ClusterError(d) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "cluster error",
+                    d.clone(),
+                ),
             },
         };
         (status, Json(json!({"error": msg, "detail": detail}))).into_response()

@@ -57,6 +57,14 @@ pub struct ServerConfig {
     /// Cluster ID for RevisionID generation (0–65535, omit for random)
     #[arg(long)]
     pub cluster_id: Option<u16>,
+
+    /// Shard group ID for cluster mode
+    #[arg(long)]
+    pub shard_group: Option<u16>,
+
+    /// Comma-separated list of namespaces owned by this shard node
+    #[arg(long, value_delimiter = ',')]
+    pub owned_namespaces: Vec<String>,
 }
 
 /// Parse a human-readable size string into bytes.

@@ -833,6 +833,22 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                         c.peers.join(", ")
                     },
                 ),
+                ("", "", String::new()),
+                ("Cluster", "", String::new()),
+                (
+                    "  cluster.shard_group",
+                    "shard group ID (0 = standalone)",
+                    c.shard_group.to_string(),
+                ),
+                (
+                    "  cluster.owned_namespaces",
+                    "namespaces owned by this node",
+                    if c.owned_namespaces.is_empty() {
+                        "all".to_owned()
+                    } else {
+                        c.owned_namespaces.join(", ")
+                    },
+                ),
             ];
             for (key, desc, val) in items {
                 if key.is_empty() {
@@ -1162,6 +1178,21 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
                 c.peers.clear();
             } else {
                 c.peers = value.split(',').map(|s| s.trim().to_owned()).collect();
+            }
+            println!("OK (takes effect on next restart)");
+        }
+        "cluster.shard_group" => match value.parse::<u16>() {
+            Ok(v) => {
+                c.shard_group = v;
+                println!("OK (takes effect on next restart)");
+            }
+            Err(_) => eprintln!("error: expected a number (0-65535)"),
+        },
+        "cluster.owned_namespaces" => {
+            if value == "none" || value == "all" {
+                c.owned_namespaces.clear();
+            } else {
+                c.owned_namespaces = value.split(',').map(|s| s.trim().to_owned()).collect();
             }
             println!("OK (takes effect on next restart)");
         }
