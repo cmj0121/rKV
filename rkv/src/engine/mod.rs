@@ -1,4 +1,5 @@
 mod aol;
+mod batch;
 mod bloom;
 mod cache;
 mod checksum;
@@ -21,6 +22,7 @@ mod sstable;
 mod stats;
 mod value;
 
+pub use batch::{BatchOp, WriteBatch};
 pub use error::{Error, Result};
 pub use key::Key;
 pub use metrics::{CompactionEvent, EventListener, FlushEvent};
@@ -2603,6 +2605,11 @@ impl DB {
         self.revision_gen.generate()
     }
 
+    /// Acquire the AOL lock for batch operations.
+    pub(crate) fn aol_lock(&self) -> std::sync::MutexGuard<'_, aol::Aol> {
+        self.aol.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub(crate) fn append_to_aol(
         &self,
         ns: &str,
@@ -2611,37 +2618,34 @@ impl DB {
         value: &Value,
         ttl: Option<Duration>,
     ) -> Result<()> {
-        let mut aol = self.aol.lock().unwrap_or_else(|e| e.into_inner());
+        let mut aol = self.aol_lock();
+        self.append_to_aol_locked(&mut aol, ns, rev, key, value, ttl)
+    }
+
+    /// Append to AOL using an already-acquired lock, then broadcast to
+    /// replicas/peers. Used by `write_batch` to hold the lock across
+    /// multiple appends.
+    pub(crate) fn append_to_aol_locked(
+        &self,
+        aol: &mut aol::Aol,
+        ns: &str,
+        rev: u128,
+        key: &Key,
+        value: &Value,
+        ttl: Option<Duration>,
+    ) -> Result<()> {
         aol.append(ns, rev, key, value, ttl)?;
 
         // Broadcast to replicas if this node is a primary
         if let Some(ref sender) = self.repl_sender {
-            let expires_at_ms = match ttl {
-                Some(d) => {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    now + d.as_millis() as u64
-                }
-                None => 0,
-            };
+            let expires_at_ms = Self::ttl_to_epoch_ms(ttl);
             let payload = aol::encode_payload(ns, rev, expires_at_ms, key, value);
             sender.broadcast_aol(&payload);
         }
 
         // Broadcast to peers if this node is a peer (master-master)
         if self.config.role == replication::Role::Peer {
-            let expires_at_ms = match ttl {
-                Some(d) => {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    now + d.as_millis() as u64
-                }
-                None => 0,
-            };
+            let expires_at_ms = Self::ttl_to_epoch_ms(ttl);
             let payload = aol::encode_payload(ns, rev, expires_at_ms, key, value);
             let local_cluster = self.revision_gen.cluster_id();
             let sessions = self.peer_sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -2652,6 +2656,20 @@ impl DB {
             }
         }
         Ok(())
+    }
+
+    /// Convert an optional TTL duration to an absolute epoch timestamp in ms.
+    fn ttl_to_epoch_ms(ttl: Option<Duration>) -> u64 {
+        match ttl {
+            Some(d) => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                now + d.as_millis() as u64
+            }
+            None => 0,
+        }
     }
 
     /// Replay an AOL record from a peer using LWW conflict resolution.
@@ -3073,6 +3091,10 @@ impl DB {
 
     pub(crate) fn inc_op_puts(&self) {
         self.op_puts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn inc_op_puts_by(&self, n: u64) {
+        self.op_puts.fetch_add(n, Ordering::Relaxed);
     }
 
     pub(crate) fn inc_op_gets(&self) {

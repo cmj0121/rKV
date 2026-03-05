@@ -2017,4 +2017,111 @@ mod tests {
         assert!(body.contains("# TYPE rkv_keys gauge"));
         assert!(body.contains("# TYPE rkv_op_duration_seconds histogram"));
     }
+
+    #[tokio::test]
+    async fn batch_put_and_delete() {
+        let app = app();
+
+        let body = serde_json::json!({
+            "ops": [
+                {"op": "put", "key": "k1", "value": "v1"},
+                {"op": "put", "key": "k2", "value": "v2"},
+                {"op": "delete", "key": "k3"}
+            ]
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/_/batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["results"].as_array().unwrap().len(), 3);
+        assert_eq!(v["results"][0]["key"], "k1");
+        assert_eq!(v["results"][1]["key"], "k2");
+        assert_eq!(v["results"][2]["key"], "k3");
+
+        // Verify the puts are readable
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/api/_/keys/k1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn batch_empty_returns_400() {
+        let app = app();
+        let body = serde_json::json!({"ops": []});
+        let resp = app
+            .oneshot(
+                Request::post("/api/_/batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn batch_with_ttl() {
+        let app = app();
+        let body = serde_json::json!({
+            "ops": [
+                {"op": "put", "key": "ttl_key", "value": "val", "ttl": 3600}
+            ]
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/_/batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // TTL endpoint should return a value
+        let resp = app
+            .oneshot(
+                Request::get("/api/_/keys/ttl_key/ttl")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let secs: f64 = serde_json::from_str(&body).unwrap();
+        assert!(secs > 3500.0 && secs <= 3600.0);
+    }
+
+    #[tokio::test]
+    async fn batch_replica_returns_403() {
+        let app = replica_app();
+        let body = serde_json::json!({
+            "ops": [{"op": "put", "key": "k1", "value": "v1"}]
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/_/batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
 }
