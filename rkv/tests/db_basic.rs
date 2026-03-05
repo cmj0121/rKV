@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use rkv::{
     CompactionEvent, Compression, Config, Error, EventListener, FlushEvent, IoModel, Key,
-    LevelStat, RevisionID, Stats, Value, DB, DEFAULT_NAMESPACE,
+    LevelStat, RevisionID, Stats, Value, WriteBatch, DB, DEFAULT_NAMESPACE,
 };
 
 #[test]
@@ -5418,6 +5418,269 @@ fn prometheus_metrics_tracks_compaction() {
             && !output.contains("rkv_bytes_compacted_total 0"),
         "expected bytes_compacted_total > 0"
     );
+
+    db.close().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// WriteBatch tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn write_batch_basic_put_and_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = DB::open(Config::new(tmp.path())).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let batch = WriteBatch::new()
+        .put("k1", "v1", None)
+        .put("k2", "v2", None)
+        .put("k3", "v3", None);
+
+    let revs = ns.write_batch(batch).unwrap();
+    assert_eq!(revs.len(), 3);
+
+    assert_eq!(ns.get("k1").unwrap(), Value::from("v1"));
+    assert_eq!(ns.get("k2").unwrap(), Value::from("v2"));
+    assert_eq!(ns.get("k3").unwrap(), Value::from("v3"));
+
+    // Now delete k2 in a batch
+    let batch = WriteBatch::new().delete("k2");
+    let revs = ns.write_batch(batch).unwrap();
+    assert_eq!(revs.len(), 1);
+
+    assert!(ns.get("k2").is_err());
+    assert_eq!(ns.get("k1").unwrap(), Value::from("v1"));
+    assert_eq!(ns.get("k3").unwrap(), Value::from("v3"));
+
+    db.close().unwrap();
+}
+
+#[test]
+fn write_batch_mixed_put_and_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = DB::open(Config::new(tmp.path())).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // Pre-populate
+    ns.put("existing", "old_value", None).unwrap();
+
+    let batch = WriteBatch::new()
+        .put("new_key", "new_value", None)
+        .delete("existing")
+        .put("another", "value", None);
+
+    let revs = ns.write_batch(batch).unwrap();
+    assert_eq!(revs.len(), 3);
+
+    assert_eq!(ns.get("new_key").unwrap(), Value::from("new_value"));
+    assert!(ns.get("existing").is_err());
+    assert_eq!(ns.get("another").unwrap(), Value::from("value"));
+
+    db.close().unwrap();
+}
+
+#[test]
+fn write_batch_empty_returns_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = DB::open(Config::new(tmp.path())).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let batch = WriteBatch::new();
+    let revs = ns.write_batch(batch).unwrap();
+    assert!(revs.is_empty());
+
+    db.close().unwrap();
+}
+
+#[test]
+fn write_batch_with_ttl() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = DB::open(Config::new(tmp.path())).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let batch = WriteBatch::new()
+        .put("k1", "v1", Some(Duration::from_secs(3600)))
+        .put("k2", "v2", None);
+
+    let revs = ns.write_batch(batch).unwrap();
+    assert_eq!(revs.len(), 2);
+
+    // k1 should have a TTL
+    let ttl = ns.ttl("k1").unwrap();
+    assert!(ttl.is_some());
+    let remaining = ttl.unwrap();
+    assert!(remaining.as_secs() > 3500);
+
+    // k2 should not have a TTL
+    let ttl = ns.ttl("k2").unwrap();
+    assert!(ttl.is_none());
+
+    db.close().unwrap();
+}
+
+#[test]
+fn write_batch_survives_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().to_path_buf();
+
+    // Write batch and close
+    {
+        let db = DB::open(Config::new(&db_path)).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        let batch = WriteBatch::new()
+            .put("k1", "v1", None)
+            .put("k2", "v2", None)
+            .delete("k3"); // delete non-existing is fine
+
+        ns.write_batch(batch).unwrap();
+        db.close().unwrap();
+    }
+
+    // Reopen and verify AOL replay recovers the batch
+    {
+        let db = DB::open(Config::new(&db_path)).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        assert_eq!(ns.get("k1").unwrap(), Value::from("v1"));
+        assert_eq!(ns.get("k2").unwrap(), Value::from("v2"));
+
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn write_batch_survives_flush_and_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().to_path_buf();
+
+    {
+        let db = DB::open(Config::new(&db_path)).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        let batch = WriteBatch::new()
+            .put("k1", "v1", None)
+            .put("k2", "v2", None)
+            .put("k3", "v3", None);
+        ns.write_batch(batch).unwrap();
+
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+
+    {
+        let db = DB::open(Config::new(&db_path)).unwrap();
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        assert_eq!(ns.get("k1").unwrap(), Value::from("v1"));
+        assert_eq!(ns.get("k2").unwrap(), Value::from("v2"));
+        assert_eq!(ns.get("k3").unwrap(), Value::from("v3"));
+
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn write_batch_updates_stats() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = DB::open(Config::new(tmp.path())).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let batch = WriteBatch::new()
+        .put("k1", "v1", None)
+        .put("k2", "v2", None)
+        .delete("k3");
+
+    ns.write_batch(batch).unwrap();
+
+    let stats = db.stats();
+    assert!(
+        stats.op_puts >= 2,
+        "expected >= 2 puts, got {}",
+        stats.op_puts
+    );
+    assert!(
+        stats.op_deletes >= 1,
+        "expected >= 1 deletes, got {}",
+        stats.op_deletes
+    );
+
+    db.close().unwrap();
+}
+
+#[test]
+fn write_batch_rejected_on_replica() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.role = rkv::Role::Replica;
+    config.primary_addr = Some("127.0.0.1:19999".to_string());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let batch = WriteBatch::new().put("k1", "v1", None);
+    let err = ns.write_batch(batch).unwrap_err();
+    assert!(matches!(err, Error::ReadOnlyReplica));
+
+    db.close().unwrap();
+}
+
+#[test]
+fn write_batch_concurrent_batches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(DB::open(Config::new(tmp.path())).unwrap());
+
+    let mut handles = Vec::new();
+    for t in 0..4 {
+        let db = Arc::clone(&db);
+        handles.push(std::thread::spawn(move || {
+            let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+            let mut batch = WriteBatch::new();
+            for i in 0..25 {
+                batch = batch.put(format!("t{t}_k{i}"), format!("v{i}"), None);
+            }
+            ns.write_batch(batch).unwrap();
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // All 100 keys should be present
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    for t in 0..4 {
+        for i in 0..25 {
+            let val = ns.get(format!("t{t}_k{i}")).unwrap();
+            assert_eq!(val, Value::from(format!("v{i}")));
+        }
+    }
+
+    drop(ns);
+    let Ok(db) = Arc::try_unwrap(db) else {
+        panic!("other Arc references still exist");
+    };
+    db.close().unwrap();
+}
+
+#[test]
+fn write_batch_int_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = DB::open(Config::new(tmp.path())).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let batch = WriteBatch::new()
+        .put(1_i64, "one", None)
+        .put(2_i64, "two", None)
+        .put(3_i64, "three", None)
+        .delete(2_i64);
+
+    let revs = ns.write_batch(batch).unwrap();
+    assert_eq!(revs.len(), 4);
+
+    assert_eq!(ns.get(1_i64).unwrap(), Value::from("one"));
+    assert!(ns.get(2_i64).is_err());
+    assert_eq!(ns.get(3_i64).unwrap(), Value::from("three"));
 
     db.close().unwrap();
 }
