@@ -91,6 +91,10 @@ docker compose up --build
 
 For protocol details and architecture, see [Replication](docs/replication.md#primary-replica-replication).
 
+For horizontal scaling beyond single-node capacity, rKV supports **cluster mode** with
+namespace-level sharding — each namespace lives on a dedicated shard group, with stateless
+gateways routing requests by namespace. See [Cluster / Sharding](docs/cluster.md).
+
 ## Concept
 
 - **Revision-aware** — every write produces a unique RevisionID; query history with `rev_get`/`rev_count`

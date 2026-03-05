@@ -763,3 +763,5 @@ See the [README](README.md#http-server) for startup examples and curl recipes.
   MemTable, AOL).
 - **[Replication](docs/replication.md)** — primary-replica replication (read scaling) and
   peer-peer replication (multi-writer with LWW conflict resolution).
+- **[Cluster / Sharding](docs/cluster.md)** — namespace-level sharding with gateway routing
+  for horizontal data distribution across shard groups.

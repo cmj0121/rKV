@@ -153,6 +153,9 @@ for read traffic. Writes on any node propagate to all others via peer replicatio
 Write nodes and replica-01 bind-mount data to `.data/` subdirectories; replica-02 and
 replica-03 use ephemeral container storage.
 
+For cluster/sharding mode (namespace-level sharding with gateway routing), use
+`docker compose --profile cluster up`. See [Cluster / Sharding](cluster.md) for details.
+
 ## Peer Replication
 
 Peer (master-master) replication allows two or more nodes to accept writes independently, with
