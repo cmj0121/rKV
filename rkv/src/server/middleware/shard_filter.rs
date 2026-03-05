@@ -121,3 +121,73 @@ where
         Box::pin(async move { svc.call(req).await })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_ns_from_key_path() {
+        assert_eq!(extract_namespace("/api/users/keys/foo"), Some("users"));
+    }
+
+    #[test]
+    fn extract_ns_from_namespace_root() {
+        assert_eq!(extract_namespace("/api/orders"), Some("orders"));
+    }
+
+    #[test]
+    fn extract_ns_skips_admin() {
+        assert_eq!(extract_namespace("/api/admin/stats"), None);
+    }
+
+    #[test]
+    fn extract_ns_skips_namespaces_endpoint() {
+        assert_eq!(extract_namespace("/api/namespaces"), None);
+    }
+
+    #[test]
+    fn extract_ns_non_api() {
+        assert_eq!(extract_namespace("/health"), None);
+        assert_eq!(extract_namespace("/metrics"), None);
+    }
+
+    #[test]
+    fn extract_ns_does_not_match_namespace_prefixed_names() {
+        // A namespace called "namespaces_data" should be treated as a namespace,
+        // not confused with the /api/namespaces management endpoint
+        assert_eq!(
+            extract_namespace("/api/namespaces_data/keys/foo"),
+            Some("namespaces_data")
+        );
+    }
+
+    #[test]
+    fn extract_ns_default() {
+        assert_eq!(extract_namespace("/api/_/keys/foo"), Some("_"));
+    }
+
+    #[test]
+    fn shard_state_standalone() {
+        let state = ShardState {
+            shard_group: 0,
+            owned: HashSet::new(),
+        };
+        assert!(!state.is_cluster_mode());
+        assert!(state.owns("anything"));
+    }
+
+    #[test]
+    fn shard_state_cluster() {
+        let state = ShardState {
+            shard_group: 1,
+            owned: ["users".to_string(), "sessions".to_string()]
+                .into_iter()
+                .collect(),
+        };
+        assert!(state.is_cluster_mode());
+        assert!(state.owns("users"));
+        assert!(state.owns("sessions"));
+        assert!(!state.owns("orders"));
+    }
+}
