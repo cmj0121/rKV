@@ -1691,6 +1691,12 @@ impl DB {
                 .observe(flush_start.elapsed().as_secs_f64());
             let mut aol = self.aol.lock().unwrap_or_else(|e| e.into_inner());
             aol.truncate(&self.config.path)?;
+
+            // Flush pack writers for durability (best-effort)
+            let obj_stores = self.object_stores.read().unwrap_or_else(|e| e.into_inner());
+            for (_, store) in obj_stores.iter() {
+                let _ = store.flush();
+            }
         }
 
         // Signal background compaction thread
