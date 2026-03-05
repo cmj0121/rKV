@@ -3,6 +3,7 @@ mod batch;
 mod bloom;
 mod cache;
 mod checksum;
+mod cluster;
 pub(crate) mod crypto;
 mod dump;
 mod error;
@@ -23,6 +24,7 @@ mod stats;
 mod value;
 
 pub use batch::{BatchOp, WriteBatch};
+pub use cluster::{NodeInfo, RoutingTable, ShardGroup};
 pub use error::{Error, Result};
 pub use key::Key;
 pub use metrics::{CompactionEvent, EventListener, FlushEvent};
@@ -215,6 +217,11 @@ pub struct Config {
     pub write_stall_size: usize,
     /// Optional event listener for flush/compaction lifecycle hooks.
     pub event_listener: Option<Arc<dyn metrics::EventListener>>,
+    /// Shard group ID for cluster mode (default: 0 = standalone).
+    pub shard_group: u16,
+    /// Namespaces owned by this node in cluster mode.
+    /// Empty means all namespaces are accepted (standalone behavior).
+    pub owned_namespaces: Vec<String>,
 }
 
 impl fmt::Debug for Config {
@@ -259,6 +266,8 @@ impl Config {
             peers: Vec::new(),
             write_stall_size: 8 * 1024 * 1024,
             event_listener: None,
+            shard_group: 0,
+            owned_namespaces: Vec::new(),
         }
     }
 }
