@@ -343,32 +343,33 @@ one character before it. Use `help wipe` for detailed usage.
 
 The `Config` struct controls database behavior and LSM tuning parameters:
 
-| Field               | Type             | Default    | Description                                |
-| ------------------- | ---------------- | ---------- | ------------------------------------------ |
-| `path`              | `PathBuf`        | (required) | Database directory path                    |
-| `create_if_missing` | `bool`           | `true`     | Create the directory if it doesn't exist   |
-| `write_buffer_size` | `usize`          | 4 MB       | In-memory write buffer size before flush   |
-| `max_levels`        | `usize`          | 3          | Maximum number of LSM levels               |
-| `block_size`        | `usize`          | 4 KB       | SSTable block size                         |
-| `cache_size`        | `usize`          | 8 MB       | Block cache size for decompressed blocks   |
-| `object_size`       | `usize`          | 1 KB       | Bin object size threshold (see above)      |
-| `compress`          | `bool`           | `true`     | LZ4-compress bin objects on disk           |
-| `bloom_bits`        | `usize`          | 10         | Bloom filter bits per key (0 = disabled)   |
-| `verify_checksums`  | `bool`           | `true`     | Verify checksums on read                   |
-| `compression`       | `Compression`    | `LZ4`      | SSTable block compression                  |
-| `io_model`          | `IoModel`        | `Mmap`     | File I/O strategy (see I/O Modes below)    |
-| `cluster_id`        | `Option<u16>`    | `None`     | Cluster ID for RevisionID (random if None) |
-| `aol_buffer_size`   | `usize`          | 128        | AOL flush threshold in records (0 = every) |
-| `l0_max_count`      | `usize`          | 4          | Max L0 SSTable count before compaction     |
-| `l0_max_size`       | `usize`          | 64 MB      | Max total L0 size before compaction        |
-| `l1_max_size`       | `usize`          | 256 MB     | Max L1 size before merge to L2             |
-| `default_max_size`  | `usize`          | 2 GB       | Default max size for L2+ levels            |
-| `bloom_prefix_len`  | `usize`          | 0          | Prefix bloom filter length (0 = disabled)  |
-| `role`              | `Role`           | Standalone | Replication role                           |
-| `repl_bind`         | `String`         | `0.0.0.0`  | Replication listen address                 |
-| `repl_port`         | `u16`            | 8322       | Replication listen port                    |
-| `primary_addr`      | `Option<String>` | `None`     | Primary address for replica to connect to  |
-| `peers`             | `Vec<String>`    | `[]`       | Peer addresses (peer mode only)            |
+| Field               | Type              | Default    | Description                                |
+| ------------------- | ----------------- | ---------- | ------------------------------------------ |
+| `path`              | `PathBuf`         | (required) | Database directory path                    |
+| `create_if_missing` | `bool`            | `true`     | Create the directory if it doesn't exist   |
+| `write_buffer_size` | `usize`           | 4 MB       | In-memory write buffer size before flush   |
+| `max_levels`        | `usize`           | 3          | Maximum number of LSM levels               |
+| `block_size`        | `usize`           | 4 KB       | SSTable block size                         |
+| `cache_size`        | `usize`           | 8 MB       | Block cache size for decompressed blocks   |
+| `object_size`       | `usize`           | 1 KB       | Bin object size threshold (see above)      |
+| `compress`          | `bool`            | `true`     | LZ4-compress bin objects on disk           |
+| `bloom_bits`        | `usize`           | 10         | Bloom filter bits per key (0 = disabled)   |
+| `verify_checksums`  | `bool`            | `true`     | Verify checksums on read                   |
+| `compression`       | `Compression`     | `LZ4`      | SSTable block compression                  |
+| `io_model`          | `IoModel`         | `Mmap`     | File I/O strategy (see I/O Modes below)    |
+| `cluster_id`        | `Option<u16>`     | `None`     | Cluster ID for RevisionID (random if None) |
+| `aol_buffer_size`   | `usize`           | 128        | AOL flush threshold in records (0 = every) |
+| `l0_max_count`      | `usize`           | 4          | Max L0 SSTable count before compaction     |
+| `l0_max_size`       | `usize`           | 64 MB      | Max total L0 size before compaction        |
+| `l1_max_size`       | `usize`           | 256 MB     | Max L1 size before merge to L2             |
+| `default_max_size`  | `usize`           | 2 GB       | Default max size for L2+ levels            |
+| `bloom_prefix_len`  | `usize`           | 0          | Prefix bloom filter length (0 = disabled)  |
+| `role`              | `Role`            | Standalone | Replication role                           |
+| `repl_bind`         | `String`          | `0.0.0.0`  | Replication listen address                 |
+| `repl_port`         | `u16`             | 8322       | Replication listen port                    |
+| `primary_addr`      | `Option<String>`  | `None`     | Primary address for replica to connect to  |
+| `peers`             | `Vec<String>`     | `[]`       | Peer addresses (peer mode only)            |
+| `event_listener`    | `Option<Arc<..>>` | `None`     | Callback for flush/compaction events       |
 
 The CLI uses dot-notation keys for `config <key> <value>`:
 
@@ -482,6 +483,125 @@ Written atomically via write-to-temp + rename. Missing or malformed files defaul
 `db.analyze()` re-derives all statistics from current engine state and persists operation counters
 to disk. In the CLI, the `analyze` command calls this method and prints the results. Useful as an
 admin recovery tool when stats may have drifted.
+
+### Observability
+
+rKV exposes Prometheus-compatible metrics via an HTTP endpoint and a programmatic API.
+
+#### Prometheus Endpoint
+
+When running the HTTP server (`rkv serve`), `GET /metrics` returns all metrics in
+Prometheus exposition text format. From the library API, call `db.prometheus_metrics()`
+to get the same text as a `String`.
+
+#### Available Metrics
+
+**Counters** (monotonically increasing):
+
+| Metric                         | Labels                | Description                       |
+| ------------------------------ | --------------------- | --------------------------------- |
+| `rkv_ops_total`                | `op={put,get,delete}` | Total database operations         |
+| `rkv_cache_total`              | `result={hit,miss}`   | Block cache operations            |
+| `rkv_flush_total`              |                       | Total flush operations            |
+| `rkv_compaction_total`         |                       | Total compaction operations       |
+| `rkv_bytes_flushed_total`      |                       | Total bytes flushed to SSTables   |
+| `rkv_bytes_compacted_total`    |                       | Total bytes written by compaction |
+| `rkv_conflicts_resolved_total` |                       | Replication conflicts resolved    |
+
+**Gauges** (current value):
+
+| Metric                    | Labels            | Description                     |
+| ------------------------- | ----------------- | ------------------------------- |
+| `rkv_keys`                |                   | Current total keys in memtables |
+| `rkv_data_size_bytes`     |                   | Current data size on disk       |
+| `rkv_namespaces`          |                   | Current namespace count         |
+| `rkv_sstables`            |                   | Current SSTable count           |
+| `rkv_write_buffer_bytes`  |                   | Current write buffer memory     |
+| `rkv_pending_compactions` |                   | Namespaces needing compaction   |
+| `rkv_uptime_seconds`      |                   | Time since database opened      |
+| `rkv_level_files`         | `level={0,1,...}` | SSTable files per level         |
+| `rkv_level_bytes`         | `level={0,1,...}` | Bytes per level                 |
+
+**Histograms** (latency distribution with 14 buckets from 10 us to 60 s):
+
+| Metric                            | Labels                     | Description             |
+| --------------------------------- | -------------------------- | ----------------------- |
+| `rkv_op_duration_seconds`         | `op={put,get,delete,scan}` | Operation latency       |
+| `rkv_flush_duration_seconds`      |                            | Flush operation latency |
+| `rkv_compaction_duration_seconds` |                            | Compaction latency      |
+
+#### EventListener
+
+The `EventListener` trait provides callbacks for database lifecycle events.
+Set `Config.event_listener` to receive notifications:
+
+```rust
+use rkv::{EventListener, FlushEvent, CompactionEvent};
+use std::sync::Arc;
+
+struct MyListener;
+impl EventListener for MyListener {
+    fn on_flush_complete(&self, event: FlushEvent) {
+        println!("flushed {} entries ({} bytes) in {:?}",
+            event.entries, event.bytes, event.duration);
+    }
+    fn on_compaction_complete(&self, event: CompactionEvent) {
+        println!("compacted L{}->L{} ({} bytes) in {:?}",
+            event.source_level, event.target_level, event.bytes, event.duration);
+    }
+}
+
+let mut config = Config::default();
+config.event_listener = Some(Arc::new(MyListener));
+```
+
+`FlushEvent` fields: `namespace`, `entries`, `bytes`, `duration`.
+`CompactionEvent` fields: `namespace`, `source_level`, `target_level`, `bytes`, `duration`.
+
+Both callback methods have default no-op implementations, so you only need to implement
+the events you care about.
+
+### Gap Analysis
+
+This section catalogs known dead code, missing API exposure, and architectural limitations.
+
+#### Remaining Dead Code
+
+| Item                             | File             | Reason                                     |
+| -------------------------------- | ---------------- | ------------------------------------------ |
+| `IoBackend::write_file_atomic()` | `io.rs`          | Trait stub, no backend implements it yet   |
+| `IoBackend::sync_file()`         | `io.rs`          | Trait stub, no backend implements it yet   |
+| `PackEntry::original_size`       | `objects.rs`     | Pack format field reserved for future use  |
+| `DumpRecord::expires_at_ms`      | `dump.rs`        | Format spec field, consumed when TTL added |
+| `replay_peer_record()`           | `mod.rs`         | Peer AOL replay, not yet wired in          |
+| `hex_to_bytes()`                 | `repl_sender.rs` | Utility used only in tests                 |
+| `LazyMeta::first_key`            | `sstable.rs`     | Accessed via `#[cfg(test)]` method only    |
+| `SSTableReader::features`        | `sstable.rs`     | Accessed via `#[cfg(test)]` method only    |
+
+#### Missing API Exposure
+
+- **`DB::load()`** is implemented but has no CLI command or HTTP endpoint. Users must
+  call it from Rust code to restore a dump file.
+- **`DB::force_sync()`** triggers a full resync on replica nodes but is not exposed
+  via the CLI or HTTP server.
+- **Prometheus metrics** are served at `GET /metrics` but there is no CLI `metrics`
+  command for local inspection without the HTTP server.
+
+#### Known Limitations
+
+- **4 GB object size limit**: `ValuePointer.size` is `u32`, capping individual bin
+  objects at ~4 GB. Values larger than this will overflow.
+- **AOL durability gap**: The AOL buffers writes (default: flush every 128 records).
+  A crash before the buffer is flushed loses uncommitted records. Set
+  `aol_buffer_size = 0` for every-record flush at the cost of throughput.
+- **No encrypted dump/load**: `DB::dump()` and `DB::load()` do not encrypt the dump
+  file even for namespaces that use encryption at rest.
+- **Unbounded key size**: Keys are limited to `u16::MAX` (65,535) bytes by the SSTable
+  entry format, but there is no Config-level limit or early validation.
+- **No cursor/iterator API**: Scan operations materialize all results into a `Vec`.
+  Large result sets consume proportional memory.
+- **I/O backend stubs**: The `IoModel` config (None/DirectIO/Mmap) selects a backend,
+  but all three fall through to buffered I/O. DirectIO and Mmap are not yet implemented.
 
 ### Embeddable Library
 
