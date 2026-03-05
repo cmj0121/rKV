@@ -36,6 +36,7 @@ impl Deref for IoBytes {
 /// - `sync_file` — fsync on an open handle.
 pub(crate) trait IoBackend: Send + Sync {
     fn read_file(&self, path: &Path) -> Result<IoBytes>;
+    #[allow(dead_code)]
     fn write_file_atomic(&self, path: &Path, data: &[u8]) -> Result<()>;
     fn create_file(&self, path: &Path) -> Result<fs::File>;
     #[allow(dead_code)]

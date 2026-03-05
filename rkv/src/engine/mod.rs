@@ -2439,12 +2439,17 @@ impl DB {
         };
 
         let store = objects::ObjectStore::open(&config.path, ns, Arc::clone(io))?;
+
+        // Delete orphaned loose files
         let on_disk = store.list_object_hashes()?;
         for hash in &on_disk {
             if !live_hashes.contains(hash) {
                 store.delete_object(hash)?;
             }
         }
+
+        // Repack pack files to physically remove dead objects
+        store.repack_gc(&live_hashes)?;
 
         Ok(())
     }

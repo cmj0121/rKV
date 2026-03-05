@@ -180,9 +180,14 @@ handle is released.
 After all level merges complete for a namespace, compaction runs a
 garbage-collection sweep over the bin object store:
 
-1. Collect all live `ValuePointer` hashes from every surviving SSTable.
-2. Walk `<db>/objects/<namespace>/` and list all object files on disk.
-3. Delete any object whose hash is not in the live set.
+1. Skip GC if the MemTable has entries (concurrent puts may have written
+   objects not yet reflected in the MemTable — deferring GC avoids
+   deleting live objects).
+2. Collect all live `ValuePointer` hashes from every surviving SSTable.
+3. List all objects on disk (pack index + loose files).
+4. Remove orphaned hashes from the pack index and delete orphaned loose files.
+5. Call `repack_gc(live_hashes)` to physically remove dead records from pack
+   files by rewriting them with only live entries.
 
 This handles overwrites (old Pointer orphaned), tombstones (shadowed
 Pointer orphaned), and dedup safely (an object is kept as long as at
@@ -591,3 +596,144 @@ skip counter). This handles partial writes from crashes during append.
   for per-record flush (maximum durability). `DB::close()` always flushes remaining data.
 - **No fsync on every write**: The implementation flushes the userspace buffer but does not
   call `fsync` per record. A future `sync_mode` config option will control this.
+
+## Bin Object Store
+
+Large values (> `object_size`) are stored in a content-addressable **bin object store**
+rather than inline in the LSM-tree. For an overview of value separation, see
+[Value Separation](../CONCEPTS.md#value-separation-bin-objects) in the Concepts document.
+This section covers the on-disk format and internal implementation.
+
+### Pack File Format
+
+Objects are stored in append-only **pack files** — multiple objects batched into a single
+file for reduced I/O syscalls. Each namespace has its own set of pack files at
+`<db>/objects/<namespace>/pack-NNNNNN.pack` (zero-padded sequence number).
+
+```text
+Header (6 bytes):
+  [magic: 4B "rKVO"]  [version: u16 BE = 1]
+
+Records (repeated, append-only):
+  [hash: 32B]               BLAKE3 content hash
+  [original_size: u32 BE]   uncompressed data size
+  [flags: u8]               bit 0 = LZ4 compressed
+  [data_len: u32 BE]        compressed data length
+  [data: data_len bytes]    payload (raw or LZ4)
+  [checksum: 5B CRC32C]     covers hash through end of data
+```
+
+Record overhead: 46 bytes (41-byte header + 5-byte checksum). At 4 KB objects
+compressed to ~3 KB, each record is approximately 3046 bytes.
+
+Pack files are self-describing — the index is rebuilt by scanning records on open,
+so no separate index file is needed. This simplifies crash recovery: truncated or
+corrupted tail records are detected by checksum verification and silently skipped,
+exactly like AOL recovery.
+
+### In-Memory Index
+
+On `ObjectStore::open()`, all pack files are scanned in sequence order to build an
+in-memory `HashMap<[u8; 32], PackEntry>`:
+
+```text
+PackEntry {
+    pack_seq: u64,      // which pack file
+    offset: u64,        // byte offset of record start
+    data_len: u32,      // compressed data length
+    original_size: u32, // uncompressed size
+    flags: u8,          // compression flags
+}
+```
+
+Duplicate hashes across packs are resolved by sequence order — later packs overwrite
+earlier entries, ensuring the latest version wins.
+
+### Write Path
+
+New objects are appended to the active pack file:
+
+```text
+ObjectStore::write(data, compress)
+  1. BLAKE3 hash the data
+  2. Check pack index for dedup — if hash exists, return existing ValuePointer
+  3. Check loose files for dedup (backward compat)
+  4. LZ4 compress if enabled
+  5. Rotate pack file if current one >= 256 MB
+  6. Append record to active pack file (BufWriter + flush + fsync)
+  7. Insert into in-memory index
+  8. Return ValuePointer(hash, size)
+```
+
+**Fsync**: Every record append calls `sync_all()` after flushing the BufWriter,
+ensuring the record is durable on the storage device before the `ValuePointer` is
+inserted into the MemTable. This matches the AOL's durability guarantee.
+
+**Size limit**: Objects larger than 4 GB are rejected (pack format uses `u32` for
+`data_len` and `original_size`). The compressed payload size is also checked after
+LZ4 compression, since LZ4 can produce output slightly larger than the input for
+incompressible data.
+
+**Pack rotation**: When the active pack file reaches 256 MB, it is closed and a
+new pack file is created with the next sequence number. This bounds memory usage
+during `scan_pack_file()` and keeps repack overhead manageable.
+
+### Read Path
+
+```text
+ObjectStore::read(vp, verify)
+  1. Look up hash in pack index (hold Mutex briefly, clone PackEntry)
+  2. If found: seek to offset in pack file, read record, verify CRC32C
+  3. If not found: fall back to loose file read (legacy format)
+  4. Decompress if FLAG_LZ4 set
+  5. If verify: recompute BLAKE3 hash, compare against ValuePointer
+  6. Return data
+```
+
+The Mutex is held only for the index lookup (clone + release), not during file I/O.
+This keeps read latency predictable under concurrent access.
+
+### GC Repacking
+
+When compaction triggers bin object GC (see [Bin Object GC](#bin-object-gc) above),
+orphaned records are physically removed by rewriting pack files:
+
+```text
+repack_gc(live_hashes)
+  1. Close active pack writer (flush all buffered data)
+  2. Scan all pack files on disk (not the in-memory index)
+  3. For each record: keep if hash is in live_hashes, count as dead otherwise
+  4. If no dead records: return early (no-op)
+  5. Write a new pack file with only live records
+  6. Update in-memory index to point to new pack (BEFORE deleting old packs)
+  7. Delete old pack files
+```
+
+**Crash safety**: The in-memory index is updated before old packs are deleted. If the
+process crashes between steps 6 and 7, the old packs remain on disk as harmless
+leftovers — they are re-scanned on the next `ObjectStore::open()` and their entries
+merge harmlessly with the new pack's entries (same hashes, same data).
+
+The repack scans pack files on disk rather than the in-memory index because
+`delete_object()` may have already removed entries from the index. Scanning the
+physical files ensures all orphaned records are found and removed.
+
+### Backward Compatibility
+
+The object store supports two storage formats:
+
+| Format          | Layout             | When used                            |
+| --------------- | ------------------ | ------------------------------------ |
+| **Pack files**  | `pack-NNNNNN.pack` | All new writes (current format)      |
+| **Loose files** | `<fan_out>/<hash>` | Legacy databases (read-only support) |
+
+**Loose file format** (1-byte header + payload):
+
+```text
+[flags: 1B]  bit 0 = LZ4 compressed
+[payload]    raw or LZ4-compressed data
+```
+
+The read path checks the pack index first, then falls back to loose files. Dedup
+checks both formats — a loose file with the same hash prevents a duplicate pack write.
+GC handles both: loose files are deleted directly, packed records are removed via repack.

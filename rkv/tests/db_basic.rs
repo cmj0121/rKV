@@ -2024,20 +2024,8 @@ fn value_sep_dedup_same_content() {
     // Both keys return the same value
     assert_eq!(ns.get("k1").unwrap(), ns.get("k2").unwrap());
 
-    // Count total object files: should be exactly 1 (dedup)
-    let ns_objects_dir = tmp.path().join("objects").join("_");
-    let mut file_count = 0;
-    for fan_out in std::fs::read_dir(ns_objects_dir).unwrap() {
-        let fan_out = fan_out.unwrap();
-        if fan_out.file_type().unwrap().is_dir() {
-            for f in std::fs::read_dir(fan_out.path()).unwrap() {
-                if f.unwrap().file_type().unwrap().is_file() {
-                    file_count += 1;
-                }
-            }
-        }
-    }
-    assert_eq!(file_count, 1);
+    // Count total objects: should be exactly 1 (dedup)
+    assert_eq!(count_object_files(tmp.path(), "_"), 1);
 }
 
 #[test]
@@ -2142,20 +2130,8 @@ fn value_sep_object_size_zero_forces_all_to_objects() {
     let result = ns.get("tiny").unwrap();
     assert_eq!(result, Value::from("x"));
 
-    // Object file should exist
-    let ns_objects_dir = tmp.path().join("objects").join("_");
-    let mut file_count = 0;
-    for fan_out in std::fs::read_dir(ns_objects_dir).unwrap() {
-        let fan_out = fan_out.unwrap();
-        if fan_out.file_type().unwrap().is_dir() {
-            for f in std::fs::read_dir(fan_out.path()).unwrap() {
-                if f.unwrap().file_type().unwrap().is_file() {
-                    file_count += 1;
-                }
-            }
-        }
-    }
-    assert!(file_count > 0);
+    // Object should exist (in pack file)
+    assert!(count_object_files(tmp.path(), "_") > 0);
 }
 
 #[test]
@@ -2254,23 +2230,9 @@ fn value_sep_cross_namespace_isolation() {
     assert!(ns1_objects.is_dir());
     assert!(ns2_objects.is_dir());
 
-    // Count object files in each namespace — should be 1 each (separate stores)
-    let count_files = |dir: &std::path::Path| -> usize {
-        let mut count = 0;
-        for fan_out in std::fs::read_dir(dir).unwrap() {
-            let fan_out = fan_out.unwrap();
-            if fan_out.file_type().unwrap().is_dir() {
-                for f in std::fs::read_dir(fan_out.path()).unwrap() {
-                    if f.unwrap().file_type().unwrap().is_file() {
-                        count += 1;
-                    }
-                }
-            }
-        }
-        count
-    };
-    assert_eq!(count_files(&ns1_objects), 1);
-    assert_eq!(count_files(&ns2_objects), 1);
+    // Count objects in each namespace — should be 1 each (separate stores)
+    assert_eq!(count_object_files(tmp.path(), "ns1"), 1);
+    assert_eq!(count_object_files(tmp.path(), "ns2"), 1);
 }
 
 #[test]
@@ -2314,20 +2276,8 @@ fn value_sep_dedup_within_namespace_still_works() {
     assert_eq!(ns.get("k1").unwrap(), Value::from(data.as_str()));
     assert_eq!(ns.get("k2").unwrap(), Value::from(data.as_str()));
 
-    // Only 1 object file — dedup still works within a namespace
-    let ns_objects = tmp.path().join("objects").join("myns");
-    let mut file_count = 0;
-    for fan_out in std::fs::read_dir(ns_objects).unwrap() {
-        let fan_out = fan_out.unwrap();
-        if fan_out.file_type().unwrap().is_dir() {
-            for f in std::fs::read_dir(fan_out.path()).unwrap() {
-                if f.unwrap().file_type().unwrap().is_file() {
-                    file_count += 1;
-                }
-            }
-        }
-    }
-    assert_eq!(file_count, 1);
+    // Only 1 object — dedup still works within a namespace
+    assert_eq!(count_object_files(tmp.path(), "myns"), 1);
 }
 
 // --- Bulk delete (wipe) ---
@@ -3424,14 +3374,33 @@ fn count_object_files(db_path: &std::path::Path, ns: &str) -> usize {
         return 0;
     }
     let mut count = 0;
-    for fan_entry in std::fs::read_dir(&obj_dir).unwrap() {
-        let fan_entry = fan_entry.unwrap();
-        if fan_entry.file_type().unwrap().is_dir() {
-            for obj_entry in std::fs::read_dir(fan_entry.path()).unwrap() {
-                let name = obj_entry.unwrap().file_name().to_string_lossy().to_string();
-                if name.len() == 64 {
+
+    for entry in std::fs::read_dir(&obj_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        if entry.file_type().unwrap().is_dir() {
+            // Fan-out directory — count loose object files
+            for obj_entry in std::fs::read_dir(entry.path()).unwrap() {
+                let obj_name = obj_entry.unwrap().file_name().to_string_lossy().to_string();
+                if obj_name.len() == 64 {
                     count += 1;
                 }
+            }
+        } else if name.starts_with("pack-") && name.ends_with(".pack") {
+            // Pack file — count records by scanning
+            let data = std::fs::read(entry.path()).unwrap();
+            let mut pos = 6; // skip header (magic + version)
+            while pos + 46 <= data.len() {
+                // 41 header + 5 checksum minimum
+                let data_len =
+                    u32::from_be_bytes(data[pos + 37..pos + 41].try_into().unwrap()) as usize;
+                let record_end = pos + 41 + data_len + 5;
+                if record_end > data.len() {
+                    break;
+                }
+                count += 1;
+                pos = record_end;
             }
         }
     }

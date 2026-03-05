@@ -102,34 +102,26 @@ different namespaces produces separate files. This preserves namespace isolation
 
 #### Object Store Layout
 
-Object files are stored in a Git-style **fan-out directory** structure, scoped per namespace.
-The first byte (2 hex chars) of the hash is used as a subdirectory:
+Objects are stored in **append-only pack files**, scoped per namespace:
 
 ```text
 <db>/objects/
   <namespace>/
-    ab/cdef0123456789abcdef0123456789abcdef0123456789abcdef01234567
-    ab/ff01234567890abcdef01234567890abcdef01234567890abcdef0123456
-    cd/0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab
+    pack-000001.pack
+    pack-000002.pack
 ```
 
-Each namespace gets its own isolated object store directory. This mirrors the per-namespace
-MemTable pattern and limits the number of entries per directory, scaling to millions of
-objects without hitting filesystem performance cliffs.
+Each namespace gets its own isolated object store directory. New objects are appended
+sequentially to the active pack file, avoiding the overhead of creating individual files
+per object. Pack files are rotated at 256 MB. An in-memory index maps each hash to its
+location within a pack file for O(1) lookups.
 
-#### Object File Format
+**Legacy format**: Older databases may contain **loose files** — one file per object in a
+Git-style fan-out directory (`<ns>/ab/<hash>`). The read path checks pack files first,
+then falls back to loose files. New writes always go to pack files.
 
-Each object file contains a 1-byte header followed by the payload:
-
-```text
-[ flags: 1 byte ][ payload ]
-
-flags bit 0: 0 = raw, 1 = LZ4-compressed
-flags bits 1-7: reserved
-```
-
-When `compress` is enabled (default), the payload is LZ4-compressed. The flags byte
-tells the reader how to decode. Compression is applied per-object at write time.
+For pack file format details, see [Bin Object Store](docs/storage.md#bin-object-store)
+in the storage engine documentation.
 
 #### Write Path
 
@@ -143,24 +135,25 @@ put(key, value)
   │ no     │ yes
   ▼        ▼
 inline   BLAKE3 hash the value
-in LSM   object file exists?
+in LSM   hash in pack index or loose file?
            │
          ┌─┴──┐
          │yes │ no
          │    ▼
          │  LZ4 compress (if enabled)
-         │  write to objects/<ns>/<prefix>/<hash>
+         │  append to active pack file
          ▼
          store ValuePointer in LSM
 ```
 
-Deduplication happens naturally: if the object file already exists (same hash), the write
-is skipped and only the LSM entry is created.
+Deduplication happens naturally: if the object hash already exists in the pack index
+or as a loose file (same hash), the write is skipped and only the LSM entry is created.
 
 #### Read Path
 
-`get(key)` → read `ValuePointer` from LSM → open `objects/<ns>/<prefix>/<hash>` → read flags byte
-→ decompress if needed → return value.
+`get(key)` → read `ValuePointer` from LSM → look up hash in pack index → seek + read
+from pack file → verify CRC32C → decompress if needed → verify BLAKE3 → return value.
+Falls back to loose file read if hash is not in the pack index.
 
 #### ValuePointer Format (36 bytes fixed)
 
@@ -177,10 +170,11 @@ setting it to `usize::MAX` effectively disables separation.
 
 #### Garbage Collection
 
-GC is deferred to a future phase. Bin objects accumulate on disk; dead entries (overwritten or
-deleted values) are not reclaimed until a GC mechanism is implemented. Because objects are
-content-addressed, an object is safe to delete only when no `ValuePointer` in any LSM level
-references its hash.
+After compaction, the engine runs a GC sweep over the bin object store. It collects all
+live `ValuePointer` hashes from surviving SSTables, then repacks the pack files to exclude
+dead objects. Because objects are content-addressed, an object is safe to delete only when
+no `ValuePointer` in any SSTable references its hash. See
+[Bin Object GC](docs/storage.md#bin-object-gc) for implementation details.
 
 ### Namespace
 
