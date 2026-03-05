@@ -96,14 +96,14 @@ For protocol details and architecture, see [Replication](docs/replication.md#pri
 - **Revision-aware** — every write produces a unique RevisionID; query history with `rev_get`/`rev_count`
 - **Dual key types** — `Int(i64)` for ordered mode, `Str` for unordered; first Str key triggers irreversible auto-upgrade
 - **Namespace isolation** — isolated key spaces within one DB, created implicitly on first use
-- **Single-key operations** — every operation targets exactly one key
+- **Atomic writes** — `WriteBatch` applies multiple put/delete ops atomically (all-or-nothing visibility)
 - **Replication** — primary-replica (read scaling) and peer-peer (multi-writer with LWW conflict resolution)
 
 The following features are intentionally **not supported**:
 
 | Feature                | Why not                                            |
 | ---------------------- | -------------------------------------------------- |
-| Batch operations       | No WriteBatch, mget, mput, or mdel                 |
+| Transactions (ACID)    | WriteBatch provides atomicity; no read isolation   |
 | Compare-and-swap (CAS) | RevisionID is for history, not concurrency control |
 | Iterator / Cursor      | Bounded `scan`/`rscan` with limit is sufficient    |
 | Snapshots              | Every read sees the latest state                   |

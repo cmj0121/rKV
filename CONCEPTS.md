@@ -652,8 +652,6 @@ This section catalogs known dead code, missing API exposure, and architectural l
 
 - **`DB::load()`** is implemented but has no CLI command or HTTP endpoint. Users must
   call it from Rust code to restore a dump file.
-- **`DB::force_sync()`** triggers a full resync on replica nodes but is not exposed
-  via the CLI or HTTP server.
 - **Prometheus metrics** are served at `GET /metrics` but there is no CLI `metrics`
   command for local inspection without the HTTP server.
 
