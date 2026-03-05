@@ -80,6 +80,11 @@ impl WriteBatch {
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }
+
+    /// Returns an iterator over the operations in the batch.
+    pub fn iter(&self) -> std::slice::Iter<'_, BatchOp> {
+        self.ops.iter()
+    }
 }
 
 #[cfg(test)]

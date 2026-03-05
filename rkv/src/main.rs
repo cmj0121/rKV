@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
-use rkv::{Config, Key, Namespace, DB, DEFAULT_NAMESPACE};
+use rkv::{Config, Key, Namespace, WriteBatch, DB, DEFAULT_NAMESPACE};
 use rustyline::DefaultEditor;
 
 #[cfg(feature = "server")]
@@ -373,6 +373,26 @@ fn print_command_help(cmd: &str) {
             println!();
             println!("  See also: repair");
         }
+        "batch" => {
+            println!("batch");
+            println!();
+            println!("  Enter batch mode for atomic multi-key writes.");
+            println!("  All queued operations are applied together on commit.");
+            println!();
+            println!("  Batch sub-commands:");
+            println!("    put <key> <value> [ttl]  Queue a put");
+            println!("    del <key>                Queue a delete");
+            println!("    show                     Show queued operations");
+            println!("    commit                   Apply all ops atomically");
+            println!("    abort                    Discard and exit batch mode");
+            println!();
+            println!("  Examples:");
+            println!("    batch");
+            println!("    put k1 v1");
+            println!("    put k2 v2 60s");
+            println!("    del k3");
+            println!("    commit");
+        }
         _ => {
             eprintln!("unknown command: {cmd} (type 'help' for usage)");
         }
@@ -387,7 +407,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
 
     if db.is_replica() {
         match tokens[0] {
-            "put" | "del" | "wipe" | "drop" => {
+            "put" | "del" | "wipe" | "drop" | "batch" => {
                 eprintln!("error: read-only replica — writes are rejected");
                 return Action::Continue;
             }
@@ -907,6 +927,9 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 Err(e) => eprintln!("error: {e}"),
             }
         }
+        "batch" => {
+            run_batch_mode(db, ns);
+        }
         "help" | "?" => {
             if let Some(cmd) = tokens.get(1) {
                 print_command_help(cmd);
@@ -927,6 +950,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 println!("  count                    Count all keys");
                 println!("  rev <key>                Show total revisions for a key");
                 println!("  rev <key> <index>        Show value at revision index (0 = oldest)");
+                println!("  batch                    Enter batch mode for atomic multi-key writes");
                 println!();
                 println!("Namespace:");
                 println!(
@@ -1160,6 +1184,127 @@ fn prompt(ns_name: &str, encrypted: bool, role: &str) -> String {
         format!("{prefix} [{ns_name}+]> ")
     } else {
         format!("{prefix} [{ns_name}]> ")
+    }
+}
+
+fn run_batch_mode(_db: &DB, ns: &Namespace<'_>) {
+    let mut rl = match DefaultEditor::new() {
+        Ok(rl) => rl,
+        Err(e) => {
+            eprintln!("failed to initialize editor: {e}");
+            return;
+        }
+    };
+
+    let mut batch = WriteBatch::new();
+    println!("Batch mode — queue put/del ops, then commit or abort.");
+
+    loop {
+        let prompt = format!("[{}] batch ({})> ", ns.name(), batch.len());
+        match rl.readline(&prompt) {
+            Ok(line) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let _ = rl.add_history_entry(line);
+                let tokens: Vec<&str> = line.split_whitespace().collect();
+                match tokens[0] {
+                    "put" => {
+                        if tokens.len() < 3 {
+                            eprintln!("usage: put <key> <value> [ttl]");
+                            continue;
+                        }
+                        let ttl = if let Some(ttl_str) = tokens.get(3) {
+                            match parse_duration(ttl_str) {
+                                Some(ttl) => Some(ttl),
+                                None => {
+                                    eprintln!(
+                                        "error: invalid TTL '{ttl_str}' (e.g., 10s, 5m, 2h, 1d)"
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        let key = parse_key(tokens[1]);
+                        let value: Vec<u8> = tokens[2].as_bytes().to_vec();
+                        batch = batch.put(key, value, ttl);
+                        println!("  queued: put {}", tokens[1]);
+                    }
+                    "del" | "delete" => {
+                        if tokens.len() < 2 {
+                            eprintln!("usage: del <key>");
+                            continue;
+                        }
+                        let key = parse_key(tokens[1]);
+                        batch = batch.delete(key);
+                        println!("  queued: del {}", tokens[1]);
+                    }
+                    "show" => {
+                        if batch.is_empty() {
+                            println!("(empty batch)");
+                        } else {
+                            for (i, op) in batch.iter().enumerate() {
+                                match op {
+                                    rkv::BatchOp::Put { key, ttl, .. } => {
+                                        let ttl_str = match ttl {
+                                            Some(d) => format!(" (ttl: {})", format_duration(*d)),
+                                            None => String::new(),
+                                        };
+                                        println!("  [{}] put {}{}", i, key, ttl_str);
+                                    }
+                                    rkv::BatchOp::Delete { key } => {
+                                        println!("  [{}] del {}", i, key);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "commit" | "submit" => {
+                        if batch.is_empty() {
+                            println!("(empty batch, nothing to commit)");
+                        } else {
+                            let count = batch.len();
+                            match ns.write_batch(batch) {
+                                Ok(revs) => {
+                                    println!("Applied {count} operations:");
+                                    for rev in &revs {
+                                        println!("  rev {rev}");
+                                    }
+                                }
+                                Err(e) => eprintln!("error: {e}"),
+                            }
+                        }
+                        return;
+                    }
+                    "abort" | "cancel" => {
+                        println!("Batch aborted ({} ops discarded)", batch.len());
+                        return;
+                    }
+                    "help" | "?" => {
+                        println!("Batch commands:");
+                        println!("  put <key> <value> [ttl]  Queue a put operation");
+                        println!("  del <key>                Queue a delete operation");
+                        println!("  show                     Show queued operations");
+                        println!("  commit                   Apply all ops atomically");
+                        println!("  abort                    Discard all ops and exit batch mode");
+                    }
+                    _ => eprintln!("unknown batch command: {} (type 'help')", tokens[0]),
+                }
+            }
+            Err(
+                rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof,
+            ) => {
+                println!("Batch aborted ({} ops discarded)", batch.len());
+                return;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return;
+            }
+        }
     }
 }
 
