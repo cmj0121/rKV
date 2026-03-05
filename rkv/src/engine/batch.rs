@@ -28,7 +28,7 @@ pub enum BatchOp {
 /// ```rust,ignore
 /// use rkv::{Config, DB, WriteBatch};
 ///
-/// let db = DB::open(Config::default().path("/tmp/batch_example")).unwrap();
+/// let db = DB::open(Config::new("/tmp/batch_example")).unwrap();
 /// let ns = db.namespace("_", None).unwrap();
 ///
 /// let batch = WriteBatch::new()

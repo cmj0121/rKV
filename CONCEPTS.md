@@ -296,8 +296,7 @@ revisions are strictly increasing per key without requiring global ordering.
 the individual fields from a RevisionID.
 
 History queries use revision indexing: `rev_count(key)` returns the total number of revisions for a key, and
-`rev_get(key, index)` retrieves the value at a specific revision index (0 = oldest). CAS operations use RevisionIDs for
-optimistic concurrency control.
+`rev_get(key, index)` retrieves the value at a specific revision index (0 = oldest).
 
 ### TTL (Time-to-Live)
 
@@ -347,8 +346,9 @@ is an atomic write group.
 
 ```rust
 use rkv::{DB, Config, WriteBatch};
+use std::time::Duration;
 
-let db = DB::open(Config::default().path("/tmp/batch_example")).unwrap();
+let db = DB::open(Config::new("/tmp/batch_example")).unwrap();
 let ns = db.namespace("_", None).unwrap();
 
 let batch = WriteBatch::new()
@@ -434,6 +434,7 @@ The `Config` struct controls database behavior and LSM tuning parameters:
 | `l1_max_size`       | `usize`           | 256 MB     | Max L1 size before merge to L2             |
 | `default_max_size`  | `usize`           | 2 GB       | Default max size for L2+ levels            |
 | `bloom_prefix_len`  | `usize`           | 0          | Prefix bloom filter length (0 = disabled)  |
+| `write_stall_size`  | `usize`           | 8 MB       | Backpressure threshold (0 = disabled)      |
 | `role`              | `Role`            | Standalone | Replication role                           |
 | `repl_bind`         | `String`          | `0.0.0.0`  | Replication listen address                 |
 | `repl_port`         | `u16`             | 8322       | Replication listen port                    |
@@ -464,6 +465,7 @@ The CLI uses dot-notation keys for `config <key> <value>`:
 | `l1_max_size`       | `lsm.l1_max_size`           |
 | `default_max_size`  | `lsm.default_max_size`      |
 | `bloom_prefix_len`  | `lsm.bloom_prefix_len`      |
+| `write_stall_size`  | `lsm.write_stall_size`      |
 | `role`              | `repl.role`                 |
 | `repl_bind`         | `repl.bind`                 |
 | `repl_port`         | `repl.port`                 |
@@ -637,16 +639,15 @@ This section catalogs known dead code, missing API exposure, and architectural l
 
 #### Remaining Dead Code
 
-| Item                             | File             | Reason                                     |
-| -------------------------------- | ---------------- | ------------------------------------------ |
-| `IoBackend::write_file_atomic()` | `io.rs`          | Trait stub, no backend implements it yet   |
-| `IoBackend::sync_file()`         | `io.rs`          | Trait stub, no backend implements it yet   |
-| `PackEntry::original_size`       | `objects.rs`     | Pack format field reserved for future use  |
-| `DumpRecord::expires_at_ms`      | `dump.rs`        | Format spec field, consumed when TTL added |
-| `replay_peer_record()`           | `mod.rs`         | Peer AOL replay, not yet wired in          |
-| `hex_to_bytes()`                 | `repl_sender.rs` | Utility used only in tests                 |
-| `LazyMeta::first_key`            | `sstable.rs`     | Accessed via `#[cfg(test)]` method only    |
-| `SSTableReader::features`        | `sstable.rs`     | Accessed via `#[cfg(test)]` method only    |
+| Item                             | File         | Reason                                     |
+| -------------------------------- | ------------ | ------------------------------------------ |
+| `IoBackend::write_file_atomic()` | `io.rs`      | Trait stub, no backend implements it yet   |
+| `IoBackend::sync_file()`         | `io.rs`      | Trait stub, no backend implements it yet   |
+| `PackEntry::original_size`       | `objects.rs` | Pack format field reserved for future use  |
+| `DumpRecord::expires_at_ms`      | `dump.rs`    | Format spec field, consumed when TTL added |
+| `replay_peer_record()`           | `mod.rs`     | Peer AOL replay, not yet wired in          |
+| `LazyMeta::first_key`            | `sstable.rs` | Accessed via `#[cfg(test)]` method only    |
+| `SSTableReader::features`        | `sstable.rs` | Accessed via `#[cfg(test)]` method only    |
 
 #### Missing API Exposure
 
@@ -724,9 +725,9 @@ The server is built with Axum and gated behind the `server` Cargo feature flag (
 included in the default build to keep the core library dependency-free.
 
 The REST API is namespace-aware: every data operation targets a specific namespace in its URL path. Supported
-operations include key-value CRUD (`get`, `put`, `delete`), prefix scans with pagination, revision history queries,
-TTL management, and administrative actions (flush, compact, stats). Custom response headers carry metadata such as
-revision IDs and TTL information.
+operations include key-value CRUD (`get`, `put`, `delete`), atomic batch writes, prefix scans with pagination,
+revision history queries, TTL management, and administrative actions (flush, compact, stats). Custom response
+headers carry metadata such as revision IDs and TTL information.
 
 **Security**: By default the server binds to `127.0.0.1` (loopback only) and rejects requests from non-local IPs.
 For network-accessible deployments, an IP allow-list (`--allow-ip`) restricts API access to explicitly trusted

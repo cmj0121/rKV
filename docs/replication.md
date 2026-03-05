@@ -89,9 +89,9 @@ message. A handshake exchange at connection start verifies cluster membership vi
 
 Replicas reject mutations at every layer (defense-in-depth):
 
-- **Engine**: `put`, `delete`, `delete_range`, `delete_prefix` return `ReadOnlyReplica`
-- **HTTP routes**: Guards on `PUT /keys`, `DELETE /keys`, `DELETE /scan`, namespace routes
-- **REPL**: Commands `put`, `del`, `wipe`, `drop`, `config set` blocked with error message
+- **Engine**: `put`, `delete`, `delete_range`, `delete_prefix`, `write_batch` return `ReadOnlyReplica`
+- **HTTP routes**: Guards on `PUT /keys`, `DELETE /keys`, `DELETE /scan`, `POST /batch`, namespace routes
+- **REPL**: Commands `put`, `del`, `wipe`, `drop`, `batch`, `config set` blocked with error message
 - **Web UI**: Mutation buttons disabled; role badge shown in header
 
 Maintenance operations (`flush`, `sync`, `compact`) are **not** writes — they reorganize local
