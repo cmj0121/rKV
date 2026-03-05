@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::bloom::BloomFilter;
 use super::cache::{self, BlockCache};
@@ -380,26 +380,36 @@ struct IndexEntry {
     size: u32,
 }
 
+/// Lazily-parsed SSTable metadata: index, bloom filters, and first key.
+///
+/// Stored inside `OnceLock` and initialized on first access.
+struct LazyMeta {
+    index: Vec<IndexEntry>,
+    bloom: BloomFilter,
+    prefix_bloom: Option<BloomFilter>,
+    bloom_prefix_len: usize,
+    #[allow(dead_code)] // accessed via #[cfg(test)] first_key() method
+    first_key: Option<Vec<u8>>,
+}
+
+/// Offsets extracted from the footer for deferred index/filter parsing.
+struct FooterOffsets {
+    index_offset: usize,
+    index_size: usize,
+    filter_offset: usize,
+    filter_size: usize,
+    filter_format: u8,
+}
+
 /// Reads key-value entries from an SSTable file.
 ///
-/// Opens a file, parses the footer and index, then serves point lookups
-/// via binary search on the block index.
+/// Opens a file, parses the footer eagerly (for validation), then defers
+/// index, bloom filter, and first-key parsing to first access via `OnceLock`.
 pub(crate) struct SSTableReader {
     /// Raw file contents (read into memory or memory-mapped).
     data: IoBytes,
-    /// Parsed index entries, sorted by last_key.
-    index: Vec<IndexEntry>,
     /// Total entry count from the footer.
     entry_count: u64,
-    /// Bloom filter for probabilistic key membership testing.
-    bloom: BloomFilter,
-    /// Prefix bloom filter for scan optimization.
-    prefix_bloom: Option<BloomFilter>,
-    /// Prefix length used to build the prefix bloom (0 = none).
-    bloom_prefix_len: usize,
-    /// First key in the SSTable (serialized bytes), for range filtering.
-    #[allow(dead_code)] // accessed via #[cfg(test)] first_key() method
-    first_key: Option<Vec<u8>>,
     /// Unique SSTable identifier (sequence number from file naming).
     sst_id: u64,
     /// Shared LRU block cache for decompressed data blocks.
@@ -411,6 +421,10 @@ pub(crate) struct SSTableReader {
     version: u16,
     /// Whether blocks contain restart point trailers.
     has_restarts: bool,
+    /// Footer offsets for deferred index/filter parsing.
+    footer_offsets: FooterOffsets,
+    /// Lazily-parsed metadata (index, bloom, first key).
+    lazy_meta: OnceLock<std::result::Result<LazyMeta, String>>,
 }
 
 impl SSTableReader {
@@ -501,103 +515,143 @@ impl SSTableReader {
             )));
         }
 
-        let index_data = &data[index_offset..index_offset + index_size];
-        let index = Self::parse_index(index_data)?;
-
-        // Parse filter metadata (bytes 30..43 — same layout in V1 and V2)
+        // Parse filter metadata offsets (bytes 30..43 — same layout in V1 and V2)
         let filter_offset = u64::from_be_bytes(footer[30..38].try_into().unwrap()) as usize;
         let filter_size = u32::from_be_bytes(footer[38..42].try_into().unwrap()) as usize;
         let filter_format = footer[42];
 
-        let (bloom, prefix_bloom, bloom_prefix_len) = if filter_size > 0
-            && filter_offset + filter_size <= footer_start
-        {
-            let filter_data = &data[filter_offset..filter_offset + filter_size];
-
-            match filter_format {
-                0x01 => {
-                    // Compound: [key_bloom_len: u32 LE][key_bloom_data]
-                    //           [prefix_len: u8][prefix_bloom_data]
-                    if filter_data.len() < 4 {
-                        (BloomFilter::new(0), None, 0)
-                    } else {
-                        // SAFETY: filter_data.len() >= 4 checked above
-                        let key_bloom_len =
-                            u32::from_le_bytes(filter_data[0..4].try_into().unwrap()) as usize;
-                        let key_bloom_end = 4 + key_bloom_len;
-                        if key_bloom_end >= filter_data.len() {
-                            (BloomFilter::new(0), None, 0)
-                        } else {
-                            let key_bloom =
-                                BloomFilter::from_bytes(&filter_data[4..key_bloom_end])?;
-                            let prefix_len = filter_data[key_bloom_end] as usize;
-                            let prefix_bloom_start = key_bloom_end + 1;
-                            let prefix_bloom = if prefix_bloom_start < filter_data.len() {
-                                Some(BloomFilter::from_bytes(&filter_data[prefix_bloom_start..])?)
-                            } else {
-                                None
-                            };
-                            (key_bloom, prefix_bloom, prefix_len)
-                        }
-                    }
-                }
-                _ => {
-                    // Legacy (0x00): filter block = key bloom only
-                    (BloomFilter::from_bytes(filter_data)?, None, 0)
-                }
-            }
-        } else {
-            (BloomFilter::new(0), None, 0) // no filter
-        };
-
-        // Extract first key from the first block for range filtering
-        let first_key = if let Some(first_ie) = index.first() {
-            let block_start = first_ie.offset as usize;
-            let block_end = block_start + first_ie.size as usize;
-            if block_end <= data.len() {
-                let block_on_disk = &data[block_start..block_end];
-                let cksum_start = block_on_disk.len() - Checksum::encoded_size();
-                let compression_tag = block_on_disk[0];
-                let compressed_payload = &block_on_disk[1..cksum_start];
-                if let Ok(block_data) = decompress_block(compression_tag, compressed_payload) {
-                    // Parse just the first entry's key
-                    if block_data.len() >= 2 {
-                        // SAFETY: block_data.len() >= 2 checked above
-                        let kl = u16::from_be_bytes(block_data[0..2].try_into().unwrap()) as usize;
-                        if 2 + kl <= block_data.len() {
-                            Some(block_data[2..2 + kl].to_vec())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
         let has_restarts = features & FEATURE_RESTART_POINTS != 0;
+
+        let footer_offsets = FooterOffsets {
+            index_offset,
+            index_size,
+            filter_offset,
+            filter_size,
+            filter_format,
+        };
 
         Ok(Self {
             data,
-            index,
             entry_count,
-            bloom,
-            prefix_bloom,
-            bloom_prefix_len,
-            first_key,
             sst_id,
             cache,
             features,
             version,
             has_restarts,
+            footer_offsets,
+            lazy_meta: OnceLock::new(),
         })
+    }
+
+    /// Ensure lazy metadata is initialized, returning a reference to it.
+    ///
+    /// Parses the index, bloom filters, and first key on first call.
+    /// Subsequent calls return the cached result. Corruption errors are
+    /// permanently cached (corrupt SSTables don't self-heal).
+    fn ensure_meta(&self) -> Result<&LazyMeta> {
+        self.lazy_meta
+            .get_or_init(|| Self::parse_lazy_meta(&self.data, &self.footer_offsets, self.version))
+            .as_ref()
+            .map_err(|msg| Error::Corruption(msg.clone()))
+    }
+
+    /// Parse all deferred metadata: index, bloom filters, first key.
+    fn parse_lazy_meta(
+        data: &[u8],
+        fo: &FooterOffsets,
+        version: u16,
+    ) -> std::result::Result<LazyMeta, String> {
+        // Bounds-check (defensive — open() already validated against footer_start)
+        if fo.index_offset + fo.index_size > data.len() {
+            return Err(format!(
+                "SSTable index out of bounds: offset={}, size={}, data_len={}",
+                fo.index_offset,
+                fo.index_size,
+                data.len()
+            ));
+        }
+
+        // Parse index block
+        let index_data = &data[fo.index_offset..fo.index_offset + fo.index_size];
+        let index = Self::parse_index(index_data).map_err(|e| e.to_string())?;
+
+        // Parse bloom filters
+        let (bloom, prefix_bloom, bloom_prefix_len) =
+            Self::parse_filters(data, fo).map_err(|e| e.to_string())?;
+
+        // Extract first key from first block
+        let first_key = Self::extract_first_key(data, &index, version);
+
+        Ok(LazyMeta {
+            index,
+            bloom,
+            prefix_bloom,
+            bloom_prefix_len,
+            first_key,
+        })
+    }
+
+    /// Parse bloom filters from the filter block region.
+    fn parse_filters(
+        data: &[u8],
+        fo: &FooterOffsets,
+    ) -> Result<(BloomFilter, Option<BloomFilter>, usize)> {
+        if fo.filter_size == 0 || fo.filter_offset + fo.filter_size > data.len() {
+            return Ok((BloomFilter::new(0), None, 0));
+        }
+
+        let filter_data = &data[fo.filter_offset..fo.filter_offset + fo.filter_size];
+
+        match fo.filter_format {
+            0x01 => {
+                // Compound: [key_bloom_len: u32 LE][key_bloom_data]
+                //           [prefix_len: u8][prefix_bloom_data]
+                if filter_data.len() < 4 {
+                    return Ok((BloomFilter::new(0), None, 0));
+                }
+                let key_bloom_len =
+                    u32::from_le_bytes(filter_data[0..4].try_into().unwrap()) as usize;
+                let key_bloom_end = 4 + key_bloom_len;
+                if key_bloom_end >= filter_data.len() {
+                    return Ok((BloomFilter::new(0), None, 0));
+                }
+                let key_bloom = BloomFilter::from_bytes(&filter_data[4..key_bloom_end])?;
+                let prefix_len = filter_data[key_bloom_end] as usize;
+                let prefix_bloom_start = key_bloom_end + 1;
+                let prefix_bloom = if prefix_bloom_start < filter_data.len() {
+                    Some(BloomFilter::from_bytes(&filter_data[prefix_bloom_start..])?)
+                } else {
+                    None
+                };
+                Ok((key_bloom, prefix_bloom, prefix_len))
+            }
+            _ => {
+                // Legacy (0x00): filter block = key bloom only
+                Ok((BloomFilter::from_bytes(filter_data)?, None, 0))
+            }
+        }
+    }
+
+    /// Extract the first key from the first data block (best-effort).
+    fn extract_first_key(data: &[u8], index: &[IndexEntry], _version: u16) -> Option<Vec<u8>> {
+        let first_ie = index.first()?;
+        let block_start = first_ie.offset as usize;
+        let block_end = block_start + first_ie.size as usize;
+        if block_end > data.len() {
+            return None;
+        }
+        let block_on_disk = &data[block_start..block_end];
+        let cksum_start = block_on_disk.len() - Checksum::encoded_size();
+        let compression_tag = block_on_disk[0];
+        let compressed_payload = &block_on_disk[1..cksum_start];
+        let block_data = decompress_block(compression_tag, compressed_payload).ok()?;
+        if block_data.len() >= 2 {
+            let kl = u16::from_be_bytes(block_data[0..2].try_into().unwrap()) as usize;
+            if 2 + kl <= block_data.len() {
+                return Some(block_data[2..2 + kl].to_vec());
+            }
+        }
+        None
     }
 
     /// Parse the index block into entries.
@@ -654,25 +708,27 @@ impl SSTableReader {
         key: &Key,
         verify_checksums: bool,
     ) -> Result<Option<(Value, RevisionID, u64)>> {
-        if self.index.is_empty() {
+        let meta = self.ensure_meta()?;
+
+        if meta.index.is_empty() {
             return Ok(None);
         }
 
         let key_bytes = key.to_bytes();
 
         // Bloom filter check: skip this SSTable if the key is definitely absent
-        if !self.bloom.may_contain(&key_bytes) {
+        if !meta.bloom.may_contain(&key_bytes) {
             return Ok(None);
         }
 
         // Binary search: find the first block whose last_key >= target
-        let block_idx = match self
+        let block_idx = match meta
             .index
             .binary_search_by(|e| e.last_key.as_slice().cmp(&key_bytes))
         {
             Ok(i) => i,
             Err(i) => {
-                if i >= self.index.len() {
+                if i >= meta.index.len() {
                     return Ok(None); // key beyond all blocks
                 }
                 i
@@ -683,8 +739,8 @@ impl SSTableReader {
 
         // Scan starting block and continue to subsequent blocks that may
         // contain more entries for the same key.
-        for bi in block_idx..self.index.len() {
-            let ie = &self.index[bi];
+        for bi in block_idx..meta.index.len() {
+            let ie = &meta.index[bi];
             let found_in_block =
                 self.get_from_block(ie, bi, &key_bytes, verify_checksums, &mut last_match)?;
 
@@ -778,23 +834,25 @@ impl SSTableReader {
         key: &Key,
         verify_checksums: bool,
     ) -> Result<Vec<(Value, RevisionID, u64)>> {
-        if self.index.is_empty() {
+        let meta = self.ensure_meta()?;
+
+        if meta.index.is_empty() {
             return Ok(Vec::new());
         }
 
         let key_bytes = key.to_bytes();
 
-        if !self.bloom.may_contain(&key_bytes) {
+        if !meta.bloom.may_contain(&key_bytes) {
             return Ok(Vec::new());
         }
 
-        let block_idx = match self
+        let block_idx = match meta
             .index
             .binary_search_by(|e| e.last_key.as_slice().cmp(&key_bytes))
         {
             Ok(i) => i,
             Err(i) => {
-                if i >= self.index.len() {
+                if i >= meta.index.len() {
                     return Ok(Vec::new());
                 }
                 i
@@ -803,8 +861,8 @@ impl SSTableReader {
 
         let mut result = Vec::new();
 
-        for bi in block_idx..self.index.len() {
-            let ie = &self.index[bi];
+        for bi in block_idx..meta.index.len() {
+            let ie = &meta.index[bi];
             let found_in_block =
                 self.get_all_from_block(ie, bi, &key_bytes, verify_checksums, &mut result)?;
 
@@ -1214,13 +1272,15 @@ impl SSTableReader {
         ordered_mode: bool,
         verify_checksums: bool,
     ) -> Result<Vec<(Key, Value, RevisionID, u64)>> {
-        if self.index.is_empty() {
+        let meta = self.ensure_meta()?;
+
+        if meta.index.is_empty() {
             return Ok(Vec::new());
         }
 
         // Prefix bloom check: skip this SSTable if it definitely doesn't
         // contain keys with this prefix.
-        if !self.may_contain_prefix(prefix_bytes) {
+        if !Self::may_contain_prefix_inner(meta, prefix_bytes) {
             return Ok(Vec::new());
         }
 
@@ -1229,20 +1289,20 @@ impl SSTableReader {
         if ordered_mode {
             // Range scan: find the first block whose last_key >= prefix_bytes,
             // then read blocks forward until keys no longer match.
-            let start_block = match self
+            let start_block = match meta
                 .index
                 .binary_search_by(|e| e.last_key.as_slice().cmp(prefix_bytes))
             {
                 Ok(i) => i,
                 Err(i) => {
-                    if i >= self.index.len() {
+                    if i >= meta.index.len() {
                         return Ok(Vec::new());
                     }
                     i
                 }
             };
 
-            for (bi, ie) in self.index[start_block..].iter().enumerate() {
+            for (bi, ie) in meta.index[start_block..].iter().enumerate() {
                 let entries = self.read_block(ie, start_block + bi, verify_checksums)?;
                 for (key_bytes, revision, expires_at_ms, value_tag, value_data) in entries {
                     if key_bytes.as_slice() >= prefix_bytes {
@@ -1254,7 +1314,7 @@ impl SSTableReader {
             }
         } else {
             // Prefix matching: scan all blocks, filter by prefix.
-            for (bi, ie) in self.index.iter().enumerate() {
+            for (bi, ie) in meta.index.iter().enumerate() {
                 let entries = self.read_block(ie, bi, verify_checksums)?;
                 for (key_bytes, revision, expires_at_ms, value_tag, value_data) in entries {
                     if key_bytes.starts_with(prefix_bytes) {
@@ -1279,13 +1339,15 @@ impl SSTableReader {
         ordered_mode: bool,
         verify_checksums: bool,
     ) -> Result<Vec<(Key, Value, RevisionID, u64)>> {
-        if self.index.is_empty() {
+        let meta = self.ensure_meta()?;
+
+        if meta.index.is_empty() {
             return Ok(Vec::new());
         }
 
         // Prefix bloom check for unordered mode (prefix matching).
         // For ordered mode, prefix_bytes is a range bound, not a prefix.
-        if !ordered_mode && !self.may_contain_prefix(prefix_bytes) {
+        if !ordered_mode && !Self::may_contain_prefix_inner(meta, prefix_bytes) {
             return Ok(Vec::new());
         }
 
@@ -1295,7 +1357,7 @@ impl SSTableReader {
             // Range scan: find blocks that may contain keys <= prefix_bytes.
             // We need all blocks from the beginning up to the block whose
             // last_key >= prefix_bytes.
-            let end_block = match self
+            let end_block = match meta
                 .index
                 .binary_search_by(|e| e.last_key.as_slice().cmp(prefix_bytes))
             {
@@ -1318,7 +1380,7 @@ impl SSTableReader {
             };
 
             // Read from block 0 up to end_block inclusive
-            for (bi, ie) in self.index[..=end_block].iter().enumerate() {
+            for (bi, ie) in meta.index[..=end_block].iter().enumerate() {
                 let entries = self.read_block(ie, bi, verify_checksums)?;
                 for (key_bytes, revision, expires_at_ms, value_tag, value_data) in entries {
                     if key_bytes.as_slice() <= prefix_bytes {
@@ -1338,19 +1400,26 @@ impl SSTableReader {
 
     /// Test whether the prefix bloom filter may contain the given prefix.
     ///
-    /// Truncates the query prefix to `bloom_prefix_len` (the length used at
-    /// write time) before checking the bloom filter. Returns `true` if the
-    /// prefix might be present (or no prefix bloom exists), `false` if it
-    /// is definitely absent.
+    /// Returns `true` (conservative) on metadata parse error — the actual
+    /// read will surface the error.
+    #[cfg(test)]
     pub(crate) fn may_contain_prefix(&self, prefix_bytes: &[u8]) -> bool {
+        match self.ensure_meta() {
+            Ok(meta) => Self::may_contain_prefix_inner(meta, prefix_bytes),
+            Err(_) => true, // conservative: don't skip, let actual read surface error
+        }
+    }
+
+    /// Inner prefix bloom check on already-loaded metadata.
+    fn may_contain_prefix_inner(meta: &LazyMeta, prefix_bytes: &[u8]) -> bool {
         if prefix_bytes.is_empty() {
             return true; // empty prefix matches everything
         }
-        match &self.prefix_bloom {
+        match &meta.prefix_bloom {
             Some(pf) => {
                 let query =
-                    if self.bloom_prefix_len > 0 && prefix_bytes.len() >= self.bloom_prefix_len {
-                        &prefix_bytes[..self.bloom_prefix_len]
+                    if meta.bloom_prefix_len > 0 && prefix_bytes.len() >= meta.bloom_prefix_len {
+                        &prefix_bytes[..meta.bloom_prefix_len]
                     } else {
                         prefix_bytes
                     };
@@ -1362,8 +1431,8 @@ impl SSTableReader {
 
     /// Return the first key in this SSTable (serialized bytes), if any.
     #[cfg(test)]
-    pub(crate) fn first_key(&self) -> Option<&[u8]> {
-        self.first_key.as_deref()
+    pub(crate) fn first_key(&self) -> Result<Option<&[u8]>> {
+        Ok(self.ensure_meta()?.first_key.as_deref())
     }
 
     /// Read and decompress a single block, returning raw entries.
@@ -1433,9 +1502,10 @@ impl SSTableReader {
         &self,
         verify_checksums: bool,
     ) -> Result<Vec<(Key, Value, RevisionID, u64)>> {
+        let meta = self.ensure_meta()?;
         let mut result = Vec::with_capacity(self.entry_count as usize);
 
-        for (bi, ie) in self.index.iter().enumerate() {
+        for (bi, ie) in meta.index.iter().enumerate() {
             for (key_bytes, revision, expires_at_ms, value_tag, value_data) in
                 self.read_block(ie, bi, verify_checksums)?
             {
@@ -1472,8 +1542,8 @@ impl SSTableReader {
 
     /// Return the number of data blocks in this SSTable.
     #[cfg(test)]
-    pub(crate) fn block_count(&self) -> usize {
-        self.index.len()
+    pub(crate) fn block_count(&self) -> Result<usize> {
+        Ok(self.ensure_meta()?.index.len())
     }
 }
 
@@ -1593,7 +1663,7 @@ mod tests {
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
         assert_eq!(r.entry_count(), 2);
-        assert_eq!(r.block_count(), 1);
+        assert_eq!(r.block_count().unwrap(), 1);
     }
 
     #[test]
@@ -1614,7 +1684,7 @@ mod tests {
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
         assert_eq!(r.entry_count(), 20);
-        assert!(r.block_count() > 1);
+        assert!(r.block_count().unwrap() > 1);
     }
 
     // --- Roundtrip: write then read back ---
@@ -1677,7 +1747,7 @@ mod tests {
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
-        assert!(r.block_count() > 1);
+        assert!(r.block_count().unwrap() > 1);
         for i in 0..50 {
             let val = r.get(&Key::Int(i), true).unwrap();
             assert_eq!(
@@ -2420,7 +2490,7 @@ mod tests {
         assert!(r.has_restarts);
         assert_eq!(r.features(), FEATURE_RESTART_POINTS);
         assert_eq!(r.entry_count(), 50);
-        assert!(r.block_count() > 1);
+        assert!(r.block_count().unwrap() > 1);
 
         // Verify all keys are readable
         for i in 0..50 {
@@ -2491,7 +2561,7 @@ mod tests {
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
         assert!(r.has_restarts);
-        assert_eq!(r.block_count(), 1);
+        assert_eq!(r.block_count().unwrap(), 1);
         let result = r.get(&Key::Int(42), true).unwrap();
         assert_eq!(result, Some((Value::from("only"), RevisionID::ZERO, 0)));
         // Missing key returns None
