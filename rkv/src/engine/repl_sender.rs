@@ -11,7 +11,6 @@ use super::io::IoBackend;
 use super::replication::{ReplMessage, Role};
 
 /// Messages broadcast from the primary engine to connected replicas.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum BroadcastMsg {
     /// Raw AOL record payload.
@@ -23,7 +22,6 @@ pub(crate) enum BroadcastMsg {
 }
 
 /// Shared configuration for the primary replication listener.
-#[allow(dead_code)]
 pub(crate) struct PrimaryConfig {
     pub(crate) db_path: PathBuf,
     pub(crate) cluster_id: u16,
@@ -36,7 +34,6 @@ pub(crate) struct PrimaryConfig {
 /// The sender listens on a TCP port and accepts replica connections. For each
 /// replica it performs a full sync (streaming SSTable and object files from
 /// disk) followed by live AOL record streaming.
-#[allow(dead_code)] // consumed by DB integration (upcoming commit)
 pub(crate) struct ReplSender {
     listener_handle: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
@@ -45,7 +42,6 @@ pub(crate) struct ReplSender {
 }
 
 /// Context passed to each replica handler thread.
-#[allow(dead_code)]
 struct ReplicaCtx {
     db_path: PathBuf,
     cluster_id: u16,
@@ -55,7 +51,6 @@ struct ReplicaCtx {
     io_backend: Arc<dyn IoBackend>,
 }
 
-#[allow(dead_code)]
 impl ReplSender {
     /// Start the replication listener on `bind:port`.
     ///
@@ -418,7 +413,6 @@ impl ReplSender {
 
 /// Enumerate all SSTable files under `<db>/sst/`.
 /// Returns `(namespace, level, sst_id, path)` tuples.
-#[allow(dead_code)]
 pub(crate) fn enumerate_sst_files(
     db_path: &Path,
     max_levels: usize,
@@ -461,7 +455,6 @@ pub(crate) fn enumerate_sst_files(
 
 /// Enumerate all bin object files under `<db>/objects/`.
 /// Returns `(namespace, hex_hash, path)` tuples.
-#[allow(dead_code)]
 pub(crate) fn enumerate_object_files(db_path: &Path) -> Vec<(String, String, PathBuf)> {
     let obj_root = db_path.join("objects");
     let mut results = Vec::new();

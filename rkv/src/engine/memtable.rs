@@ -98,7 +98,6 @@ impl MemTable {
 
     /// Insert a value only if `rev` is strictly greater than the current
     /// revision for this key. Returns `true` if the write was applied.
-    #[allow(dead_code)]
     ///
     /// Unlike `put()`, this does NOT bump the revision for monotonicity —
     /// the incoming revision is used as-is. This is the LWW path used for

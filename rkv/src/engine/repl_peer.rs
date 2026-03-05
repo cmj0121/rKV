@@ -70,7 +70,6 @@ pub(crate) struct PeerSession {
     remote_cluster_id: u16,
 }
 
-#[allow(dead_code)]
 impl PeerSession {
     /// Start a peer session on an already-connected TCP stream.
     ///
@@ -660,13 +659,11 @@ impl PeerSession {
 // ---------------------------------------------------------------------------
 
 /// Listens for inbound peer connections and spawns a PeerSession for each.
-#[allow(dead_code)]
 pub(crate) struct PeerListener {
     handle: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
 }
 
-#[allow(dead_code)]
 impl PeerListener {
     pub(crate) fn start(
         bind: &str,
@@ -741,13 +738,11 @@ impl PeerListener {
 
 /// Connects to a configured peer address and maintains the connection
 /// with exponential backoff on failure.
-#[allow(dead_code)]
 pub(crate) struct PeerConnector {
     handle: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
 }
 
-#[allow(dead_code)]
 impl PeerConnector {
     pub(crate) fn start(
         peer_addr: String,

@@ -178,7 +178,7 @@ impl<'db> Namespace<'db> {
 
     /// Like `get()`, but returns `Some(Value::Tombstone)` for deleted keys
     /// instead of `Err(KeyNotFound)`. Returns `None` when the key never existed.
-    #[allow(dead_code)] // used by server feature (routes/keys.rs)
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(crate) fn get_raw(&self, key: impl Into<Key>) -> Result<Option<Value>> {
         let _timer = metrics::Timer::start(&self.db.metrics().op_get);
         let key = key.into();
