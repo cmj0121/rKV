@@ -339,6 +339,76 @@ The `wipe` REPL command exposes bulk delete with three syntax forms:
 Constraints: both sides of a range are required; the prefix glob `*` must have at least
 one character before it. Use `help wipe` for detailed usage.
 
+### WriteBatch (Atomic Multi-Key Writes)
+
+`WriteBatch` buffers multiple put and delete operations and applies them atomically — all operations
+succeed together or none are visible. This is not a transaction (no read isolation, no rollback); it
+is an atomic write group.
+
+```rust
+use rkv::{DB, Config, WriteBatch};
+
+let db = DB::open(Config::default().path("/tmp/batch_example")).unwrap();
+let ns = db.namespace("_", None).unwrap();
+
+let batch = WriteBatch::new()
+    .put("key1", "value1", None)
+    .put("key2", "value2", Some(Duration::from_secs(3600)))
+    .delete("old_key");
+
+let revisions = ns.write_batch(batch).unwrap();
+assert_eq!(revisions.len(), 3);
+```
+
+Atomicity is achieved by holding the AOL lock for all record writes and then the memtable lock for
+all in-memory applies. Lock ordering (AOL then memtable) matches single-key writes to prevent
+deadlocks. Each operation gets its own revision ID and is individually broadcast to replicas — no
+replication protocol changes are needed.
+
+#### CLI: batch Command
+
+The `batch` REPL command enters an interactive sub-REPL for building a write batch:
+
+| Sub-command             | Description               |
+| ----------------------- | ------------------------- |
+| `put <key> <val> [ttl]` | Queue a put operation     |
+| `del <key>`             | Queue a delete operation  |
+| `show`                  | Display queued operations |
+| `commit`                | Apply all ops atomically  |
+| `abort`                 | Discard all ops and exit  |
+
+The prompt changes to `[ns] batch (N)>` showing the namespace and operation count. Ctrl-C or
+Ctrl-D aborts the batch.
+
+#### HTTP: POST /api/{ns}/batch
+
+```http
+POST /api/{ns}/batch
+Content-Type: application/json
+
+{
+  "ops": [
+    {"op": "put", "key": "k1", "value": "v1"},
+    {"op": "put", "key": "k2", "value": "v2", "ttl": 3600},
+    {"op": "delete", "key": "k3"}
+  ]
+}
+```
+
+Response (200 OK):
+
+```json
+{
+  "results": [
+    { "key": "k1", "revision": "0193..." },
+    { "key": "k2", "revision": "0193..." },
+    { "key": "k3", "revision": "0193..." }
+  ]
+}
+```
+
+An empty `ops` array returns 400 Bad Request. Replica nodes return 403 Forbidden.
+
 ### Configuration
 
 The `Config` struct controls database behavior and LSM tuning parameters:
