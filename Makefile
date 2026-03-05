@@ -1,4 +1,4 @@
-.PHONY: all clean test fuzz run build bench bench-server fuzz-server docker-up docker-down upgrade help $(SUBDIR)
+.PHONY: all clean test fuzz run build bench bench-server fuzz-server docker-up docker-down cluster-up cluster-down upgrade help $(SUBDIR)
 
 all: $(SUBDIR) 		# default action
 	@[ -f .git/hooks/pre-commit ] || pre-commit install --install-hooks
@@ -35,6 +35,12 @@ docker-up:			# start rKV in Docker (build + run)
 
 docker-down:			# stop rKV Docker service
 	docker compose down
+
+cluster-up:			# start rKV cluster (2 shard groups + gateway)
+	docker compose --profile cluster up --build -d
+
+cluster-down:			# stop rKV cluster
+	docker compose --profile cluster down
 
 upgrade:			# upgrade all the necessary packages
 	pre-commit autoupdate

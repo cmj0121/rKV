@@ -171,3 +171,171 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+
+  # --- Cluster mode (docker compose --profile cluster up) ---
+  gateway:
+    profiles: ["cluster"]
+    build: .
+    platform: linux/amd64
+    ports:
+      - "8320:8321"
+    command:
+      [
+        "serve",
+        "--bind",
+        "0.0.0.0",
+        "--allow-all",
+        "--ui",
+        "--cluster-config",
+        "/etc/rkv/cluster.toml",
+      ]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  shard1-a:
+    profiles: ["cluster"]
+    build: .
+    platform: linux/amd64
+    ports:
+      - "8331:8321"
+    volumes:
+      - .data/shard1-a:/data
+    command:
+      [
+        "serve",
+        "--bind",
+        "0.0.0.0",
+        "--db",
+        "/data",
+        "--allow-all",
+        "--role",
+        "peer",
+        "--repl-port",
+        "8322",
+        "--cluster-id",
+        "10",
+        "--peers",
+        "shard1-b:8322",
+        "--shard-group",
+        "1",
+        "--owned-namespaces",
+        "users,sessions",
+      ]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  shard1-b:
+    profiles: ["cluster"]
+    build: .
+    platform: linux/amd64
+    ports:
+      - "8332:8321"
+    volumes:
+      - .data/shard1-b:/data
+    command:
+      [
+        "serve",
+        "--bind",
+        "0.0.0.0",
+        "--db",
+        "/data",
+        "--allow-all",
+        "--role",
+        "peer",
+        "--repl-port",
+        "8322",
+        "--cluster-id",
+        "11",
+        "--peers",
+        "shard1-a:8322",
+        "--shard-group",
+        "1",
+        "--owned-namespaces",
+        "users,sessions",
+      ]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  shard2-a:
+    profiles: ["cluster"]
+    build: .
+    platform: linux/amd64
+    ports:
+      - "8333:8321"
+    volumes:
+      - .data/shard2-a:/data
+    command:
+      [
+        "serve",
+        "--bind",
+        "0.0.0.0",
+        "--db",
+        "/data",
+        "--allow-all",
+        "--role",
+        "peer",
+        "--repl-port",
+        "8322",
+        "--cluster-id",
+        "20",
+        "--peers",
+        "shard2-b:8322",
+        "--shard-group",
+        "2",
+        "--owned-namespaces",
+        "orders,products",
+      ]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  shard2-b:
+    profiles: ["cluster"]
+    build: .
+    platform: linux/amd64
+    ports:
+      - "8334:8321"
+    volumes:
+      - .data/shard2-b:/data
+    command:
+      [
+        "serve",
+        "--bind",
+        "0.0.0.0",
+        "--db",
+        "/data",
+        "--allow-all",
+        "--role",
+        "peer",
+        "--repl-port",
+        "8322",
+        "--cluster-id",
+        "21",
+        "--peers",
+        "shard2-a:8322",
+        "--shard-group",
+        "2",
+        "--owned-namespaces",
+        "orders,products",
+      ]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
