@@ -1,4 +1,5 @@
 mod aol;
+mod batch;
 mod bloom;
 mod cache;
 mod checksum;
@@ -21,6 +22,7 @@ mod sstable;
 mod stats;
 mod value;
 
+pub use batch::{BatchOp, WriteBatch};
 pub use error::{Error, Result};
 pub use key::Key;
 pub use metrics::{CompactionEvent, EventListener, FlushEvent};

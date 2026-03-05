@@ -4,7 +4,7 @@ pub mod engine;
 pub mod server;
 
 pub use engine::{
-    CompactionEvent, Compression, Config, Error, EventListener, FlushEvent, IoModel, Key,
-    LevelStat, Namespace, RecoveryReport, Result, RevisionID, Role, Stats, Value, DB,
+    BatchOp, CompactionEvent, Compression, Config, Error, EventListener, FlushEvent, IoModel, Key,
+    LevelStat, Namespace, RecoveryReport, Result, RevisionID, Role, Stats, Value, WriteBatch, DB,
     DEFAULT_NAMESPACE,
 };
