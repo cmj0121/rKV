@@ -1,8 +1,10 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rkv::{
-    Compression, Config, Error, IoModel, Key, LevelStat, RevisionID, Stats, Value, DB,
-    DEFAULT_NAMESPACE,
+    CompactionEvent, Compression, Config, Error, EventListener, FlushEvent, IoModel, Key,
+    LevelStat, RevisionID, Stats, Value, DB, DEFAULT_NAMESPACE,
 };
 
 #[test]
@@ -5303,6 +5305,119 @@ fn rev_count_after_flush_with_restart_points() {
 
     assert_eq!(ns.rev_count(42).unwrap(), 5);
     assert_eq!(ns.get(42).unwrap(), Value::from("rev4"));
+
+    db.close().unwrap();
+}
+
+// --- Prometheus metrics ---
+
+#[test]
+fn prometheus_metrics_includes_op_counts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("a", "1", None).unwrap();
+    ns.put("b", "2", None).unwrap();
+    ns.get("a").unwrap();
+
+    let output = db.prometheus_metrics();
+    assert!(output.contains("rkv_ops_total{op=\"put\"} 2"));
+    assert!(output.contains("rkv_ops_total{op=\"get\"} 1"));
+    assert!(output.contains("# TYPE rkv_op_duration_seconds histogram"));
+    // Histogram should record 2 put observations
+    assert!(output.contains("rkv_op_duration_seconds_count{op=\"put\"} 2"));
+    // Histogram should record 1 get observation
+    assert!(output.contains("rkv_op_duration_seconds_count{op=\"get\"} 1"));
+
+    db.close().unwrap();
+}
+
+#[test]
+fn prometheus_metrics_tracks_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("k", "v", None).unwrap();
+    db.flush().unwrap();
+
+    let output = db.prometheus_metrics();
+    assert!(
+        output.contains("rkv_flush_total 1"),
+        "expected flush_total 1"
+    );
+    assert!(
+        output.contains("rkv_bytes_flushed_total"),
+        "expected bytes_flushed_total"
+    );
+    // Flush duration histogram should have 1 observation
+    assert!(output.contains("rkv_flush_duration_seconds_count 1"));
+
+    db.close().unwrap();
+}
+
+#[test]
+fn event_listener_receives_flush_events() {
+    struct TestListener {
+        flush_count: AtomicU64,
+    }
+    impl EventListener for TestListener {
+        fn on_flush_complete(&self, _event: FlushEvent) {
+            self.flush_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let listener = Arc::new(TestListener {
+        flush_count: AtomicU64::new(0),
+    });
+    let mut config = Config::new(tmp.path());
+    config.event_listener = Some(listener.clone());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("a", "1", None).unwrap();
+    db.flush().unwrap();
+
+    assert_eq!(listener.flush_count.load(Ordering::Relaxed), 1);
+
+    ns.put("b", "2", None).unwrap();
+    db.flush().unwrap();
+    assert_eq!(listener.flush_count.load(Ordering::Relaxed), 2);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn prometheus_metrics_tracks_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.write_buffer_size = 64; // tiny buffer to force flushes
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // Generate multiple L0 files to trigger compaction
+    for i in 0..5 {
+        ns.put(i, format!("val_{i}").as_str(), None).unwrap();
+        db.flush().unwrap();
+    }
+
+    db.compact().unwrap();
+
+    let output = db.prometheus_metrics();
+    // Background thread may also compact, so check >= 1
+    assert!(
+        output.contains("rkv_compaction_total") && !output.contains("rkv_compaction_total 0"),
+        "expected compaction_total > 0"
+    );
+    assert!(
+        output.contains("rkv_bytes_compacted_total")
+            && !output.contains("rkv_bytes_compacted_total 0"),
+        "expected bytes_compacted_total > 0"
+    );
 
     db.close().unwrap();
 }

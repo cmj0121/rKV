@@ -5,6 +5,7 @@ use super::crypto;
 use super::error::{Error, Result};
 use super::key::Key;
 use super::memtable::{MemLookup, MemLookupRev};
+use super::metrics;
 use super::revision::RevisionID;
 use super::value::Value;
 use super::DB;
@@ -90,6 +91,7 @@ impl<'db> Namespace<'db> {
         value: impl Into<Value>,
         ttl: Option<Duration>,
     ) -> Result<RevisionID> {
+        let _timer = metrics::Timer::start(&self.db.metrics().op_put);
         if self.db.is_replica() {
             return Err(Error::ReadOnlyReplica);
         }
@@ -119,6 +121,7 @@ impl<'db> Namespace<'db> {
     }
 
     pub fn get(&self, key: impl Into<Key>) -> Result<Value> {
+        let _timer = metrics::Timer::start(&self.db.metrics().op_get);
         let key = key.into();
         self.db.inc_op_gets();
 
@@ -147,6 +150,7 @@ impl<'db> Namespace<'db> {
 
     /// Like `get()`, but also returns the `RevisionID` for the value.
     pub fn get_with_revision(&self, key: impl Into<Key>) -> Result<(Value, RevisionID)> {
+        let _timer = metrics::Timer::start(&self.db.metrics().op_get);
         let key = key.into();
         self.db.inc_op_gets();
 
@@ -176,6 +180,7 @@ impl<'db> Namespace<'db> {
     /// instead of `Err(KeyNotFound)`. Returns `None` when the key never existed.
     #[allow(dead_code)] // used by server feature (routes/keys.rs)
     pub(crate) fn get_raw(&self, key: impl Into<Key>) -> Result<Option<Value>> {
+        let _timer = metrics::Timer::start(&self.db.metrics().op_get);
         let key = key.into();
         self.db.inc_op_gets();
 
@@ -204,6 +209,7 @@ impl<'db> Namespace<'db> {
     }
 
     pub fn delete(&self, key: impl Into<Key>) -> Result<()> {
+        let _timer = metrics::Timer::start(&self.db.metrics().op_delete);
         if self.db.is_replica() {
             return Err(Error::ReadOnlyReplica);
         }
@@ -364,6 +370,7 @@ impl<'db> Namespace<'db> {
         offset: usize,
         include_deleted: bool,
     ) -> Result<Vec<Key>> {
+        let _timer = metrics::Timer::start(&self.db.metrics().op_scan);
         let (mt_entries, ordered_mode) = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
@@ -394,6 +401,7 @@ impl<'db> Namespace<'db> {
         offset: usize,
         include_deleted: bool,
     ) -> Result<Vec<Key>> {
+        let _timer = metrics::Timer::start(&self.db.metrics().op_scan);
         let (mt_entries, ordered_mode) = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());

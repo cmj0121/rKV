@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::header;
+use axum::response::IntoResponse;
 use axum::Json;
 
 use crate::server::error::ServerError;
@@ -76,6 +78,18 @@ pub async fn force_sync(
     }
     state.db.force_sync()?;
     Ok(Json("ok"))
+}
+
+/// GET /metrics — Prometheus exposition format
+pub async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let body = state.db.prometheus_metrics();
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
 }
 
 /// GET /api/admin/config

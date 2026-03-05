@@ -8,6 +8,7 @@ mod error;
 mod io;
 mod key;
 mod memtable;
+pub(crate) mod metrics;
 mod namespace;
 mod objects;
 mod recovery;
@@ -22,6 +23,7 @@ mod value;
 
 pub use error::{Error, Result};
 pub use key::Key;
+pub use metrics::{CompactionEvent, EventListener, FlushEvent};
 pub use namespace::Namespace;
 pub use recovery::RecoveryReport;
 pub use replication::Role;
@@ -146,7 +148,7 @@ impl FromStr for Compression {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     pub path: PathBuf,
     pub create_if_missing: bool,
@@ -209,6 +211,21 @@ pub struct Config {
     /// the flush thread drains it below `write_buffer_size`.
     /// Set to 0 to disable write stalling.
     pub write_stall_size: usize,
+    /// Optional event listener for flush/compaction lifecycle hooks.
+    pub event_listener: Option<Arc<dyn metrics::EventListener>>,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("path", &self.path)
+            .field("write_buffer_size", &self.write_buffer_size)
+            .field("max_levels", &self.max_levels)
+            .field("block_size", &self.block_size)
+            .field("cache_size", &self.cache_size)
+            .field("event_listener", &self.event_listener.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Config {
@@ -239,6 +256,7 @@ impl Config {
             primary_addr: None,
             peers: Vec::new(),
             write_stall_size: 8 * 1024 * 1024,
+            event_listener: None,
         }
     }
 }
@@ -282,6 +300,9 @@ pub struct DB {
     op_puts: AtomicU64,
     op_gets: AtomicU64,
     op_deletes: AtomicU64,
+    // Metrics (latency histograms, maintenance counters)
+    metrics: Arc<metrics::Metrics>,
+    event_listener: Option<Arc<dyn metrics::EventListener>>,
     // Replication
     repl_sender: Option<repl_sender::ReplSender>,
     repl_receiver: Option<repl_receiver::ReplReceiver>,
@@ -391,6 +412,9 @@ impl DB {
             }))
         };
 
+        // Metrics registry (shared across threads)
+        let metrics_arc = Arc::new(metrics::Metrics::new());
+
         // Background compaction thread
         let compaction_stop = Arc::new(AtomicBool::new(false));
         let compaction_notify = Arc::new((Mutex::new(false), Condvar::new()));
@@ -407,6 +431,8 @@ impl DB {
             let block_cache = block_cache.clone();
             let io = Arc::clone(&io_backend);
             let ns_data = Arc::clone(&namespace_data);
+            let bg_metrics = Arc::clone(&metrics_arc);
+            let bg_listener = config.event_listener.clone();
 
             Some(thread::spawn(move || {
                 loop {
@@ -451,6 +477,8 @@ impl DB {
                             &block_cache,
                             &io,
                             &ns_data,
+                            &bg_metrics,
+                            &bg_listener,
                         );
                     }
 
@@ -467,6 +495,7 @@ impl DB {
 
         // Load persisted operation counters
         let (op_puts, op_gets, op_deletes) = Self::load_stats_meta(&config.path);
+        let event_listener = config.event_listener.clone();
 
         let mut db = Self {
             config,
@@ -490,6 +519,8 @@ impl DB {
             op_puts: AtomicU64::new(op_puts),
             op_gets: AtomicU64::new(op_gets),
             op_deletes: AtomicU64::new(op_deletes),
+            metrics: metrics_arc,
+            event_listener,
             repl_sender: None,
             repl_receiver: None,
             repl_force_sync: None,
@@ -1344,6 +1375,17 @@ impl DB {
         &mut self.config
     }
 
+    /// Returns a reference to the shared metrics registry.
+    pub(crate) fn metrics(&self) -> &Arc<metrics::Metrics> {
+        &self.metrics
+    }
+
+    /// Render all metrics in Prometheus exposition text format.
+    pub fn prometheus_metrics(&self) -> String {
+        let stats = self.stats();
+        metrics::render_prometheus(&stats, &self.metrics)
+    }
+
     /// Switch to a namespace, creating it if it does not exist.
     ///
     /// Pass `password: Some("...")` to open an encrypted namespace, or `None`
@@ -1561,6 +1603,7 @@ impl DB {
     /// flushes (triggered by a remote `FlushNotify`) pass `false` to avoid
     /// infinite broadcast loops.
     fn flush_internal(&self, broadcast: bool) -> Result<()> {
+        let flush_start = Instant::now();
         let namespaces: Vec<String> = {
             let map = self
                 .namespace_data
@@ -1584,6 +1627,8 @@ impl DB {
             if entries.is_empty() {
                 continue;
             }
+
+            let entry_count = entries.len() as u64;
 
             // Allocate a new sequence number and write the SSTable
             let seq = self.sst_sequence.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1611,6 +1656,7 @@ impl DB {
                 self.block_cache.clone(),
                 &*self.io_backend,
             )?;
+            let sst_bytes = reader.size_bytes() as u64;
             let mut sst = self.sstables.write().unwrap_or_else(|e| e.into_inner());
             let levels = sst
                 .entry(ns_name.clone())
@@ -1620,10 +1666,29 @@ impl DB {
             }
             levels[0].insert(0, reader);
 
+            // Record flush metrics
+            self.metrics.flush_total.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .bytes_flushed
+                .fetch_add(sst_bytes, Ordering::Relaxed);
+
+            // Notify event listener
+            if let Some(ref listener) = self.event_listener {
+                listener.on_flush_complete(metrics::FlushEvent {
+                    namespace: ns_name.clone(),
+                    entries: entry_count,
+                    bytes: sst_bytes,
+                    duration: flush_start.elapsed(),
+                });
+            }
+
             flushed_any = true;
         }
 
         if flushed_any {
+            self.metrics
+                .flush
+                .observe(flush_start.elapsed().as_secs_f64());
             let mut aol = self.aol.lock().unwrap_or_else(|e| e.into_inner());
             aol.truncate(&self.config.path)?;
         }
@@ -2008,6 +2073,8 @@ impl DB {
             &self.block_cache,
             &self.io_backend,
             &self.namespace_data,
+            &self.metrics,
+            &self.event_listener,
         )
     }
 
@@ -2069,6 +2136,7 @@ impl DB {
     }
 
     /// Run compaction across all namespaces (static helper for background thread).
+    #[allow(clippy::too_many_arguments)]
     fn do_compact(
         config: &Config,
         sstables: &RwLock<LeveledSSTables>,
@@ -2076,14 +2144,18 @@ impl DB {
         block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
         io: &Arc<dyn io::IoBackend>,
         namespace_data: &RwLock<HashMap<String, Mutex<memtable::MemTable>>>,
+        m: &Arc<metrics::Metrics>,
+        listener: &Option<Arc<dyn metrics::EventListener>>,
     ) -> Result<()> {
+        let compact_start = Instant::now();
         let namespaces: Vec<String> = {
             let sst = sstables.read().unwrap_or_else(|e| e.into_inner());
             sst.keys().cloned().collect()
         };
 
+        let mut compacted_any = false;
         for ns_name in &namespaces {
-            Self::do_compact_namespace(
+            let did_compact = Self::do_compact_namespace(
                 ns_name,
                 config,
                 sstables,
@@ -2091,13 +2163,23 @@ impl DB {
                 block_cache,
                 io,
                 namespace_data,
+                m,
+                listener,
             )?;
+            compacted_any = compacted_any || did_compact;
+        }
+
+        if compacted_any {
+            m.compaction.observe(compact_start.elapsed().as_secs_f64());
+            m.compaction_total.fetch_add(1, Ordering::Relaxed);
         }
 
         Ok(())
     }
 
     /// Compact a single namespace with cascading level merges (static helper).
+    /// Returns `true` if any merge was performed.
+    #[allow(clippy::too_many_arguments)]
     fn do_compact_namespace(
         ns: &str,
         config: &Config,
@@ -2106,11 +2188,13 @@ impl DB {
         block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
         io: &Arc<dyn io::IoBackend>,
         namespace_data: &RwLock<HashMap<String, Mutex<memtable::MemTable>>>,
-    ) -> Result<()> {
+        m: &Arc<metrics::Metrics>,
+        listener: &Option<Arc<dyn metrics::EventListener>>,
+    ) -> Result<bool> {
         let max_levels = config.max_levels;
 
         if max_levels < 2 {
-            return Ok(());
+            return Ok(false);
         }
 
         {
@@ -2120,13 +2204,14 @@ impl DB {
                 .and_then(|levels| levels.first())
                 .is_some_and(|l0| !l0.is_empty());
             if !has_l0 {
-                return Ok(());
+                return Ok(false);
             }
         }
 
         // Step 1: merge L0 → L1
         let is_bottom = max_levels <= 2;
-        Self::do_merge_two_levels(
+        let merge_start = Instant::now();
+        let output_size = Self::do_merge_two_levels(
             ns,
             0,
             1,
@@ -2138,6 +2223,20 @@ impl DB {
             io,
         )?;
 
+        if output_size > 0 {
+            m.bytes_compacted
+                .fetch_add(output_size as u64, Ordering::Relaxed);
+            if let Some(ref l) = listener {
+                l.on_compaction_complete(metrics::CompactionEvent {
+                    namespace: ns.to_owned(),
+                    source_level: 0,
+                    target_level: 1,
+                    bytes: output_size as u64,
+                    duration: merge_start.elapsed(),
+                });
+            }
+        }
+
         // Step 2: cascade through deeper levels
         for level in 1..max_levels - 1 {
             if Self::do_level_total_size(sstables, ns, level)
@@ -2147,7 +2246,8 @@ impl DB {
             }
             let target = level + 1;
             let drop = target >= max_levels - 1;
-            Self::do_merge_two_levels(
+            let merge_start = Instant::now();
+            let output_size = Self::do_merge_two_levels(
                 ns,
                 level,
                 target,
@@ -2158,12 +2258,25 @@ impl DB {
                 block_cache,
                 io,
             )?;
+            if output_size > 0 {
+                m.bytes_compacted
+                    .fetch_add(output_size as u64, Ordering::Relaxed);
+                if let Some(ref l) = listener {
+                    l.on_compaction_complete(metrics::CompactionEvent {
+                        namespace: ns.to_owned(),
+                        source_level: level,
+                        target_level: target,
+                        bytes: output_size as u64,
+                        duration: merge_start.elapsed(),
+                    });
+                }
+            }
         }
 
         // Step 3: garbage-collect orphaned bin objects
         Self::do_gc_orphaned_objects(ns, config, sstables, io, namespace_data)?;
 
-        Ok(())
+        Ok(true)
     }
 
     /// Merge all SSTables from `source_level` into `target_level` (static helper).
