@@ -1,4 +1,5 @@
 mod admin;
+mod batch;
 mod health;
 mod keys;
 mod namespaces;
@@ -38,6 +39,8 @@ pub fn router(state: Arc<AppState>, enable_ui: bool) -> Router {
             get(scan::list_keys).delete(scan::delete_keys),
         )
         .route("/api/{ns}/count", get(scan::count_keys))
+        // Batch writes
+        .route("/api/{ns}/batch", post(batch::write_batch))
         // Revisions & TTL
         .route("/api/{ns}/keys/{key}/revisions", get(revisions::rev_count))
         .route(
