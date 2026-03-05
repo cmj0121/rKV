@@ -441,6 +441,8 @@ The `Config` struct controls database behavior and LSM tuning parameters:
 | `primary_addr`      | `Option<String>`  | `None`     | Primary address for replica to connect to  |
 | `peers`             | `Vec<String>`     | `[]`       | Peer addresses (peer mode only)            |
 | `event_listener`    | `Option<Arc<..>>` | `None`     | Callback for flush/compaction events       |
+| `shard_group`       | `u16`             | 0          | Shard group ID (0 = standalone)            |
+| `owned_namespaces`  | `Vec<String>`     | `[]`       | Namespaces owned by this shard node        |
 
 The CLI uses dot-notation keys for `config <key> <value>`:
 
@@ -471,6 +473,8 @@ The CLI uses dot-notation keys for `config <key> <value>`:
 | `repl_port`         | `repl.port`                 |
 | `primary_addr`      | `repl.primary_addr`         |
 | `peers`             | `repl.peers`                |
+| `shard_group`       | `cluster.shard_group`       |
+| `owned_namespaces`  | `cluster.owned_namespaces`  |
 
 `Config::new(path)` initializes all fields to their defaults. Fields can be overridden before
 passing the config to `DB::open`.
@@ -763,3 +767,5 @@ See the [README](README.md#http-server) for startup examples and curl recipes.
   MemTable, AOL).
 - **[Replication](docs/replication.md)** — primary-replica replication (read scaling) and
   peer-peer replication (multi-writer with LWW conflict resolution).
+- **[Cluster / Sharding](docs/cluster.md)** — namespace-level sharding with gateway routing
+  for horizontal data distribution across shard groups.
