@@ -14,7 +14,6 @@ pub fn parse_key(raw: &str) -> Key {
 }
 
 /// Format key for JSON output in scan results.
-#[allow(dead_code)] // consumed in scan routes
 pub fn format_key(key: &Key) -> String {
     match key {
         Key::Int(n) => n.to_string(),

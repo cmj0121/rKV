@@ -41,9 +41,6 @@ impl IntoResponse for ServerError {
                     "io error",
                     format!("io error ({})", e.kind()),
                 ),
-                Error::NotImplemented(d) => {
-                    (StatusCode::NOT_IMPLEMENTED, "not implemented", d.clone())
-                }
                 Error::ReadOnlyReplica => (
                     StatusCode::FORBIDDEN,
                     "read-only replica",

@@ -59,13 +59,11 @@ pub(crate) struct ReplicaCallbacks {
 /// The receiver connects to the primary, performs a handshake, receives a
 /// full sync (SSTable + object files), then enters a live-stream loop
 /// consuming AOL records.
-#[allow(dead_code)] // consumed by DB integration (upcoming commit)
 pub(crate) struct ReplReceiver {
     receiver_handle: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
 }
 
-#[allow(dead_code)]
 impl ReplReceiver {
     /// Connect to the primary at `addr` and start the replication loop.
     ///
@@ -331,6 +329,7 @@ impl ReplReceiver {
         Self::receive_full_sync_chunks(reader, sst_count, object_count, db_path, max_levels, stop)
     }
 
+    #[cfg(test)]
     fn receive_full_sync<R: std::io::Read>(
         reader: &mut R,
         db_path: &Path,
@@ -548,7 +547,6 @@ impl ReplReceiver {
 // ---------------------------------------------------------------------------
 
 /// Write an SSTable file received during full sync.
-#[allow(dead_code)]
 fn write_sst_file(
     db_path: &Path,
     namespace: &str,
@@ -567,7 +565,6 @@ fn write_sst_file(
 }
 
 /// Write a bin object file received during full sync.
-#[allow(dead_code)]
 fn write_object_file(db_path: &Path, namespace: &str, hash: &[u8; 32], data: &[u8]) -> Result<()> {
     let hex_hash = bytes_to_hex(hash);
     let fan_prefix = &hex_hash[..2];
@@ -579,7 +576,6 @@ fn write_object_file(db_path: &Path, namespace: &str, hash: &[u8; 32], data: &[u
 }
 
 /// Encode bytes as lowercase hex string.
-#[allow(dead_code)]
 fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

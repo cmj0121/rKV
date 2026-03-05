@@ -26,9 +26,6 @@ pub enum Error {
     #[error("invalid config: {0}")]
     InvalidConfig(String),
 
-    #[error("not implemented: {0}")]
-    NotImplemented(String),
-
     #[error("read-only replica: writes are rejected")]
     ReadOnlyReplica,
 }

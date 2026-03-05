@@ -600,7 +600,6 @@ impl ObjectStore {
     }
 
     /// Flush the pack writer's buffer and fsync to disk.
-    #[allow(dead_code)] // consumed in Unit 3 (close/sync integration)
     pub(crate) fn flush(&self) -> Result<()> {
         let mut state = self.packs.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref mut writer) = state.writer {

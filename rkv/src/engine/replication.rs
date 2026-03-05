@@ -55,53 +55,32 @@ impl FromStr for Role {
 // Wire protocol message types
 // ---------------------------------------------------------------------------
 
-// Wire protocol constants and types are defined now but consumed by the
-// replication sender/receiver in upcoming commits.
-#[allow(dead_code)]
 /// Message type tags for the replication wire protocol.
 const MSG_HANDSHAKE: u8 = 0x01;
-#[allow(dead_code)]
 const MSG_FULL_SYNC_START: u8 = 0x02;
-#[allow(dead_code)]
 const MSG_SST_CHUNK: u8 = 0x03;
-#[allow(dead_code)]
 const MSG_OBJECT_CHUNK: u8 = 0x04;
-#[allow(dead_code)]
 const MSG_AOL_RECORD: u8 = 0x05;
-#[allow(dead_code)]
 const MSG_HEARTBEAT: u8 = 0x06;
-#[allow(dead_code)]
 const MSG_ACK: u8 = 0x07;
-#[allow(dead_code)]
 const MSG_FULL_SYNC_END: u8 = 0x08;
-#[allow(dead_code)]
 const MSG_ERROR: u8 = 0x09;
-#[allow(dead_code)]
 const MSG_DROP_NAMESPACE: u8 = 0x0A;
-#[allow(dead_code)]
 const MSG_SYNC_REQUEST: u8 = 0x0B;
-#[allow(dead_code)]
 const MSG_INCREMENTAL_SYNC_START: u8 = 0x0C;
-#[allow(dead_code)]
 const MSG_FLUSH_NOTIFY: u8 = 0x0D;
 
 /// Role tags for handshake messages.
-#[allow(dead_code)]
 const ROLE_PRIMARY: u8 = 0x01;
-#[allow(dead_code)]
 const ROLE_REPLICA: u8 = 0x02;
-#[allow(dead_code)]
 const ROLE_PEER: u8 = 0x03;
 
 /// Magic bytes for the replication protocol: ASCII `rKVR`.
-#[allow(dead_code)]
 const REPL_MAGIC: [u8; 4] = [0x72, 0x4B, 0x56, 0x52];
 /// Current replication protocol version.
-#[allow(dead_code)]
 const REPL_VERSION: u16 = 1;
 
 /// A message in the replication wire protocol.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ReplMessage {
     /// Initial handshake — exchanged by both sides on connect.
@@ -152,7 +131,6 @@ pub(crate) enum ReplMessage {
 // Encoding
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 impl ReplMessage {
     /// Encode this message into the wire format and write it to `w`.
     ///
