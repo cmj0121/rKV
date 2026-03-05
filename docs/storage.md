@@ -6,8 +6,7 @@
 ## Maintenance Operations
 
 Maintenance operations handle durability, recovery, backup, and storage optimization.
-Most maintenance methods return `Result`. `flush`, `compact`, `list_namespaces`, and
-`drop_namespace` are implemented; remaining methods are stubs (`NotImplemented`).
+All maintenance methods return `Result`.
 
 ### Flush / Sync
 
@@ -23,7 +22,7 @@ path is:
 ```text
 DB::flush()
   for each namespace with non-empty MemTable:
-    1. drain_latest() — extract latest value per key (sorted, includes tombstones)
+    1. drain_all() — extract all revisions per key (sorted, includes tombstones)
     2. SSTableWriter::add() each entry in key order
     3. SSTableWriter::finish() — write index + footer
     4. SSTableReader::open() — cache reader (newest first)
@@ -37,12 +36,6 @@ reader cache and sequence counter across all levels.
 
 `sync` flushes any buffered AOL writes and calls `fsync` on the AOL file descriptor,
 guaranteeing that all committed data is persisted to the storage device.
-
-**Limitations (V1)**:
-
-- TTL is not preserved across flush — keys with TTL become permanent once flushed
-- `scan`, `rscan`, `count`, and `exists` only check the MemTable (not SSTables)
-- Revision history is not flushed — only the latest value per key is written
 
 ### Destroy / Repair
 
@@ -335,9 +328,34 @@ The checksum covers the tag byte plus the compressed payload.
 [key_len: u16 BE][key_bytes][value_tag: u8][value_len: u32 BE][value_data]
 ```
 
+V4 entries additionally include revision and TTL fields after the value data:
+
+```text
+[key_len: u16 BE][key_bytes][value_tag: u8][value_len: u32 BE][value_data]
+[revision: u128 BE (16B)][expires_at_ms: u64 BE (8B)]
+```
+
 Entries are stored in sorted key order. `key_bytes` uses the same memcmp-preserving
 serialization as `Key::to_bytes()`. `value_tag` encodes the Value variant (0x00 = Data,
 0x01 = Null, 0x02 = Tombstone, 0x03 = Pointer).
+
+**Restart points (per-block index):**
+
+Every 16th entry within a data block records its byte offset as a **restart point**.
+These offsets are appended as a trailer at the end of the decompressed block, before
+compression:
+
+```text
+[entry_0][entry_1]...[entry_N][restart_0: u32 LE]...[restart_R: u32 LE][num_restarts: u32 LE]
+```
+
+Point lookups binary-search the restart keys to jump directly to the right 16-entry
+interval, then parse only that interval instead of scanning the entire block. This
+reduces within-block search from O(N) to O(log N + 16).
+
+The `FEATURE_RESTART_POINTS` flag (`0x01`) in the footer's features field signals that
+blocks contain restart trailers. Old readers reject unknown feature flags (safe forward
+compatibility). New readers handle both old blocks (no trailer) and new blocks.
 
 **Index block layout:**
 
@@ -346,19 +364,26 @@ repeated: [key_len: u16 BE][last_key_bytes][offset: u64 BE][size: u32 BE]
 ```
 
 Each entry records the last key in a data block plus the block's file offset and on-disk
-size. Point lookups binary-search the index to find the candidate block, then linear-scan
-entries within that block.
+size. Point lookups binary-search the index to find the candidate block, then use restart
+points for O(log N) search within the block.
 
 **Footer layout (48 bytes):**
 
 ```text
 [magic: 4B "rKVS"][version: u16 BE][entry_count: u64 BE]
 [index_offset: u64 BE][index_size: u32 BE]
-[data_blocks: u32 BE][reserved: 13B][checksum: 5B CRC32C]
+[data_blocks: u32 BE][features: u32 BE][reserved: 9B][checksum: 5B CRC32C]
 ```
 
+The `features` bitmask signals optional format extensions. Currently defined flags:
+
+| Bit    | Flag                     | Description                          |
+| ------ | ------------------------ | ------------------------------------ |
+| `0x01` | `FEATURE_RESTART_POINTS` | Data blocks contain restart trailers |
+
 The footer checksum covers the first 43 bytes. The reader verifies magic, version, and
-checksum before parsing the index.
+checksum before parsing the index. Unknown feature flags cause the reader to reject the
+file (safe forward compatibility).
 
 ### SSTable Read Path
 
@@ -373,7 +398,7 @@ Namespace::get(key)
        a. Bloom filter check — if key is definitely absent, skip SSTable
        b. Binary search index for candidate block
        c. Decompress + verify checksum
-       d. Linear scan entries for key
+       d. Binary search via restart points (or partition_point on cached entries)
        e. If found:
           - Tombstone → return KeyNotFound
           - Pointer → resolve via ObjectStore
@@ -492,7 +517,7 @@ enforce per-key monotonicity.
 
 **Current status**: The MemTable serves as the write buffer. On startup, the AOL is replayed
 to reconstruct memtable state (see [Append-Only Log](#append-only-log-aol) below). `DB::flush()` calls
-`drain_latest()` to extract the latest value per key in sorted order, writes an L0 SSTable,
+`drain_all()` to extract all revisions per key in sorted order, writes an L0 SSTable,
 and truncates the AOL. After flush, the MemTable is empty and ready for new writes.
 
 ### Append-Only Log (AOL)
@@ -560,8 +585,6 @@ skip counter). This handles partial writes from crashes during append.
 
 #### Limitations
 
-- **No truncation**: The AOL grows without bound until flush/compaction is implemented.
-  Once SSTable flushing lands, the AOL will be truncated after a successful flush.
 - **Buffered flush**: The AOL buffers up to `aol_buffer_size` records (default 128) before
   flushing to the OS. A background thread flushes every 60 s if dirty data exists. On a
   hard crash, up to `aol_buffer_size` records (or 60 s of writes) may be lost. Set to 0

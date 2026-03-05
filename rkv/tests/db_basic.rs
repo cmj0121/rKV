@@ -5248,3 +5248,92 @@ fn get_after_auto_flush_with_compaction() {
 
     db.close().unwrap();
 }
+
+// --- Restart point integration tests ---
+
+#[test]
+fn get_after_flush_uses_restart_points() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 0..200 {
+        ns.put(i as i64, format!("value_{i}").as_str(), None)
+            .unwrap();
+    }
+    db.flush().unwrap();
+
+    for i in 0..200 {
+        let val = ns.get(i as i64).unwrap();
+        assert_eq!(val, Value::from(format!("value_{i}").as_str()), "key {i}");
+    }
+
+    db.close().unwrap();
+}
+
+#[test]
+fn get_after_compaction_uses_restart_points() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.write_buffer_size = 4096;
+    config.l0_max_count = 2;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 0..500 {
+        ns.put(i as i64, format!("v{i}").as_str(), None).unwrap();
+    }
+    db.flush().unwrap();
+    db.wait_for_compaction();
+
+    for i in 0..500 {
+        let val = ns.get(i as i64).unwrap();
+        assert_eq!(val, Value::from(format!("v{i}").as_str()), "key {i}");
+    }
+
+    db.close().unwrap();
+}
+
+#[test]
+fn get_no_cache_uses_targeted_restart_parse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.cache_size = 0;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 0..500 {
+        ns.put(i as i64, format!("val{i}").as_str(), None).unwrap();
+    }
+    db.flush().unwrap();
+
+    for i in 0..500 {
+        let val = ns.get(i as i64).unwrap();
+        assert_eq!(val, Value::from(format!("val{i}").as_str()), "key {i}");
+    }
+
+    let s = db.stats();
+    assert_eq!(s.cache_hits, 0);
+    assert_eq!(s.cache_misses, 0);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn rev_count_after_flush_with_restart_points() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 0..5 {
+        ns.put(42, format!("rev{i}").as_str(), None).unwrap();
+    }
+    db.flush().unwrap();
+
+    assert_eq!(ns.rev_count(42).unwrap(), 5);
+    assert_eq!(ns.get(42).unwrap(), Value::from("rev4"));
+
+    db.close().unwrap();
+}

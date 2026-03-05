@@ -30,8 +30,14 @@ const V1_FOOTER_SIZE: usize = 48;
 /// V2 footer size in bytes (adds features bitmask + reserved).
 pub(crate) const V2_FOOTER_SIZE: usize = 56;
 
+/// Feature flag: blocks contain restart point trailers for binary search.
+const FEATURE_RESTART_POINTS: u32 = 0x01;
+
 /// Known feature flags bitmask. Unknown bits trigger a reject.
-const KNOWN_FEATURES: u32 = 0;
+const KNOWN_FEATURES: u32 = FEATURE_RESTART_POINTS;
+
+/// Number of entries between restart points within a data block.
+const RESTART_INTERVAL: u32 = 16;
 
 /// Compression tag stored per block on disk.
 const COMPRESS_NONE: u8 = 0x00;
@@ -71,6 +77,8 @@ pub(crate) struct SSTableWriter {
     prefix_bloom: Option<BloomFilter>,
     /// Prefix length for prefix bloom (0 = disabled).
     bloom_prefix_len: usize,
+    /// Restart point byte offsets within the current block.
+    restarts: Vec<u32>,
 }
 
 impl SSTableWriter {
@@ -105,6 +113,7 @@ impl SSTableWriter {
             bloom: BloomFilter::new(bloom_bits),
             prefix_bloom,
             bloom_prefix_len,
+            restarts: Vec::new(),
         })
     }
 
@@ -130,6 +139,11 @@ impl SSTableWriter {
 
         let value_data = value_to_data(value);
         let value_tag = value.to_tag();
+
+        // Record restart point at every RESTART_INTERVAL entries
+        if self.block_entry_count.is_multiple_of(RESTART_INTERVAL) {
+            self.restarts.push(self.block_buf.len() as u32);
+        }
 
         // V4 entry: [key_len: u16 BE][key_bytes][revision: u128 BE][expires_at_ms: u64 BE][value_tag: u8][value_len: u32 BE][value_data]
         let key_len = key_bytes.len() as u16;
@@ -209,6 +223,7 @@ impl SSTableWriter {
             filter_offset,
             filter_size,
             filter_format,
+            FEATURE_RESTART_POINTS,
         );
         self.file.write_all(&footer)?;
 
@@ -220,6 +235,14 @@ impl SSTableWriter {
     /// Flush the current block to disk: compress, checksum, write.
     fn flush_block(&mut self) -> Result<()> {
         let block_offset = self.offset;
+
+        // Append restart point trailer: [restart_0: u32 LE]...[num_restarts: u32 LE]
+        for &offset in &self.restarts {
+            self.block_buf.extend_from_slice(&offset.to_le_bytes());
+        }
+        self.block_buf
+            .extend_from_slice(&(self.restarts.len() as u32).to_le_bytes());
+        self.restarts.clear();
 
         let (tag, payload) = compress_block(&self.block_buf, &self.compression);
 
@@ -279,6 +302,7 @@ impl SSTableWriter {
         filter_offset: u64,
         filter_size: u32,
         filter_format: u8,
+        features: u32,
     ) -> Vec<u8> {
         let mut buf = Vec::with_capacity(V2_FOOTER_SIZE);
         buf.extend_from_slice(&MAGIC);
@@ -291,7 +315,7 @@ impl SSTableWriter {
         buf.extend_from_slice(&filter_size.to_be_bytes());
         buf.push(filter_format);
         // V2 fields: features bitmask + 4 reserved bytes
-        buf.extend_from_slice(&0u32.to_be_bytes()); // features = 0
+        buf.extend_from_slice(&features.to_be_bytes());
         buf.extend_from_slice(&[0u8; 4]); // reserved
                                           // Checksum covers first 51 bytes (56 − 5)
         let checksum = Checksum::compute(&buf);
@@ -385,6 +409,8 @@ pub(crate) struct SSTableReader {
     features: u32,
     /// Format version from the footer (1, 2, or 3).
     version: u16,
+    /// Whether blocks contain restart point trailers.
+    has_restarts: bool,
 }
 
 impl SSTableReader {
@@ -556,6 +582,8 @@ impl SSTableReader {
             None
         };
 
+        let has_restarts = features & FEATURE_RESTART_POINTS != 0;
+
         Ok(Self {
             data,
             index,
@@ -568,6 +596,7 @@ impl SSTableReader {
             cache,
             features,
             version,
+            has_restarts,
         })
     }
 
@@ -618,7 +647,8 @@ impl SSTableReader {
     /// (oldest-first order), returns the last match (latest revision).
     ///
     /// Uses the bloom filter for fast negative answers, binary search
-    /// for block selection, and linear scan within the block.
+    /// for block selection, and binary search within blocks via restart
+    /// points (or `partition_point` on cached entries).
     pub(crate) fn get(
         &self,
         key: &Key,
@@ -655,29 +685,15 @@ impl SSTableReader {
         // contain more entries for the same key.
         for bi in block_idx..self.index.len() {
             let ie = &self.index[bi];
-            let entries = self.read_block(ie, bi, verify_checksums)?;
+            let found_in_block =
+                self.get_from_block(ie, bi, &key_bytes, verify_checksums, &mut last_match)?;
 
-            let mut found_in_block = false;
-            for (kb, revision, expires_at_ms, value_tag, value_data) in entries {
-                if kb == key_bytes {
-                    let value = Value::from_tag(value_tag, &value_data)?;
-                    last_match = Some((value, RevisionID::from(revision), expires_at_ms));
-                    found_in_block = true;
-                } else if found_in_block {
-                    // Past the matching key entries in this block
-                    return Ok(last_match);
-                }
-            }
-
-            // If we found matches in this block but the block's last key is
-            // our target, more entries may span into the next block.
             if found_in_block {
                 if ie.last_key.as_slice() != key_bytes {
                     return Ok(last_match);
                 }
                 // last_key == target → entries may continue in next block
             } else {
-                // No match in this block and we started at the right block
                 break;
             }
         }
@@ -685,11 +701,78 @@ impl SSTableReader {
         Ok(last_match)
     }
 
+    /// Search a single block for a key, updating `last_match` with the latest
+    /// revision found. Returns `true` if any match was found in this block.
+    ///
+    /// On cache hit: binary search via `partition_point`.
+    /// On cache miss (no cache) with restart points: targeted parse via
+    ///   `find_key_in_block` — skips full entry parsing for non-matching entries.
+    /// On cache miss (cache enabled): full parse + cache insert + binary search.
+    fn get_from_block(
+        &self,
+        ie: &IndexEntry,
+        block_index: usize,
+        key_bytes: &[u8],
+        verify_checksums: bool,
+        last_match: &mut Option<(Value, RevisionID, u64)>,
+    ) -> Result<bool> {
+        // 1. Cache hit → binary search on parsed entries
+        if let Some(ref c) = self.cache {
+            let mut cache = c.lock().unwrap();
+            if let Some(entries) = cache.get(self.sst_id, block_index as u32) {
+                drop(cache);
+                return Self::binary_search_entries(&entries, key_bytes, last_match);
+            }
+        }
+
+        // 2. Cache miss, no cache, restart points → targeted parse (fastest cold path)
+        if self.has_restarts && self.cache.is_none() {
+            let block_data = self.decompress_raw_block(ie, verify_checksums)?;
+            let (entry_data, restarts) = Self::strip_restart_trailer(&block_data)?;
+            if let Some(found) =
+                Self::find_key_in_block(entry_data, &restarts, key_bytes, self.version)?
+            {
+                *last_match = Some(found);
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
+        // 3. Cache miss with cache enabled → full parse + cache insert + binary search
+        let entries = self.read_block(ie, block_index, verify_checksums)?;
+        Self::binary_search_entries(&entries, key_bytes, last_match)
+    }
+
+    /// Binary search on parsed entries for a target key.
+    ///
+    /// Updates `last_match` with the latest revision (last entry) for the key.
+    /// Returns `true` if any match was found.
+    fn binary_search_entries(
+        entries: &[RawEntry],
+        key_bytes: &[u8],
+        last_match: &mut Option<(Value, RevisionID, u64)>,
+    ) -> Result<bool> {
+        // partition_point: first index where key >= target
+        let start = entries.partition_point(|e| e.0.as_slice() < key_bytes);
+        let mut found = false;
+        for entry in &entries[start..] {
+            if entry.0.as_slice() == key_bytes {
+                let value = Value::from_tag(entry.3, &entry.4)?;
+                *last_match = Some((value, RevisionID::from(entry.1), entry.2));
+                found = true;
+            } else {
+                break;
+            }
+        }
+        Ok(found)
+    }
+
     /// Look up ALL revisions for a key in the SSTable.
     ///
     /// Returns all matching entries in oldest-first order (the natural
     /// SSTable storage order). Uses bloom filter and binary search for
-    /// fast block selection.
+    /// fast block selection, with binary search within blocks via restart
+    /// points or `partition_point` on cached entries.
     pub(crate) fn get_all_revisions(
         &self,
         key: &Key,
@@ -722,18 +805,8 @@ impl SSTableReader {
 
         for bi in block_idx..self.index.len() {
             let ie = &self.index[bi];
-            let entries = self.read_block(ie, bi, verify_checksums)?;
-
-            let mut found_in_block = false;
-            for (kb, revision, expires_at_ms, value_tag, value_data) in entries {
-                if kb == key_bytes {
-                    let value = Value::from_tag(value_tag, &value_data)?;
-                    result.push((value, RevisionID::from(revision), expires_at_ms));
-                    found_in_block = true;
-                } else if found_in_block {
-                    return Ok(result);
-                }
-            }
+            let found_in_block =
+                self.get_all_from_block(ie, bi, &key_bytes, verify_checksums, &mut result)?;
 
             if found_in_block {
                 if ie.last_key.as_slice() != key_bytes {
@@ -745,6 +818,60 @@ impl SSTableReader {
         }
 
         Ok(result)
+    }
+
+    /// Search a single block for all revisions of a key, appending to `result`.
+    /// Returns `true` if any match was found.
+    fn get_all_from_block(
+        &self,
+        ie: &IndexEntry,
+        block_index: usize,
+        key_bytes: &[u8],
+        verify_checksums: bool,
+        result: &mut Vec<(Value, RevisionID, u64)>,
+    ) -> Result<bool> {
+        // 1. Cache hit → binary search on parsed entries
+        if let Some(ref c) = self.cache {
+            let mut cache = c.lock().unwrap();
+            if let Some(entries) = cache.get(self.sst_id, block_index as u32) {
+                drop(cache);
+                return Self::binary_search_all_entries(&entries, key_bytes, result);
+            }
+        }
+
+        // 2. Cache miss, no cache, restart points → targeted parse
+        if self.has_restarts && self.cache.is_none() {
+            let block_data = self.decompress_raw_block(ie, verify_checksums)?;
+            let (entry_data, restarts) = Self::strip_restart_trailer(&block_data)?;
+            let found = Self::find_all_in_block(entry_data, &restarts, key_bytes, self.version)?;
+            let any = !found.is_empty();
+            result.extend(found);
+            return Ok(any);
+        }
+
+        // 3. Cache miss with cache enabled → full parse + cache insert + binary search
+        let entries = self.read_block(ie, block_index, verify_checksums)?;
+        Self::binary_search_all_entries(&entries, key_bytes, result)
+    }
+
+    /// Binary search on parsed entries for all revisions of a target key.
+    fn binary_search_all_entries(
+        entries: &[RawEntry],
+        key_bytes: &[u8],
+        result: &mut Vec<(Value, RevisionID, u64)>,
+    ) -> Result<bool> {
+        let start = entries.partition_point(|e| e.0.as_slice() < key_bytes);
+        let mut found = false;
+        for entry in &entries[start..] {
+            if entry.0.as_slice() == key_bytes {
+                let value = Value::from_tag(entry.3, &entry.4)?;
+                result.push((value, RevisionID::from(entry.1), entry.2));
+                found = true;
+            } else {
+                break;
+            }
+        }
+        Ok(found)
     }
 
     /// Parse all entries from a decompressed block.
@@ -827,6 +954,249 @@ impl SSTableReader {
             entries.push((key_bytes, revision, expires_at_ms, value_tag, value_data));
         }
         Ok(entries)
+    }
+
+    /// Strip the restart point trailer from a decompressed block.
+    ///
+    /// Returns the entry data slice (without trailer) and the restart offsets.
+    /// Trailer format: `[restart_0: u32 LE]...[num_restarts: u32 LE]`
+    fn strip_restart_trailer(block: &[u8]) -> Result<(&[u8], Vec<u32>)> {
+        if block.len() < 4 {
+            return Err(Error::Corruption(
+                "block too small for restart trailer".into(),
+            ));
+        }
+        let num_restarts =
+            u32::from_le_bytes(block[block.len() - 4..].try_into().unwrap()) as usize;
+        let trailer_size = (num_restarts + 1) * 4;
+        if trailer_size > block.len() {
+            return Err(Error::Corruption(format!(
+                "restart trailer exceeds block: {num_restarts} restarts, block size {}",
+                block.len()
+            )));
+        }
+        let entry_end = block.len() - trailer_size;
+        let mut restarts = Vec::with_capacity(num_restarts);
+        for i in 0..num_restarts {
+            let off = entry_end + i * 4;
+            restarts.push(u32::from_le_bytes(block[off..off + 4].try_into().unwrap()));
+        }
+        Ok((&block[..entry_end], restarts))
+    }
+
+    /// Read the key at a given byte offset within entry data (no allocation).
+    ///
+    /// Returns `(key_slice, position_after_key)`.
+    fn key_at_offset(entry_data: &[u8], pos: usize) -> Result<(&[u8], usize)> {
+        if pos + 2 > entry_data.len() {
+            return Err(Error::Corruption("restart: truncated at key_len".into()));
+        }
+        let kl = u16::from_be_bytes(entry_data[pos..pos + 2].try_into().unwrap()) as usize;
+        let key_end = pos + 2 + kl;
+        if key_end > entry_data.len() {
+            return Err(Error::Corruption("restart: truncated at key".into()));
+        }
+        Ok((&entry_data[pos + 2..key_end], key_end))
+    }
+
+    /// Skip past the value portion of an entry (after the key has been read).
+    ///
+    /// `pos` should point to the revision field (V3+) or value_tag (V1/V2).
+    fn skip_entry_value(entry_data: &[u8], mut pos: usize, version: u16) -> Result<usize> {
+        if version >= 3 {
+            pos += 16; // revision: u128
+        }
+        if version >= 4 {
+            pos += 8; // expires_at_ms: u64
+        }
+        pos += 1; // value_tag
+        if pos + 4 > entry_data.len() {
+            return Err(Error::Corruption("restart: truncated at value_len".into()));
+        }
+        let vl = u32::from_be_bytes(entry_data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4 + vl;
+        if pos > entry_data.len() {
+            return Err(Error::Corruption("restart: truncated at value_data".into()));
+        }
+        Ok(pos)
+    }
+
+    /// Parse only the value portion of an entry (revision, expires, tag, data).
+    ///
+    /// `pos` should point right after the key bytes (i.e. the `after_key`
+    /// position from `key_at_offset`). Returns `(next_pos, revision,
+    /// expires_at_ms, value)`.
+    fn parse_entry_value(
+        entry_data: &[u8],
+        pos: usize,
+        version: u16,
+    ) -> Result<(usize, u128, u64, Value)> {
+        let mut p = pos;
+
+        let revision = if version >= 3 {
+            if p + 16 > entry_data.len() {
+                return Err(Error::Corruption("entry truncated at revision".into()));
+            }
+            let rev = u128::from_be_bytes(entry_data[p..p + 16].try_into().unwrap());
+            p += 16;
+            rev
+        } else {
+            0u128
+        };
+
+        let expires_at_ms = if version >= 4 {
+            if p + 8 > entry_data.len() {
+                return Err(Error::Corruption("entry truncated at expires_at_ms".into()));
+            }
+            let ms = u64::from_be_bytes(entry_data[p..p + 8].try_into().unwrap());
+            p += 8;
+            ms
+        } else {
+            0u64
+        };
+
+        if p + 1 > entry_data.len() {
+            return Err(Error::Corruption("entry truncated at value_tag".into()));
+        }
+        let value_tag = entry_data[p];
+        p += 1;
+
+        if p + 4 > entry_data.len() {
+            return Err(Error::Corruption("entry truncated at value_len".into()));
+        }
+        let vl = u32::from_be_bytes(entry_data[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+
+        if p + vl > entry_data.len() {
+            return Err(Error::Corruption("entry truncated at value_data".into()));
+        }
+        let value_data = &entry_data[p..p + vl];
+        p += vl;
+
+        let value = Value::from_tag(value_tag, value_data)?;
+        Ok((p, revision, expires_at_ms, value))
+    }
+
+    /// Search restart point keys via binary search.
+    ///
+    /// Returns the index of the last restart point whose key <= `target`.
+    fn search_restart_keys(entry_data: &[u8], restarts: &[u32], target: &[u8]) -> Result<usize> {
+        let n = restarts.len();
+        if n == 0 {
+            return Err(Error::Corruption("no restart points in block".into()));
+        }
+
+        let mut lo = 0usize;
+        let mut hi = n - 1;
+
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            let (key, _) = Self::key_at_offset(entry_data, restarts[mid] as usize)?;
+            if key <= target {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+
+        Ok(lo)
+    }
+
+    /// Find a key within a decompressed block using restart points.
+    ///
+    /// Binary-searches restart keys to locate the interval, then parses
+    /// only entries in that interval. Returns the latest revision match
+    /// (last entry with matching key, since entries are oldest-first).
+    fn find_key_in_block(
+        entry_data: &[u8],
+        restarts: &[u32],
+        key_bytes: &[u8],
+        version: u16,
+    ) -> Result<Option<(Value, RevisionID, u64)>> {
+        if restarts.is_empty() || entry_data.is_empty() {
+            return Ok(None);
+        }
+
+        let ri = Self::search_restart_keys(entry_data, restarts, key_bytes)?;
+        let mut pos = restarts[ri] as usize;
+        let mut last_match: Option<(Value, RevisionID, u64)> = None;
+
+        while pos < entry_data.len() {
+            let (key, after_key) = Self::key_at_offset(entry_data, pos)?;
+
+            if key == key_bytes {
+                // Parse value portion only (key already read above — no redundant alloc)
+                let (next_pos, rev, expires, value) =
+                    Self::parse_entry_value(entry_data, after_key, version)?;
+                last_match = Some((value, RevisionID::from(rev), expires));
+                pos = next_pos;
+            } else if key > key_bytes {
+                break;
+            } else {
+                // Skip this non-matching entry (zero allocation)
+                pos = Self::skip_entry_value(entry_data, after_key, version)?;
+            }
+        }
+
+        Ok(last_match)
+    }
+
+    /// Find all revisions of a key within a decompressed block using restart points.
+    fn find_all_in_block(
+        entry_data: &[u8],
+        restarts: &[u32],
+        key_bytes: &[u8],
+        version: u16,
+    ) -> Result<Vec<(Value, RevisionID, u64)>> {
+        if restarts.is_empty() || entry_data.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ri = Self::search_restart_keys(entry_data, restarts, key_bytes)?;
+        let mut pos = restarts[ri] as usize;
+        let mut result = Vec::new();
+
+        while pos < entry_data.len() {
+            let (key, after_key) = Self::key_at_offset(entry_data, pos)?;
+
+            if key == key_bytes {
+                let (next_pos, rev, expires, value) =
+                    Self::parse_entry_value(entry_data, after_key, version)?;
+                result.push((value, RevisionID::from(rev), expires));
+                pos = next_pos;
+            } else if key > key_bytes {
+                break;
+            } else {
+                pos = Self::skip_entry_value(entry_data, after_key, version)?;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Decompress a raw block from disk, verify checksum if requested.
+    fn decompress_raw_block(&self, ie: &IndexEntry, verify_checksums: bool) -> Result<Vec<u8>> {
+        let block_start = ie.offset as usize;
+        let block_end = block_start + ie.size as usize;
+
+        if block_end > self.data.len() {
+            return Err(Error::Corruption(format!(
+                "SSTable block out of bounds: {block_start}..{block_end} (file size {})",
+                self.data.len()
+            )));
+        }
+
+        let block_on_disk = &self.data[block_start..block_end];
+        let cksum_start = block_on_disk.len() - Checksum::encoded_size();
+
+        if verify_checksums {
+            let checksum = Checksum::from_bytes(&block_on_disk[cksum_start..])?;
+            checksum.verify(&block_on_disk[..cksum_start])?;
+        }
+
+        let compression_tag = block_on_disk[0];
+        let compressed_payload = &block_on_disk[1..cksum_start];
+        decompress_block(compression_tag, compressed_payload)
     }
 
     /// Scan entries matching a prefix/range.
@@ -1037,7 +1407,13 @@ impl SSTableReader {
         let compressed_payload = &block_on_disk[1..cksum_start];
         let block_data = decompress_block(compression_tag, compressed_payload)?;
 
-        let entries = Self::parse_block_entries(&block_data, self.version)?;
+        let entry_data = if self.has_restarts {
+            let (entries_slice, _restarts) = Self::strip_restart_trailer(&block_data)?;
+            entries_slice
+        } else {
+            &block_data
+        };
+        let entries = Self::parse_block_entries(entry_data, self.version)?;
 
         // 3. Cache insert (brief lock)
         if let Some(ref c) = self.cache {
@@ -1884,7 +2260,7 @@ mod tests {
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
-        assert_eq!(r.features(), 0);
+        assert_eq!(r.features(), FEATURE_RESTART_POINTS);
         for i in 0..10 {
             assert_eq!(
                 r.get(&Key::Int(i), true).unwrap(),
@@ -1977,8 +2353,8 @@ mod tests {
         let mut data = fs::read(&path).unwrap();
         let footer_start = data.len() - V2_FOOTER_SIZE;
 
-        // Patch features at footer[43..47] to 0x0000_0001 (unknown bit)
-        data[footer_start + 43..footer_start + 47].copy_from_slice(&1u32.to_be_bytes());
+        // Patch features at footer[43..47] to 0x8000_0000 (unknown bit)
+        data[footer_start + 43..footer_start + 47].copy_from_slice(&0x8000_0000u32.to_be_bytes());
 
         // Recompute checksum over first 51 bytes of footer
         let cksum = Checksum::compute(&data[footer_start..footer_start + 51]);
@@ -2021,5 +2397,187 @@ mod tests {
         };
         let msg = format!("{err}");
         assert!(msg.contains("unsupported version"), "{msg}");
+    }
+
+    #[test]
+    fn restart_points_written_and_readable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("restart.sst");
+        // Small block size to get multiple blocks with restart points
+        let mut w = SSTableWriter::new(&path, 64, Compression::None, 10, 0, &io()).unwrap();
+        for i in 0..50 {
+            w.add(
+                &Key::Int(i),
+                &Value::from(format!("v{i}").as_str()),
+                RevisionID::ZERO,
+                0,
+            )
+            .unwrap();
+        }
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
+        assert!(r.has_restarts);
+        assert_eq!(r.features(), FEATURE_RESTART_POINTS);
+        assert_eq!(r.entry_count(), 50);
+        assert!(r.block_count() > 1);
+
+        // Verify all keys are readable
+        for i in 0..50 {
+            let result = r.get(&Key::Int(i), true).unwrap();
+            assert_eq!(
+                result,
+                Some((Value::from(format!("v{i}").as_str()), RevisionID::ZERO, 0)),
+                "key {i} mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn restart_trailer_roundtrip() {
+        // Manually build a restart trailer and verify strip_restart_trailer
+        let mut block = Vec::new();
+        // Fake entry data (just some bytes)
+        block.extend_from_slice(b"entry_data_here");
+        let entry_end = block.len();
+
+        // Write 3 restart offsets: 0, 5, 10
+        block.extend_from_slice(&0u32.to_le_bytes());
+        block.extend_from_slice(&5u32.to_le_bytes());
+        block.extend_from_slice(&10u32.to_le_bytes());
+        block.extend_from_slice(&3u32.to_le_bytes()); // num_restarts
+
+        let (entries, restarts) = SSTableReader::strip_restart_trailer(&block).unwrap();
+        assert_eq!(entries, &block[..entry_end]);
+        assert_eq!(restarts, vec![0, 5, 10]);
+    }
+
+    #[test]
+    fn restart_points_with_compression() {
+        for compression in [Compression::LZ4, Compression::Zstd] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("compressed_restart.sst");
+            let mut w = SSTableWriter::new(&path, 128, compression.clone(), 10, 0, &io()).unwrap();
+            for i in 0..100 {
+                w.add(
+                    &Key::Int(i),
+                    &Value::from(format!("val{i}").as_str()),
+                    RevisionID::ZERO,
+                    0,
+                )
+                .unwrap();
+            }
+            w.finish().unwrap();
+
+            let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
+            assert!(r.has_restarts);
+            for i in 0..100 {
+                let result = r.get(&Key::Int(i), true).unwrap();
+                assert!(result.is_some(), "key {i} missing with {compression:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn restart_single_entry_block() {
+        // A block with exactly 1 entry should have 1 restart point at offset 0
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("single.sst");
+        // Very large block size so all entries fit in one block
+        let mut w = SSTableWriter::new(&path, 1_000_000, Compression::None, 10, 0, &io()).unwrap();
+        w.add(&Key::Int(42), &Value::from("only"), RevisionID::ZERO, 0)
+            .unwrap();
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
+        assert!(r.has_restarts);
+        assert_eq!(r.block_count(), 1);
+        let result = r.get(&Key::Int(42), true).unwrap();
+        assert_eq!(result, Some((Value::from("only"), RevisionID::ZERO, 0)));
+        // Missing key returns None
+        assert_eq!(r.get(&Key::Int(99), true).unwrap(), None);
+    }
+
+    #[test]
+    fn restart_exactly_interval_entries() {
+        // Exactly RESTART_INTERVAL entries in a single block — 1 restart point
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("exact.sst");
+        let mut w = SSTableWriter::new(&path, 1_000_000, Compression::None, 10, 0, &io()).unwrap();
+        for i in 0..RESTART_INTERVAL {
+            w.add(&Key::Int(i as i64), &Value::from("v"), RevisionID::ZERO, 0)
+                .unwrap();
+        }
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
+        assert!(r.has_restarts);
+        // All keys findable
+        for i in 0..RESTART_INTERVAL {
+            assert!(
+                r.get(&Key::Int(i as i64), true).unwrap().is_some(),
+                "key {i} missing"
+            );
+        }
+    }
+
+    #[test]
+    fn restart_multi_revision_single_key() {
+        // Multiple revisions of the same key in one block
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("multirev.sst");
+        let mut w = SSTableWriter::new(&path, 1_000_000, Compression::None, 10, 0, &io()).unwrap();
+        for rev in 1..=5u128 {
+            w.add(
+                &Key::Int(1),
+                &Value::from(format!("r{rev}").as_str()),
+                RevisionID::from(rev),
+                0,
+            )
+            .unwrap();
+        }
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
+        // get() returns latest (last) revision
+        let result = r.get(&Key::Int(1), true).unwrap().unwrap();
+        assert_eq!(result.0, Value::from("r5"));
+        assert_eq!(result.1, RevisionID::from(5));
+
+        // get_all_revisions() returns all 5
+        let all = r.get_all_revisions(&Key::Int(1), true).unwrap();
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0].1, RevisionID::from(1));
+        assert_eq!(all[4].1, RevisionID::from(5));
+    }
+
+    #[test]
+    fn restart_str_keys() {
+        // Verify restart points work with Str keys (variable length, different ordering)
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("strkeys.sst");
+        let mut w = SSTableWriter::new(&path, 128, Compression::None, 10, 0, &io()).unwrap();
+        let keys: Vec<String> = (0..60).map(|i| format!("key_{i:04}")).collect();
+        for k in &keys {
+            w.add(
+                &Key::Str(k.clone()),
+                &Value::from(k.as_str()),
+                RevisionID::ZERO,
+                0,
+            )
+            .unwrap();
+        }
+        w.finish().unwrap();
+
+        let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
+        assert!(r.has_restarts);
+        // Verify all keys readable
+        for k in &keys {
+            let result = r.get(&Key::Str(k.clone()), true).unwrap();
+            assert!(result.is_some(), "key {k} missing");
+            assert_eq!(result.unwrap().0, Value::from(k.as_str()));
+        }
+        // Non-existent key
+        assert_eq!(r.get(&Key::Str("zzz_missing".into()), true).unwrap(), None);
     }
 }
