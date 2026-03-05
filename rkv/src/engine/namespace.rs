@@ -1,6 +1,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use super::batch::{BatchOp, WriteBatch};
 use super::crypto;
 use super::error::{Error, Result};
 use super::key::Key;
@@ -118,6 +119,92 @@ impl<'db> Namespace<'db> {
             let _ = self.db.flush(); // best-effort; data is safe in AOL
         }
         Ok(actual_rev)
+    }
+
+    /// Apply multiple operations atomically.
+    ///
+    /// All operations are appended to the AOL under a single lock hold, then
+    /// applied to the memtable under a single lock hold. Either all operations
+    /// succeed or none are visible.
+    ///
+    /// Returns a revision ID for each operation, in order.
+    pub fn write_batch(&self, batch: WriteBatch) -> Result<Vec<RevisionID>> {
+        if self.db.is_replica() {
+            return Err(Error::ReadOnlyReplica);
+        }
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 1. Pre-process: encrypt values, separate bin objects, generate revisions
+        let mut prepared: Vec<(Key, Value, Option<Duration>)> = Vec::with_capacity(batch.len());
+        for op in batch.ops {
+            match op {
+                BatchOp::Put { key, value, ttl } => {
+                    let value = self.encrypt_value(value);
+                    let value = self.db.maybe_separate_value(&self.name, value)?;
+                    prepared.push((key, value, ttl));
+                }
+                BatchOp::Delete { key } => {
+                    prepared.push((key, Value::tombstone(), None));
+                }
+            }
+        }
+
+        let revisions: Vec<_> = prepared
+            .iter()
+            .map(|_| self.db.generate_revision())
+            .collect();
+
+        // 2. Append all ops to AOL under a single lock
+        {
+            let mut aol = self.db.aol_lock();
+            for (i, (key, value, ttl)) in prepared.iter().enumerate() {
+                self.db.append_to_aol_locked(
+                    &mut aol,
+                    &self.name,
+                    revisions[i].as_u128(),
+                    key,
+                    value,
+                    *ttl,
+                )?;
+            }
+        }
+
+        // 3. Apply all ops to memtable under a single lock
+        let (actual_revs, should_flush, should_stall) = {
+            let mt = self.db.get_or_create_memtable(&self.name);
+            let mut mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mut actual_revs = Vec::with_capacity(prepared.len());
+            let mut puts = 0u64;
+            let mut deletes = 0u64;
+            for (i, (key, value, ttl)) in prepared.into_iter().enumerate() {
+                if value.is_tombstone() {
+                    mt.delete(key, revisions[i]);
+                    actual_revs.push(revisions[i]);
+                    deletes += 1;
+                } else {
+                    let actual_rev = mt.put(key, value, revisions[i], ttl);
+                    actual_revs.push(actual_rev);
+                    puts += 1;
+                }
+            }
+            self.db.inc_op_puts_by(puts);
+            self.db.inc_op_deletes_by(deletes);
+            let size = mt.approximate_size();
+            let config = self.db.config();
+            let stall = config.write_stall_size > 0 && size >= config.write_stall_size;
+            (actual_revs, size >= config.write_buffer_size, stall)
+        };
+
+        // 4. Flush if needed
+        if should_stall {
+            self.db.flush()?;
+        } else if should_flush {
+            let _ = self.db.flush();
+        }
+
+        Ok(actual_revs)
     }
 
     pub fn get(&self, key: impl Into<Key>) -> Result<Value> {
