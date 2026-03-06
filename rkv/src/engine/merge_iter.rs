@@ -1,9 +1,11 @@
-#![allow(dead_code)] // consumed by later commits in this branch
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::sync::Arc;
 
 use super::error::Result;
+use super::io::IoBytes;
 use super::key::Key;
+use super::sstable::{self, IndexEntry};
 use super::value::Value;
 
 // ---------------------------------------------------------------------------
@@ -35,6 +37,211 @@ impl VecSource {
 impl MergeSource for VecSource {
     fn next_entry(&mut self) -> Result<Option<(Key, Value)>> {
         Ok(self.entries.next())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSTableScanIter — lazy block-by-block SSTable iterator
+// ---------------------------------------------------------------------------
+
+/// Scan direction for SSTableScanIter.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum ScanDirection {
+    /// Forward: keys >= prefix (ordered) or starts_with(prefix) (unordered).
+    Forward,
+    /// Reverse: keys <= prefix (ordered) or starts_with(prefix) (unordered).
+    Reverse,
+}
+
+pub(crate) struct SSTableScanIter {
+    data: Arc<IoBytes>,
+    index: Vec<IndexEntry>,
+    version: u16,
+    has_restarts: bool,
+    verify_checksums: bool,
+    /// Prefix bytes to match against. Empty = match all.
+    prefix_bytes: Vec<u8>,
+    /// Whether to use ordered (range) scanning vs prefix matching.
+    ordered_mode: bool,
+    /// Scan direction.
+    direction: ScanDirection,
+    /// Current block index.
+    block_idx: usize,
+    /// Current position within the current block's parsed entries.
+    entry_idx: usize,
+    /// Parsed entries for the current block (lazy loaded).
+    current_entries: Vec<(Key, Value)>,
+    /// Whether we've finished scanning (early termination for ordered mode).
+    exhausted: bool,
+}
+
+impl SSTableScanIter {
+    /// Create a new lazy SSTable scan iterator.
+    ///
+    /// Captures `Arc<IoBytes>` and cloned index entries at construction time,
+    /// so the sstables RwLock can be released immediately after.
+    pub(crate) fn new(
+        reader: &sstable::SSTableReader,
+        prefix_bytes: Vec<u8>,
+        ordered_mode: bool,
+        verify_checksums: bool,
+    ) -> Result<Option<Self>> {
+        Self::with_direction(
+            reader,
+            prefix_bytes,
+            ordered_mode,
+            verify_checksums,
+            ScanDirection::Forward,
+        )
+    }
+
+    /// Create a scan iterator with explicit direction.
+    pub(crate) fn with_direction(
+        reader: &sstable::SSTableReader,
+        prefix_bytes: Vec<u8>,
+        ordered_mode: bool,
+        verify_checksums: bool,
+        direction: ScanDirection,
+    ) -> Result<Option<Self>> {
+        // Prefix bloom check for forward scans and unordered reverse.
+        // For ordered reverse, prefix_bytes is a range bound, not a prefix.
+        if (direction == ScanDirection::Forward || !ordered_mode)
+            && !reader.may_contain_prefix_for_scan(&prefix_bytes)
+        {
+            return Ok(None);
+        }
+
+        let index = reader.index_entries()?;
+        if index.is_empty() {
+            return Ok(None);
+        }
+
+        let start_block =
+            if ordered_mode && !prefix_bytes.is_empty() && direction == ScanDirection::Forward {
+                // Binary search: find the first block whose last_key >= prefix_bytes
+                match index.binary_search_by(|e| e.last_key.as_slice().cmp(&prefix_bytes)) {
+                    Ok(i) => i,
+                    Err(i) => {
+                        if i >= index.len() {
+                            return Ok(None);
+                        }
+                        i
+                    }
+                }
+            } else {
+                0
+            };
+
+        Ok(Some(Self {
+            data: Arc::clone(reader.data()),
+            index,
+            version: reader.version(),
+            has_restarts: reader.has_restarts(),
+            verify_checksums,
+            prefix_bytes,
+            ordered_mode,
+            direction,
+            block_idx: start_block,
+            entry_idx: 0,
+            current_entries: Vec::new(),
+            exhausted: false,
+        }))
+    }
+
+    /// Load the next block's matching entries into `current_entries`.
+    /// Returns false if no more blocks to process.
+    fn load_next_block(&mut self) -> Result<bool> {
+        loop {
+            if self.block_idx >= self.index.len() {
+                return Ok(false);
+            }
+
+            let ie = &self.index[self.block_idx];
+            let raw = sstable::read_block_from_data(
+                &self.data,
+                ie,
+                self.version,
+                self.has_restarts,
+                self.verify_checksums,
+            )?;
+
+            self.current_entries.clear();
+            self.entry_idx = 0;
+
+            let now_ms = super::now_epoch_ms();
+
+            for (key_bytes, _revision, expires_at_ms, value_tag, value_data) in raw {
+                let matches = if self.prefix_bytes.is_empty() {
+                    true
+                } else if self.ordered_mode {
+                    match self.direction {
+                        ScanDirection::Forward => {
+                            key_bytes.as_slice() >= self.prefix_bytes.as_slice()
+                        }
+                        ScanDirection::Reverse => {
+                            key_bytes.as_slice() <= self.prefix_bytes.as_slice()
+                        }
+                    }
+                } else {
+                    key_bytes.starts_with(&self.prefix_bytes)
+                };
+
+                if matches {
+                    let key = Key::from_bytes(&key_bytes)?;
+                    let value = if expires_at_ms != 0 && now_ms >= expires_at_ms {
+                        Value::tombstone()
+                    } else {
+                        Value::from_tag(value_tag, &value_data)?
+                    };
+                    self.current_entries.push((key, value));
+                }
+            }
+
+            self.block_idx += 1;
+
+            if !self.current_entries.is_empty() {
+                return Ok(true);
+            }
+
+            // In ordered mode, if this block had no matches and its last_key
+            // is already past our prefix range, we can stop early.
+            if self.ordered_mode && !self.prefix_bytes.is_empty() && self.block_idx > 0 {
+                // We already incremented block_idx, so check the previous block
+                // No easy early-termination here for range scans (they scan forward),
+                // but for prefix matching we can't do it in ordered mode anyway.
+                // Just continue to the next block.
+            }
+        }
+    }
+}
+
+impl MergeSource for SSTableScanIter {
+    fn next_entry(&mut self) -> Result<Option<(Key, Value)>> {
+        if self.exhausted {
+            return Ok(None);
+        }
+
+        // If we have entries left in the current block, return the next one
+        if self.entry_idx < self.current_entries.len() {
+            let idx = self.entry_idx;
+            self.entry_idx += 1;
+            // Take ownership by swapping with a placeholder
+            let entry =
+                std::mem::replace(&mut self.current_entries[idx], (Key::Int(0), Value::Null));
+            return Ok(Some(entry));
+        }
+
+        // Try to load the next block
+        if self.load_next_block()? {
+            let idx = self.entry_idx;
+            self.entry_idx += 1;
+            let entry =
+                std::mem::replace(&mut self.current_entries[idx], (Key::Int(0), Value::Null));
+            Ok(Some(entry))
+        } else {
+            self.exhausted = true;
+            Ok(None)
+        }
     }
 }
 

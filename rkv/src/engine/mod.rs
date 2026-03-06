@@ -10,6 +10,7 @@ mod error;
 mod io;
 mod key;
 mod memtable;
+#[allow(dead_code)] // consumed when scan/rscan/count are refactored (next commit)
 mod merge_iter;
 pub(crate) mod metrics;
 mod namespace;

@@ -1547,31 +1547,26 @@ impl SSTableReader {
     }
 
     /// Return the Arc-wrapped raw data for iterator construction.
-    #[allow(dead_code)] // used by merge_iter::SSTableScanIter (added in next commit)
     pub(crate) fn data(&self) -> &Arc<IoBytes> {
         &self.data
     }
 
     /// Return the format version.
-    #[allow(dead_code)]
     pub(crate) fn version(&self) -> u16 {
         self.version
     }
 
     /// Return whether blocks have restart point trailers.
-    #[allow(dead_code)]
     pub(crate) fn has_restarts(&self) -> bool {
         self.has_restarts
     }
 
     /// Return cloned index entries for iterator construction.
-    #[allow(dead_code)]
     pub(crate) fn index_entries(&self) -> Result<Vec<IndexEntry>> {
         Ok(self.ensure_meta()?.index.clone())
     }
 
     /// Check prefix bloom filter for scan skip.
-    #[allow(dead_code)]
     pub(crate) fn may_contain_prefix_for_scan(&self, prefix_bytes: &[u8]) -> bool {
         match self.ensure_meta() {
             Ok(meta) => Self::may_contain_prefix_inner(meta, prefix_bytes),
@@ -1580,7 +1575,6 @@ impl SSTableReader {
     }
 }
 
-#[allow(dead_code)] // used by merge_iter::SSTableScanIter (added in next commit)
 /// Decompress and parse a block from raw SSTable data without an SSTableReader.
 ///
 /// Used by `SSTableScanIter` to read blocks lazily without holding the sstables
