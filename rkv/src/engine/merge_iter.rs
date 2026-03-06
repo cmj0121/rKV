@@ -53,6 +53,11 @@ pub(crate) enum ScanDirection {
     Reverse,
 }
 
+/// Lazy block-by-block SSTable iterator for merge scans.
+///
+/// Captures `Arc<IoBytes>` at construction time so the SSTable `RwLock` can
+/// be released immediately. Blocks are decompressed and parsed on demand.
+/// In ordered mode, keys are matched by range; in unordered mode, by prefix.
 pub(crate) struct SSTableScanIter {
     data: Arc<IoBytes>,
     index: Vec<IndexEntry>,
@@ -384,6 +389,11 @@ impl MergeIterator {
 // ---------------------------------------------------------------------------
 
 /// Collects all entries from a MergeIterator, then yields them in reverse order.
+///
+/// True lazy reverse iteration over an LSM merge is significantly more complex
+/// (reverse block reading, reverse heap). This drain-then-reverse approach is
+/// simpler and sufficient for rscan with limit/offset (early termination still
+/// applies on the reversed output).
 pub(crate) struct RScanAdapter {
     entries: Vec<(Key, Value)>,
     pos: usize,

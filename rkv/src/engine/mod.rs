@@ -283,6 +283,16 @@ const STATS_MAGIC: &[u8; 4] = b"rKVT";
 /// Current stats metadata format version.
 const STATS_VERSION: u16 = 1;
 
+/// Main database handle providing thread-safe access to the LSM-tree engine.
+///
+/// All public methods take `&self` and use interior mutability (`Mutex`/`RwLock`)
+/// for concurrent access. Background threads handle AOL flushing (every 60 s)
+/// and compaction (condvar-signaled with 30 s poll fallback).
+///
+/// Lock ordering: `Mutex<Aol>` → `Mutex<MemTable>` (same for single writes
+/// and `WriteBatch`). The `namespace_data` `RwLock` is only held briefly to
+/// obtain a `Mutex<MemTable>` reference; the map never shrinks, so cached
+/// raw pointers remain valid.
 pub struct DB {
     config: Config,
     opened_at: Instant,
@@ -331,6 +341,14 @@ pub struct DB {
 }
 
 impl DB {
+    /// Open (or create) a database at the configured path.
+    ///
+    /// Initialization sequence:
+    /// 1. Replay the append-only log to reconstruct in-memory state.
+    /// 2. Scan existing SSTable files to rebuild the level index.
+    /// 3. Detect on-disk encryption markers for known namespaces.
+    /// 4. Start background threads (AOL flush, compaction).
+    /// 5. Start replication if configured (primary/replica/peer).
     pub fn open(config: Config) -> Result<Self> {
         if config.create_if_missing {
             fs::create_dir_all(&config.path)?;
@@ -552,6 +570,10 @@ impl DB {
         Ok(db)
     }
 
+    /// Shut down the database gracefully.
+    ///
+    /// Stops replication threads, signals background flush/compaction to exit,
+    /// joins all threads, and persists operation counters to `stats.meta`.
     pub fn close(mut self) -> Result<()> {
         self.stop_replication();
         self.flush_stop.store(true, Ordering::Relaxed);
