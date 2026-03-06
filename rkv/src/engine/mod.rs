@@ -558,8 +558,9 @@ impl DB {
                         let (lock, cvar) = &*notify;
                         let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
                         if !*pending && !stop.load(Ordering::Relaxed) {
-                            let result =
-                                cvar.wait_timeout(pending, Duration::from_secs(30)).unwrap();
+                            let result = cvar
+                                .wait_timeout(pending, Duration::from_secs(30))
+                                .unwrap_or_else(|e| e.into_inner());
                             pending = result.0;
                         }
                         *pending = false;
@@ -2301,7 +2302,7 @@ impl DB {
         let (lock, cvar) = &*self.compaction_done;
         let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
         while !*done {
-            done = cvar.wait(done).unwrap();
+            done = cvar.wait(done).unwrap_or_else(|e| e.into_inner());
         }
         *done = false;
     }

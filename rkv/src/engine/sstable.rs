@@ -804,7 +804,7 @@ impl SSTableReader {
     ) -> Result<bool> {
         // 1. Cache hit → binary search on parsed entries
         if let Some(ref c) = self.cache {
-            let mut cache = c.lock().unwrap();
+            let mut cache = c.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entries) = cache.get(self.sst_id, block_index as u32) {
                 drop(cache);
                 return Self::binary_search_entries(&entries, key_bytes, last_match);
@@ -920,7 +920,7 @@ impl SSTableReader {
     ) -> Result<bool> {
         // 1. Cache hit → binary search on parsed entries
         if let Some(ref c) = self.cache {
-            let mut cache = c.lock().unwrap();
+            let mut cache = c.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entries) = cache.get(self.sst_id, block_index as u32) {
                 drop(cache);
                 return Self::binary_search_all_entries(&entries, key_bytes, result);
@@ -1368,7 +1368,7 @@ impl SSTableReader {
     ) -> Result<Vec<RawEntry>> {
         // 1. Cache lookup (brief lock)
         if let Some(ref c) = self.cache {
-            let mut cache = c.lock().unwrap();
+            let mut cache = c.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entries) = cache.get(self.sst_id, block_index as u32) {
                 return Ok(entries);
             }
