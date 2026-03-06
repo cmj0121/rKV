@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::bloom::BloomFilter;
@@ -53,6 +53,8 @@ const COMPRESS_ZSTD: u8 = 0x02;
 /// Usage: call `add()` for each entry in sorted key order, then `finish()`
 /// to flush the final block and write the index + footer.
 pub(crate) struct SSTableWriter {
+    /// File path for cleanup on write failure.
+    path: PathBuf,
     /// Target file handle.
     file: fs::File,
     /// Block size threshold in bytes.
@@ -103,6 +105,7 @@ impl SSTableWriter {
             None
         };
         Ok(Self {
+            path: path.to_path_buf(),
             file,
             block_size,
             compression,
@@ -176,7 +179,16 @@ impl SSTableWriter {
     }
 
     /// Finish writing: flush any remaining entries, write filter, index, and footer.
+    /// On failure, removes the partial file to avoid leaving corrupted state on disk.
     pub(crate) fn finish(mut self) -> Result<()> {
+        let result = self.finish_inner();
+        if result.is_err() {
+            let _ = fs::remove_file(&self.path);
+        }
+        result
+    }
+
+    fn finish_inner(&mut self) -> Result<()> {
         // Flush remaining entries
         if !self.block_buf.is_empty() {
             self.flush_block()?;
