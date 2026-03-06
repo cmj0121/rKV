@@ -63,6 +63,26 @@ fn is_expired(expires_at_ms: u64) -> bool {
 /// Default namespace name.
 pub const DEFAULT_NAMESPACE: &str = "_";
 
+/// Per-namespace state: memtable + append-only log.
+pub(crate) struct NamespaceState {
+    pub memtable: Mutex<memtable::MemTable>,
+    pub aol: Mutex<aol::Aol>,
+}
+
+impl NamespaceState {
+    /// Create a new `NamespaceState`, ensuring the namespace directory exists
+    /// and opening (or creating) its AOL file.
+    pub(crate) fn create(db_path: &Path, ns_name: &str, aol_buffer_size: usize) -> Result<Self> {
+        let ns_dir = db_path.join("sst").join(ns_name);
+        fs::create_dir_all(&ns_dir)?;
+        let ns_aol = aol::Aol::open_at(ns_dir.join(aol::AOL_FILENAME), aol_buffer_size)?;
+        Ok(Self {
+            memtable: Mutex::new(memtable::MemTable::new()),
+            aol: Mutex::new(ns_aol),
+        })
+    }
+}
+
 /// I/O model for file access.
 ///
 /// Controls how the engine reads and writes data files. The three modes are
@@ -299,8 +319,7 @@ pub struct DB {
     encrypted_namespaces: Mutex<HashMap<String, bool>>,
     io_backend: Arc<dyn io::IoBackend>,
     revision_gen: revision::RevisionGen,
-    namespace_data: Arc<RwLock<HashMap<String, Mutex<memtable::MemTable>>>>,
-    aol: Arc<Mutex<aol::Aol>>,
+    namespace_data: Arc<RwLock<HashMap<String, NamespaceState>>>,
     object_stores: Arc<RwLock<HashMap<String, objects::ObjectStore>>>,
     /// Per-namespace, per-level SSTable readers.
     /// `sstables[ns][level]` = Vec of readers.
@@ -356,46 +375,86 @@ impl DB {
         let io_backend = io::create_backend(&config.io_model);
         let revision_gen = revision::RevisionGen::new(config.cluster_id);
 
-        // Replay AOL to reconstruct memtables
-        let namespace_data = Arc::new(RwLock::new(HashMap::new()));
-        let (records, _skipped) =
-            aol::Aol::replay(&config.path, config.verify_checksums, &*io_backend)?;
+        // Replay AOL to reconstruct memtables.
+        // First try per-namespace AOLs, then fall back to legacy global AOL.
+        let mut ns_memtables: HashMap<String, memtable::MemTable> = HashMap::new();
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
 
-        {
-            let mut map = namespace_data.write().unwrap_or_else(|e| e.into_inner());
-            for record in records {
-                // Skip expired records — replaying them would create
-                // tombstones in the memtable that shadow valid SSTable data.
-                if record.expires_at_ms > 0 && record.expires_at_ms <= now_ms {
-                    continue;
-                }
+        let legacy_aol_path = config.path.join(aol::AOL_FILENAME);
+        let sst_root = config.path.join("sst");
+        let mut used_legacy = false;
 
-                // Namespace-creation sentinel: only register the namespace.
-                let is_sentinel = record.key == Key::Str(String::new()) && record.value.is_null();
-
-                let mt = map
-                    .entry(record.namespace)
-                    .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
-
-                if !is_sentinel {
-                    let mt = mt.get_mut().unwrap();
-                    let rev = RevisionID::from(record.revision);
-                    let ttl = if record.expires_at_ms > 0 {
-                        // Convert absolute expiry back to remaining duration
-                        let remaining_ms = record.expires_at_ms.saturating_sub(now_ms);
-                        Some(Duration::from_millis(remaining_ms))
-                    } else {
-                        None
-                    };
-                    mt.put(record.key, record.value, rev, ttl);
+        // Try per-namespace AOLs first
+        if sst_root.exists() {
+            if let Ok(entries) = fs::read_dir(&sst_root) {
+                for entry in entries.flatten() {
+                    if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        let ns_aol_path = entry.path().join(aol::AOL_FILENAME);
+                        if ns_aol_path.exists() {
+                            let (records, _skipped) = aol::Aol::replay_at(
+                                &ns_aol_path,
+                                config.verify_checksums,
+                                &*io_backend,
+                            )?;
+                            Self::replay_records_into(&mut ns_memtables, records, now_ms);
+                        }
+                    }
                 }
             }
         }
+
+        // Fall back to legacy global AOL if no per-namespace records found
+        if ns_memtables.is_empty() && legacy_aol_path.exists() {
+            let (records, _skipped) =
+                aol::Aol::replay(&config.path, config.verify_checksums, &*io_backend)?;
+            Self::replay_records_into(&mut ns_memtables, records, now_ms);
+            used_legacy = true;
+        }
+
+        // Build NamespaceState map: memtable + per-namespace AOL
+        let mut ns_map: HashMap<String, NamespaceState> = HashMap::new();
+        for (ns_name, mt) in ns_memtables {
+            let ns_dir = config.path.join("sst").join(&ns_name);
+            fs::create_dir_all(&ns_dir)?;
+            let ns_aol = aol::Aol::open_at(ns_dir.join(aol::AOL_FILENAME), config.aol_buffer_size)?;
+            ns_map.insert(
+                ns_name,
+                NamespaceState {
+                    memtable: Mutex::new(mt),
+                    aol: Mutex::new(ns_aol),
+                },
+            );
+        }
+
+        // If migrating from legacy AOL, re-append records to per-namespace AOLs
+        // so crash recovery works from the new files, then delete the legacy file.
+        if used_legacy && legacy_aol_path.exists() {
+            let (records, _) =
+                aol::Aol::replay(&config.path, config.verify_checksums, &*io_backend)?;
+            for record in &records {
+                if record.expires_at_ms > 0 && record.expires_at_ms <= now_ms {
+                    continue;
+                }
+                if let Some(ns_state) = ns_map.get(&record.namespace) {
+                    let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                    aol.append_raw(
+                        &record.namespace,
+                        record.revision,
+                        &record.key,
+                        &record.value,
+                        record.expires_at_ms,
+                    )?;
+                }
+            }
+            // Delete legacy AOL
+            let _ = fs::remove_file(&legacy_aol_path);
+        }
+
+        let namespace_data = Arc::new(RwLock::new(ns_map));
 
         // Per-namespace object stores (created lazily on first access)
         let object_stores = Arc::new(RwLock::new(HashMap::new()));
@@ -415,15 +474,9 @@ impl DB {
         let sstables = Arc::new(RwLock::new(sstables));
         let sst_sequence = Arc::new(AtomicU64::new(sst_sequence));
 
-        // Open AOL for appending
-        let aol = Arc::new(Mutex::new(aol::Aol::open(
-            &config.path,
-            config.aol_buffer_size,
-        )?));
-
         let flush_stop = Arc::new(AtomicBool::new(false));
         let flush_thread = {
-            let aol = Arc::clone(&aol);
+            let ns_data = Arc::clone(&namespace_data);
             let stop = Arc::clone(&flush_stop);
             Some(thread::spawn(move || {
                 let mut tick = 0u32;
@@ -432,13 +485,19 @@ impl DB {
                     tick += 1;
                     if tick >= 60 {
                         tick = 0;
-                        let mut aol = aol.lock().unwrap_or_else(|e| e.into_inner());
-                        let _ = aol.flush_if_dirty();
+                        let map = ns_data.read().unwrap_or_else(|e| e.into_inner());
+                        for ns_state in map.values() {
+                            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                            let _ = aol.flush_if_dirty();
+                        }
                     }
                 }
                 // Final flush on shutdown
-                let mut aol = aol.lock().unwrap_or_else(|e| e.into_inner());
-                let _ = aol.flush_if_dirty();
+                let map = ns_data.read().unwrap_or_else(|e| e.into_inner());
+                for ns_state in map.values() {
+                    let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = aol.flush_if_dirty();
+                }
             }))
         };
 
@@ -534,7 +593,6 @@ impl DB {
             io_backend,
             revision_gen,
             namespace_data,
-            aol,
             object_stores,
             sstables,
             sst_sequence,
@@ -626,7 +684,6 @@ impl DB {
         let ns_data = Arc::clone(&self.namespace_data);
         let sst_seq = Arc::clone(&self.sst_sequence);
         let sstables = Arc::clone(&self.sstables);
-        let aol = Arc::clone(&self.aol);
         let io_backend = Arc::clone(&self.io_backend);
         let block_cache = self.block_cache.clone();
         let compaction_notify = Arc::clone(&self.compaction_notify);
@@ -647,10 +704,10 @@ impl DB {
             for ns_name in &namespaces {
                 let entries = {
                     let map = ns_data.read().unwrap_or_else(|e| e.into_inner());
-                    let Some(mt_mutex) = map.get(ns_name) else {
+                    let Some(ns_state) = map.get(ns_name) else {
                         continue;
                     };
-                    let mut mt = mt_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut mt = ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
                     if mt.is_empty() {
                         continue;
                     }
@@ -694,12 +751,16 @@ impl DB {
                 }
                 levels[0].insert(0, reader);
 
-                flushed_any = true;
-            }
+                // Truncate this namespace's AOL
+                {
+                    let map = ns_data.read().unwrap_or_else(|e| e.into_inner());
+                    if let Some(ns_state) = map.get(ns_name) {
+                        let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                        aol.truncate()?;
+                    }
+                }
 
-            if flushed_any {
-                let mut aol = aol.lock().unwrap_or_else(|e| e.into_inner());
-                aol.truncate(&db_path)?;
+                flushed_any = true;
             }
 
             if flushed_any {
@@ -723,11 +784,14 @@ impl DB {
                 let stop = Arc::new(AtomicBool::new(false));
 
                 // Build a flush callback for full sync
-                let aol_for_flush = Arc::clone(&self.aol);
+                let ns_data_for_flush = Arc::clone(&self.namespace_data);
                 let flush_fn = move || {
-                    // Minimal flush: just flush AOL buffer so data is on disk
-                    let mut aol = aol_for_flush.lock().unwrap_or_else(|e| e.into_inner());
-                    aol.flush_if_dirty()?;
+                    // Flush all per-namespace AOL buffers so data is on disk
+                    let map = ns_data_for_flush.read().unwrap_or_else(|e| e.into_inner());
+                    for ns_state in map.values() {
+                        let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                        aol.flush_if_dirty()?;
+                    }
                     Ok(())
                 };
 
@@ -759,9 +823,10 @@ impl DB {
                 let last_revision = Arc::new(Mutex::new(0u128));
                 let rev_tracker = Arc::clone(&last_revision);
 
-                // Build a replay callback that writes to local AOL + memtable
-                let aol = Arc::clone(&self.aol);
+                // Build a replay callback that writes to local per-ns AOL + memtable
                 let ns_data = Arc::clone(&self.namespace_data);
+                let replay_db_path = self.config.path.clone();
+                let replay_aol_buf = self.config.aol_buffer_size;
                 let replay_fn: repl_receiver::ReplayFn = Box::new(move |payload: &[u8]| {
                     let record = aol::decode_payload(payload)?;
 
@@ -773,10 +838,27 @@ impl DB {
                         }
                     }
 
-                    // Write to local AOL for crash recovery
+                    // Write to per-namespace AOL for crash recovery
                     {
-                        let mut aol = aol.lock().unwrap_or_else(|e| e.into_inner());
-                        aol.append_encoded(payload)?;
+                        let map = ns_data.read().unwrap_or_else(|e| e.into_inner());
+                        if let Some(ns_state) = map.get(&record.namespace) {
+                            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                            aol.append_encoded(payload)?;
+                        } else {
+                            drop(map);
+                            let mut map = ns_data.write().unwrap_or_else(|e| e.into_inner());
+                            let ns_state =
+                                map.entry(record.namespace.clone()).or_insert_with(|| {
+                                    NamespaceState::create(
+                                        &replay_db_path,
+                                        &record.namespace,
+                                        replay_aol_buf,
+                                    )
+                                    .expect("create namespace state")
+                                });
+                            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                            aol.append_encoded(payload)?;
+                        }
                     }
 
                     // Apply to memtable
@@ -785,38 +867,18 @@ impl DB {
                         .unwrap_or_default()
                         .as_millis() as u64;
 
-                    // Skip expired records — replaying them would create
-                    // tombstones in the memtable that shadow valid SSTable data.
                     if record.expires_at_ms > 0 && record.expires_at_ms <= now_ms {
                         return Ok(());
                     }
 
-                    // Namespace-creation sentinel: empty key + Null value.
-                    // Only ensures the namespace memtable exists; no data to store.
                     let is_sentinel =
                         record.key == Key::Str(String::new()) && record.value.is_null();
 
-                    let map = ns_data.read().unwrap_or_else(|e| e.into_inner());
-                    if let Some(mt_mutex) = map.get(&record.namespace) {
-                        if !is_sentinel {
-                            let mut mt = mt_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                            let rev = RevisionID::from(record.revision);
-                            let ttl = if record.expires_at_ms > 0 {
-                                let remaining_ms = record.expires_at_ms.saturating_sub(now_ms);
-                                Some(Duration::from_millis(remaining_ms))
-                            } else {
-                                None
-                            };
-                            mt.put(record.key, record.value, rev, ttl);
-                        }
-                    } else {
-                        drop(map);
-                        let mut map = ns_data.write().unwrap_or_else(|e| e.into_inner());
-                        let mt = map
-                            .entry(record.namespace)
-                            .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
-                        if !is_sentinel {
-                            let mt = mt.get_mut().unwrap_or_else(|e| e.into_inner());
+                    if !is_sentinel {
+                        let map = ns_data.read().unwrap_or_else(|e| e.into_inner());
+                        if let Some(ns_state) = map.get(&record.namespace) {
+                            let mut mt =
+                                ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
                             let rev = RevisionID::from(record.revision);
                             let ttl = if record.expires_at_ms > 0 {
                                 let remaining_ms = record.expires_at_ms.saturating_sub(now_ms);
@@ -839,7 +901,7 @@ impl DB {
                 let sync_cache = self.block_cache.clone();
                 let sync_io = Arc::clone(&self.io_backend);
                 let sync_ns_data = Arc::clone(&self.namespace_data);
-                let sync_aol = Arc::clone(&self.aol);
+                let sync_aol_buf = self.config.aol_buffer_size;
                 let post_sync_fn: repl_receiver::PostSyncFn = Box::new(move || {
                     let (new_sst, new_seq) = Self::scan_sstables(
                         &sync_db_path,
@@ -848,39 +910,33 @@ impl DB {
                         sync_io.as_ref(),
                     )?;
 
-                    // Clear stale memtable entries so they don't shadow the
-                    // authoritative SSTable snapshot from the primary.
-                    //
-                    // IMPORTANT: We must NOT call `ns_map.clear()` because
-                    // `get_or_create_memtable()` returns raw pointers into the
-                    // HashMap under the SAFETY invariant "we only grow, never
-                    // shrink". Clearing the map would invalidate those pointers.
-                    // Instead, reset each MemTable in-place and add any new
-                    // namespace entries.
+                    // Reset memtables and per-namespace AOLs in-place.
                     {
                         let mut ns_map = sync_ns_data.write().unwrap_or_else(|e| e.into_inner());
-                        // Reset all existing memtables in-place (Mutex stays at same address)
-                        for mt_mutex in ns_map.values() {
-                            let mut mt = mt_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                        for ns_state in ns_map.values() {
+                            let mut mt =
+                                ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
                             *mt = memtable::MemTable::new();
+                            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                            let _ = aol.truncate();
                         }
                         // Register new SST namespaces (HashMap only grows)
                         for ns_name in new_sst.keys() {
-                            ns_map
-                                .entry(ns_name.clone())
-                                .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
+                            ns_map.entry(ns_name.clone()).or_insert_with(|| {
+                                NamespaceState::create(&sync_db_path, ns_name, sync_aol_buf)
+                                    .expect("create namespace state")
+                            });
                         }
                         ns_map
                             .entry(DEFAULT_NAMESPACE.to_owned())
-                            .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
-                    }
-
-                    // Truncate local AOL so stale records don't reappear
-                    // on restart. Future live-stream records will be appended
-                    // to a fresh AOL.
-                    {
-                        let mut aol = sync_aol.lock().unwrap_or_else(|e| e.into_inner());
-                        aol.truncate(&sync_db_path)?;
+                            .or_insert_with(|| {
+                                NamespaceState::create(
+                                    &sync_db_path,
+                                    DEFAULT_NAMESPACE,
+                                    sync_aol_buf,
+                                )
+                                .expect("create default namespace state")
+                            });
                     }
 
                     // Replace SSTable index
@@ -931,8 +987,10 @@ impl DB {
                     // 3. Re-create default namespace if it was dropped
                     if namespace == DEFAULT_NAMESPACE {
                         let mut map = drop_ns_data.write().unwrap_or_else(|e| e.into_inner());
-                        map.entry(DEFAULT_NAMESPACE.to_owned())
-                            .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
+                        map.entry(DEFAULT_NAMESPACE.to_owned()).or_insert_with(|| {
+                            NamespaceState::create(&drop_db_path, DEFAULT_NAMESPACE, 0)
+                                .expect("create default namespace state")
+                        });
                     }
 
                     Ok(())
@@ -942,15 +1000,17 @@ impl DB {
                 let cleanup_ns_data = Arc::clone(&self.namespace_data);
                 let cleanup_sstables = Arc::clone(&self.sstables);
                 let cleanup_obj_stores = Arc::clone(&self.object_stores);
-                let cleanup_aol = Arc::clone(&self.aol);
                 let cleanup_db_path = self.config.path.clone();
                 let cleanup_fn: repl_receiver::CleanupFn = Box::new(move || {
-                    // Reset all memtables in-place (SAFETY: HashMap only grows)
+                    // Reset all memtables and truncate AOLs in-place
                     {
                         let map = cleanup_ns_data.read().unwrap_or_else(|e| e.into_inner());
-                        for mt_mutex in map.values() {
-                            let mut mt = mt_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                        for ns_state in map.values() {
+                            let mut mt =
+                                ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
                             *mt = memtable::MemTable::new();
+                            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                            let _ = aol.truncate();
                         }
                     }
                     // Clear SSTables
@@ -974,10 +1034,13 @@ impl DB {
                     if obj_root.exists() {
                         fs::remove_dir_all(&obj_root)?;
                     }
-                    // Truncate AOL
+                    // Truncate all per-namespace AOLs
                     {
-                        let mut aol = cleanup_aol.lock().unwrap_or_else(|e| e.into_inner());
-                        aol.truncate(&cleanup_db_path)?;
+                        let map = cleanup_ns_data.read().unwrap_or_else(|e| e.into_inner());
+                        for ns_state in map.values() {
+                            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                            let _ = aol.truncate();
+                        }
                     }
                     Ok(())
                 });
@@ -1020,14 +1083,14 @@ impl DB {
 
                 // Build a peer replay callback using LWW
                 let db_ns_data = Arc::clone(&self.namespace_data);
-                let db_aol = Arc::clone(&self.aol);
                 let db_rev_gen_cluster = self.revision_gen.cluster_id();
                 let db_conflicts = Arc::clone(&self.conflicts_resolved);
+                let db_path_for_peer = self.config.path.clone();
+                let db_aol_buf = self.config.aol_buffer_size;
                 let replay_fn: repl_peer::PeerReplayFn = Arc::new(move |payload: &[u8]| {
                     let record = aol::decode_payload(payload)?;
                     let incoming_rev = RevisionID::from(record.revision);
 
-                    // Loop prevention
                     if incoming_rev.cluster_id() == db_rev_gen_cluster {
                         return Ok(false);
                     }
@@ -1043,10 +1106,17 @@ impl DB {
                     let is_sentinel =
                         record.key == Key::Str(String::new()) && record.value.is_null();
 
+                    // Helper: ensure NamespaceState exists in the map
+                    let ensure_ns = |map: &mut HashMap<String, NamespaceState>, ns: &str| {
+                        map.entry(ns.to_owned()).or_insert_with(|| {
+                            NamespaceState::create(&db_path_for_peer, ns, db_aol_buf)
+                                .expect("create namespace state")
+                        });
+                    };
+
                     let applied = if is_sentinel {
                         let mut map = db_ns_data.write().unwrap_or_else(|e| e.into_inner());
-                        map.entry(record.namespace.clone())
-                            .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
+                        ensure_ns(&mut map, &record.namespace);
                         true
                     } else {
                         let ttl = if record.expires_at_ms > 0 {
@@ -1057,8 +1127,9 @@ impl DB {
                         };
 
                         let map = db_ns_data.read().unwrap_or_else(|e| e.into_inner());
-                        if let Some(mt_mutex) = map.get(&record.namespace) {
-                            let mut mt = mt_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(ns_state) = map.get(&record.namespace) {
+                            let mut mt =
+                                ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
                             mt.put_if_newer(
                                 record.key.clone(),
                                 record.value.clone(),
@@ -1068,10 +1139,10 @@ impl DB {
                         } else {
                             drop(map);
                             let mut map = db_ns_data.write().unwrap_or_else(|e| e.into_inner());
-                            let mt = map
-                                .entry(record.namespace.clone())
-                                .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
-                            let mt = mt.get_mut().unwrap_or_else(|e| e.into_inner());
+                            ensure_ns(&mut map, &record.namespace);
+                            let ns_state = map.get(&record.namespace).unwrap();
+                            let mut mt =
+                                ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
                             mt.put_if_newer(
                                 record.key.clone(),
                                 record.value.clone(),
@@ -1082,15 +1153,18 @@ impl DB {
                     };
 
                     if applied {
-                        // Track highest revision for incremental sync
                         {
                             let mut lr = rev_tracker.lock().unwrap_or_else(|e| e.into_inner());
                             if record.revision > *lr {
                                 *lr = record.revision;
                             }
                         }
-                        let mut aol = db_aol.lock().unwrap_or_else(|e| e.into_inner());
-                        aol.append_encoded(payload)?;
+                        // Write to per-namespace AOL
+                        let map = db_ns_data.read().unwrap_or_else(|e| e.into_inner());
+                        if let Some(ns_state) = map.get(&record.namespace) {
+                            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                            aol.append_encoded(payload)?;
+                        }
                     } else {
                         db_conflicts.fetch_add(1, Ordering::Relaxed);
                     }
@@ -1123,7 +1197,7 @@ impl DB {
                 let sync_cache = self.block_cache.clone();
                 let sync_io = Arc::clone(&self.io_backend);
                 let sync_ns_data = Arc::clone(&self.namespace_data);
-                let sync_aol = Arc::clone(&self.aol);
+                let sync_aol_buf = self.config.aol_buffer_size;
                 let post_sync_fn: repl_peer::PeerPostSyncFn = Arc::new(move || {
                     let (new_sst, new_seq) = Self::scan_sstables(
                         &sync_db_path,
@@ -1132,27 +1206,32 @@ impl DB {
                         sync_io.as_ref(),
                     )?;
 
-                    // Reset memtables in-place and register new namespaces
+                    // Reset memtables and per-namespace AOLs in-place
                     {
                         let mut ns_map = sync_ns_data.write().unwrap_or_else(|e| e.into_inner());
-                        for mt_mutex in ns_map.values() {
-                            let mut mt = mt_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                        for ns_state in ns_map.values() {
+                            let mut mt =
+                                ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
                             *mt = memtable::MemTable::new();
+                            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                            let _ = aol.truncate();
                         }
                         for ns_name in new_sst.keys() {
-                            ns_map
-                                .entry(ns_name.clone())
-                                .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
+                            ns_map.entry(ns_name.clone()).or_insert_with(|| {
+                                NamespaceState::create(&sync_db_path, ns_name, sync_aol_buf)
+                                    .expect("create namespace state")
+                            });
                         }
                         ns_map
                             .entry(DEFAULT_NAMESPACE.to_owned())
-                            .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
-                    }
-
-                    // Truncate local AOL so stale records don't reappear on restart
-                    {
-                        let mut aol = sync_aol.lock().unwrap_or_else(|e| e.into_inner());
-                        aol.truncate(&sync_db_path)?;
+                            .or_insert_with(|| {
+                                NamespaceState::create(
+                                    &sync_db_path,
+                                    DEFAULT_NAMESPACE,
+                                    sync_aol_buf,
+                                )
+                                .expect("create default namespace state")
+                            });
                     }
 
                     // Replace SSTable index
@@ -1171,10 +1250,13 @@ impl DB {
                 });
 
                 // Build a flush callback for AOL (needed before incremental sync)
-                let flush_aol = Arc::clone(&self.aol);
+                let flush_ns_data = Arc::clone(&self.namespace_data);
                 let flush_fn: repl_peer::PeerFlushFn = Arc::new(move || {
-                    let mut aol = flush_aol.lock().unwrap_or_else(|e| e.into_inner());
-                    aol.flush_if_dirty()?;
+                    let ns_map = flush_ns_data.read().unwrap_or_else(|e| e.into_inner());
+                    for ns_state in ns_map.values() {
+                        let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                        aol.flush_if_dirty()?;
+                    }
                     Ok(())
                 });
 
@@ -1183,6 +1265,7 @@ impl DB {
                 let drop_sstables = Arc::clone(&self.sstables);
                 let drop_obj_stores = Arc::clone(&self.object_stores);
                 let drop_db_path = self.config.path.clone();
+                let drop_aol_buf = self.config.aol_buffer_size;
                 let drop_ns_fn: repl_peer::PeerDropNsFn = Arc::new(move |namespace: &str| {
                     // 1. Remove from in-memory maps
                     {
@@ -1211,8 +1294,10 @@ impl DB {
                     // 3. Re-create default namespace if it was dropped
                     if namespace == DEFAULT_NAMESPACE {
                         let mut map = drop_ns_data.write().unwrap_or_else(|e| e.into_inner());
-                        map.entry(DEFAULT_NAMESPACE.to_owned())
-                            .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
+                        map.entry(DEFAULT_NAMESPACE.to_owned()).or_insert_with(|| {
+                            NamespaceState::create(&drop_db_path, DEFAULT_NAMESPACE, drop_aol_buf)
+                                .expect("create default namespace state")
+                        });
                     }
 
                     Ok(())
@@ -1311,8 +1396,8 @@ impl DB {
         let namespace_count = map.len() as u64;
         let mut total_keys: u64 = 0;
         let mut write_buffer_bytes: u64 = 0;
-        for mt in map.values() {
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+        for ns_state in map.values() {
+            let mt = ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
             total_keys += mt.count();
             write_buffer_bytes += mt.approximate_size() as u64;
         }
@@ -1447,18 +1532,26 @@ impl DB {
             // this session. This handles the case where the DB is reopened
             // and the in-memory map is empty.
             let meta_path = self.sst_namespace_dir(name).join("ns.meta");
-            let persisted_encrypted = meta_path.exists();
-            if persisted_encrypted && !encrypted {
-                map.insert(name.to_owned(), true);
-                return Err(Error::EncryptionRequired(format!(
-                    "namespace '{name}' requires a password"
-                )));
-            }
-            if !persisted_encrypted && encrypted {
-                // Write encryption marker to disk
+            if meta_path.exists() {
+                if !encrypted {
+                    map.insert(name.to_owned(), true);
+                    return Err(Error::EncryptionRequired(format!(
+                        "namespace '{name}' requires a password"
+                    )));
+                }
+                // Verify the password against the stored token
+                let token = fs::read(&meta_path)?;
+                if let Err(e) = crypto::verify_token(password.unwrap(), &token) {
+                    return Err(Error::Corruption(format!(
+                        "namespace '{name}': wrong password or corrupted encryption marker ({e})"
+                    )));
+                }
+            } else if encrypted {
+                // First encrypted access — write verification token to disk
                 let ns_dir = self.sst_namespace_dir(name);
                 fs::create_dir_all(&ns_dir)?;
-                fs::write(&meta_path, b"encrypted")?;
+                let token = crypto::create_verification_token(password.unwrap());
+                fs::write(&meta_path, &token)?;
             }
 
             map.insert(name.to_owned(), encrypted);
@@ -1600,16 +1693,9 @@ impl DB {
             }
         }
 
-        // 4. Flush remaining namespaces + truncate AOL so the dropped
-        //    namespace's records don't resurrect on restart.
-        //    flush() only truncates when it actually writes SSTables, so we
-        //    force-truncate afterwards to cover the case where no other
-        //    namespaces have pending data.
+        // 4. Flush remaining namespaces — the dropped namespace's per-ns
+        //    AOL + SSTable directory was already deleted above.
         self.flush()?;
-        {
-            let mut aol = self.aol.lock().unwrap_or_else(|e| e.into_inner());
-            aol.truncate(&self.config.path)?;
-        }
 
         // Re-create the default namespace if it was just dropped, so it
         // always appears in list_namespaces().
@@ -1716,6 +1802,13 @@ impl DB {
                 });
             }
 
+            // Truncate this namespace's AOL — its data is now in the SSTable
+            {
+                let ns_state = self.get_or_create_ns(ns_name);
+                let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                aol.truncate()?;
+            }
+
             flushed_any = true;
         }
 
@@ -1723,8 +1816,6 @@ impl DB {
             self.metrics
                 .flush
                 .observe(flush_start.elapsed().as_secs_f64());
-            let mut aol = self.aol.lock().unwrap_or_else(|e| e.into_inner());
-            aol.truncate(&self.config.path)?;
 
             // Flush pack writers for durability (best-effort)
             let obj_stores = self.object_stores.read().unwrap_or_else(|e| e.into_inner());
@@ -1763,8 +1854,15 @@ impl DB {
     /// underlying file descriptor, guaranteeing that all committed data
     /// is persisted to the storage device.
     pub fn sync(&self) -> Result<()> {
-        let mut aol = self.aol.lock().unwrap_or_else(|e| e.into_inner());
-        aol.sync()
+        let map = self
+            .namespace_data
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        for ns_state in map.values() {
+            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+            aol.sync()?;
+        }
+        Ok(())
     }
 
     // --- Destroy / Repair ---
@@ -1785,7 +1883,7 @@ impl DB {
         }
 
         // Safety check: verify this looks like an rKV database
-        let has_aol = path.join("aol").exists();
+        let has_aol = path.join(aol::AOL_FILENAME).exists();
         let has_sst = path.join("sst").exists();
         if !has_aol && !has_sst {
             return Err(Error::Corruption(format!(
@@ -1818,33 +1916,60 @@ impl DB {
             )));
         }
 
-        // --- Phase 1: Replay AOL with verification ---
-        let aol_file = path.join("aol");
-        let mut good_records: Vec<aol::AolRecord> = Vec::new();
-        if aol_file.exists() {
+        // --- Phase 1: Replay per-namespace AOL files with verification ---
+        let sst_root = path.join("sst");
+        let mut total_good_records: u64 = 0;
+        if sst_root.exists() {
+            for ns_entry in fs::read_dir(&sst_root)? {
+                let ns_entry = ns_entry?;
+                if !ns_entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let ns_dir = ns_entry.path();
+                let aol_file = ns_dir.join(aol::AOL_FILENAME);
+                if !aol_file.exists() {
+                    continue;
+                }
+                let ns_name = ns_entry.file_name().to_string_lossy().to_string();
+                let repair_aol_io = io::BufferedIo;
+                let (records, skipped) = aol::Aol::replay_at(&aol_file, true, &repair_aol_io)?;
+                let skipped_count = skipped.len() as u64;
+                report.wal_records_scanned += (records.len() as u64) + skipped_count;
+                report.wal_records_skipped += skipped_count;
+                if !skipped.is_empty() {
+                    for detail in &skipped {
+                        report.warnings.push(format!("AOL[{ns_name}]: {detail}"));
+                    }
+                    Self::rewrite_aol_at(&aol_file, &records)?;
+                    report
+                        .warnings
+                        .push(format!("AOL[{ns_name}]: rewritten with valid records only"));
+                }
+                total_good_records += records.len() as u64;
+            }
+        }
+
+        // Also handle legacy global AOL if it still exists
+        let legacy_aol = path.join(aol::AOL_FILENAME);
+        if legacy_aol.exists() {
             let repair_aol_io = io::BufferedIo;
             let (records, skipped) = aol::Aol::replay(&path, true, &repair_aol_io)?;
             let skipped_count = skipped.len() as u64;
-            report.wal_records_scanned = (records.len() as u64) + skipped_count;
-            report.wal_records_skipped = skipped_count;
+            report.wal_records_scanned += (records.len() as u64) + skipped_count;
+            report.wal_records_skipped += skipped_count;
             if !skipped.is_empty() {
                 for detail in &skipped {
-                    report.warnings.push(format!("AOL: {detail}"));
+                    report.warnings.push(format!("AOL[legacy]: {detail}"));
                 }
+                Self::rewrite_aol(&path, &records)?;
+                report
+                    .warnings
+                    .push("AOL[legacy]: rewritten with valid records only".into());
             }
-            good_records = records;
-        }
-
-        // Rewrite AOL with only valid records
-        if report.wal_records_skipped > 0 {
-            Self::rewrite_aol(&path, &good_records)?;
-            report
-                .warnings
-                .push("AOL rewritten with valid records only".into());
+            total_good_records += records.len() as u64;
         }
 
         // --- Phase 2: Scan SSTables ---
-        let sst_root = path.join("sst");
         if sst_root.exists() {
             Self::repair_sstables(&sst_root, &mut report)?;
         }
@@ -1856,18 +1981,20 @@ impl DB {
         }
 
         // Compute keys_recovered from surviving AOL records
-        report.keys_recovered = good_records.len() as u64;
+        report.keys_recovered = total_good_records;
 
         Ok(report)
     }
 
-    /// Rewrite the AOL file with only the given valid records.
+    /// Rewrite the legacy AOL file with only the given valid records.
     fn rewrite_aol(db_path: &Path, records: &[aol::AolRecord]) -> Result<()> {
-        // Open the AOL (positions at end), then truncate to header-only
-        let mut aol = aol::Aol::open(db_path, 0)?;
-        aol.truncate(db_path)?;
+        Self::rewrite_aol_at(&db_path.join(aol::AOL_FILENAME), records)
+    }
 
-        // Re-append only valid records
+    /// Rewrite an AOL file at a specific path with only the given valid records.
+    fn rewrite_aol_at(aol_path: &Path, records: &[aol::AolRecord]) -> Result<()> {
+        let mut aol = aol::Aol::open_at(aol_path.to_path_buf(), 0)?;
+        aol.truncate()?;
         for record in records {
             aol.append_raw(
                 &record.namespace,
@@ -1877,7 +2004,6 @@ impl DB {
                 record.expires_at_ms,
             )?;
         }
-
         Ok(())
     }
 
@@ -2183,7 +2309,7 @@ impl DB {
         sst_sequence: &AtomicU64,
         block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
         io: &Arc<dyn io::IoBackend>,
-        namespace_data: &RwLock<HashMap<String, Mutex<memtable::MemTable>>>,
+        namespace_data: &RwLock<HashMap<String, NamespaceState>>,
         m: &Arc<metrics::Metrics>,
         listener: &Option<Arc<dyn metrics::EventListener>>,
     ) -> Result<()> {
@@ -2227,7 +2353,7 @@ impl DB {
         sst_sequence: &AtomicU64,
         block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
         io: &Arc<dyn io::IoBackend>,
-        namespace_data: &RwLock<HashMap<String, Mutex<memtable::MemTable>>>,
+        namespace_data: &RwLock<HashMap<String, NamespaceState>>,
         m: &Arc<metrics::Metrics>,
         listener: &Option<Arc<dyn metrics::EventListener>>,
     ) -> Result<bool> {
@@ -2550,7 +2676,7 @@ impl DB {
         config: &Config,
         sstables: &RwLock<LeveledSSTables>,
         io: &Arc<dyn io::IoBackend>,
-        namespace_data: &RwLock<HashMap<String, Mutex<memtable::MemTable>>>,
+        namespace_data: &RwLock<HashMap<String, NamespaceState>>,
     ) -> Result<()> {
         let obj_dir = config.path.join("objects").join(ns);
         if !obj_dir.exists() {
@@ -2564,8 +2690,8 @@ impl DB {
         // the memtable is empty avoids deleting live objects.
         {
             let ns_map = namespace_data.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(mt_mutex) = ns_map.get(ns) {
-                let mt = mt_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ns_state) = ns_map.get(ns) {
+                let mt = ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
                 if !mt.is_empty() {
                     return Ok(());
                 }
@@ -2637,9 +2763,10 @@ impl DB {
         self.revision_gen.generate()
     }
 
-    /// Acquire the AOL lock for batch operations.
-    pub(crate) fn aol_lock(&self) -> std::sync::MutexGuard<'_, aol::Aol> {
-        self.aol.lock().unwrap_or_else(|e| e.into_inner())
+    /// Acquire the per-namespace AOL lock for batch operations.
+    pub(crate) fn aol_lock(&self, ns: &str) -> std::sync::MutexGuard<'_, aol::Aol> {
+        let ns_state = self.get_or_create_ns(ns);
+        ns_state.aol.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub(crate) fn append_to_aol(
@@ -2650,7 +2777,7 @@ impl DB {
         value: &Value,
         ttl: Option<Duration>,
     ) -> Result<()> {
-        let mut aol = self.aol_lock();
+        let mut aol = self.aol_lock(ns);
         self.append_to_aol_locked(&mut aol, ns, rev, key, value, ttl)
     }
 
@@ -2747,30 +2874,15 @@ impl DB {
                 None
             };
 
-            let map = self
-                .namespace_data
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(mt_mutex) = map.get(&record.namespace) {
-                let mut mt = mt_mutex.lock().unwrap_or_else(|e| e.into_inner());
-                mt.put_if_newer(record.key.clone(), record.value.clone(), incoming_rev, ttl)
-            } else {
-                drop(map);
-                let mut map = self
-                    .namespace_data
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner());
-                let mt = map
-                    .entry(record.namespace.clone())
-                    .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
-                let mt = mt.get_mut().unwrap_or_else(|e| e.into_inner());
-                mt.put_if_newer(record.key.clone(), record.value.clone(), incoming_rev, ttl)
-            }
+            let ns_state = self.get_or_create_ns(&record.namespace);
+            let mut mt = ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+            mt.put_if_newer(record.key.clone(), record.value.clone(), incoming_rev, ttl)
         };
 
         if applied {
-            // Write to local AOL for crash recovery
-            let mut aol = self.aol.lock().unwrap_or_else(|e| e.into_inner());
+            // Write to local per-namespace AOL for crash recovery
+            let ns_state = self.get_or_create_ns(&record.namespace);
+            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
             aol.append_encoded(payload)?;
         } else {
             self.conflicts_resolved.fetch_add(1, Ordering::Relaxed);
@@ -3077,6 +3189,33 @@ impl DB {
 
     /// Scan existing SSTable files across all levels on startup.
     ///
+    /// Replay AOL records into a map of per-namespace memtables.
+    fn replay_records_into(
+        ns_memtables: &mut HashMap<String, memtable::MemTable>,
+        records: Vec<aol::AolRecord>,
+        now_ms: u64,
+    ) {
+        for record in records {
+            if record.expires_at_ms > 0 && record.expires_at_ms <= now_ms {
+                continue;
+            }
+            let is_sentinel = record.key == Key::Str(String::new()) && record.value.is_null();
+            let mt = ns_memtables
+                .entry(record.namespace)
+                .or_insert_with(memtable::MemTable::new);
+            if !is_sentinel {
+                let rev = RevisionID::from(record.revision);
+                let ttl = if record.expires_at_ms > 0 {
+                    let remaining_ms = record.expires_at_ms.saturating_sub(now_ms);
+                    Some(Duration::from_millis(remaining_ms))
+                } else {
+                    None
+                };
+                mt.put(record.key, record.value, rev, ttl);
+            }
+        }
+    }
+
     /// Walks `<db>/sst/<namespace>/L<n>/` directories, opens each `.sst`
     /// file, and returns the per-namespace leveled reader lists plus the
     /// next sequence number to use.
@@ -3213,8 +3352,8 @@ impl DB {
         }
     }
 
-    pub(crate) fn get_or_create_memtable(&self, name: &str) -> &Mutex<memtable::MemTable> {
-        // Fast path: read lock to check if memtable already exists
+    pub(crate) fn get_or_create_ns(&self, name: &str) -> &NamespaceState {
+        // Fast path: read lock to check if namespace state already exists
         {
             let map = self
                 .namespace_data
@@ -3223,21 +3362,28 @@ impl DB {
             if map.contains_key(name) {
                 // SAFETY: The RwLock<HashMap> only grows (we never remove entries),
                 // so a reference obtained under the read lock remains valid.
-                let ptr = map.get(name).unwrap() as *const Mutex<memtable::MemTable>;
+                let ptr = map.get(name).unwrap() as *const NamespaceState;
                 return unsafe { &*ptr };
             }
         }
 
-        // Slow path: write lock to insert
+        // Slow path: write lock to insert, create namespace directory + AOL
         let mut map = self
             .namespace_data
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        map.entry(name.to_owned())
-            .or_insert_with(|| Mutex::new(memtable::MemTable::new()));
-        let ptr = map.get(name).unwrap() as *const Mutex<memtable::MemTable>;
+        map.entry(name.to_owned()).or_insert_with(|| {
+            NamespaceState::create(&self.config.path, name, self.config.aol_buffer_size)
+                .expect("failed to create namespace state")
+        });
+        let ptr = map.get(name).unwrap() as *const NamespaceState;
         // SAFETY: Same as above — the HashMap only grows, so the reference is stable.
         unsafe { &*ptr }
+    }
+
+    /// Convenience: get only the memtable mutex for read-path callers.
+    pub(crate) fn get_or_create_memtable(&self, name: &str) -> &Mutex<memtable::MemTable> {
+        &self.get_or_create_ns(name).memtable
     }
 }
 

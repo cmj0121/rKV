@@ -163,7 +163,7 @@ impl<'db> Namespace<'db> {
 
         // 2. Append all ops to AOL under a single lock
         {
-            let mut aol = self.db.aol_lock();
+            let mut aol = self.db.aol_lock(&self.name);
             for (i, (key, value, ttl)) in prepared.iter().enumerate() {
                 self.db.append_to_aol_locked(
                     &mut aol,
