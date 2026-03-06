@@ -8,10 +8,10 @@
 | ------ | ------------------------------- |
 | OS     | linux x86_64                    |
 | CPU    | AMD EPYC 7763 64-Core Processor |
-| Cores  | 2                               |
-| Memory | 7 GB                            |
-| Rust   | 1.93.1 (01f6ddf75 2026-02-11)   |
-| Date   | 2026-03-04                      |
+| Cores  | 4                               |
+| Memory | 15 GB                           |
+| Rust   | 1.94.0 (4a4ef493e 2026-03-02)   |
+| Date   | 2026-03-06                      |
 
 ## Methodology
 
@@ -31,16 +31,16 @@ Wall-clock time is measured via `std::time::Instant`.
 
 ## Results
 
-| Operation | 1K       | 8K        | 16K       | 1M        |
-| --------- | -------- | --------- | --------- | --------- |
-| put       | 647 µs   | 6.93 ms   | 13.90 ms  | 2.60 s    |
-| get       | 158 µs   | 1.57 ms   | 3.31 ms   | 10.33 s   |
-| delete    | 372 µs   | 3.12 ms   | 5.75 ms   | 1.09 s    |
-| scan      | 154 µs   | 1.31 ms   | 2.68 ms   | 601.99 ms |
-| flush     | 3.67 ms  | 3.81 ms   | 6.53 ms   | 8.40 ms   |
-| get_sst   | 3.68 ms  | 26.86 ms  | 54.37 ms  | 11.67 s   |
-| put_obj   | 55.63 ms | 407.43 ms | 877.21 ms | 151.18 s  |
-| get_obj   | 20.60 ms | 170.43 ms | 341.64 ms | 226.91 s  |
+| Operation | 1K        | 8K       | 16K       | 1M        |
+| --------- | --------- | -------- | --------- | --------- |
+| put       | 770 µs    | 7.96 ms  | 15.55 ms  | 2.19 s    |
+| get       | 243 µs    | 2.25 ms  | 4.74 ms   | 8.72 s    |
+| delete    | 470 µs    | 3.96 ms  | 7.94 ms   | 868.32 ms |
+| scan      | 117 µs    | 868 µs   | 1.72 ms   | 218.70 ms |
+| flush     | 1.59 ms   | 3.96 ms  | 6.68 ms   | 5.93 ms   |
+| get_sst   | 3.38 ms   | 25.90 ms | 53.39 ms  | 9.22 s    |
+| put_obj   | 276.44 ms | 2.10 s   | 4.39 s    | 274.39 s  |
+| get_obj   | 7.86 ms   | 63.13 ms | 126.87 ms | 20.46 s   |
 
 ## Reproduce
 
