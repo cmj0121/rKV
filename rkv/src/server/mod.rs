@@ -14,13 +14,15 @@ use std::sync::{Arc, RwLock};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
-use crate::{Config, Namespace, DB};
+use crate::{Config, Namespace, RoutingTable, ShardGroup, DB};
 
 pub struct AppState {
     pub db: DB,
     /// Cached passwords for encrypted namespaces.
     /// Populated by POST /api/namespaces, lost on restart.
     ns_passwords: RwLock<HashMap<String, String>>,
+    /// Cluster routing table (empty in standalone mode).
+    pub routing_table: RwLock<RoutingTable>,
 }
 
 impl AppState {
@@ -44,6 +46,7 @@ pub fn build_router_with_ui(db: DB, enable_ui: bool) -> axum::Router {
     let state = Arc::new(AppState {
         db,
         ns_passwords: RwLock::new(HashMap::new()),
+        routing_table: RwLock::new(RoutingTable::new(ShardGroup::new(0))),
     });
     routes::router(state, enable_ui)
 }
@@ -75,6 +78,10 @@ pub fn run(config: ServerConfig) {
         db_config.peers = config.peers.clone();
         db_config.cluster_id = config.cluster_id;
 
+        // Cluster config
+        db_config.shard_group = config.shard_group.unwrap_or(0);
+        db_config.owned_namespaces = config.owned_namespaces.clone();
+
         let db = match DB::open(db_config) {
             Ok(db) => db,
             Err(e) => {
@@ -87,11 +94,20 @@ pub fn run(config: ServerConfig) {
         let timeout_secs = config.timeout;
         let enable_ui = config.ui;
 
+        // Read shard config from the opened DB
+        let shard_group = db.config().shard_group;
+        let owned_namespaces = db.config().owned_namespaces.clone();
+
+        let default_group = ShardGroup::new(shard_group);
+        let routing_table = RoutingTable::new(default_group);
+
         let state = Arc::new(AppState {
             db,
             ns_passwords: RwLock::new(HashMap::new()),
+            routing_table: RwLock::new(routing_table),
         });
         let ip_layer = middleware::IpFilterLayer::new(config.allow_all, &config.allow_ip);
+        let shard_layer = middleware::ShardFilterLayer::new(shard_group, &owned_namespaces);
         let mut app = routes::router(state.clone(), enable_ui)
             .layer(axum::extract::DefaultBodyLimit::max(body_limit));
         if timeout_secs > 0 {
@@ -100,7 +116,10 @@ pub fn run(config: ServerConfig) {
                 std::time::Duration::from_secs(timeout_secs),
             ));
         }
-        let app = app.layer(TraceLayer::new_for_http()).layer(ip_layer);
+        let app = app
+            .layer(TraceLayer::new_for_http())
+            .layer(ip_layer)
+            .layer(shard_layer);
 
         let addr = format!("{}:{}", config.bind, config.port);
         let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -1094,6 +1113,9 @@ mod tests {
         let state = std::sync::Arc::new(super::AppState {
             db,
             ns_passwords: std::sync::RwLock::new(std::collections::HashMap::new()),
+            routing_table: std::sync::RwLock::new(crate::RoutingTable::new(
+                crate::ShardGroup::new(0),
+            )),
         });
 
         // Build router with IP filter allowing only 10.0.0.1
@@ -2123,5 +2145,199 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // --- Cluster / shard tests ---
+
+    fn shard_app() -> axum::Router {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::Config::new(dir.path());
+        config.create_if_missing = true;
+        config.shard_group = 1;
+        config.owned_namespaces = vec!["users".to_string(), "sessions".to_string()];
+        std::mem::forget(dir);
+        let db = crate::DB::open(config).unwrap();
+        let state = std::sync::Arc::new(super::AppState {
+            db,
+            ns_passwords: std::sync::RwLock::new(std::collections::HashMap::new()),
+            routing_table: std::sync::RwLock::new(crate::RoutingTable::new(
+                crate::ShardGroup::new(1),
+            )),
+        });
+        let shard_layer =
+            super::middleware::ShardFilterLayer::new(1, &["users".into(), "sessions".into()]);
+        super::routes::router(state, false).layer(shard_layer)
+    }
+
+    #[tokio::test]
+    async fn shard_owned_namespace_passes_through() {
+        let app = shard_app();
+        // PUT to owned namespace should work (201 Created)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::put("/api/users/keys/name")
+                    .header("content-type", "application/json")
+                    .body(Body::from("\"alice\""))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn shard_unowned_namespace_returns_307() {
+        let app = shard_app();
+        let resp = app
+            .oneshot(
+                Request::get("/api/orders/keys/foo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            resp.headers().get("x-rkv-shard").unwrap().to_str().unwrap(),
+            "1"
+        );
+    }
+
+    #[tokio::test]
+    async fn shard_health_not_filtered() {
+        let app = shard_app();
+        let resp = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn shard_admin_not_filtered() {
+        let app = shard_app();
+        let resp = app
+            .oneshot(
+                Request::get("/api/admin/cluster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["shard_group"], 1);
+    }
+
+    #[tokio::test]
+    async fn cluster_health_includes_shard_info() {
+        let app = shard_app();
+        let resp = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = body_string(resp.into_body()).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["shard_group"], 1);
+        assert!(v["owned_namespaces"].is_array());
+    }
+
+    #[tokio::test]
+    async fn standalone_health_no_shard_info() {
+        let app = app();
+        let resp = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = body_string(resp.into_body()).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v.get("shard_group").is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_set_route() {
+        let app = shard_app();
+        let body = serde_json::json!({"namespace": "orders", "shard_group": 2});
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/admin/route")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let data = body_string(resp.into_body()).await;
+        let v: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["version"], 1);
+    }
+
+    #[tokio::test]
+    async fn admin_set_route_missing_namespace() {
+        let app = shard_app();
+        let body = serde_json::json!({"shard_group": 2});
+        let resp = app
+            .oneshot(
+                Request::post("/api/admin/route")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn admin_set_route_missing_shard_group() {
+        let app = shard_app();
+        let body = serde_json::json!({"namespace": "users"});
+        let resp = app
+            .oneshot(
+                Request::post("/api/admin/route")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn shard_default_namespace_owned() {
+        let app = shard_app();
+        // Default namespace _ is not in owned_namespaces, should be rejected
+        let resp = app
+            .oneshot(
+                Request::get("/api/_/keys/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    }
+
+    #[tokio::test]
+    async fn admin_config_includes_shard_fields() {
+        let app = shard_app();
+        let resp = app
+            .oneshot(
+                Request::get("/api/admin/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_string(resp.into_body()).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["shard_group"], 1);
+        assert!(v["owned_namespaces"].is_array());
     }
 }

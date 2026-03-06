@@ -139,19 +139,17 @@ The node's role is exposed through multiple channels:
 
 ### Docker Compose Topology
 
-A `docker-compose.yml` in the project root defines a five-node topology with two write nodes
-and three read nodes, all using peer replication:
+A `docker-compose.yml` in the project root defines a three-node primary-replica topology:
 
-- **primary** (port 8321): Peer, cluster-id 1, connects to peer
-- **peer** (port 8323): Peer, cluster-id 2, connects to primary
-- **replica-01** (port 8324): Peer, cluster-id 3, connects to both write nodes
-- **replica-02** (port 8325): Peer, cluster-id 4, connects to both write nodes (no volume)
-- **replica-03** (port 8326): Peer, cluster-id 5, connects to both write nodes (no volume)
+- **primary** (port 8321): Primary, cluster-id 1, accepts reads and writes
+- **replica-01** (port 8324): Replica, cluster-id 2, connects to primary:8322
+- **replica-02** (port 8325): Replica, cluster-id 3, connects to primary:8322
 
-All nodes are technically peers (can accept writes), but the replica nodes are designated
-for read traffic. Writes on any node propagate to all others via peer replication.
-Write nodes and replica-01 bind-mount data to `.data/` subdirectories; replica-02 and
-replica-03 use ephemeral container storage.
+The primary accepts all writes and streams changes to replicas. Replicas reject writes
+with `ReadOnlyReplica`. All nodes bind-mount data to `.data/` subdirectories.
+
+For cluster/sharding mode (namespace-level sharding with gateway routing), use
+`docker compose --profile cluster up`. See [Cluster / Sharding](cluster.md) for details.
 
 ## Peer Replication
 

@@ -1,5 +1,40 @@
+# Default mode (docker compose up):
+#
+#   Client
+#     |
+#     v
+#   primary :8321 (R+W)
+#     |  replication
+#     +--------+--------+
+#     |                  |
+#     v                  v
+#   replica-01 :8324   replica-02 :8325
+#   (read-only)        (read-only)
+#
+# Cluster mode (docker compose --profile cluster up):
+#
+#   Client
+#     |
+#     +----------+-----------+----------+
+#     |          |           |          |
+#     v          v           v          v
+#   primary    shard1-a    shard2-a    ...
+#   :8321      :8331       :8333
+#   (default)  (users,     (orders,
+#              sessions)   products)
+#              peer:       peer:
+#              shard1-b    shard2-b
+#              :8332       :8334
+#
+#   Request flow:
+#     1. Client sends request to any node
+#     2. Node checks --owned-namespaces
+#     3. If owned  -> process request, return response
+#     4. If not    -> return 307 MOVED + X-RKV-Shard header
+#     5. Client retries on the correct shard node
+
 services:
-  # --- Write nodes (peer mode, accept reads and writes) ---
+  # --- Default mode (docker compose up): 1 primary + 2 replicas ---
   primary:
     build: .
     platform: linux/amd64
@@ -17,13 +52,11 @@ services:
         "--allow-all",
         "--ui",
         "--role",
-        "peer",
+        "primary",
         "--repl-port",
         "8322",
         "--cluster-id",
         "1",
-        "--peers",
-        "peer:8322",
       ]
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
@@ -32,39 +65,6 @@ services:
       retries: 3
       start_period: 5s
 
-  peer:
-    build: .
-    platform: linux/amd64
-    ports:
-      - "8323:8321"
-    volumes:
-      - .data/peer:/data
-    command:
-      [
-        "serve",
-        "--bind",
-        "0.0.0.0",
-        "--db",
-        "/data",
-        "--allow-all",
-        "--ui",
-        "--role",
-        "peer",
-        "--repl-port",
-        "8322",
-        "--cluster-id",
-        "2",
-        "--peers",
-        "primary:8322",
-      ]
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 5s
-
-  # --- Read nodes (peer mode, designated for read traffic) ---
   replica-01:
     build: .
     platform: linux/amd64
@@ -82,15 +82,11 @@ services:
         "--allow-all",
         "--ui",
         "--role",
-        "peer",
-        "--repl-port",
-        "8322",
+        "replica",
         "--cluster-id",
-        "3",
-        "--peers",
+        "2",
+        "--primary-addr",
         "primary:8322",
-        "--peers",
-        "peer:8322",
       ]
     depends_on:
       primary:
@@ -107,6 +103,8 @@ services:
     platform: linux/amd64
     ports:
       - "8325:8321"
+    volumes:
+      - .data/replica-02:/data
     command:
       [
         "serve",
@@ -117,15 +115,11 @@ services:
         "--allow-all",
         "--ui",
         "--role",
-        "peer",
-        "--repl-port",
-        "8322",
+        "replica",
         "--cluster-id",
-        "4",
-        "--peers",
+        "3",
+        "--primary-addr",
         "primary:8322",
-        "--peers",
-        "peer:8322",
       ]
     depends_on:
       primary:
@@ -137,11 +131,18 @@ services:
       retries: 3
       start_period: 5s
 
-  replica-03:
+  # --- Cluster mode (docker compose --profile cluster up) ---
+  # Adds 2 shard groups alongside the primary/replicas.
+  # Primary serves as the default shard (all unassigned namespaces).
+  # Shard groups own specific namespaces and reject others with 307 MOVED.
+  shard1-a:
+    profiles: ["cluster"]
     build: .
     platform: linux/amd64
     ports:
-      - "8326:8321"
+      - "8331:8321"
+    volumes:
+      - .data/shard1-a:/data
     command:
       [
         "serve",
@@ -156,14 +157,136 @@ services:
         "--repl-port",
         "8322",
         "--cluster-id",
-        "5",
+        "10",
         "--peers",
-        "primary:8322",
-        "--peers",
-        "peer:8322",
+        "shard1-b:8322",
+        "--shard-group",
+        "1",
+        "--owned-namespaces",
+        "users,sessions",
       ]
     depends_on:
-      peer:
+      primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  shard1-b:
+    profiles: ["cluster"]
+    build: .
+    platform: linux/amd64
+    ports:
+      - "8332:8321"
+    volumes:
+      - .data/shard1-b:/data
+    command:
+      [
+        "serve",
+        "--bind",
+        "0.0.0.0",
+        "--db",
+        "/data",
+        "--allow-all",
+        "--ui",
+        "--role",
+        "peer",
+        "--repl-port",
+        "8322",
+        "--cluster-id",
+        "11",
+        "--peers",
+        "shard1-a:8322",
+        "--shard-group",
+        "1",
+        "--owned-namespaces",
+        "users,sessions",
+      ]
+    depends_on:
+      primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  shard2-a:
+    profiles: ["cluster"]
+    build: .
+    platform: linux/amd64
+    ports:
+      - "8333:8321"
+    volumes:
+      - .data/shard2-a:/data
+    command:
+      [
+        "serve",
+        "--bind",
+        "0.0.0.0",
+        "--db",
+        "/data",
+        "--allow-all",
+        "--ui",
+        "--role",
+        "peer",
+        "--repl-port",
+        "8322",
+        "--cluster-id",
+        "20",
+        "--peers",
+        "shard2-b:8322",
+        "--shard-group",
+        "2",
+        "--owned-namespaces",
+        "orders,products",
+      ]
+    depends_on:
+      primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  shard2-b:
+    profiles: ["cluster"]
+    build: .
+    platform: linux/amd64
+    ports:
+      - "8334:8321"
+    volumes:
+      - .data/shard2-b:/data
+    command:
+      [
+        "serve",
+        "--bind",
+        "0.0.0.0",
+        "--db",
+        "/data",
+        "--allow-all",
+        "--ui",
+        "--role",
+        "peer",
+        "--repl-port",
+        "8322",
+        "--cluster-id",
+        "21",
+        "--peers",
+        "shard2-a:8322",
+        "--shard-group",
+        "2",
+        "--owned-namespaces",
+        "orders,products",
+      ]
+    depends_on:
+      primary:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]

@@ -28,6 +28,12 @@ pub enum Error {
 
     #[error("read-only replica: writes are rejected")]
     ReadOnlyReplica,
+
+    #[error("namespace '{0}' is owned by shard group {1}")]
+    NotMyShard(String, u16),
+
+    #[error("cluster error: {0}")]
+    ClusterError(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

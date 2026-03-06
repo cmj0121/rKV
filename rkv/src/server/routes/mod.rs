@@ -56,6 +56,9 @@ pub fn router(state: Arc<AppState>, enable_ui: bool) -> Router {
         .route("/api/admin/compact", post(admin::compact))
         .route("/api/admin/config", get(admin::get_config))
         .route("/api/admin/force-sync", post(admin::force_sync))
+        // Cluster admin
+        .route("/api/admin/cluster", get(admin::get_cluster))
+        .route("/api/admin/route", post(admin::set_route))
         // Prometheus metrics endpoint
         .route("/metrics", get(admin::prometheus_metrics))
         .with_state(state);

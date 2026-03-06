@@ -329,22 +329,20 @@ impl<'db> Namespace<'db> {
         let start = start.into();
         let end = end.into();
 
-        // Collect keys from memtable
-        let (mt_keys, ordered_mode) = {
+        let ordered_mode = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
-            (mt.keys_in_range(&start, &end, inclusive), mt.is_ordered())
+            mt.is_ordered()
         };
 
-        // Collect keys from SSTables in the same range
+        // Use merge iterator to collect all live keys in range
         let empty_prefix = Key::Str(String::new());
-        let sst_entries = self
+        let mut iter = self
             .db
-            .scan_from_sstables(&self.name, &empty_prefix, ordered_mode)?;
+            .build_merge_iterator(&self.name, &empty_prefix, ordered_mode)?;
 
-        // Union memtable + SSTable keys, filtering to range and excluding tombstones
-        let mut keys: std::collections::BTreeSet<Key> = mt_keys.into_iter().collect();
-        for (key, value) in sst_entries {
+        let mut keys = Vec::new();
+        while let Some((key, value)) = iter.next()? {
             if value.is_tombstone() {
                 continue;
             }
@@ -354,14 +352,8 @@ impl<'db> Namespace<'db> {
                 key >= start && key < end
             };
             if in_range {
-                keys.insert(key);
+                keys.push(key);
             }
-        }
-        // Remove keys that the memtable already knows are tombstoned
-        {
-            let mt = self.db.get_or_create_memtable(&self.name);
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
-            keys.retain(|k| !matches!(mt.lookup(k), MemLookup::Tombstone));
         }
 
         let count = keys.len() as u64;
@@ -387,33 +379,25 @@ impl<'db> Namespace<'db> {
         if self.db.is_replica() {
             return Err(Error::ReadOnlyReplica);
         }
-        let (mt_keys, ordered_mode) = {
+        let ordered_mode = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
-            (mt.keys_with_prefix(prefix), mt.is_ordered())
+            mt.is_ordered()
         };
 
-        // Scan SSTables for matching prefix keys
         let prefix_key = Key::Str(prefix.to_owned());
-        let sst_entries = self
+        let mut iter = self
             .db
-            .scan_from_sstables(&self.name, &prefix_key, ordered_mode)?;
+            .build_merge_iterator(&self.name, &prefix_key, ordered_mode)?;
 
-        // Union memtable + SSTable keys, filtering by prefix and excluding tombstones
-        let mut keys: std::collections::BTreeSet<Key> = mt_keys.into_iter().collect();
-        for (key, value) in sst_entries {
+        let mut keys = Vec::new();
+        while let Some((key, value)) = iter.next()? {
             if value.is_tombstone() {
                 continue;
             }
             if key.to_string().starts_with(prefix) {
-                keys.insert(key);
+                keys.push(key);
             }
-        }
-        // Remove keys that the memtable already knows are tombstoned
-        {
-            let mt = self.db.get_or_create_memtable(&self.name);
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
-            keys.retain(|k| !matches!(mt.lookup(k), MemLookup::Tombstone));
         }
 
         let count = keys.len() as u64;
@@ -458,27 +442,32 @@ impl<'db> Namespace<'db> {
         include_deleted: bool,
     ) -> Result<Vec<Key>> {
         let _timer = metrics::Timer::start(&self.db.metrics().op_scan);
-        let (mt_entries, ordered_mode) = {
+        let ordered_mode = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
-            (mt.scan_all_raw(prefix), mt.is_ordered())
+            mt.is_ordered()
         };
 
-        let mut merged = self
+        let mut iter = self
             .db
-            .scan_from_sstables(&self.name, prefix, ordered_mode)?;
+            .build_merge_iterator(&self.name, prefix, ordered_mode)?;
 
-        for (key, value) in mt_entries {
-            merged.insert(key, value);
+        let mut result = Vec::new();
+        let mut skipped = 0usize;
+        while let Some((key, value)) = iter.next()? {
+            if !include_deleted && value.is_tombstone() {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            result.push(key);
+            if result.len() >= limit {
+                break;
+            }
         }
-
-        Ok(merged
-            .into_iter()
-            .filter(|(_, v)| include_deleted || !v.is_tombstone())
-            .map(|(k, _)| k)
-            .skip(offset)
-            .take(limit)
-            .collect())
+        Ok(result)
     }
 
     pub fn rscan(
@@ -489,50 +478,54 @@ impl<'db> Namespace<'db> {
         include_deleted: bool,
     ) -> Result<Vec<Key>> {
         let _timer = metrics::Timer::start(&self.db.metrics().op_scan);
-        let (mt_entries, ordered_mode) = {
+        let ordered_mode = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
-            (mt.rscan_all_raw(prefix), mt.is_ordered())
+            mt.is_ordered()
         };
 
-        let mut merged = self
+        let merge = self
             .db
-            .rscan_from_sstables(&self.name, prefix, ordered_mode)?;
+            .build_rscan_merge_iterator(&self.name, prefix, ordered_mode)?;
+        let mut rscan = super::merge_iter::RScanAdapter::from_merge_iter(merge)?;
 
-        for (key, value) in mt_entries {
-            merged.insert(key, value);
+        let mut result = Vec::new();
+        let mut skipped = 0usize;
+        while let Some((key, value)) = rscan.next() {
+            if !include_deleted && value.is_tombstone() {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            result.push(key);
+            if result.len() >= limit {
+                break;
+            }
         }
-
-        // Collect and reverse for rscan
-        let all: Vec<Key> = merged
-            .into_iter()
-            .filter(|(_, v)| include_deleted || !v.is_tombstone())
-            .map(|(k, _)| k)
-            .collect();
-
-        Ok(all.into_iter().rev().skip(offset).take(limit).collect())
+        Ok(result)
     }
 
     pub fn count(&self) -> Result<u64> {
-        let (mt_entries, ordered_mode) = {
+        let ordered_mode = {
             let mt = self.db.get_or_create_memtable(&self.name);
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
-            (mt.scan_all_raw(&Key::Str(String::new())), mt.is_ordered())
+            mt.is_ordered()
         };
 
-        // Merge SSTable entries with memtable entries (memtable wins)
         let empty_prefix = Key::Str(String::new());
-        let mut merged = self
+        let mut iter = self
             .db
-            .scan_from_sstables(&self.name, &empty_prefix, ordered_mode)?;
-        for (key, value) in mt_entries {
-            merged.insert(key, value);
-        }
+            .build_merge_iterator(&self.name, &empty_prefix, ordered_mode)?;
 
-        Ok(merged
-            .into_iter()
-            .filter(|(_, v)| !v.is_tombstone())
-            .count() as u64)
+        let mut count = 0u64;
+        while let Some((_key, value)) = iter.next()? {
+            if !value.is_tombstone() {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// Returns the total number of revisions for a key across memtable and

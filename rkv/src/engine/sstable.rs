@@ -13,6 +13,8 @@ use super::revision::RevisionID;
 use super::value::Value;
 use super::Compression;
 
+pub(crate) use cache::RawEntry;
+
 // --- Constants ---
 
 /// SSTable file magic bytes: "rKVS".
@@ -367,17 +369,15 @@ pub(super) fn decompress_block(tag: u8, data: &[u8]) -> Result<Vec<u8>> {
 
 // --- SSTableReader ---
 
-/// Raw entry parsed from a data block: (key_bytes, value_tag, value_data).
-use cache::RawEntry;
-
 /// Index entry parsed from an SSTable's index block.
-struct IndexEntry {
+#[derive(Clone)]
+pub(crate) struct IndexEntry {
     /// Last key in this data block (serialized bytes).
-    last_key: Vec<u8>,
+    pub(crate) last_key: Vec<u8>,
     /// Byte offset of the data block in the file.
-    offset: u64,
+    pub(crate) offset: u64,
     /// Size of the data block on disk (including compression tag + checksum).
-    size: u32,
+    pub(crate) size: u32,
 }
 
 /// Lazily-parsed SSTable metadata: index, bloom filters, and first key.
@@ -407,7 +407,7 @@ struct FooterOffsets {
 /// index, bloom filter, and first-key parsing to first access via `OnceLock`.
 pub(crate) struct SSTableReader {
     /// Raw file contents (read into memory or memory-mapped).
-    data: IoBytes,
+    data: Arc<IoBytes>,
     /// Total entry count from the footer.
     entry_count: u64,
     /// Unique SSTable identifier (sequence number from file naming).
@@ -435,7 +435,7 @@ impl SSTableReader {
         cache: Option<Arc<Mutex<BlockCache>>>,
         io: &dyn IoBackend,
     ) -> Result<Self> {
-        let data = io.read_file(path)?;
+        let data = Arc::new(io.read_file(path)?);
 
         // Detect footer version by probing: try V2 (56 bytes) first, then V1 (48 bytes).
         let (footer_start, footer_size) = if data.len() >= V2_FOOTER_SIZE {
@@ -937,7 +937,7 @@ impl SSTableReader {
     /// V4 format: `[key_len][key][revision: u128 BE][expires_at_ms: u64 BE][value_tag][value_len][value_data]`
     /// V3 format: `[key_len][key][revision: u128 BE][value_tag][value_len][value_data]`
     /// V1/V2 format: `[key_len][key][value_tag][value_len][value_data]` (revision = 0)
-    fn parse_block_entries(block: &[u8], version: u16) -> Result<Vec<RawEntry>> {
+    pub(crate) fn parse_block_entries(block: &[u8], version: u16) -> Result<Vec<RawEntry>> {
         let mut entries = Vec::new();
         let mut pos = 0;
         while pos < block.len() {
@@ -1018,7 +1018,7 @@ impl SSTableReader {
     ///
     /// Returns the entry data slice (without trailer) and the restart offsets.
     /// Trailer format: `[restart_0: u32 LE]...[num_restarts: u32 LE]`
-    fn strip_restart_trailer(block: &[u8]) -> Result<(&[u8], Vec<u32>)> {
+    pub(crate) fn strip_restart_trailer(block: &[u8]) -> Result<(&[u8], Vec<u32>)> {
         if block.len() < 4 {
             return Err(Error::Corruption(
                 "block too small for restart trailer".into(),
@@ -1257,147 +1257,6 @@ impl SSTableReader {
         decompress_block(compression_tag, compressed_payload)
     }
 
-    /// Scan entries matching a prefix/range.
-    ///
-    /// Uses the block index to skip blocks that cannot contain matching keys.
-    /// Returns `(Key, Value, RevisionID)` triples in sorted order, including
-    /// tombstones.
-    ///
-    /// - `prefix_bytes`: serialized key prefix to match against.
-    /// - `ordered_mode`: if true, scan from prefix forward (range scan);
-    ///   if false, check all blocks for string prefix matching.
-    pub(crate) fn scan_entries(
-        &self,
-        prefix_bytes: &[u8],
-        ordered_mode: bool,
-        verify_checksums: bool,
-    ) -> Result<Vec<(Key, Value, RevisionID, u64)>> {
-        let meta = self.ensure_meta()?;
-
-        if meta.index.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Prefix bloom check: skip this SSTable if it definitely doesn't
-        // contain keys with this prefix.
-        if !Self::may_contain_prefix_inner(meta, prefix_bytes) {
-            return Ok(Vec::new());
-        }
-
-        let mut result = Vec::new();
-
-        if ordered_mode {
-            // Range scan: find the first block whose last_key >= prefix_bytes,
-            // then read blocks forward until keys no longer match.
-            let start_block = match meta
-                .index
-                .binary_search_by(|e| e.last_key.as_slice().cmp(prefix_bytes))
-            {
-                Ok(i) => i,
-                Err(i) => {
-                    if i >= meta.index.len() {
-                        return Ok(Vec::new());
-                    }
-                    i
-                }
-            };
-
-            for (bi, ie) in meta.index[start_block..].iter().enumerate() {
-                let entries = self.read_block(ie, start_block + bi, verify_checksums)?;
-                for (key_bytes, revision, expires_at_ms, value_tag, value_data) in entries {
-                    if key_bytes.as_slice() >= prefix_bytes {
-                        let key = Key::from_bytes(&key_bytes)?;
-                        let value = Value::from_tag(value_tag, &value_data)?;
-                        result.push((key, value, RevisionID::from(revision), expires_at_ms));
-                    }
-                }
-            }
-        } else {
-            // Prefix matching: scan all blocks, filter by prefix.
-            for (bi, ie) in meta.index.iter().enumerate() {
-                let entries = self.read_block(ie, bi, verify_checksums)?;
-                for (key_bytes, revision, expires_at_ms, value_tag, value_data) in entries {
-                    if key_bytes.starts_with(prefix_bytes) {
-                        let key = Key::from_bytes(&key_bytes)?;
-                        let value = Value::from_tag(value_tag, &value_data)?;
-                        result.push((key, value, RevisionID::from(revision), expires_at_ms));
-                    }
-                }
-            }
-        }
-
-        Ok(result)
-    }
-
-    /// Reverse-scan entries matching a prefix/range.
-    ///
-    /// For ordered mode: returns entries with keys <= prefix_bytes.
-    /// For unordered mode: same as scan_entries (prefix matching).
-    pub(crate) fn rscan_entries(
-        &self,
-        prefix_bytes: &[u8],
-        ordered_mode: bool,
-        verify_checksums: bool,
-    ) -> Result<Vec<(Key, Value, RevisionID, u64)>> {
-        let meta = self.ensure_meta()?;
-
-        if meta.index.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Prefix bloom check for unordered mode (prefix matching).
-        // For ordered mode, prefix_bytes is a range bound, not a prefix.
-        if !ordered_mode && !Self::may_contain_prefix_inner(meta, prefix_bytes) {
-            return Ok(Vec::new());
-        }
-
-        let mut result = Vec::new();
-
-        if ordered_mode {
-            // Range scan: find blocks that may contain keys <= prefix_bytes.
-            // We need all blocks from the beginning up to the block whose
-            // last_key >= prefix_bytes.
-            let end_block = match meta
-                .index
-                .binary_search_by(|e| e.last_key.as_slice().cmp(prefix_bytes))
-            {
-                Ok(i) => i,
-                Err(i) => {
-                    if i == 0 {
-                        // All blocks have last_key < prefix, so check if
-                        // any keys exist <= prefix. Process all blocks.
-                        // Actually, if i == 0, the first block's last_key < prefix,
-                        // meaning all keys in block 0 could be <= prefix.
-                        // We need to read up to block i (exclusive would miss keys).
-                        // Let's just include block 0 if it has any keys <= prefix.
-                    }
-                    if i > 0 {
-                        i - 1
-                    } else {
-                        0
-                    }
-                }
-            };
-
-            // Read from block 0 up to end_block inclusive
-            for (bi, ie) in meta.index[..=end_block].iter().enumerate() {
-                let entries = self.read_block(ie, bi, verify_checksums)?;
-                for (key_bytes, revision, expires_at_ms, value_tag, value_data) in entries {
-                    if key_bytes.as_slice() <= prefix_bytes {
-                        let key = Key::from_bytes(&key_bytes)?;
-                        let value = Value::from_tag(value_tag, &value_data)?;
-                        result.push((key, value, RevisionID::from(revision), expires_at_ms));
-                    }
-                }
-            }
-        } else {
-            // Prefix matching: same as forward scan
-            return self.scan_entries(prefix_bytes, ordered_mode, verify_checksums);
-        }
-
-        Ok(result)
-    }
-
     /// Test whether the prefix bloom filter may contain the given prefix.
     ///
     /// Returns `true` (conservative) on metadata parse error — the actual
@@ -1545,6 +1404,76 @@ impl SSTableReader {
     pub(crate) fn block_count(&self) -> Result<usize> {
         Ok(self.ensure_meta()?.index.len())
     }
+
+    /// Return the Arc-wrapped raw data for iterator construction.
+    pub(crate) fn data(&self) -> &Arc<IoBytes> {
+        &self.data
+    }
+
+    /// Return the format version.
+    pub(crate) fn version(&self) -> u16 {
+        self.version
+    }
+
+    /// Return whether blocks have restart point trailers.
+    pub(crate) fn has_restarts(&self) -> bool {
+        self.has_restarts
+    }
+
+    /// Return cloned index entries for iterator construction.
+    pub(crate) fn index_entries(&self) -> Result<Vec<IndexEntry>> {
+        Ok(self.ensure_meta()?.index.clone())
+    }
+
+    /// Check prefix bloom filter for scan skip.
+    pub(crate) fn may_contain_prefix_for_scan(&self, prefix_bytes: &[u8]) -> bool {
+        match self.ensure_meta() {
+            Ok(meta) => Self::may_contain_prefix_inner(meta, prefix_bytes),
+            Err(_) => true,
+        }
+    }
+}
+
+/// Decompress and parse a block from raw SSTable data without an SSTableReader.
+///
+/// Used by `SSTableScanIter` to read blocks lazily without holding the sstables
+/// RwLock. Returns parsed `RawEntry` tuples.
+pub(crate) fn read_block_from_data(
+    data: &[u8],
+    ie: &IndexEntry,
+    version: u16,
+    has_restarts: bool,
+    verify_checksums: bool,
+) -> Result<Vec<RawEntry>> {
+    let block_start = ie.offset as usize;
+    let block_end = block_start + ie.size as usize;
+
+    if block_end > data.len() {
+        return Err(Error::Corruption(format!(
+            "SSTable block out of bounds: {block_start}..{block_end} (file size {})",
+            data.len()
+        )));
+    }
+
+    let block_on_disk = &data[block_start..block_end];
+    let cksum_start = block_on_disk.len() - Checksum::encoded_size();
+
+    if verify_checksums {
+        let checksum = Checksum::from_bytes(&block_on_disk[cksum_start..])?;
+        checksum.verify(&block_on_disk[..cksum_start])?;
+    }
+
+    let compression_tag = block_on_disk[0];
+    let compressed_payload = &block_on_disk[1..cksum_start];
+    let block_data = decompress_block(compression_tag, compressed_payload)?;
+
+    let entry_data = if has_restarts {
+        let (entries_slice, _restarts) = SSTableReader::strip_restart_trailer(&block_data)?;
+        entries_slice
+    } else {
+        &block_data
+    };
+    SSTableReader::parse_block_entries(entry_data, version)
 }
 
 #[cfg(test)]
@@ -2252,24 +2181,22 @@ mod tests {
         assert!(matches!(err, Error::Corruption(_)));
     }
 
-    // --- scan_entries edge cases ---
+    // --- iterator / bloom edge cases ---
 
     #[test]
-    fn scan_entries_empty_sstable() {
+    fn iter_entries_empty_sstable_scan() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("empty_scan.sst");
         let w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
-        let entries = r
-            .scan_entries(&Key::Int(1).to_bytes(), true, false)
-            .unwrap();
+        let entries = r.iter_entries(false).unwrap();
         assert!(entries.is_empty());
     }
 
     #[test]
-    fn scan_with_prefix_bloom_filter() {
+    fn bloom_prefix_filter_for_scan() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("bloom_scan.sst");
         // bloom_bits=10, bloom_prefix_len=3
@@ -2282,17 +2209,11 @@ mod tests {
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
 
-        // Prefix that exists
-        let entries = r
-            .scan_entries(&Key::from("aaa:").to_prefix_bytes(), false, false)
-            .unwrap();
-        assert_eq!(entries.len(), 2);
+        // Prefix that exists — bloom should pass
+        assert!(r.may_contain_prefix_for_scan(&Key::from("aaa:").to_prefix_bytes()));
 
         // Prefix that doesn't exist — bloom filter should reject
-        let entries = r
-            .scan_entries(&Key::from("zzz:").to_prefix_bytes(), false, false)
-            .unwrap();
-        assert!(entries.is_empty());
+        assert!(!r.may_contain_prefix_for_scan(&Key::from("zzz:").to_prefix_bytes()));
     }
 
     // --- Format versioning ---

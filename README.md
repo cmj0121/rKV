@@ -81,15 +81,19 @@ cargo run --features server -- serve --role peer --repl-port 8322 \
 Replicas reject all write operations with a `ReadOnlyReplica` error. Peers accept
 reads and writes; namespace creation, drops, and data changes propagate automatically.
 
-A `docker-compose.yml` provides a five-node topology (2 write peers + 3 read replicas):
+A `docker-compose.yml` provides a primary + 2 replica topology:
 
 ```sh
 docker compose up --build
-# Write nodes:   http://localhost:8321 (primary), http://localhost:8323 (peer)
-# Read replicas: http://localhost:8324, http://localhost:8325, http://localhost:8326
+# Primary:  http://localhost:8321 (reads + writes)
+# Replicas: http://localhost:8324, http://localhost:8325 (read-only)
 ```
 
 For protocol details and architecture, see [Replication](docs/replication.md#primary-replica-replication).
+
+For horizontal scaling beyond single-node capacity, rKV supports **cluster mode** with
+namespace-level sharding — each namespace lives on a dedicated shard group, with stateless
+gateways routing requests by namespace. See [Cluster / Sharding](docs/cluster.md).
 
 ## Concept
 
