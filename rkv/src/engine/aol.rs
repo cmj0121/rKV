@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::checksum::Checksum;
-use super::error::{Error, Result};
+use super::error::{bytes_to_array, Error, Result};
 use super::key::Key;
 use super::value::Value;
 
@@ -192,8 +192,7 @@ impl Aol {
         if data[0..4] != MAGIC {
             return Err(Error::Corruption("AOL magic mismatch".into()));
         }
-        // SAFETY: data.len() >= HEADER_SIZE (8) checked above — slice is exactly 2 bytes
-        let version = u16::from_be_bytes(data[4..6].try_into().unwrap());
+        let version = u16::from_be_bytes(bytes_to_array(&data[4..6], "AOL version")?);
         if version != VERSION {
             return Err(Error::Corruption(format!(
                 "unsupported AOL version: {version}"
@@ -212,8 +211,9 @@ impl Aol {
                 skipped.push(format!("offset {record_offset}: truncated payload_len"));
                 break;
             }
-            // SAFETY: bounds checked above — slice is exactly 4 bytes
-            let payload_len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            let payload_len =
+                u32::from_be_bytes(bytes_to_array(&data[pos..pos + 4], "AOL payload_len")?)
+                    as usize;
             pos += 4;
 
             // Need payload + 5 checksum bytes
@@ -541,7 +541,8 @@ fn records_after_revision_from_path(
         if pos + 4 > data.len() {
             break;
         }
-        let payload_len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        let payload_len =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
 
         // payload + checksum
