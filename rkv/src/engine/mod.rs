@@ -291,6 +291,33 @@ impl Config {
             owned_namespaces: Vec::new(),
         }
     }
+
+    /// Validate configuration, returning an error for invalid combinations.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_levels == 0 {
+            return Err(Error::InvalidConfig("max_levels must be >= 1".into()));
+        }
+        if self.block_size == 0 {
+            return Err(Error::InvalidConfig("block_size must be > 0".into()));
+        }
+        if self.write_buffer_size == 0 {
+            return Err(Error::InvalidConfig("write_buffer_size must be > 0".into()));
+        }
+        if self.l0_max_count == 0 {
+            return Err(Error::InvalidConfig("l0_max_count must be >= 1".into()));
+        }
+        if self.role == Role::Replica && self.primary_addr.is_none() {
+            return Err(Error::InvalidConfig(
+                "replica role requires primary_addr".into(),
+            ));
+        }
+        if self.role == Role::Peer && self.peers.is_empty() {
+            return Err(Error::InvalidConfig(
+                "peer role requires at least one peer address".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Per-namespace, per-level SSTable readers.
@@ -369,6 +396,7 @@ impl DB {
     /// 4. Start background threads (AOL flush, compaction).
     /// 5. Start replication if configured (primary/replica/peer).
     pub fn open(config: Config) -> Result<Self> {
+        config.validate()?;
         if config.create_if_missing {
             fs::create_dir_all(&config.path)?;
         }
