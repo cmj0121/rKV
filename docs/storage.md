@@ -411,29 +411,41 @@ Namespace::get(key)
   3. Not found in any SSTable → return KeyNotFound
 ```
 
-### Merged Scan
+### Merged Scan (MergeIterator)
 
-`scan` and `rscan` query across both the MemTable and all SSTable levels to produce
-a unified, deduplicated result. This ensures that data remains visible after `flush()`
-and `compact()` — not just for point lookups, but for prefix/range iteration too.
+`scan`, `rscan`, `count`, `delete_range`, and `delete_prefix` all use a lazy
+**MergeIterator** that streams deduplicated entries from the MemTable and all SSTable
+levels via a min-heap. This avoids materializing all matching entries into memory,
+enabling early termination when a `limit` is reached.
 
-**Merge strategy** (oldest-to-newest, newest wins):
+**Architecture**:
 
 ```text
 Namespace::scan(prefix, limit, offset, include_deleted)
-  1. Collect SSTable entries matching prefix (merge order below)
-  2. Collect MemTable raw entries matching prefix (includes tombstones)
-  3. Insert all into BTreeMap<Key, Value> — newer entries overwrite older
-  4. Filter: include_deleted || !is_tombstone (skip tombstones when false)
-  5. Apply offset, then limit
-  6. For rscan: reverse iteration order before offset/limit
+  1. Build MergeIterator from:
+     - SSTableScanIter per SSTable (lazy block-by-block reading)
+     - VecSource wrapping a MemTable snapshot
+  2. Stream (Key, Value) pairs from the iterator:
+     a. Skip tombstones (unless include_deleted)
+     b. Skip offset entries
+     c. Collect up to limit keys
+     d. Break early once limit reached
 ```
 
-**SSTable merge order** ensures newer values shadow older ones:
+**Priority-based dedup** — when multiple sources contain the same key, the source
+with the highest priority wins:
 
-1. Deepest level first (L_max, L_max-1, ..., L1) — ascending key order within each
-2. L0: oldest SSTable first → newest SSTable last (so newest overwrites oldest)
-3. MemTable entries inserted last (always win over any SSTable)
+1. Deepest level (L_max) gets lowest priority
+2. L0: oldest SSTable → newest SSTable (increasing priority)
+3. MemTable snapshot gets highest priority (`u32::MAX`)
+
+The heap pops the minimum key; ties are broken by highest priority. Duplicate keys
+are drained and only the highest-priority version is emitted.
+
+**SSTableScanIter** captures `Arc<IoBytes>` at construction time, so the SSTable
+`RwLock` is released immediately. Blocks are decompressed and parsed on demand. In
+ordered mode, out-of-range blocks are skipped via the block index. Prefix bloom
+filters skip entire SSTables when the prefix is definitely absent.
 
 **Scan modes**:
 
@@ -444,9 +456,12 @@ Namespace::scan(prefix, limit, offset, include_deleted)
   (omitting the trailing null terminator), then checks each SSTable entry with
   `starts_with`. All matching blocks must be read.
 
-**Tombstone shadowing**: MemTable raw entries include tombstones. When a MemTable
-tombstone overwrites an SSTable value in the merge map, the tombstone is filtered out
-in step 4 — correctly hiding the deleted key from the final result.
+**Reverse scan**: `rscan` uses an `RScanAdapter` that drains the forward merge
+iterator, reverses the collected entries, then yields them with offset/limit. True
+lazy reverse iteration over an LSM merge is deferred to a future optimization.
+
+**Tombstone handling**: The merge iterator emits tombstones — callers decide whether
+to filter them. This ensures tombstones correctly shadow values from deeper levels.
 
 ### Bloom Filters
 

@@ -671,10 +671,9 @@ This section catalogs known dead code, missing API exposure, and architectural l
   file even for namespaces that use encryption at rest.
 - **Unbounded key size**: Keys are limited to `u16::MAX` (65,535) bytes by the SSTable
   entry format, but there is no Config-level limit or early validation.
-- **No cursor/iterator API**: Scan operations materialize all results into a `Vec`.
-  Large result sets consume proportional memory.
-- **I/O backend stubs**: The `IoModel` config (None/DirectIO/Mmap) selects a backend,
-  but all three fall through to buffered I/O. DirectIO and Mmap are not yet implemented.
+- **No public iterator API**: The internal `MergeIterator` streams entries lazily with
+  early termination, but is not exposed as a public cursor. Library users get results
+  as `Vec` via `scan()`/`rscan()` with limit/offset.
 
 ### Embeddable Library
 
@@ -755,8 +754,6 @@ See the [README](README.md#http-server) for startup examples and curl recipes.
 
 - **Interior mutability**: `DB` is `Send + Sync`. All mutable fields use `Mutex<T>` or `RwLock<T>` so public methods
   take `&self`.
-- **Stub-first development**: The initial scaffold returns `NotImplemented` for all engine methods, allowing the CLI
-  and test harness to be built before any storage logic exists.
 - **Binary/library boundary**: The CLI (`main.rs`) is strictly binary-only. `lib.rs` exports only engine types
   (`DB`, `Config`, `Error`, `Result`). Nothing from the REPL leaks into the library or FFI surface.
 
