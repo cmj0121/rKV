@@ -2547,7 +2547,7 @@ fn encrypted_data_persists_across_restart() {
 }
 
 #[test]
-fn encrypted_wrong_password_returns_corruption() {
+fn encrypted_wrong_password_rejected_at_open() {
     let tmp = tempfile::tempdir().unwrap();
     {
         let config = Config::new(tmp.path());
@@ -2559,10 +2559,12 @@ fn encrypted_wrong_password_returns_corruption() {
     {
         let config = Config::new(tmp.path());
         let db = DB::open(config).unwrap();
-        // Same namespace, wrong password — data decryption should fail
-        let ns = db.namespace("vault", Some("wrong")).unwrap();
-        let err = ns.get("key").unwrap_err();
-        assert!(matches!(err, Error::Corruption(_)));
+        // Wrong password — should be caught at namespace() call, not at get()
+        let err = db.namespace("vault", Some("wrong")).unwrap_err();
+        assert!(
+            matches!(err, Error::Corruption(_)),
+            "expected Corruption for wrong password, got {err:?}"
+        );
     }
 }
 

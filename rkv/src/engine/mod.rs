@@ -1532,18 +1532,26 @@ impl DB {
             // this session. This handles the case where the DB is reopened
             // and the in-memory map is empty.
             let meta_path = self.sst_namespace_dir(name).join("ns.meta");
-            let persisted_encrypted = meta_path.exists();
-            if persisted_encrypted && !encrypted {
-                map.insert(name.to_owned(), true);
-                return Err(Error::EncryptionRequired(format!(
-                    "namespace '{name}' requires a password"
-                )));
-            }
-            if !persisted_encrypted && encrypted {
-                // Write encryption marker to disk
+            if meta_path.exists() {
+                if !encrypted {
+                    map.insert(name.to_owned(), true);
+                    return Err(Error::EncryptionRequired(format!(
+                        "namespace '{name}' requires a password"
+                    )));
+                }
+                // Verify the password against the stored token
+                let token = fs::read(&meta_path)?;
+                if let Err(e) = crypto::verify_token(password.unwrap(), &token) {
+                    return Err(Error::Corruption(format!(
+                        "namespace '{name}': wrong password or corrupted encryption marker ({e})"
+                    )));
+                }
+            } else if encrypted {
+                // First encrypted access — write verification token to disk
                 let ns_dir = self.sst_namespace_dir(name);
                 fs::create_dir_all(&ns_dir)?;
-                fs::write(&meta_path, b"encrypted")?;
+                let token = crypto::create_verification_token(password.unwrap());
+                fs::write(&meta_path, &token)?;
             }
 
             map.insert(name.to_owned(), encrypted);
