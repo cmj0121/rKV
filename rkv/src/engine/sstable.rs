@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use super::bloom::BloomFilter;
 use super::cache::{self, BlockCache};
 use super::checksum::Checksum;
-use super::error::{Error, Result};
+use super::error::{bytes_to_array, Error, Result};
 use super::io::{IoBackend, IoBytes};
 use super::key::Key;
 use super::revision::RevisionID;
@@ -249,7 +249,7 @@ impl SSTableWriter {
             .extend_from_slice(&(self.restarts.len() as u32).to_le_bytes());
         self.restarts.clear();
 
-        let (tag, payload) = compress_block(&self.block_buf, &self.compression);
+        let (tag, payload) = compress_block(&self.block_buf, &self.compression)?;
 
         // On-disk format: [compression_tag: u8][payload][checksum: 5B]
         let mut block_on_disk = Vec::with_capacity(1 + payload.len() + Checksum::encoded_size());
@@ -265,7 +265,9 @@ impl SSTableWriter {
         self.offset += block_size as u64;
 
         // Record index entry
-        let last_key = self.block_last_key.take().unwrap();
+        let last_key = self.block_last_key.take().ok_or_else(|| {
+            Error::Corruption("SSTable flush_block called with no entries".into())
+        })?;
         self.index.push((last_key, block_offset, block_size));
 
         // Reset block state
@@ -342,16 +344,17 @@ fn value_to_data(value: &Value) -> Vec<u8> {
 }
 
 /// Compress a block payload, returning (compression_tag, compressed_bytes).
-fn compress_block(data: &[u8], compression: &Compression) -> (u8, Vec<u8>) {
+fn compress_block(data: &[u8], compression: &Compression) -> Result<(u8, Vec<u8>)> {
     match compression {
-        Compression::None => (COMPRESS_NONE, data.to_vec()),
+        Compression::None => Ok((COMPRESS_NONE, data.to_vec())),
         Compression::LZ4 => {
             let compressed = lz4_flex::compress_prepend_size(data);
-            (COMPRESS_LZ4, compressed)
+            Ok((COMPRESS_LZ4, compressed))
         }
         Compression::Zstd => {
-            let compressed = zstd::encode_all(data, 3).expect("zstd compression failed");
-            (COMPRESS_ZSTD, compressed)
+            let compressed =
+                zstd::encode_all(data, 3).map_err(|e| Error::Io(std::io::Error::other(e)))?;
+            Ok((COMPRESS_ZSTD, compressed))
         }
     }
 }
@@ -486,7 +489,7 @@ impl SSTableReader {
         footer_checksum.verify(&footer[..cksum_offset])?;
 
         // Parse version
-        let version = u16::from_be_bytes(footer[4..6].try_into().unwrap());
+        let version = u16::from_be_bytes(bytes_to_array(&footer[4..6], "SSTable footer version")?);
         if !(MIN_SUPPORTED_VERSION..=FORMAT_VERSION).contains(&version) {
             return Err(Error::Corruption(format!(
                 "SSTable unsupported version: {version} (supported: {MIN_SUPPORTED_VERSION}..{FORMAT_VERSION})"
@@ -495,7 +498,7 @@ impl SSTableReader {
 
         // Parse features (V2+), reject unknown bits
         let features = if footer_size == V2_FOOTER_SIZE {
-            let f = u32::from_be_bytes(footer[43..47].try_into().unwrap());
+            let f = u32::from_be_bytes(bytes_to_array(&footer[43..47], "SSTable features")?);
             let unknown = f & !KNOWN_FEATURES;
             if unknown != 0 {
                 return Err(Error::Corruption(format!(
@@ -507,9 +510,12 @@ impl SSTableReader {
             0
         };
 
-        let entry_count = u64::from_be_bytes(footer[6..14].try_into().unwrap());
-        let index_offset = u64::from_be_bytes(footer[14..22].try_into().unwrap()) as usize;
-        let index_size = u32::from_be_bytes(footer[22..26].try_into().unwrap()) as usize;
+        let entry_count =
+            u64::from_be_bytes(bytes_to_array(&footer[6..14], "SSTable entry count")?);
+        let index_offset =
+            u64::from_be_bytes(bytes_to_array(&footer[14..22], "SSTable index offset")?) as usize;
+        let index_size =
+            u32::from_be_bytes(bytes_to_array(&footer[22..26], "SSTable index size")?) as usize;
 
         // Bounds-check the index block
         if index_offset + index_size > footer_start {
@@ -519,8 +525,10 @@ impl SSTableReader {
         }
 
         // Parse filter metadata offsets (bytes 30..43 — same layout in V1 and V2)
-        let filter_offset = u64::from_be_bytes(footer[30..38].try_into().unwrap()) as usize;
-        let filter_size = u32::from_be_bytes(footer[38..42].try_into().unwrap()) as usize;
+        let filter_offset =
+            u64::from_be_bytes(bytes_to_array(&footer[30..38], "SSTable filter offset")?) as usize;
+        let filter_size =
+            u32::from_be_bytes(bytes_to_array(&footer[38..42], "SSTable filter size")?) as usize;
         let filter_format = footer[42];
 
         let has_restarts = features & FEATURE_RESTART_POINTS != 0;
@@ -612,8 +620,10 @@ impl SSTableReader {
                 if filter_data.len() < 4 {
                     return Ok((BloomFilter::new(0), None, 0));
                 }
-                let key_bloom_len =
-                    u32::from_le_bytes(filter_data[0..4].try_into().unwrap()) as usize;
+                let key_bloom_len = u32::from_le_bytes(bytes_to_array(
+                    &filter_data[0..4],
+                    "SSTable filter key_bloom_len",
+                )?) as usize;
                 let key_bloom_end = 4 + key_bloom_len;
                 if key_bloom_end >= filter_data.len() {
                     return Ok((BloomFilter::new(0), None, 0));
@@ -649,7 +659,9 @@ impl SSTableReader {
         let compressed_payload = &block_on_disk[1..cksum_start];
         let block_data = decompress_block(compression_tag, compressed_payload).ok()?;
         if block_data.len() >= 2 {
-            let kl = u16::from_be_bytes(block_data[0..2].try_into().unwrap()) as usize;
+            let kl = u16::from_be_bytes(
+                bytes_to_array(&block_data[0..2], "SSTable block key_len").ok()?,
+            ) as usize;
             if 2 + kl <= block_data.len() {
                 return Some(block_data[2..2 + kl].to_vec());
             }
@@ -667,8 +679,10 @@ impl SSTableReader {
                     "SSTable index truncated at key_len".into(),
                 ));
             }
-            // SAFETY: bounds checked above — slice is exactly 2 bytes
-            let key_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+            let key_len = u16::from_be_bytes(bytes_to_array(
+                &data[pos..pos + 2],
+                "SSTable index key_len",
+            )?) as usize;
             pos += 2;
 
             if pos + key_len > data.len() {
@@ -682,10 +696,11 @@ impl SSTableReader {
                     "SSTable index truncated at offset/size".into(),
                 ));
             }
-            // SAFETY: bounds checked above — slices are exactly 8 and 4 bytes
-            let offset = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+            let offset =
+                u64::from_be_bytes(bytes_to_array(&data[pos..pos + 8], "SSTable index offset")?);
             pos += 8;
-            let size = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
+            let size =
+                u32::from_be_bytes(bytes_to_array(&data[pos..pos + 4], "SSTable index size")?);
             pos += 4;
 
             entries.push(IndexEntry {
@@ -949,7 +964,10 @@ impl SSTableReader {
                     "SSTable entry truncated at key_len".into(),
                 ));
             }
-            let kl = u16::from_be_bytes(block[pos..pos + 2].try_into().unwrap()) as usize;
+            let kl = u16::from_be_bytes(bytes_to_array(
+                &block[pos..pos + 2],
+                "SSTable entry key_len",
+            )?) as usize;
             pos += 2;
 
             if pos + kl > block.len() {
@@ -967,7 +985,10 @@ impl SSTableReader {
                         "SSTable entry truncated at revision".into(),
                     ));
                 }
-                let rev = u128::from_be_bytes(block[pos..pos + 16].try_into().unwrap());
+                let rev = u128::from_be_bytes(bytes_to_array(
+                    &block[pos..pos + 16],
+                    "SSTable entry revision",
+                )?);
                 pos += 16;
                 rev
             } else {
@@ -981,7 +1002,10 @@ impl SSTableReader {
                         "SSTable entry truncated at expires_at_ms".into(),
                     ));
                 }
-                let ms = u64::from_be_bytes(block[pos..pos + 8].try_into().unwrap());
+                let ms = u64::from_be_bytes(bytes_to_array(
+                    &block[pos..pos + 8],
+                    "SSTable entry expires_at_ms",
+                )?);
                 pos += 8;
                 ms
             } else {
@@ -1001,7 +1025,10 @@ impl SSTableReader {
                     "SSTable entry truncated at value_len".into(),
                 ));
             }
-            let vl = u32::from_be_bytes(block[pos..pos + 4].try_into().unwrap()) as usize;
+            let vl = u32::from_be_bytes(bytes_to_array(
+                &block[pos..pos + 4],
+                "SSTable entry value_len",
+            )?) as usize;
             pos += 4;
 
             if pos + vl > block.len() {
@@ -1027,8 +1054,10 @@ impl SSTableReader {
                 "block too small for restart trailer".into(),
             ));
         }
-        let num_restarts =
-            u32::from_le_bytes(block[block.len() - 4..].try_into().unwrap()) as usize;
+        let num_restarts = u32::from_le_bytes(bytes_to_array(
+            &block[block.len() - 4..],
+            "SSTable restart num_restarts",
+        )?) as usize;
         let trailer_size = (num_restarts + 1) * 4;
         if trailer_size > block.len() {
             return Err(Error::Corruption(format!(
@@ -1040,7 +1069,10 @@ impl SSTableReader {
         let mut restarts = Vec::with_capacity(num_restarts);
         for i in 0..num_restarts {
             let off = entry_end + i * 4;
-            restarts.push(u32::from_le_bytes(block[off..off + 4].try_into().unwrap()));
+            restarts.push(u32::from_le_bytes(bytes_to_array(
+                &block[off..off + 4],
+                "SSTable restart offset",
+            )?));
         }
         Ok((&block[..entry_end], restarts))
     }
@@ -1052,7 +1084,10 @@ impl SSTableReader {
         if pos + 2 > entry_data.len() {
             return Err(Error::Corruption("restart: truncated at key_len".into()));
         }
-        let kl = u16::from_be_bytes(entry_data[pos..pos + 2].try_into().unwrap()) as usize;
+        let kl = u16::from_be_bytes(bytes_to_array(
+            &entry_data[pos..pos + 2],
+            "SSTable restart key_len",
+        )?) as usize;
         let key_end = pos + 2 + kl;
         if key_end > entry_data.len() {
             return Err(Error::Corruption("restart: truncated at key".into()));
@@ -1074,7 +1109,10 @@ impl SSTableReader {
         if pos + 4 > entry_data.len() {
             return Err(Error::Corruption("restart: truncated at value_len".into()));
         }
-        let vl = u32::from_be_bytes(entry_data[pos..pos + 4].try_into().unwrap()) as usize;
+        let vl = u32::from_be_bytes(bytes_to_array(
+            &entry_data[pos..pos + 4],
+            "SSTable restart value_len",
+        )?) as usize;
         pos += 4 + vl;
         if pos > entry_data.len() {
             return Err(Error::Corruption("restart: truncated at value_data".into()));
@@ -1098,7 +1136,10 @@ impl SSTableReader {
             if p + 16 > entry_data.len() {
                 return Err(Error::Corruption("entry truncated at revision".into()));
             }
-            let rev = u128::from_be_bytes(entry_data[p..p + 16].try_into().unwrap());
+            let rev = u128::from_be_bytes(bytes_to_array(
+                &entry_data[p..p + 16],
+                "SSTable entry revision",
+            )?);
             p += 16;
             rev
         } else {
@@ -1109,7 +1150,10 @@ impl SSTableReader {
             if p + 8 > entry_data.len() {
                 return Err(Error::Corruption("entry truncated at expires_at_ms".into()));
             }
-            let ms = u64::from_be_bytes(entry_data[p..p + 8].try_into().unwrap());
+            let ms = u64::from_be_bytes(bytes_to_array(
+                &entry_data[p..p + 8],
+                "SSTable entry expires_at_ms",
+            )?);
             p += 8;
             ms
         } else {
@@ -1125,7 +1169,10 @@ impl SSTableReader {
         if p + 4 > entry_data.len() {
             return Err(Error::Corruption("entry truncated at value_len".into()));
         }
-        let vl = u32::from_be_bytes(entry_data[p..p + 4].try_into().unwrap()) as usize;
+        let vl = u32::from_be_bytes(bytes_to_array(
+            &entry_data[p..p + 4],
+            "SSTable entry value_len",
+        )?) as usize;
         p += 4;
 
         if p + vl > entry_data.len() {
@@ -1490,7 +1537,7 @@ mod tests {
     #[test]
     fn compress_decompress_none() {
         let data = b"hello world";
-        let (tag, compressed) = compress_block(data, &Compression::None);
+        let (tag, compressed) = compress_block(data, &Compression::None).unwrap();
         assert_eq!(tag, COMPRESS_NONE);
         let decompressed = decompress_block(tag, &compressed).unwrap();
         assert_eq!(decompressed, data);
@@ -1499,7 +1546,7 @@ mod tests {
     #[test]
     fn compress_decompress_lz4() {
         let data = b"hello world, this is a test for lz4 compression";
-        let (tag, compressed) = compress_block(data, &Compression::LZ4);
+        let (tag, compressed) = compress_block(data, &Compression::LZ4).unwrap();
         assert_eq!(tag, COMPRESS_LZ4);
         let decompressed = decompress_block(tag, &compressed).unwrap();
         assert_eq!(decompressed, data);
@@ -1508,7 +1555,7 @@ mod tests {
     #[test]
     fn compress_decompress_zstd() {
         let data = b"hello world, this is a test for zstd compression";
-        let (tag, compressed) = compress_block(data, &Compression::Zstd);
+        let (tag, compressed) = compress_block(data, &Compression::Zstd).unwrap();
         assert_eq!(tag, COMPRESS_ZSTD);
         let decompressed = decompress_block(tag, &compressed).unwrap();
         assert_eq!(decompressed, data);

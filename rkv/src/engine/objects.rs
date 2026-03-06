@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::checksum::Checksum;
-use super::error::{Error, Result};
+use super::error::{bytes_to_array, Error, Result};
 use super::io::IoBackend;
 use super::value::ValuePointer;
 
@@ -131,7 +131,7 @@ fn scan_pack_file(path: &Path, seq: u64) -> Result<Vec<([u8; 32], PackEntry)>> {
             path.display()
         )));
     }
-    let version = u16::from_be_bytes(data[4..6].try_into().unwrap());
+    let version = u16::from_be_bytes(bytes_to_array(&data[4..6], "pack file version")?);
     if version != PACK_VERSION {
         return Err(Error::Corruption(format!(
             "pack file unsupported version {version}: {}",
@@ -152,9 +152,15 @@ fn scan_pack_file(path: &Path, seq: u64) -> Result<Vec<([u8; 32], PackEntry)>> {
         // Parse record header
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&data[pos..pos + 32]);
-        let original_size = u32::from_be_bytes(data[pos + 32..pos + 36].try_into().unwrap());
+        let original_size = u32::from_be_bytes(bytes_to_array(
+            &data[pos + 32..pos + 36],
+            "pack record original_size",
+        )?);
         let flags = data[pos + 36];
-        let data_len = u32::from_be_bytes(data[pos + 37..pos + 41].try_into().unwrap());
+        let data_len = u32::from_be_bytes(bytes_to_array(
+            &data[pos + 37..pos + 41],
+            "pack record data_len",
+        )?);
 
         let record_end = pos + PACK_RECORD_HEADER_SIZE + data_len as usize;
         let checksum_end = record_end + Checksum::encoded_size();
@@ -335,7 +341,9 @@ impl ObjectStore {
             state.writer = Some(PackWriter::create(&path, seq)?);
         }
 
-        let writer = state.writer.as_mut().unwrap();
+        let writer = state.writer.as_mut().ok_or_else(|| {
+            Error::Corruption("pack writer unexpectedly None after initialization".into())
+        })?;
         let entry = writer.append(&hash, size, flags, &payload)?;
         state.index.insert(hash, entry);
 
