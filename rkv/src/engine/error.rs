@@ -37,3 +37,13 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Safely convert a byte slice to a fixed-size array, returning `Corruption`
+/// on length mismatch. Use this instead of `.try_into().unwrap()` when parsing
+/// binary data from disk or network.
+#[inline]
+pub(crate) fn bytes_to_array<const N: usize>(data: &[u8], context: &str) -> Result<[u8; N]> {
+    data.try_into().map_err(|_| {
+        Error::Corruption(format!("{context}: expected {N} bytes, got {}", data.len()))
+    })
+}

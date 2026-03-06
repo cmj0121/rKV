@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 
 use super::checksum::Checksum;
-use super::error::{Error, Result};
+use super::error::{bytes_to_array, Error, Result};
 use super::io::{IoBackend, IoBytes};
 use super::key::Key;
 use super::value::Value;
@@ -114,16 +114,15 @@ impl DumpReader {
             )));
         }
 
-        // SAFETY: data.len() >= 8 checked above — slices are exactly 2 bytes
-        let version = u16::from_be_bytes(self.data[4..6].try_into().unwrap());
+        let version = u16::from_be_bytes(bytes_to_array(&self.data[4..6], "dump file version")?);
         if version != VERSION {
             return Err(Error::Corruption(format!(
                 "dump file unsupported version: {version}"
             )));
         }
 
-        // SAFETY: data.len() >= 8 checked above — slice is exactly 2 bytes
-        let path_len = u16::from_be_bytes(self.data[6..8].try_into().unwrap()) as usize;
+        let path_len =
+            u16::from_be_bytes(bytes_to_array(&self.data[6..8], "dump file path_len")?) as usize;
         if 8 + path_len > self.data.len() {
             return Err(Error::Corruption("dump file header truncated".into()));
         }
@@ -143,9 +142,10 @@ impl DumpReader {
             ));
         }
 
-        // SAFETY: bounds checked above — slice is exactly 4 bytes
-        let payload_len =
-            u32::from_be_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap()) as usize;
+        let payload_len = u32::from_be_bytes(bytes_to_array(
+            &self.data[self.pos..self.pos + 4],
+            "dump record payload_len",
+        )?) as usize;
         self.pos += 4;
 
         // EOF sentinel

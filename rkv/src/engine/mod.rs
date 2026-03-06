@@ -291,6 +291,33 @@ impl Config {
             owned_namespaces: Vec::new(),
         }
     }
+
+    /// Validate configuration, returning an error for invalid combinations.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_levels == 0 {
+            return Err(Error::InvalidConfig("max_levels must be >= 1".into()));
+        }
+        if self.block_size == 0 {
+            return Err(Error::InvalidConfig("block_size must be > 0".into()));
+        }
+        if self.write_buffer_size == 0 {
+            return Err(Error::InvalidConfig("write_buffer_size must be > 0".into()));
+        }
+        if self.l0_max_count == 0 {
+            return Err(Error::InvalidConfig("l0_max_count must be >= 1".into()));
+        }
+        if self.role == Role::Replica && self.primary_addr.is_none() {
+            return Err(Error::InvalidConfig(
+                "replica role requires primary_addr".into(),
+            ));
+        }
+        if self.role == Role::Peer && self.peers.is_empty() {
+            return Err(Error::InvalidConfig(
+                "peer role requires at least one peer address".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Per-namespace, per-level SSTable readers.
@@ -369,6 +396,7 @@ impl DB {
     /// 4. Start background threads (AOL flush, compaction).
     /// 5. Start replication if configured (primary/replica/peer).
     pub fn open(config: Config) -> Result<Self> {
+        config.validate()?;
         if config.create_if_missing {
             fs::create_dir_all(&config.path)?;
         }
@@ -530,8 +558,9 @@ impl DB {
                         let (lock, cvar) = &*notify;
                         let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
                         if !*pending && !stop.load(Ordering::Relaxed) {
-                            let result =
-                                cvar.wait_timeout(pending, Duration::from_secs(30)).unwrap();
+                            let result = cvar
+                                .wait_timeout(pending, Duration::from_secs(30))
+                                .unwrap_or_else(|e| e.into_inner());
                             pending = result.0;
                         }
                         *pending = false;
@@ -621,7 +650,7 @@ impl DB {
 
         // Eagerly register the default namespace so it always appears in
         // list_namespaces(), regardless of whether any data has been written.
-        db.get_or_create_memtable(DEFAULT_NAMESPACE);
+        db.get_or_create_memtable(DEFAULT_NAMESPACE)?;
 
         db.start_replication()?;
 
@@ -847,15 +876,15 @@ impl DB {
                         } else {
                             drop(map);
                             let mut map = ns_data.write().unwrap_or_else(|e| e.into_inner());
-                            let ns_state =
-                                map.entry(record.namespace.clone()).or_insert_with(|| {
-                                    NamespaceState::create(
-                                        &replay_db_path,
-                                        &record.namespace,
-                                        replay_aol_buf,
-                                    )
-                                    .expect("create namespace state")
-                                });
+                            if !map.contains_key(&record.namespace) {
+                                let ns_state = NamespaceState::create(
+                                    &replay_db_path,
+                                    &record.namespace,
+                                    replay_aol_buf,
+                                )?;
+                                map.insert(record.namespace.clone(), ns_state);
+                            }
+                            let ns_state = map.get(&record.namespace).unwrap();
                             let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
                             aol.append_encoded(payload)?;
                         }
@@ -922,21 +951,20 @@ impl DB {
                         }
                         // Register new SST namespaces (HashMap only grows)
                         for ns_name in new_sst.keys() {
-                            ns_map.entry(ns_name.clone()).or_insert_with(|| {
-                                NamespaceState::create(&sync_db_path, ns_name, sync_aol_buf)
-                                    .expect("create namespace state")
-                            });
+                            if !ns_map.contains_key(ns_name) {
+                                let ns_state =
+                                    NamespaceState::create(&sync_db_path, ns_name, sync_aol_buf)?;
+                                ns_map.insert(ns_name.clone(), ns_state);
+                            }
                         }
-                        ns_map
-                            .entry(DEFAULT_NAMESPACE.to_owned())
-                            .or_insert_with(|| {
-                                NamespaceState::create(
-                                    &sync_db_path,
-                                    DEFAULT_NAMESPACE,
-                                    sync_aol_buf,
-                                )
-                                .expect("create default namespace state")
-                            });
+                        if !ns_map.contains_key(DEFAULT_NAMESPACE) {
+                            let ns_state = NamespaceState::create(
+                                &sync_db_path,
+                                DEFAULT_NAMESPACE,
+                                sync_aol_buf,
+                            )?;
+                            ns_map.insert(DEFAULT_NAMESPACE.to_owned(), ns_state);
+                        }
                     }
 
                     // Replace SSTable index
@@ -987,10 +1015,11 @@ impl DB {
                     // 3. Re-create default namespace if it was dropped
                     if namespace == DEFAULT_NAMESPACE {
                         let mut map = drop_ns_data.write().unwrap_or_else(|e| e.into_inner());
-                        map.entry(DEFAULT_NAMESPACE.to_owned()).or_insert_with(|| {
-                            NamespaceState::create(&drop_db_path, DEFAULT_NAMESPACE, 0)
-                                .expect("create default namespace state")
-                        });
+                        if !map.contains_key(DEFAULT_NAMESPACE) {
+                            let ns_state =
+                                NamespaceState::create(&drop_db_path, DEFAULT_NAMESPACE, 0)?;
+                            map.insert(DEFAULT_NAMESPACE.to_owned(), ns_state);
+                        }
                     }
 
                     Ok(())
@@ -1107,16 +1136,19 @@ impl DB {
                         record.key == Key::Str(String::new()) && record.value.is_null();
 
                     // Helper: ensure NamespaceState exists in the map
-                    let ensure_ns = |map: &mut HashMap<String, NamespaceState>, ns: &str| {
-                        map.entry(ns.to_owned()).or_insert_with(|| {
-                            NamespaceState::create(&db_path_for_peer, ns, db_aol_buf)
-                                .expect("create namespace state")
-                        });
-                    };
+                    let ensure_ns =
+                        |map: &mut HashMap<String, NamespaceState>, ns: &str| -> Result<()> {
+                            if !map.contains_key(ns) {
+                                let ns_state =
+                                    NamespaceState::create(&db_path_for_peer, ns, db_aol_buf)?;
+                                map.insert(ns.to_owned(), ns_state);
+                            }
+                            Ok(())
+                        };
 
                     let applied = if is_sentinel {
                         let mut map = db_ns_data.write().unwrap_or_else(|e| e.into_inner());
-                        ensure_ns(&mut map, &record.namespace);
+                        ensure_ns(&mut map, &record.namespace)?;
                         true
                     } else {
                         let ttl = if record.expires_at_ms > 0 {
@@ -1139,7 +1171,7 @@ impl DB {
                         } else {
                             drop(map);
                             let mut map = db_ns_data.write().unwrap_or_else(|e| e.into_inner());
-                            ensure_ns(&mut map, &record.namespace);
+                            ensure_ns(&mut map, &record.namespace)?;
                             let ns_state = map.get(&record.namespace).unwrap();
                             let mut mt =
                                 ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
@@ -1217,21 +1249,20 @@ impl DB {
                             let _ = aol.truncate();
                         }
                         for ns_name in new_sst.keys() {
-                            ns_map.entry(ns_name.clone()).or_insert_with(|| {
-                                NamespaceState::create(&sync_db_path, ns_name, sync_aol_buf)
-                                    .expect("create namespace state")
-                            });
+                            if !ns_map.contains_key(ns_name) {
+                                let ns_state =
+                                    NamespaceState::create(&sync_db_path, ns_name, sync_aol_buf)?;
+                                ns_map.insert(ns_name.clone(), ns_state);
+                            }
                         }
-                        ns_map
-                            .entry(DEFAULT_NAMESPACE.to_owned())
-                            .or_insert_with(|| {
-                                NamespaceState::create(
-                                    &sync_db_path,
-                                    DEFAULT_NAMESPACE,
-                                    sync_aol_buf,
-                                )
-                                .expect("create default namespace state")
-                            });
+                        if !ns_map.contains_key(DEFAULT_NAMESPACE) {
+                            let ns_state = NamespaceState::create(
+                                &sync_db_path,
+                                DEFAULT_NAMESPACE,
+                                sync_aol_buf,
+                            )?;
+                            ns_map.insert(DEFAULT_NAMESPACE.to_owned(), ns_state);
+                        }
                     }
 
                     // Replace SSTable index
@@ -1294,10 +1325,14 @@ impl DB {
                     // 3. Re-create default namespace if it was dropped
                     if namespace == DEFAULT_NAMESPACE {
                         let mut map = drop_ns_data.write().unwrap_or_else(|e| e.into_inner());
-                        map.entry(DEFAULT_NAMESPACE.to_owned()).or_insert_with(|| {
-                            NamespaceState::create(&drop_db_path, DEFAULT_NAMESPACE, drop_aol_buf)
-                                .expect("create default namespace state")
-                        });
+                        if !map.contains_key(DEFAULT_NAMESPACE) {
+                            let ns_state = NamespaceState::create(
+                                &drop_db_path,
+                                DEFAULT_NAMESPACE,
+                                drop_aol_buf,
+                            )?;
+                            map.insert(DEFAULT_NAMESPACE.to_owned(), ns_state);
+                        }
                     }
 
                     Ok(())
@@ -1559,7 +1594,7 @@ impl DB {
 
             // Ensure the namespace is registered in the memtable map so it
             // appears in `list_namespaces` immediately (not only after a write).
-            self.get_or_create_memtable(name);
+            self.get_or_create_memtable(name)?;
 
             // On primary/peer nodes, broadcast a Null sentinel so other nodes
             // learn about the new namespace immediately (even if no data is written).
@@ -1582,7 +1617,7 @@ impl DB {
 
         // Ensure the namespace is registered in the memtable map so it
         // appears in `list_namespaces` immediately (not only after a write).
-        self.get_or_create_memtable(name);
+        self.get_or_create_memtable(name)?;
 
         Namespace::open(self, name, password)
     }
@@ -1700,7 +1735,7 @@ impl DB {
         // Re-create the default namespace if it was just dropped, so it
         // always appears in list_namespaces().
         if name == DEFAULT_NAMESPACE {
-            self.get_or_create_memtable(DEFAULT_NAMESPACE);
+            self.get_or_create_memtable(DEFAULT_NAMESPACE)?;
         }
 
         Ok(())
@@ -1736,7 +1771,7 @@ impl DB {
 
         for ns_name in &namespaces {
             let entries = {
-                let mt = self.get_or_create_memtable(ns_name);
+                let mt = self.get_or_create_memtable(ns_name)?;
                 let mut mt = mt.lock().unwrap_or_else(|e| e.into_inner());
                 if mt.is_empty() {
                     continue;
@@ -1804,7 +1839,7 @@ impl DB {
 
             // Truncate this namespace's AOL — its data is now in the SSTable
             {
-                let ns_state = self.get_or_create_ns(ns_name);
+                let ns_state = self.get_or_create_ns(ns_name)?;
                 let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
                 aol.truncate()?;
             }
@@ -2267,7 +2302,7 @@ impl DB {
         let (lock, cvar) = &*self.compaction_done;
         let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
         while !*done {
-            done = cvar.wait(done).unwrap();
+            done = cvar.wait(done).unwrap_or_else(|e| e.into_inner());
         }
         *done = false;
     }
@@ -2764,9 +2799,9 @@ impl DB {
     }
 
     /// Acquire the per-namespace AOL lock for batch operations.
-    pub(crate) fn aol_lock(&self, ns: &str) -> std::sync::MutexGuard<'_, aol::Aol> {
-        let ns_state = self.get_or_create_ns(ns);
-        ns_state.aol.lock().unwrap_or_else(|e| e.into_inner())
+    pub(crate) fn aol_lock(&self, ns: &str) -> Result<std::sync::MutexGuard<'_, aol::Aol>> {
+        let ns_state = self.get_or_create_ns(ns)?;
+        Ok(ns_state.aol.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     pub(crate) fn append_to_aol(
@@ -2777,7 +2812,7 @@ impl DB {
         value: &Value,
         ttl: Option<Duration>,
     ) -> Result<()> {
-        let mut aol = self.aol_lock(ns);
+        let mut aol = self.aol_lock(ns)?;
         self.append_to_aol_locked(&mut aol, ns, rev, key, value, ttl)
     }
 
@@ -2864,7 +2899,7 @@ impl DB {
         // LWW check: apply only if incoming revision > current revision for key
         let applied = if is_sentinel {
             // Sentinel just creates the namespace — always accept
-            self.get_or_create_memtable(&record.namespace);
+            self.get_or_create_memtable(&record.namespace)?;
             true
         } else {
             let ttl = if record.expires_at_ms > 0 {
@@ -2874,14 +2909,14 @@ impl DB {
                 None
             };
 
-            let ns_state = self.get_or_create_ns(&record.namespace);
+            let ns_state = self.get_or_create_ns(&record.namespace)?;
             let mut mt = ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
             mt.put_if_newer(record.key.clone(), record.value.clone(), incoming_rev, ttl)
         };
 
         if applied {
             // Write to local per-namespace AOL for crash recovery
-            let ns_state = self.get_or_create_ns(&record.namespace);
+            let ns_state = self.get_or_create_ns(&record.namespace)?;
             let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
             aol.append_encoded(payload)?;
         } else {
@@ -2991,7 +3026,7 @@ impl DB {
 
         // 2. Memtable snapshot (highest priority)
         let mt_entries = {
-            let mt = self.get_or_create_memtable(ns);
+            let mt = self.get_or_create_memtable(ns)?;
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
             mt.scan_all_raw(prefix)
         };
@@ -3064,7 +3099,7 @@ impl DB {
 
         // 2. Memtable snapshot
         let mt_entries = {
-            let mt = self.get_or_create_memtable(ns);
+            let mt = self.get_or_create_memtable(ns)?;
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
             mt.rscan_all_raw(prefix)
         };
@@ -3330,10 +3365,15 @@ impl DB {
         if version != STATS_VERSION {
             return (0, 0, 0);
         }
-        // SAFETY: data.len() >= 30 checked above — slices are exactly 8 bytes each
-        let puts = u64::from_be_bytes(data[6..14].try_into().unwrap());
-        let gets = u64::from_be_bytes(data[14..22].try_into().unwrap());
-        let deletes = u64::from_be_bytes(data[22..30].try_into().unwrap());
+        let puts = u64::from_be_bytes([
+            data[6], data[7], data[8], data[9], data[10], data[11], data[12], data[13],
+        ]);
+        let gets = u64::from_be_bytes([
+            data[14], data[15], data[16], data[17], data[18], data[19], data[20], data[21],
+        ]);
+        let deletes = u64::from_be_bytes([
+            data[22], data[23], data[24], data[25], data[26], data[27], data[28], data[29],
+        ]);
         (puts, gets, deletes)
     }
 
@@ -3352,7 +3392,7 @@ impl DB {
         }
     }
 
-    pub(crate) fn get_or_create_ns(&self, name: &str) -> &NamespaceState {
+    pub(crate) fn get_or_create_ns(&self, name: &str) -> Result<&NamespaceState> {
         // Fast path: read lock to check if namespace state already exists
         {
             let map = self
@@ -3363,7 +3403,7 @@ impl DB {
                 // SAFETY: The RwLock<HashMap> only grows (we never remove entries),
                 // so a reference obtained under the read lock remains valid.
                 let ptr = map.get(name).unwrap() as *const NamespaceState;
-                return unsafe { &*ptr };
+                return Ok(unsafe { &*ptr });
             }
         }
 
@@ -3372,18 +3412,19 @@ impl DB {
             .namespace_data
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        map.entry(name.to_owned()).or_insert_with(|| {
-            NamespaceState::create(&self.config.path, name, self.config.aol_buffer_size)
-                .expect("failed to create namespace state")
-        });
+        if !map.contains_key(name) {
+            let ns_state =
+                NamespaceState::create(&self.config.path, name, self.config.aol_buffer_size)?;
+            map.insert(name.to_owned(), ns_state);
+        }
         let ptr = map.get(name).unwrap() as *const NamespaceState;
         // SAFETY: Same as above — the HashMap only grows, so the reference is stable.
-        unsafe { &*ptr }
+        Ok(unsafe { &*ptr })
     }
 
     /// Convenience: get only the memtable mutex for read-path callers.
-    pub(crate) fn get_or_create_memtable(&self, name: &str) -> &Mutex<memtable::MemTable> {
-        &self.get_or_create_ns(name).memtable
+    pub(crate) fn get_or_create_memtable(&self, name: &str) -> Result<&Mutex<memtable::MemTable>> {
+        Ok(&self.get_or_create_ns(name)?.memtable)
     }
 }
 

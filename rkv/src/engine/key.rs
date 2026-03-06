@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::fmt;
 
-use super::error::{Error, Result};
+use super::error::{bytes_to_array, Error, Result};
 
 const TAG_INT: u8 = 0x01;
 const TAG_STR: u8 = 0x02;
@@ -76,8 +76,7 @@ impl Key {
                         data.len()
                     )));
                 }
-                // SAFETY: data.len() == 9 checked above — slice is exactly 8 bytes
-                let flipped = u64::from_be_bytes(data[1..9].try_into().unwrap());
+                let flipped = u64::from_be_bytes(bytes_to_array(&data[1..9], "int key bytes")?);
                 let v = (flipped ^ SIGN_FLIP) as i64;
                 Ok(Key::Int(v))
             }
