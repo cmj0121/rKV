@@ -2884,6 +2884,133 @@ fn flush_aol_truncated() {
     assert_eq!(size_after, 8); // Header only (magic + version + reserved)
 }
 
+// --- Per-namespace AOL tests ---
+
+#[test]
+fn per_ns_aol_isolation() {
+    // Each namespace should have its own AOL file under sst/<ns>/aol
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.aol_buffer_size = 0;
+    let db = DB::open(config).unwrap();
+
+    let ns_a = db.namespace("alpha", None).unwrap();
+    let ns_b = db.namespace("beta", None).unwrap();
+    ns_a.put(1, "a-val", None).unwrap();
+    ns_b.put(2, "b-val", None).unwrap();
+
+    // Verify separate AOL files exist
+    let aol_a = tmp.path().join("sst/alpha/aol");
+    let aol_b = tmp.path().join("sst/beta/aol");
+    assert!(aol_a.exists(), "alpha AOL should exist");
+    assert!(aol_b.exists(), "beta AOL should exist");
+
+    // Legacy global AOL should NOT exist
+    let legacy = tmp.path().join("aol");
+    assert!(!legacy.exists(), "legacy global AOL should not exist");
+
+    // Flushing one namespace should only truncate its AOL
+    let size_a_before = std::fs::metadata(&aol_a).unwrap().len();
+    let size_b_before = std::fs::metadata(&aol_b).unwrap().len();
+    assert!(size_a_before > 8);
+    assert!(size_b_before > 8);
+
+    db.flush().unwrap();
+
+    let size_a_after = std::fs::metadata(&aol_a).unwrap().len();
+    let size_b_after = std::fs::metadata(&aol_b).unwrap().len();
+    assert_eq!(size_a_after, 8, "alpha AOL should be truncated to header");
+    assert_eq!(size_b_after, 8, "beta AOL should be truncated to header");
+}
+
+#[test]
+fn per_ns_aol_survives_reopen() {
+    // Data written to per-namespace AOLs should survive close + reopen
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let mut config = Config::new(tmp.path());
+        config.aol_buffer_size = 0;
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("myns", None).unwrap();
+        ns.put("key1", "val1", None).unwrap();
+        ns.put("key2", "val2", None).unwrap();
+        db.close().unwrap();
+    }
+
+    // Reopen and verify data is intact
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("myns", None).unwrap();
+    assert_eq!(ns.get("key1").unwrap(), Value::from("val1"));
+    assert_eq!(ns.get("key2").unwrap(), Value::from("val2"));
+}
+
+#[test]
+fn per_ns_aol_legacy_migration() {
+    // Simulate a legacy global AOL and verify it migrates to per-namespace files
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Step 1: Create a DB, write data, close — this creates per-ns AOLs
+    {
+        let mut config = Config::new(tmp.path());
+        config.aol_buffer_size = 0;
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+        ns.put("k1", "v1", None).unwrap();
+        ns.put("k2", "v2", None).unwrap();
+        db.close().unwrap();
+    }
+
+    // Step 2: Move the per-ns AOL to the legacy location to simulate old format
+    let ns_aol = tmp.path().join("sst/_/aol");
+    let legacy_aol = tmp.path().join("aol");
+    std::fs::rename(&ns_aol, &legacy_aol).unwrap();
+
+    // Step 3: Reopen — should migrate from legacy to per-ns
+    {
+        let config = Config::new(tmp.path());
+        let db = DB::open(config).unwrap();
+        let ns = db.namespace("_", None).unwrap();
+        assert_eq!(ns.get("k1").unwrap(), Value::from("v1"));
+        assert_eq!(ns.get("k2").unwrap(), Value::from("v2"));
+        db.close().unwrap();
+    }
+
+    // Legacy AOL should be deleted after migration
+    assert!(
+        !legacy_aol.exists(),
+        "legacy AOL should be deleted after migration"
+    );
+    // Per-namespace AOL should exist
+    assert!(
+        ns_aol.exists(),
+        "per-ns AOL should be created after migration"
+    );
+}
+
+#[test]
+fn per_ns_aol_multi_namespace_no_cross_contamination() {
+    // Data in one namespace should not appear in another after reopen
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let mut config = Config::new(tmp.path());
+        config.aol_buffer_size = 0;
+        let db = DB::open(config).unwrap();
+        let ns_x = db.namespace("x", None).unwrap();
+        let ns_y = db.namespace("y", None).unwrap();
+        ns_x.put("shared_key", "x-value", None).unwrap();
+        ns_y.put("shared_key", "y-value", None).unwrap();
+        db.close().unwrap();
+    }
+
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns_x = db.namespace("x", None).unwrap();
+    let ns_y = db.namespace("y", None).unwrap();
+    assert_eq!(ns_x.get("shared_key").unwrap(), Value::from("x-value"));
+    assert_eq!(ns_y.get("shared_key").unwrap(), Value::from("y-value"));
+}
+
 // --- Compaction tests ---
 
 #[test]
