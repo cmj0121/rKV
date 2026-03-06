@@ -13,6 +13,8 @@ use super::revision::RevisionID;
 use super::value::Value;
 use super::Compression;
 
+pub(crate) use cache::RawEntry;
+
 // --- Constants ---
 
 /// SSTable file magic bytes: "rKVS".
@@ -367,17 +369,15 @@ pub(super) fn decompress_block(tag: u8, data: &[u8]) -> Result<Vec<u8>> {
 
 // --- SSTableReader ---
 
-/// Raw entry parsed from a data block: (key_bytes, value_tag, value_data).
-use cache::RawEntry;
-
 /// Index entry parsed from an SSTable's index block.
-struct IndexEntry {
+#[derive(Clone)]
+pub(crate) struct IndexEntry {
     /// Last key in this data block (serialized bytes).
-    last_key: Vec<u8>,
+    pub(crate) last_key: Vec<u8>,
     /// Byte offset of the data block in the file.
-    offset: u64,
+    pub(crate) offset: u64,
     /// Size of the data block on disk (including compression tag + checksum).
-    size: u32,
+    pub(crate) size: u32,
 }
 
 /// Lazily-parsed SSTable metadata: index, bloom filters, and first key.
@@ -407,7 +407,7 @@ struct FooterOffsets {
 /// index, bloom filter, and first-key parsing to first access via `OnceLock`.
 pub(crate) struct SSTableReader {
     /// Raw file contents (read into memory or memory-mapped).
-    data: IoBytes,
+    data: Arc<IoBytes>,
     /// Total entry count from the footer.
     entry_count: u64,
     /// Unique SSTable identifier (sequence number from file naming).
@@ -435,7 +435,7 @@ impl SSTableReader {
         cache: Option<Arc<Mutex<BlockCache>>>,
         io: &dyn IoBackend,
     ) -> Result<Self> {
-        let data = io.read_file(path)?;
+        let data = Arc::new(io.read_file(path)?);
 
         // Detect footer version by probing: try V2 (56 bytes) first, then V1 (48 bytes).
         let (footer_start, footer_size) = if data.len() >= V2_FOOTER_SIZE {
@@ -937,7 +937,7 @@ impl SSTableReader {
     /// V4 format: `[key_len][key][revision: u128 BE][expires_at_ms: u64 BE][value_tag][value_len][value_data]`
     /// V3 format: `[key_len][key][revision: u128 BE][value_tag][value_len][value_data]`
     /// V1/V2 format: `[key_len][key][value_tag][value_len][value_data]` (revision = 0)
-    fn parse_block_entries(block: &[u8], version: u16) -> Result<Vec<RawEntry>> {
+    pub(crate) fn parse_block_entries(block: &[u8], version: u16) -> Result<Vec<RawEntry>> {
         let mut entries = Vec::new();
         let mut pos = 0;
         while pos < block.len() {
@@ -1018,7 +1018,7 @@ impl SSTableReader {
     ///
     /// Returns the entry data slice (without trailer) and the restart offsets.
     /// Trailer format: `[restart_0: u32 LE]...[num_restarts: u32 LE]`
-    fn strip_restart_trailer(block: &[u8]) -> Result<(&[u8], Vec<u32>)> {
+    pub(crate) fn strip_restart_trailer(block: &[u8]) -> Result<(&[u8], Vec<u32>)> {
         if block.len() < 4 {
             return Err(Error::Corruption(
                 "block too small for restart trailer".into(),
@@ -1545,6 +1545,82 @@ impl SSTableReader {
     pub(crate) fn block_count(&self) -> Result<usize> {
         Ok(self.ensure_meta()?.index.len())
     }
+
+    /// Return the Arc-wrapped raw data for iterator construction.
+    #[allow(dead_code)] // used by merge_iter::SSTableScanIter (added in next commit)
+    pub(crate) fn data(&self) -> &Arc<IoBytes> {
+        &self.data
+    }
+
+    /// Return the format version.
+    #[allow(dead_code)]
+    pub(crate) fn version(&self) -> u16 {
+        self.version
+    }
+
+    /// Return whether blocks have restart point trailers.
+    #[allow(dead_code)]
+    pub(crate) fn has_restarts(&self) -> bool {
+        self.has_restarts
+    }
+
+    /// Return cloned index entries for iterator construction.
+    #[allow(dead_code)]
+    pub(crate) fn index_entries(&self) -> Result<Vec<IndexEntry>> {
+        Ok(self.ensure_meta()?.index.clone())
+    }
+
+    /// Check prefix bloom filter for scan skip.
+    #[allow(dead_code)]
+    pub(crate) fn may_contain_prefix_for_scan(&self, prefix_bytes: &[u8]) -> bool {
+        match self.ensure_meta() {
+            Ok(meta) => Self::may_contain_prefix_inner(meta, prefix_bytes),
+            Err(_) => true,
+        }
+    }
+}
+
+#[allow(dead_code)] // used by merge_iter::SSTableScanIter (added in next commit)
+/// Decompress and parse a block from raw SSTable data without an SSTableReader.
+///
+/// Used by `SSTableScanIter` to read blocks lazily without holding the sstables
+/// RwLock. Returns parsed `RawEntry` tuples.
+pub(crate) fn read_block_from_data(
+    data: &[u8],
+    ie: &IndexEntry,
+    version: u16,
+    has_restarts: bool,
+    verify_checksums: bool,
+) -> Result<Vec<RawEntry>> {
+    let block_start = ie.offset as usize;
+    let block_end = block_start + ie.size as usize;
+
+    if block_end > data.len() {
+        return Err(Error::Corruption(format!(
+            "SSTable block out of bounds: {block_start}..{block_end} (file size {})",
+            data.len()
+        )));
+    }
+
+    let block_on_disk = &data[block_start..block_end];
+    let cksum_start = block_on_disk.len() - Checksum::encoded_size();
+
+    if verify_checksums {
+        let checksum = Checksum::from_bytes(&block_on_disk[cksum_start..])?;
+        checksum.verify(&block_on_disk[..cksum_start])?;
+    }
+
+    let compression_tag = block_on_disk[0];
+    let compressed_payload = &block_on_disk[1..cksum_start];
+    let block_data = decompress_block(compression_tag, compressed_payload)?;
+
+    let entry_data = if has_restarts {
+        let (entries_slice, _restarts) = SSTableReader::strip_restart_trailer(&block_data)?;
+        entries_slice
+    } else {
+        &block_data
+    };
+    SSTableReader::parse_block_entries(entry_data, version)
 }
 
 #[cfg(test)]
