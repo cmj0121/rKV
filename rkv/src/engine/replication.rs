@@ -3,7 +3,7 @@ use std::io::{self, Read, Write};
 use std::str::FromStr;
 
 use super::checksum::Checksum;
-use super::error::{Error, Result};
+use super::error::{bytes_to_array, Error, Result};
 
 /// Node role in a replication topology.
 #[derive(Clone, Debug, PartialEq)]
@@ -316,9 +316,17 @@ impl ReplMessage {
                 if data.len() < 12 {
                     return Err(Error::Corruption("truncated full_sync_start".into()));
                 }
-                let namespace_count = u32::from_be_bytes(data[0..4].try_into().unwrap());
-                let sst_count = u32::from_be_bytes(data[4..8].try_into().unwrap());
-                let object_count = u32::from_be_bytes(data[8..12].try_into().unwrap());
+                let namespace_count = u32::from_be_bytes(bytes_to_array(
+                    &data[0..4],
+                    "full_sync_start namespace_count",
+                )?);
+                let sst_count =
+                    u32::from_be_bytes(bytes_to_array(&data[4..8], "full_sync_start sst_count")?);
+                let object_count = u32::from_be_bytes(bytes_to_array(
+                    &data[8..12],
+                    "full_sync_start object_count",
+                )?);
+
                 Ok(ReplMessage::FullSyncStart {
                     namespace_count,
                     sst_count,
@@ -340,7 +348,9 @@ impl ReplMessage {
                 pos += ns_len;
                 let level = data[pos];
                 pos += 1;
-                let sst_id = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+                let sst_id =
+                    u64::from_be_bytes(bytes_to_array(&data[pos..pos + 8], "sst_chunk sst_id")?);
+
                 pos += 8;
                 let chunk_data = data[pos..].to_vec();
                 Ok(ReplMessage::SstChunk {
@@ -380,14 +390,17 @@ impl ReplMessage {
                 if data.len() < 8 {
                     return Err(Error::Corruption("truncated heartbeat".into()));
                 }
-                let timestamp_ms = u64::from_be_bytes(data[0..8].try_into().unwrap());
+                let timestamp_ms =
+                    u64::from_be_bytes(bytes_to_array(&data[0..8], "heartbeat timestamp_ms")?);
+
                 Ok(ReplMessage::Heartbeat { timestamp_ms })
             }
             MSG_ACK => {
                 if data.len() < 16 {
                     return Err(Error::Corruption("truncated ack".into()));
                 }
-                let last_revision = u128::from_be_bytes(data[0..16].try_into().unwrap());
+                let last_revision =
+                    u128::from_be_bytes(bytes_to_array(&data[0..16], "ack last_revision")?);
                 Ok(ReplMessage::Ack { last_revision })
             }
             MSG_FULL_SYNC_END => Ok(ReplMessage::FullSyncEnd),
@@ -421,7 +434,10 @@ impl ReplMessage {
                 if data.len() < 17 {
                     return Err(Error::Corruption("truncated sync_request".into()));
                 }
-                let last_revision = u128::from_be_bytes(data[0..16].try_into().unwrap());
+                let last_revision = u128::from_be_bytes(bytes_to_array(
+                    &data[0..16],
+                    "sync_request last_revision",
+                )?);
                 let force_full = data[16] != 0;
                 Ok(ReplMessage::SyncRequest {
                     last_revision,
@@ -432,7 +448,11 @@ impl ReplMessage {
                 if data.len() < 4 {
                     return Err(Error::Corruption("truncated incremental_sync_start".into()));
                 }
-                let record_count = u32::from_be_bytes(data[0..4].try_into().unwrap());
+                let record_count = u32::from_be_bytes(bytes_to_array(
+                    &data[0..4],
+                    "incremental_sync_start record_count",
+                )?);
+
                 Ok(ReplMessage::IncrementalSyncStart { record_count })
             }
             MSG_FLUSH_NOTIFY => Ok(ReplMessage::FlushNotify),
