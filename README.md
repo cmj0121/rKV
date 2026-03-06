@@ -8,23 +8,16 @@ and peer replication — no external dependencies, no runtime to install.
 
 ## Why rKV?
 
-|                              | rKV | Redis  | RocksDB | LMDB | SQLite | etcd   | BadgerDB |
-| ---------------------------- | --- | ------ | ------- | ---- | ------ | ------ | -------- |
-| Embedded library             | yes | no     | yes     | yes  | yes    | no     | yes      |
-| HTTP API built-in            | yes | no     | no      | no   | no     | yes    | no       |
-| Web UI built-in              | yes | no     | no      | no   | no     | no     | no       |
-| REPL built-in                | yes | yes    | no      | no   | yes    | yes    | no       |
-| Revision history per key     | yes | no     | no      | no   | manual | yes    | no       |
-| Per-namespace encryption     | yes | no     | no      | no   | ext    | no     | ext      |
-| Namespace-level sharding     | yes | manual | manual  | no   | no     | no     | no       |
-| Peer replication (LWW)       | yes | no     | no      | no   | no     | Raft   | no       |
-| Content-addressed dedup      | yes | no     | no      | no   | no     | no     | yes      |
-| Value separation (large obj) | yes | no     | BlobDB  | no   | no     | no     | yes      |
-| FFI (C/Python/Go)            | yes | client | yes     | yes  | yes    | client | CGo      |
-| Atomic batch writes          | yes | MULTI  | yes     | yes  | yes    | txn    | yes      |
-| TTL / expiry                 | yes | yes    | yes     | no   | manual | lease  | yes      |
-| Compression (LZ4/Zstd)       | yes | no     | yes     | no   | no     | no     | yes      |
-| Self-contained (no services) | yes | no     | no      | yes  | yes    | no     | no       |
+- **All-in-one binary** — REPL, HTTP API, Web UI, FFI bindings, and replication in a single executable
+- **Revision history per key** — every write produces a unique RevisionID; query full history without extra schema
+- **Per-namespace encryption** — AES-256-GCM with Argon2 key derivation; mix encrypted and plaintext namespaces
+- **Content-addressed dedup** — large values stored as BLAKE3-hashed bin objects; identical values share storage
+- **Peer replication** — multi-writer with last-writer-wins over pure TCP; no external coordination service
+- **Namespace-level sharding** — distribute namespaces across shard groups without breaking scan/rscan
+- **Pluggable I/O** — buffered, mmap (default), or direct I/O per database instance
+- **TTL / expiry** — per-key time-to-live with automatic cleanup
+- **LZ4 + Zstd compression** — bin objects and SSTable blocks compressed independently
+- **Embeddable** — use as a Rust library, C/Python/Go FFI, HTTP service, or interactive REPL
 
 ## Quick Start
 
