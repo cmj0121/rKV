@@ -10,6 +10,7 @@ mod error;
 mod io;
 mod key;
 mod memtable;
+mod merge_iter;
 pub(crate) mod metrics;
 mod namespace;
 mod objects;
