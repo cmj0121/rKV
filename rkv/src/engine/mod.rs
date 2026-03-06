@@ -10,6 +10,7 @@ mod error;
 mod io;
 mod key;
 mod memtable;
+mod merge_iter;
 pub(crate) mod metrics;
 mod namespace;
 mod objects;
@@ -2783,24 +2784,22 @@ impl DB {
         Ok(unsafe { &*ptr })
     }
 
-    /// Scan entries matching a prefix across all SSTable levels.
+    /// Build a lazy merge iterator over memtable + SSTable sources.
     ///
-    /// Merges results from oldest-to-newest so newer entries overwrite older
-    /// ones. Returns raw `(Key, Value)` pairs including tombstones.
+    /// Priority (highest wins):
+    /// - memtable snapshot: `u32::MAX`
+    /// - L0 newest: `u32::MAX - 1`, L0 next: `u32::MAX - 2`, ...
+    /// - L1: decreasing from there, L2 even lower, etc.
     ///
-    /// Merge order (oldest-to-newest, so newest wins):
-    /// - L_max, L_max-1, ..., L1 (ascending key order within each level)
-    /// - L0: reverse order (oldest reader → newest reader)
-    pub(crate) fn scan_from_sstables(
+    /// The sstables RwLock is held only during iterator construction — each
+    /// `SSTableScanIter` captures an `Arc<IoBytes>` and cloned index entries.
+    pub(crate) fn build_merge_iterator(
         &self,
         ns: &str,
         prefix: &Key,
         ordered_mode: bool,
-    ) -> Result<std::collections::BTreeMap<Key, Value>> {
-        // In ordered mode, Key::Str("").to_bytes() is [0x02, 0x00] which
-        // sits after all Int keys in byte order. An empty Str prefix means
-        // "scan everything", so switch to unordered prefix matching with
-        // empty bytes — starts_with(&[]) is always true.
+    ) -> Result<merge_iter::MergeIterator> {
+        // Compute prefix bytes
         let scan_all = ordered_mode && *prefix == Key::Str(String::new());
         let (prefix_bytes, effective_ordered) = if scan_all {
             (vec![], false)
@@ -2809,106 +2808,139 @@ impl DB {
         } else {
             (prefix.to_prefix_bytes(), false)
         };
-        let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
-        let mut merged = std::collections::BTreeMap::<Key, Value>::new();
 
-        if let Some(levels) = sst.get(ns) {
-            // Process levels from bottom (oldest) to top (newest)
-            for (level_idx, level_readers) in levels.iter().enumerate().rev() {
-                if level_idx == 0 {
-                    // L0: reverse (oldest-to-newest within L0)
-                    for reader in level_readers.iter().rev() {
-                        for (key, value, _rev, expires_at_ms) in reader.scan_entries(
-                            &prefix_bytes,
-                            effective_ordered,
-                            self.config.verify_checksums,
-                        )? {
-                            let value = if is_expired(expires_at_ms) {
-                                Value::tombstone()
-                            } else {
-                                value
-                            };
-                            merged.insert(key, value);
+        let mut sources: Vec<(Box<dyn merge_iter::MergeSource>, u32)> = Vec::new();
+
+        // 1. SSTable sources (lowest priority first)
+        {
+            let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(levels) = sst.get(ns) {
+                let mut sst_sources: Vec<Box<dyn merge_iter::MergeSource>> = Vec::new();
+
+                // Process levels from bottom (oldest) to top (newest)
+                for (level_idx, level_readers) in levels.iter().enumerate().rev() {
+                    if level_idx == 0 {
+                        // L0: oldest-to-newest (reverse of storage order)
+                        for reader in level_readers.iter().rev() {
+                            if let Some(iter) = merge_iter::SSTableScanIter::new(
+                                reader,
+                                prefix_bytes.clone(),
+                                effective_ordered,
+                                self.config.verify_checksums,
+                            )? {
+                                sst_sources.push(Box::new(iter));
+                            }
                         }
-                    }
-                } else {
-                    for reader in level_readers {
-                        for (key, value, _rev, expires_at_ms) in reader.scan_entries(
-                            &prefix_bytes,
-                            effective_ordered,
-                            self.config.verify_checksums,
-                        )? {
-                            let value = if is_expired(expires_at_ms) {
-                                Value::tombstone()
-                            } else {
-                                value
-                            };
-                            merged.insert(key, value);
+                    } else {
+                        for reader in level_readers {
+                            if let Some(iter) = merge_iter::SSTableScanIter::new(
+                                reader,
+                                prefix_bytes.clone(),
+                                effective_ordered,
+                                self.config.verify_checksums,
+                            )? {
+                                sst_sources.push(Box::new(iter));
+                            }
                         }
                     }
                 }
+
+                // Assign priorities: first source gets priority 1, last gets N
+                let n = sst_sources.len() as u32;
+                for (i, src) in sst_sources.into_iter().enumerate() {
+                    sources.push((src, i as u32 + 1));
+                }
+                // Memtable gets priority n + 1
+                let _ = n; // used implicitly via sources.len()
             }
         }
 
-        Ok(merged)
+        // 2. Memtable snapshot (highest priority)
+        let mt_entries = {
+            let mt = self.get_or_create_memtable(ns);
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            mt.scan_all_raw(prefix)
+        };
+        let memtable_priority = sources.len() as u32 + 1;
+        sources.push((
+            Box::new(merge_iter::VecSource::new(mt_entries)),
+            memtable_priority,
+        ));
+
+        Ok(merge_iter::MergeIterator::new(sources))
     }
 
-    /// Reverse-scan entries matching a prefix across all SSTable levels.
+    /// Build a lazy merge iterator for reverse scanning.
     ///
-    /// For ordered mode: returns entries with keys <= prefix. For unordered
-    /// mode: same as scan_from_sstables (prefix matching). Same merge order
-    /// as scan_from_sstables.
-    pub(crate) fn rscan_from_sstables(
+    /// Same as `build_merge_iterator` but uses `rscan_all_raw` for the
+    /// memtable snapshot and uses rscan-compatible prefix logic for SSTables.
+    pub(crate) fn build_rscan_merge_iterator(
         &self,
         ns: &str,
         prefix: &Key,
         ordered_mode: bool,
-    ) -> Result<std::collections::BTreeMap<Key, Value>> {
+    ) -> Result<merge_iter::MergeIterator> {
         let prefix_bytes = if ordered_mode {
             prefix.to_bytes()
         } else {
             prefix.to_prefix_bytes()
         };
-        let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
-        let mut merged = std::collections::BTreeMap::<Key, Value>::new();
 
-        if let Some(levels) = sst.get(ns) {
-            for (level_idx, level_readers) in levels.iter().enumerate().rev() {
-                if level_idx == 0 {
-                    for reader in level_readers.iter().rev() {
-                        for (key, value, _rev, expires_at_ms) in reader.rscan_entries(
-                            &prefix_bytes,
-                            ordered_mode,
-                            self.config.verify_checksums,
-                        )? {
-                            let value = if is_expired(expires_at_ms) {
-                                Value::tombstone()
-                            } else {
-                                value
-                            };
-                            merged.insert(key, value);
+        let mut sources: Vec<(Box<dyn merge_iter::MergeSource>, u32)> = Vec::new();
+
+        // 1. SSTable sources
+        {
+            let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(levels) = sst.get(ns) {
+                let mut sst_sources: Vec<Box<dyn merge_iter::MergeSource>> = Vec::new();
+
+                for (level_idx, level_readers) in levels.iter().enumerate().rev() {
+                    if level_idx == 0 {
+                        for reader in level_readers.iter().rev() {
+                            if let Some(iter) = merge_iter::SSTableScanIter::with_direction(
+                                reader,
+                                prefix_bytes.clone(),
+                                ordered_mode,
+                                self.config.verify_checksums,
+                                merge_iter::ScanDirection::Reverse,
+                            )? {
+                                sst_sources.push(Box::new(iter));
+                            }
+                        }
+                    } else {
+                        for reader in level_readers {
+                            if let Some(iter) = merge_iter::SSTableScanIter::with_direction(
+                                reader,
+                                prefix_bytes.clone(),
+                                ordered_mode,
+                                self.config.verify_checksums,
+                                merge_iter::ScanDirection::Reverse,
+                            )? {
+                                sst_sources.push(Box::new(iter));
+                            }
                         }
                     }
-                } else {
-                    for reader in level_readers {
-                        for (key, value, _rev, expires_at_ms) in reader.rscan_entries(
-                            &prefix_bytes,
-                            ordered_mode,
-                            self.config.verify_checksums,
-                        )? {
-                            let value = if is_expired(expires_at_ms) {
-                                Value::tombstone()
-                            } else {
-                                value
-                            };
-                            merged.insert(key, value);
-                        }
-                    }
+                }
+
+                for (i, src) in sst_sources.into_iter().enumerate() {
+                    sources.push((src, i as u32 + 1));
                 }
             }
         }
 
-        Ok(merged)
+        // 2. Memtable snapshot
+        let mt_entries = {
+            let mt = self.get_or_create_memtable(ns);
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            mt.rscan_all_raw(prefix)
+        };
+        let memtable_priority = sources.len() as u32 + 1;
+        sources.push((
+            Box::new(merge_iter::VecSource::new(mt_entries)),
+            memtable_priority,
+        ));
+
+        Ok(merge_iter::MergeIterator::new(sources))
     }
 
     /// Look up a key across all SSTable levels for a namespace.
