@@ -86,6 +86,11 @@ impl<'db> Namespace<'db> {
         Ok(value)
     }
 
+    /// Store a key-value pair, returning its revision ID.
+    ///
+    /// Write path: generate revision → AOL append → memtable insert.
+    /// If the memtable exceeds `write_stall_size`, a synchronous flush is
+    /// triggered before returning (backpressure).
     pub fn put(
         &self,
         key: impl Into<Key>,
@@ -207,6 +212,11 @@ impl<'db> Namespace<'db> {
         Ok(actual_revs)
     }
 
+    /// Retrieve the value for a key.
+    ///
+    /// Read path: memtable (3-state: Found/Tombstone/NotFound) → SSTables
+    /// (newest level first). Tombstoned or expired keys return `KeyNotFound`.
+    /// Large values stored as bin objects are resolved transparently.
     pub fn get(&self, key: impl Into<Key>) -> Result<Value> {
         let _timer = metrics::Timer::start(&self.db.metrics().op_get);
         let key = key.into();

@@ -142,7 +142,10 @@ impl SSTableWriter {
         let value_data = value_to_data(value);
         let value_tag = value.to_tag();
 
-        // Record restart point at every RESTART_INTERVAL entries
+        // Restart points enable O(log N + 16) binary search within a block.
+        // Every RESTART_INTERVAL entries, we record the byte offset of the
+        // next entry. Point lookups binary-search the restart offsets to find
+        // the right 16-entry window, then linear-scan within it.
         if self.block_entry_count.is_multiple_of(RESTART_INTERVAL) {
             self.restarts.push(self.block_buf.len() as u32);
         }
