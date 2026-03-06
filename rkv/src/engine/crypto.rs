@@ -243,6 +243,34 @@ mod tests {
     }
 
     #[test]
+    fn verification_token_correct_password() {
+        let token = create_verification_token("secret");
+        assert!(verify_token("secret", &token).is_ok());
+    }
+
+    #[test]
+    fn verification_token_wrong_password() {
+        let token = create_verification_token("correct");
+        let err = verify_token("wrong", &token).unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)));
+    }
+
+    #[test]
+    fn verification_token_truncated() {
+        let err = verify_token("pw", &[0u8; 10]).unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)));
+    }
+
+    #[test]
+    fn verification_token_corrupted() {
+        let mut token = create_verification_token("pw");
+        let last = token.len() - 1;
+        token[last] ^= 0xFF;
+        let err = verify_token("pw", &token).unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)));
+    }
+
+    #[test]
     fn salt_file_wrong_length_returns_corruption() {
         let tmp = tempfile::tempdir().unwrap();
         let crypto_dir = tmp.path().join("crypto");
