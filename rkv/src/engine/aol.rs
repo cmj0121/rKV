@@ -15,7 +15,7 @@ const VERSION: u16 = 1;
 /// File header size in bytes.
 const HEADER_SIZE: usize = 8;
 /// AOL filename within the database directory.
-const AOL_FILENAME: &str = "aol";
+pub(crate) const AOL_FILENAME: &str = "aol";
 
 /// A record decoded from the AOL during replay.
 #[derive(Debug)]
@@ -29,6 +29,7 @@ pub(crate) struct AolRecord {
 
 /// Append-only log for write-ahead durability.
 pub(crate) struct Aol {
+    path: PathBuf,
     writer: BufWriter<File>,
     buffer_size: usize,
     append_count: usize,
@@ -36,13 +37,17 @@ pub(crate) struct Aol {
 }
 
 impl Aol {
-    /// Open the AOL for appending. Creates the file and writes the header
-    /// if it does not exist; otherwise positions the writer at the end.
+    /// Open the AOL for appending at the legacy path `<db_dir>/aol`.
     ///
     /// `buffer_size` controls the flush threshold: after this many appends
     /// the writer is flushed. Set to 0 for per-record flush.
+    #[allow(dead_code)]
     pub(crate) fn open(db_dir: &Path, buffer_size: usize) -> Result<Self> {
-        let path = aol_path(db_dir);
+        Self::open_at(aol_path(db_dir), buffer_size)
+    }
+
+    /// Open the AOL for appending at an explicit file path.
+    pub(crate) fn open_at(path: PathBuf, buffer_size: usize) -> Result<Self> {
         let exists = path.exists();
 
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
@@ -54,6 +59,7 @@ impl Aol {
         }
 
         Ok(Self {
+            path,
             writer,
             buffer_size,
             append_count: 0,
@@ -157,21 +163,27 @@ impl Aol {
         Ok(())
     }
 
-    /// Replay the AOL file and return all decoded records plus a count of
-    /// skipped (corrupted/truncated) records.
-    ///
-    /// This is a static method — it reads the file independently of `Aol`.
+    /// Replay the AOL file at the legacy path `<db_dir>/aol`.
     pub(crate) fn replay(
         db_dir: &Path,
         verify: bool,
         io: &dyn super::io::IoBackend,
     ) -> Result<(Vec<AolRecord>, Vec<String>)> {
-        let path = aol_path(db_dir);
+        Self::replay_at(&aol_path(db_dir), verify, io)
+    }
+
+    /// Replay the AOL file at an explicit path and return all decoded records
+    /// plus a list of skipped (corrupted/truncated) record descriptions.
+    pub(crate) fn replay_at(
+        path: &Path,
+        verify: bool,
+        io: &dyn super::io::IoBackend,
+    ) -> Result<(Vec<AolRecord>, Vec<String>)> {
         if !path.exists() {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        let data = io.read_file(&path)?;
+        let data = io.read_file(path)?;
         if data.len() < HEADER_SIZE {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -263,13 +275,12 @@ impl Aol {
     ///
     /// Called after a successful flush — all data is now persisted in SSTables,
     /// so the AOL can be reset to prevent unbounded growth.
-    pub(crate) fn truncate(&mut self, db_dir: &Path) -> Result<()> {
+    pub(crate) fn truncate(&mut self) -> Result<()> {
         // Flush any pending writes before truncating
         self.writer.flush()?;
 
         // Re-create the AOL file from scratch
-        let path = aol_path(db_dir);
-        let file = std::fs::File::create(&path)?;
+        let file = std::fs::File::create(&self.path)?;
         let mut writer = BufWriter::new(file);
         write_header(&mut writer)?;
 
@@ -464,19 +475,51 @@ fn extract_revision(payload: &[u8]) -> Option<u128> {
     ))
 }
 
-/// Read the AOL file and return raw payloads for records whose revision exceeds
-/// `after_revision`. Returns an empty Vec if the AOL file does not exist or
-/// contains no matching records.
-///
-/// This is used by the primary to serve incremental sync — the raw payloads
-/// are sent as `AolRecord { payload }` messages to the replica.
+/// Read all per-namespace AOL files under `<db_dir>/sst/*/aol` and return raw
+/// payloads for records whose revision exceeds `after_revision`. Falls back to
+/// the legacy `<db_dir>/aol` if no per-namespace files exist.
 pub(crate) fn records_after_revision(
     db_dir: &Path,
     after_revision: u128,
     io: &dyn super::io::IoBackend,
 ) -> Vec<Vec<u8>> {
-    let path = aol_path(db_dir);
-    let data = match io.read_file(&path) {
+    let mut all_results = Vec::new();
+
+    // Scan per-namespace AOLs
+    let sst_root = db_dir.join("sst");
+    if let Ok(entries) = std::fs::read_dir(&sst_root) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let ns_aol = entry.path().join(AOL_FILENAME);
+                if ns_aol.exists() {
+                    all_results.extend(records_after_revision_from_path(
+                        &ns_aol,
+                        after_revision,
+                        io,
+                    ));
+                }
+            }
+        }
+    }
+
+    // Fall back to legacy global AOL if no per-namespace results and legacy file exists
+    if all_results.is_empty() {
+        let legacy = aol_path(db_dir);
+        if legacy.exists() {
+            return records_after_revision_from_path(&legacy, after_revision, io);
+        }
+    }
+
+    all_results
+}
+
+/// Read a single AOL file and return raw payloads for records after `after_revision`.
+fn records_after_revision_from_path(
+    path: &Path,
+    after_revision: u128,
+    io: &dyn super::io::IoBackend,
+) -> Vec<Vec<u8>> {
+    let data = match io.read_file(path) {
         Ok(d) => d,
         Err(_) => return Vec::new(),
     };
@@ -856,7 +899,7 @@ mod tests {
             aol.append("_", 2, &Key::Int(2), &Value::from("v2"), None)
                 .unwrap();
 
-            aol.truncate(tmp.path()).unwrap();
+            aol.truncate().unwrap();
         }
 
         // After truncate, replay should return zero records
@@ -877,7 +920,7 @@ mod tests {
             aol.append("_", 1, &Key::Int(1), &Value::from("old"), None)
                 .unwrap();
 
-            aol.truncate(tmp.path()).unwrap();
+            aol.truncate().unwrap();
 
             // New appends after truncate should work
             aol.append("_", 2, &Key::Int(2), &Value::from("new"), None)

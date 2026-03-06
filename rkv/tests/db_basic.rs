@@ -1092,7 +1092,7 @@ fn repair_corrupted_aol() {
     }
 
     // Corrupt the last byte of the AOL (damages the last record's checksum)
-    let aol_path = db_path.join("aol");
+    let aol_path = db_path.join("sst/_/aol");
     let mut aol_data = std::fs::read(&aol_path).unwrap();
     let last = aol_data.len() - 1;
     aol_data[last] ^= 0xFF;
@@ -2874,7 +2874,7 @@ fn flush_aol_truncated() {
 
     ns.put(1, "data", None).unwrap();
 
-    let aol_path = tmp.path().join("aol");
+    let aol_path = tmp.path().join("sst/_/aol");
     let size_before = std::fs::metadata(&aol_path).unwrap().len();
     assert!(size_before > 8); // More than just header
 
