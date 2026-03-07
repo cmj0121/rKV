@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::config_file::FileConfig;
+use crate::config_file::{self, FileConfig};
 
 #[derive(clap::Args)]
 pub struct ServerConfig {
@@ -75,52 +75,9 @@ pub struct ServerConfig {
 
 /// Parse a human-readable size string into bytes.
 ///
-/// Accepts: plain bytes (`2097152`), or suffix (`512kb`, `2mb`, `1gb`).
-/// Case-insensitive.
+/// Delegates to [`config_file::parse_size`].
 pub fn parse_body_limit(s: &str) -> Result<usize, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("body limit cannot be empty".to_string());
-    }
-
-    // Try plain integer first
-    if let Ok(n) = s.parse::<usize>() {
-        return Ok(n);
-    }
-
-    let lower = s.to_ascii_lowercase();
-    let (num_part, multiplier) = if let Some(n) = lower.strip_suffix("gb") {
-        (n, 1024 * 1024 * 1024)
-    } else if let Some(n) = lower.strip_suffix("mb") {
-        (n, 1024 * 1024)
-    } else if let Some(n) = lower.strip_suffix("kb") {
-        (n, 1024)
-    } else if let Some(n) = lower.strip_suffix('b') {
-        (n, 1)
-    } else {
-        return Err(format!("invalid body limit: {s}"));
-    };
-
-    let num_part = num_part.trim();
-
-    // Prefer exact integer arithmetic; fall back to f64 only for fractions.
-    if let Ok(n) = num_part.parse::<usize>() {
-        return Ok(n * multiplier);
-    }
-
-    let num: f64 = num_part
-        .parse()
-        .map_err(|_| format!("invalid body limit: {s}"))?;
-
-    if num < 0.0 {
-        return Err(format!("body limit cannot be negative: {s}"));
-    }
-
-    if !num.is_finite() {
-        return Err(format!("invalid body limit: {s}"));
-    }
-
-    Ok((num * multiplier as f64) as usize)
+    config_file::parse_size(s)
 }
 
 #[cfg(test)]

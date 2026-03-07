@@ -209,7 +209,7 @@ fn apply_file_config(mut config: ServerConfig) -> ServerConfig {
 
         // Replication
         let r = &fc.replication;
-        config.role = format!("{:?}", r.role).to_ascii_lowercase();
+        config.role = r.role.to_string();
         config.cluster_id = r.cluster_id;
         config.repl_port = r.repl_port;
         config.primary_addr = r.primary_addr.clone();
