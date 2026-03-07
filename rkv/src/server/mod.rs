@@ -437,6 +437,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_keys_reverse_order() {
+        let app = app();
+
+        for key in &["alpha", "beta", "gamma"] {
+            app.clone()
+                .oneshot(
+                    Request::put(format!("/api/_/keys/{key}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from("\"v\""))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Normal scan: ascending
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/api/_/keys").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = body_string(resp.into_body()).await;
+        let asc: Vec<String> = serde_json::from_str(&body).unwrap();
+        assert_eq!(asc, vec!["alpha", "beta", "gamma"]);
+
+        // Reverse scan: descending
+        let resp = app
+            .oneshot(
+                Request::get("/api/_/keys?reverse=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_string(resp.into_body()).await;
+        let desc: Vec<String> = serde_json::from_str(&body).unwrap();
+        assert_eq!(desc, vec!["gamma", "beta", "alpha"]);
+    }
+
+    #[tokio::test]
     async fn count_keys() {
         let app = app();
 
