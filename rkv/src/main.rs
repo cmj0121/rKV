@@ -1440,12 +1440,27 @@ fn run_repl(db: &mut DB, initial_ns: &str) {
     println!("~ Bye ~");
 }
 
-fn load_file_config(path: &Path) -> rkv::config_file::FileConfig {
+/// Default config file path: ~/.rkv_config.yaml
+fn default_config_path() -> PathBuf {
+    dirs_sys::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".rkv_config.yaml")
+}
+
+/// Load config file. If `explicit` is true (user specified --config), errors
+/// are fatal. If false (default path), missing files are silently ignored.
+fn load_file_config(path: &Path, explicit: bool) -> Option<rkv::config_file::FileConfig> {
+    if !explicit && !path.exists() {
+        return None;
+    }
     match rkv::config_file::load_file(path) {
-        Ok(fc) => fc,
+        Ok(fc) => Some(fc),
         Err(e) => {
-            eprintln!("failed to load config file: {e}");
-            std::process::exit(1);
+            if explicit {
+                eprintln!("failed to load config file: {e}");
+                std::process::exit(1);
+            }
+            None
         }
     }
 }
@@ -1453,8 +1468,12 @@ fn load_file_config(path: &Path) -> rkv::config_file::FileConfig {
 fn main() {
     let args = Args::parse();
 
-    // Load config file if --config is specified (global flag)
-    let file_config = args.config.as_ref().map(|p| load_file_config(p));
+    // Load config: explicit --config flag, or default ~/.rkv_config.yaml
+    let (config_path, explicit) = match args.config {
+        Some(ref p) => (p.clone(), true),
+        None => (default_config_path(), false),
+    };
+    let file_config = load_file_config(&config_path, explicit);
 
     match args.command {
         Some(Command::Init { format }) => {
