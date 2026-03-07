@@ -658,4 +658,80 @@ cluster:
         assert_eq!(fc.server.port, 8321);
         assert!(matches!(fc.replication.role, Role::Standalone));
     }
+
+    #[test]
+    fn load_file_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "storage:\n  max_levels: 7\nserver:\n  port: 1234\n").unwrap();
+        let fc = load_file(&path).unwrap();
+        assert_eq!(fc.storage.max_levels, 7);
+        assert_eq!(fc.server.port, 1234);
+    }
+
+    #[test]
+    fn load_file_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[storage]\nmax_levels = 7\n\n[server]\nport = 1234\n",
+        )
+        .unwrap();
+        let fc = load_file(&path).unwrap();
+        assert_eq!(fc.storage.max_levels, 7);
+        assert_eq!(fc.server.port, 1234);
+    }
+
+    #[test]
+    fn load_file_missing() {
+        assert!(load_file(Path::new("/nonexistent/config.yaml")).is_err());
+    }
+
+    #[test]
+    fn load_file_bad_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        assert!(load_file(&path).is_err());
+    }
+
+    #[test]
+    fn yaml_integer_size_values() {
+        let yaml = "storage:\n  write_buffer_size: 4194304\n  cache_size: 0\n";
+        let fc = parse(yaml, ConfigFormat::Yaml).unwrap();
+        assert_eq!(fc.storage.write_buffer_size, Size(4_194_304));
+        assert_eq!(fc.storage.cache_size, Size(0));
+    }
+
+    #[test]
+    fn toml_integer_size_values() {
+        let toml_str = "[storage]\nwrite_buffer_size = 4194304\ncache_size = 0\n";
+        let fc = parse(toml_str, ConfigFormat::Toml).unwrap();
+        assert_eq!(fc.storage.write_buffer_size, Size(4_194_304));
+        assert_eq!(fc.storage.cache_size, Size(0));
+    }
+
+    #[test]
+    fn partial_yaml_only_server() {
+        let yaml = "server:\n  port: 5555\n  ui: true\n";
+        let fc = parse(yaml, ConfigFormat::Yaml).unwrap();
+        assert_eq!(fc.server.port, 5555);
+        assert!(fc.server.ui);
+        // Storage should be defaults
+        assert_eq!(fc.storage.max_levels, 3);
+        assert_eq!(fc.storage.write_buffer_size, Size(4 * 1024 * 1024));
+    }
+
+    #[test]
+    fn apply_preserves_unset_defaults() {
+        let yaml = "storage:\n  max_levels: 10\n";
+        let fc = parse(yaml, ConfigFormat::Yaml).unwrap();
+        let mut config = Config::new("/tmp/test");
+        let original_block_size = config.block_size;
+        fc.apply_to_config(&mut config);
+        assert_eq!(config.max_levels, 10);
+        // block_size should still be the default since StorageSection default matches Config default
+        assert_eq!(config.block_size, original_block_size);
+    }
 }
