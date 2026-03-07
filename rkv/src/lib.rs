@@ -1,3 +1,4 @@
+pub mod config_file;
 pub mod engine;
 
 #[cfg(feature = "server")]

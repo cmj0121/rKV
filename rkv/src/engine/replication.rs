@@ -6,7 +6,7 @@ use super::checksum::Checksum;
 use super::error::{bytes_to_array, Error, Result};
 
 /// Node role in a replication topology.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Role {
     /// Standalone node — no replication (default).
     Standalone,

@@ -22,16 +22,33 @@ struct Args {
     #[arg(short, long, default_value_t = true)]
     create: bool,
 
-    #[cfg(feature = "server")]
     #[command(subcommand)]
     command: Option<Command>,
 }
 
-#[cfg(feature = "server")]
 #[derive(clap::Subcommand)]
 enum Command {
     /// Start the HTTP server
-    Serve(server::ServerConfig),
+    #[cfg(feature = "server")]
+    Serve(ServeArgs),
+
+    /// Print a template configuration file to stdout
+    Config {
+        /// Output format: yaml (default) or toml
+        #[arg(long, default_value = "yaml")]
+        format: String,
+    },
+}
+
+#[cfg(feature = "server")]
+#[derive(clap::Args)]
+struct ServeArgs {
+    /// Path to config file (.yaml, .yml, or .toml)
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    #[command(flatten)]
+    server: server::ServerConfig,
 }
 
 enum Action {
@@ -1426,10 +1443,25 @@ fn run_repl(db: &mut DB, initial_ns: &str) {
 fn main() {
     let args = Args::parse();
 
-    #[cfg(feature = "server")]
-    if let Some(Command::Serve(config)) = args.command {
-        server::run(config);
-        return;
+    match args.command {
+        Some(Command::Config { format }) => {
+            let fmt = match format.to_ascii_lowercase().as_str() {
+                "yaml" | "yml" => rkv::config_file::ConfigFormat::Yaml,
+                "toml" => rkv::config_file::ConfigFormat::Toml,
+                other => {
+                    eprintln!("unknown format: {other} (expected: yaml, toml)");
+                    std::process::exit(1);
+                }
+            };
+            print!("{}", rkv::config_file::template(fmt));
+            return;
+        }
+        #[cfg(feature = "server")]
+        Some(Command::Serve(serve_args)) => {
+            run_serve(serve_args);
+            return;
+        }
+        None => {}
     }
 
     let path = args.path.map(PathBuf::from).unwrap_or_else(|| {
@@ -1454,4 +1486,24 @@ fn main() {
     if let Err(e) = db.close() {
         eprintln!("error closing database: {e}");
     }
+}
+
+#[cfg(feature = "server")]
+fn run_serve(serve_args: ServeArgs) {
+    let mut server_config = serve_args.server;
+
+    // Load config file if specified and attach to ServerConfig
+    if let Some(ref config_path) = serve_args.config {
+        match rkv::config_file::load_file(config_path) {
+            Ok(file_config) => {
+                server_config.file_config = Some(file_config);
+            }
+            Err(e) => {
+                eprintln!("failed to load config file: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    server::run(server_config);
 }

@@ -1,7 +1,13 @@
 use std::path::PathBuf;
 
+use crate::config_file::FileConfig;
+
 #[derive(clap::Args)]
 pub struct ServerConfig {
+    /// Loaded file config (set programmatically, not a CLI arg)
+    #[arg(skip)]
+    pub file_config: Option<FileConfig>,
+
     /// Bind address
     #[arg(long, default_value = "127.0.0.1")]
     pub bind: String,

@@ -87,7 +87,7 @@ impl NamespaceState {
 ///
 /// Controls how the engine reads and writes data files. The three modes are
 /// mutually exclusive.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IoModel {
     /// Buffered I/O — relies on the OS page cache.
     None,
@@ -132,7 +132,7 @@ impl FromStr for IoModel {
 ///
 /// Controls how data blocks are compressed when flushed to SSTable files.
 /// Bin objects use their own compression setting (`compress`).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Compression {
     /// No compression — blocks are stored as-is.
     None,
@@ -718,7 +718,7 @@ impl DB {
         let compaction_notify = Arc::clone(&self.compaction_notify);
         let db_path = self.config.path.clone();
         let block_size = self.config.block_size;
-        let compression = self.config.compression.clone();
+        let compression = self.config.compression;
         let bloom_bits = self.config.bloom_bits;
         let bloom_prefix_len = self.config.bloom_prefix_len;
 
@@ -755,7 +755,7 @@ impl DB {
                 let mut writer = sstable::SSTableWriter::new(
                     &sst_path,
                     block_size,
-                    compression.clone(),
+                    compression,
                     bloom_bits,
                     bloom_prefix_len,
                     &*io_backend,
@@ -1794,7 +1794,7 @@ impl DB {
             let mut writer = sstable::SSTableWriter::new(
                 &sst_path,
                 self.config.block_size,
-                self.config.compression.clone(),
+                self.config.compression,
                 self.config.bloom_bits,
                 self.config.bloom_prefix_len,
                 &*self.io_backend,
@@ -2642,7 +2642,7 @@ impl DB {
         let mut writer = sstable::SSTableWriter::new(
             &output_path,
             config.block_size,
-            config.compression.clone(),
+            config.compression,
             config.bloom_bits,
             config.bloom_prefix_len,
             &**io,
