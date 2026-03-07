@@ -375,6 +375,8 @@ fn scan_ordering_invariant_with_flush() {
     let db = open_db(&db_path);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(duration);
     let mut op_count = 0u64;
+    // Oracle tracks live keys (true = live, entry removed on delete)
+    let mut oracle: BTreeMap<String, ()> = BTreeMap::new();
 
     while std::time::Instant::now() < deadline {
         let op = rng.u32(0..100);
@@ -389,12 +391,14 @@ fn scan_ordering_invariant_with_flush() {
                 rng.fill(&mut val);
                 let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
                 ns.put(key.as_str(), val.as_slice(), None).unwrap();
+                oracle.insert(key, ());
             }
             // delete (15%)
             45..60 => {
                 let key = format!("sk{:04}", rng.u32(0..200));
                 let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
                 let _ = ns.delete(key.as_str());
+                oracle.remove(&key);
             }
             // flush (10%)
             60..70 => {
@@ -405,10 +409,14 @@ fn scan_ordering_invariant_with_flush() {
                 db.compact().unwrap();
                 db.wait_for_compaction();
             }
-            // verify scan ordering invariants (25%)
+            // verify scan correctness against oracle (25%)
             _ => {
                 let prefix = format!("sk{:01}", rng.u32(0..10));
                 let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+                // Oracle: expected live keys with this prefix, sorted
+                let oracle_keys: Vec<&String> =
+                    oracle.keys().filter(|k| k.starts_with(&prefix)).collect();
 
                 // Forward scan
                 let db_keys: Vec<String> = ns
@@ -418,22 +426,18 @@ fn scan_ordering_invariant_with_flush() {
                     .map(|k| k.to_string())
                     .collect();
 
-                // INVARIANT 1: scan always returns keys in sorted order
-                for window in db_keys.windows(2) {
-                    assert!(
-                        window[0] <= window[1],
-                        "op#{op_count} scan not sorted: {:?} > {:?}",
-                        window[0],
-                        window[1]
-                    );
-                }
+                assert_eq!(
+                    db_keys.len(),
+                    oracle_keys.len(),
+                    "op#{op_count} scan(prefix={prefix}): count mismatch db={} oracle={}",
+                    db_keys.len(),
+                    oracle_keys.len()
+                );
 
-                // INVARIANT 2: no duplicate keys in scan results
-                for window in db_keys.windows(2) {
-                    assert!(
-                        window[0] != window[1],
-                        "op#{op_count} scan has duplicate: {:?}",
-                        window[0]
+                for (db_k, oracle_k) in db_keys.iter().zip(oracle_keys.iter()) {
+                    assert_eq!(
+                        db_k, *oracle_k,
+                        "op#{op_count} scan(prefix={prefix}): key mismatch"
                     );
                 }
 
@@ -445,22 +449,24 @@ fn scan_ordering_invariant_with_flush() {
                     .map(|k| k.to_string())
                     .collect();
 
-                // INVARIANT 3: rscan always returns keys in reverse sorted order
-                for window in rdb_keys.windows(2) {
-                    assert!(
-                        window[0] >= window[1],
-                        "op#{op_count} rscan not reverse-sorted: {:?} < {:?}",
-                        window[0],
-                        window[1]
-                    );
-                }
+                let oracle_rkeys: Vec<&String> = oracle
+                    .keys()
+                    .rev()
+                    .filter(|k| k.starts_with(&prefix))
+                    .collect();
 
-                // INVARIANT 4: no duplicate keys in rscan results
-                for window in rdb_keys.windows(2) {
-                    assert!(
-                        window[0] != window[1],
-                        "op#{op_count} rscan has duplicate: {:?}",
-                        window[0]
+                assert_eq!(
+                    rdb_keys.len(),
+                    oracle_rkeys.len(),
+                    "op#{op_count} rscan(prefix={prefix}): count mismatch db={} oracle={}",
+                    rdb_keys.len(),
+                    oracle_rkeys.len()
+                );
+
+                for (db_k, oracle_k) in rdb_keys.iter().zip(oracle_rkeys.iter()) {
+                    assert_eq!(
+                        db_k, *oracle_k,
+                        "op#{op_count} rscan(prefix={prefix}): key mismatch"
                     );
                 }
             }
