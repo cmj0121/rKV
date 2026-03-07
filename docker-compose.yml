@@ -33,264 +33,136 @@
 #     4. If not    -> return 307 MOVED + X-RKV-Shard header
 #     5. Client retries on the correct shard node
 
+x-common: &common
+  build: .
+  platform: linux/amd64
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
+    interval: 10s
+    timeout: 3s
+    retries: 3
+    start_period: 5s
+
 services:
   # --- Default mode (docker compose up): 1 primary + 2 replicas ---
   primary:
-    build: .
-    platform: linux/amd64
+    <<: *common
     ports:
       - "8321:8321"
     volumes:
       - .data/primary:/data
-    command:
-      [
-        "serve",
-        "--bind",
-        "0.0.0.0",
-        "--db",
-        "/data",
-        "--allow-all",
-        "--ui",
-        "--role",
-        "primary",
-        "--repl-port",
-        "8322",
-        "--cluster-id",
-        "1",
-      ]
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 5s
+    environment:
+      RKV_SERVER_UI: "true"
+      RKV_REPLICATION_ROLE: primary
+      RKV_REPLICATION_REPL_PORT: "8322"
+      RKV_REPLICATION_CLUSTER_ID: "1"
 
   replica-01:
-    build: .
-    platform: linux/amd64
+    <<: *common
     ports:
       - "8324:8321"
     volumes:
       - .data/replica-01:/data
-    command:
-      [
-        "serve",
-        "--bind",
-        "0.0.0.0",
-        "--db",
-        "/data",
-        "--allow-all",
-        "--ui",
-        "--role",
-        "replica",
-        "--cluster-id",
-        "2",
-        "--primary-addr",
-        "primary:8322",
-      ]
+    environment:
+      RKV_SERVER_UI: "true"
+      RKV_REPLICATION_ROLE: replica
+      RKV_REPLICATION_CLUSTER_ID: "2"
+      RKV_REPLICATION_PRIMARY_ADDR: primary:8322
     depends_on:
       primary:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 5s
 
   replica-02:
-    build: .
-    platform: linux/amd64
+    <<: *common
     ports:
       - "8325:8321"
     volumes:
       - .data/replica-02:/data
-    command:
-      [
-        "serve",
-        "--bind",
-        "0.0.0.0",
-        "--db",
-        "/data",
-        "--allow-all",
-        "--ui",
-        "--role",
-        "replica",
-        "--cluster-id",
-        "3",
-        "--primary-addr",
-        "primary:8322",
-      ]
+    environment:
+      RKV_SERVER_UI: "true"
+      RKV_REPLICATION_ROLE: replica
+      RKV_REPLICATION_CLUSTER_ID: "3"
+      RKV_REPLICATION_PRIMARY_ADDR: primary:8322
     depends_on:
       primary:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 5s
 
   # --- Cluster mode (docker compose --profile cluster up) ---
   # Adds 2 shard groups alongside the primary/replicas.
   # Primary serves as the default shard (all unassigned namespaces).
   # Shard groups own specific namespaces and reject others with 307 MOVED.
   shard1-a:
+    <<: *common
     profiles: ["cluster"]
-    build: .
-    platform: linux/amd64
     ports:
       - "8331:8321"
     volumes:
       - .data/shard1-a:/data
-    command:
-      [
-        "serve",
-        "--bind",
-        "0.0.0.0",
-        "--db",
-        "/data",
-        "--allow-all",
-        "--ui",
-        "--role",
-        "peer",
-        "--repl-port",
-        "8322",
-        "--cluster-id",
-        "10",
-        "--peers",
-        "shard1-b:8322",
-        "--shard-group",
-        "1",
-        "--owned-namespaces",
-        "users,sessions",
-      ]
+    environment:
+      RKV_SERVER_UI: "true"
+      RKV_REPLICATION_ROLE: peer
+      RKV_REPLICATION_REPL_PORT: "8322"
+      RKV_REPLICATION_CLUSTER_ID: "10"
+      RKV_REPLICATION_PEERS: shard1-b:8322
+      RKV_CLUSTER_SHARD_GROUP: "1"
+      RKV_CLUSTER_OWNED_NAMESPACES: users,sessions
     depends_on:
       primary:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 5s
 
   shard1-b:
+    <<: *common
     profiles: ["cluster"]
-    build: .
-    platform: linux/amd64
     ports:
       - "8332:8321"
     volumes:
       - .data/shard1-b:/data
-    command:
-      [
-        "serve",
-        "--bind",
-        "0.0.0.0",
-        "--db",
-        "/data",
-        "--allow-all",
-        "--ui",
-        "--role",
-        "peer",
-        "--repl-port",
-        "8322",
-        "--cluster-id",
-        "11",
-        "--peers",
-        "shard1-a:8322",
-        "--shard-group",
-        "1",
-        "--owned-namespaces",
-        "users,sessions",
-      ]
+    environment:
+      RKV_SERVER_UI: "true"
+      RKV_REPLICATION_ROLE: peer
+      RKV_REPLICATION_REPL_PORT: "8322"
+      RKV_REPLICATION_CLUSTER_ID: "11"
+      RKV_REPLICATION_PEERS: shard1-a:8322
+      RKV_CLUSTER_SHARD_GROUP: "1"
+      RKV_CLUSTER_OWNED_NAMESPACES: users,sessions
     depends_on:
       primary:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 5s
 
   shard2-a:
+    <<: *common
     profiles: ["cluster"]
-    build: .
-    platform: linux/amd64
     ports:
       - "8333:8321"
     volumes:
       - .data/shard2-a:/data
-    command:
-      [
-        "serve",
-        "--bind",
-        "0.0.0.0",
-        "--db",
-        "/data",
-        "--allow-all",
-        "--ui",
-        "--role",
-        "peer",
-        "--repl-port",
-        "8322",
-        "--cluster-id",
-        "20",
-        "--peers",
-        "shard2-b:8322",
-        "--shard-group",
-        "2",
-        "--owned-namespaces",
-        "orders,products",
-      ]
+    environment:
+      RKV_SERVER_UI: "true"
+      RKV_REPLICATION_ROLE: peer
+      RKV_REPLICATION_REPL_PORT: "8322"
+      RKV_REPLICATION_CLUSTER_ID: "20"
+      RKV_REPLICATION_PEERS: shard2-b:8322
+      RKV_CLUSTER_SHARD_GROUP: "2"
+      RKV_CLUSTER_OWNED_NAMESPACES: orders,products
     depends_on:
       primary:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 5s
 
   shard2-b:
+    <<: *common
     profiles: ["cluster"]
-    build: .
-    platform: linux/amd64
     ports:
       - "8334:8321"
     volumes:
       - .data/shard2-b:/data
-    command:
-      [
-        "serve",
-        "--bind",
-        "0.0.0.0",
-        "--db",
-        "/data",
-        "--allow-all",
-        "--ui",
-        "--role",
-        "peer",
-        "--repl-port",
-        "8322",
-        "--cluster-id",
-        "21",
-        "--peers",
-        "shard2-a:8322",
-        "--shard-group",
-        "2",
-        "--owned-namespaces",
-        "orders,products",
-      ]
+    environment:
+      RKV_SERVER_UI: "true"
+      RKV_REPLICATION_ROLE: peer
+      RKV_REPLICATION_REPL_PORT: "8322"
+      RKV_REPLICATION_CLUSTER_ID: "21"
+      RKV_REPLICATION_PEERS: shard2-a:8322
+      RKV_CLUSTER_SHARD_GROUP: "2"
+      RKV_CLUSTER_OWNED_NAMESPACES: orders,products
     depends_on:
       primary:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8321/health"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 5s

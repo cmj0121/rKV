@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Parser;
@@ -11,6 +11,10 @@ use rkv::server;
 #[derive(Parser)]
 #[command(name = "rkv", about = "rKV — revisioned key-value store")]
 struct Args {
+    /// Path to config file (.yaml, .yml, or .toml)
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
     /// Database directory path
     path: Option<String>,
 
@@ -22,16 +26,29 @@ struct Args {
     #[arg(short, long, default_value_t = true)]
     create: bool,
 
-    #[cfg(feature = "server")]
     #[command(subcommand)]
     command: Option<Command>,
 }
 
-#[cfg(feature = "server")]
 #[derive(clap::Subcommand)]
 enum Command {
     /// Start the HTTP server
-    Serve(server::ServerConfig),
+    #[cfg(feature = "server")]
+    Serve(Box<ServeArgs>),
+
+    /// Print a template configuration file to stdout
+    Init {
+        /// Output format: yaml (default) or toml
+        #[arg(long, default_value = "yaml")]
+        format: String,
+    },
+}
+
+#[cfg(feature = "server")]
+#[derive(clap::Args)]
+struct ServeArgs {
+    #[command(flatten)]
+    server: server::ServerConfig,
 }
 
 enum Action {
@@ -1423,22 +1440,89 @@ fn run_repl(db: &mut DB, initial_ns: &str) {
     println!("~ Bye ~");
 }
 
+/// Default config file path: ~/.rkv_config.yaml
+fn default_config_path() -> PathBuf {
+    dirs_sys::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".rkv_config.yaml")
+}
+
+/// Load config file. If `explicit` is true (user specified --config), errors
+/// are fatal. If false (default path), missing files are silently ignored.
+fn load_file_config(path: &Path, explicit: bool) -> Option<rkv::config_file::FileConfig> {
+    match rkv::config_file::load_file(path) {
+        Ok(fc) => Some(fc),
+        Err(e) => {
+            if explicit {
+                eprintln!("failed to load config file: {e}");
+                std::process::exit(1);
+            }
+            None
+        }
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
-    #[cfg(feature = "server")]
-    if let Some(Command::Serve(config)) = args.command {
-        server::run(config);
+    // Handle init subcommand early (no config loading needed)
+    if let Some(Command::Init { format }) = &args.command {
+        let fmt = match format.to_ascii_lowercase().as_str() {
+            "yaml" | "yml" => rkv::config_file::ConfigFormat::Yaml,
+            "toml" => rkv::config_file::ConfigFormat::Toml,
+            other => {
+                eprintln!("unknown format: {other} (expected: yaml, toml)");
+                std::process::exit(1);
+            }
+        };
+        print!("{}", rkv::config_file::template(fmt));
         return;
     }
 
-    let path = args.path.map(PathBuf::from).unwrap_or_else(|| {
+    // Load config: explicit --config flag, or default ~/.rkv_config.yaml
+    let (config_path, explicit) = match args.config {
+        Some(ref p) => (p.clone(), true),
+        None => (default_config_path(), false),
+    };
+    let file_config = {
+        let mut fc = load_file_config(&config_path, explicit).unwrap_or_default();
+        fc.apply_env_overrides();
+        fc
+    };
+
+    match args.command {
+        Some(Command::Init { .. }) => unreachable!(),
+        #[cfg(feature = "server")]
+        Some(Command::Serve(serve_args)) => {
+            run_serve(*serve_args, file_config);
+            return;
+        }
+        None => {}
+    }
+
+    let default_path = || {
         dirs_sys::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".rkv")
-    });
+    };
+
+    let cli_path = args.path.map(PathBuf::from);
+
+    // Resolve DB path: CLI arg > env/config file > default
+    let path = if let Some(ref p) = cli_path {
+        p.clone()
+    } else {
+        file_config
+            .storage
+            .path
+            .clone()
+            .unwrap_or_else(&default_path)
+    };
 
     let mut config = Config::new(&path);
+    file_config.apply_to_config(&mut config);
+    // Ensure path is from the resolution above, not apply_to_config
+    config.path = path;
     config.create_if_missing = args.create;
 
     let mut db = match DB::open(config) {
@@ -1454,4 +1538,11 @@ fn main() {
     if let Err(e) = db.close() {
         eprintln!("error closing database: {e}");
     }
+}
+
+#[cfg(feature = "server")]
+fn run_serve(serve_args: ServeArgs, file_config: rkv::config_file::FileConfig) {
+    let mut server_config = serve_args.server;
+    server_config.file_config = Some(file_config);
+    server::run(server_config);
 }

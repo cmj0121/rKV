@@ -60,12 +60,24 @@ pub fn run(config: ServerConfig) {
 
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async move {
-        let path = config.db.unwrap_or_else(default_db_path);
+        // Apply file config as base layer, then CLI args on top
+        let config = apply_file_config(config);
 
+        let path = config.db.clone().unwrap_or_else(default_db_path);
         let mut db_config = Config::new(&path);
+
+        // If file config has storage settings, apply them first
+        if let Some(ref fc) = config.file_config {
+            fc.apply_to_config(&mut db_config);
+            // CLI --db overrides file config path
+            if config.db.is_some() {
+                db_config.path = path.clone();
+            }
+        }
+
         db_config.create_if_missing = config.create;
 
-        // Replication config
+        // Replication config (CLI values, which may have been set from file config)
         match config.role.parse::<crate::Role>() {
             Ok(role) => db_config.role = role,
             Err(e) => {
@@ -176,6 +188,45 @@ fn default_db_path() -> PathBuf {
     dirs_sys::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".rkv")
+}
+
+/// Apply file config values to ServerConfig fields as defaults.
+/// CLI args set via clap will override these when they differ from defaults,
+/// but since clap doesn't distinguish "user-specified" from "default", the
+/// file config acts as the base layer for all server settings.
+fn apply_file_config(mut config: ServerConfig) -> ServerConfig {
+    if let Some(ref fc) = config.file_config {
+        let s = &fc.server;
+        config.bind = s.bind.clone();
+        config.port = s.port;
+        config.body_limit = s.body_limit.0;
+        config.timeout = s.timeout;
+        config.ui = s.ui;
+        if !s.allow_ips.is_empty() {
+            config.allow_ip = s.allow_ips.clone();
+        }
+        config.allow_all = s.allow_all;
+
+        // Replication
+        let r = &fc.replication;
+        config.role = r.role.to_string();
+        config.cluster_id = r.cluster_id;
+        config.repl_port = r.repl_port;
+        config.primary_addr = r.primary_addr.clone();
+        config.peers = r.peers.clone();
+
+        // Cluster
+        config.shard_group = Some(fc.cluster.shard_group);
+        config.owned_namespaces = fc.cluster.owned_namespaces.clone();
+
+        // DB path from file config (if not overridden by --db)
+        if config.db.is_none() {
+            if let Some(ref p) = fc.storage.path {
+                config.db = Some(p.clone());
+            }
+        }
+    }
+    config
 }
 
 async fn shutdown_signal() {

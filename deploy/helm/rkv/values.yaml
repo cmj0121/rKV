@@ -36,7 +36,7 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
-# rKV server flags (mapped 1:1 to `rkv serve` CLI args)
+# rKV server settings (injected as RKV_* environment variables)
 server:
   bind: "0.0.0.0"
   port: 8321
@@ -44,3 +44,13 @@ server:
   bodyLimit: "2mb"
   timeout: 30
   ui: false
+
+# Additional RKV_* env vars for storage, replication, cluster tuning.
+# See docs/config.md for the full reference.
+# Example:
+#   extraEnv:
+#     - name: RKV_STORAGE_CACHE_SIZE
+#       value: "64mb"
+#     - name: RKV_REPLICATION_ROLE
+#       value: primary
+extraEnv: []

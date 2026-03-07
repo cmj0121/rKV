@@ -28,21 +28,25 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - serve
-            - --bind
-            - {{ .Values.server.bind | quote }}
-            - --port
-            - {{ .Values.server.port | quote }}
+          env:
+            - name: RKV_SERVER_BIND
+              value: {{ .Values.server.bind | quote }}
+            - name: RKV_SERVER_PORT
+              value: {{ .Values.server.port | quote }}
+            - name: RKV_SERVER_BODY_LIMIT
+              value: {{ .Values.server.bodyLimit | quote }}
+            - name: RKV_SERVER_TIMEOUT
+              value: {{ .Values.server.timeout | quote }}
             {{- if .Values.server.allowAll }}
-            - --allow-all
+            - name: RKV_SERVER_ALLOW_ALL
+              value: "true"
             {{- end }}
-            - --body-limit
-            - {{ .Values.server.bodyLimit | quote }}
-            - --timeout
-            - {{ .Values.server.timeout | quote }}
-            - --db
-            - /data
             {{- if .Values.server.ui }}
-            - --ui
+            - name: RKV_SERVER_UI
+              value: "true"
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
             {{- end }}
           ports:
             - name: http

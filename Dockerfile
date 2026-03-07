@@ -43,5 +43,9 @@ COPY --from=builder /rkv /usr/local/bin/rkv
 EXPOSE 8321 8322
 VOLUME /data
 
+ENV RKV_STORAGE_PATH=/data \
+    RKV_SERVER_BIND=0.0.0.0 \
+    RKV_SERVER_ALLOW_ALL=true
+
 ENTRYPOINT ["rkv"]
-CMD ["serve", "--bind", "0.0.0.0", "--db", "/data", "--allow-all"]
+CMD ["serve"]
