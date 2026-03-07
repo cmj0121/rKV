@@ -366,14 +366,17 @@ impl MergeIterator {
         let mut best_value = winner.value;
         let mut best_priority = winner.priority;
 
-        // Drain all items with the same key (they're at the top due to ordering)
+        // Drain all items with the same key (they're at the top due to ordering).
+        // Use >= so that for same-priority entries from the same source
+        // (multiple revisions per key in one SSTable), the LAST entry
+        // (newest revision) wins.
         while let Some(top) = self.heap.peek() {
             if top.key != best_key {
                 break;
             }
             let dup = self.heap.pop().unwrap();
             self.refill(dup.source_idx)?;
-            if dup.priority > best_priority {
+            if dup.priority >= best_priority {
                 best_key = dup.key;
                 best_value = dup.value;
                 best_priority = dup.priority;
@@ -576,6 +579,34 @@ mod tests {
 
         let (k4, _) = iter.next().unwrap().unwrap();
         assert_eq!(k4, Key::Int(4));
+
+        assert!(iter.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn merge_same_priority_keeps_newest_revision() {
+        // Simulates an SSTable with multiple revisions per key (produced by
+        // compaction with drop_tombstones=false). The source emits entries in
+        // revision order: oldest first, newest last. The merge iterator must
+        // keep the LAST entry (newest revision), not the first.
+        let sst = VecSource::new(vec![
+            (Key::Int(1), Value::from("old_value")), // rev1 (oldest)
+            (Key::Int(1), Value::tombstone()),       // rev2 (newest — delete)
+            (Key::Int(2), Value::tombstone()),       // rev1 (oldest — delete)
+            (Key::Int(2), Value::from("new_value")), // rev2 (newest — re-insert)
+        ]);
+
+        let mut iter = MergeIterator::new(vec![(Box::new(sst), 5)]);
+
+        // Key 1: tombstone (rev2) must win over old_value (rev1)
+        let (k1, v1) = iter.next().unwrap().unwrap();
+        assert_eq!(k1, Key::Int(1));
+        assert!(v1.is_tombstone(), "newest revision (tombstone) should win");
+
+        // Key 2: new_value (rev2) must win over tombstone (rev1)
+        let (k2, v2) = iter.next().unwrap().unwrap();
+        assert_eq!(k2, Key::Int(2));
+        assert_eq!(v2, Value::from("new_value"), "newest revision should win");
 
         assert!(iter.next().unwrap().is_none());
     }
