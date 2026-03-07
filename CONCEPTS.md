@@ -759,6 +759,8 @@ See the [README](README.md#http-server) for startup examples and curl recipes.
 
 ## Further Reading
 
+- **[Configuration](docs/config.md)** — config file (YAML/TOML), environment variable
+  overrides (`RKV_*`), CLI flags, and precedence rules.
 - **[Storage Engine](docs/storage.md)** — maintenance operations (flush, sync, compaction),
   data integrity (checksums, recovery), and LSM-tree internals (SSTables, bloom filters,
   MemTable, AOL).
