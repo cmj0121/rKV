@@ -140,6 +140,7 @@ var state = {
   offset: 0,
   prefix: "",
   showDeleted: false,
+  reverse: false,
   role: "standalone",
 };
 var renderGen = 0;
@@ -247,6 +248,24 @@ function renderKeys(app) {
     ]),
   );
 
+  var sortBtn = el("button", {
+    className: "btn-sort",
+    textContent: state.reverse ? "Z→A" : "A→Z",
+    title: state.reverse
+      ? "Sorted descending (rscan)"
+      : "Sorted ascending (scan)",
+    onClick: function () {
+      state.reverse = !state.reverse;
+      state.offset = 0;
+      sortBtn.textContent = state.reverse ? "Z→A" : "A→Z";
+      sortBtn.title = state.reverse
+        ? "Sorted descending (rscan)"
+        : "Sorted ascending (scan)";
+      loadKeys();
+    },
+  });
+  toolbar.appendChild(sortBtn);
+
   var newKeyBtn = el("button", {
     className: "btn-blue",
     textContent: "+ New Key",
@@ -299,6 +318,7 @@ function loadKeys() {
   var qs = "?offset=" + state.offset;
   if (state.prefix) qs += "&prefix=" + encodeURIComponent(state.prefix);
   if (state.showDeleted) qs += "&deleted=true";
+  if (state.reverse) qs += "&reverse=true";
   api("GET", "/api/" + encodeURIComponent(state.ns) + "/keys" + qs)
     .then(function (r) {
       state.keys = r.data || [];
