@@ -919,16 +919,24 @@ cluster:
     /// Serialize env-var tests so they don't interfere with each other.
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Helper to set env vars, run a closure, and clean up.
+    /// RAII guard that removes env vars on drop (even on panic).
+    struct EnvGuard(Vec<String>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for k in &self.0 {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
+    /// Helper to set env vars, run a closure, and clean up (panic-safe).
     fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
         let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard(vars.iter().map(|(k, _)| k.to_string()).collect());
         for (k, v) in vars {
             std::env::set_var(k, v);
         }
         f();
-        for (k, _) in vars {
-            std::env::remove_var(k);
-        }
     }
 
     #[test]
