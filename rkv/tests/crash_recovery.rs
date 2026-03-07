@@ -17,8 +17,9 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Barrier};
+use std::time::Duration;
 
-use rkv::{Config, Key, DB, DEFAULT_NAMESPACE};
+use rkv::{Config, Key, WriteBatch, DB, DEFAULT_NAMESPACE};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -722,6 +723,267 @@ fn concurrent_writes_with_flush() {
                 assert_eq!(val.as_bytes().unwrap(), format!("v{i}").as_bytes());
             }
         }
+        db.close().unwrap();
+    }
+}
+
+// =========================================================================
+// 5. WriteBatch crash recovery
+// =========================================================================
+
+#[test]
+fn write_batch_crash_recovery() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("batch_crash");
+
+    {
+        let db = open_db(&db_path);
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        // Batch 1: 50 puts
+        let mut batch = WriteBatch::new();
+        for i in 0..50 {
+            batch = batch.put(
+                Key::from(format!("batch{i:03}").as_str()),
+                format!("bv{i}"),
+                None,
+            );
+        }
+        ns.write_batch(batch).unwrap();
+
+        // Batch 2: mixed puts and deletes
+        let mut batch2 = WriteBatch::new();
+        for i in 50..80 {
+            batch2 = batch2.put(
+                Key::from(format!("batch{i:03}").as_str()),
+                format!("bv{i}"),
+                None,
+            );
+        }
+        // Delete first 10 from batch 1
+        for i in 0..10 {
+            batch2 = batch2.delete(Key::from(format!("batch{i:03}").as_str()));
+        }
+        ns.write_batch(batch2).unwrap();
+
+        drop(db); // crash
+    }
+
+    {
+        let db = reopen_db(&db_path);
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        // Keys 0–9 should be deleted
+        for i in 0..10 {
+            assert!(
+                ns.get(format!("batch{i:03}")).is_err(),
+                "batch{i:03} should be deleted"
+            );
+        }
+
+        // Keys 10–79 should be alive
+        for i in 10..80 {
+            let val = ns.get(format!("batch{i:03}")).unwrap();
+            assert_eq!(val.as_bytes().unwrap(), format!("bv{i}").as_bytes());
+        }
+
+        assert_eq!(ns.count().unwrap(), 70);
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn write_batch_after_flush_crash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("batch_flush_crash");
+
+    {
+        let db = open_db(&db_path);
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        // Regular puts, then flush
+        for i in 0..20 {
+            ns.put(format!("pre{i:02}"), "old", None).unwrap();
+        }
+        db.flush().unwrap();
+
+        // Batch overwrites some flushed keys + adds new ones
+        let mut batch = WriteBatch::new();
+        for i in 0..10 {
+            batch = batch.put(Key::from(format!("pre{i:02}").as_str()), "batch_new", None);
+        }
+        for i in 0..15 {
+            batch = batch.put(
+                Key::from(format!("post{i:02}").as_str()),
+                "batch_post",
+                None,
+            );
+        }
+        ns.write_batch(batch).unwrap();
+
+        drop(db); // crash
+    }
+
+    {
+        let db = reopen_db(&db_path);
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        // pre00–pre09 should have "batch_new"
+        for i in 0..10 {
+            let val = ns.get(format!("pre{i:02}")).unwrap();
+            assert_eq!(val.as_bytes().unwrap(), b"batch_new");
+        }
+        // pre10–pre19 should still have "old"
+        for i in 10..20 {
+            let val = ns.get(format!("pre{i:02}")).unwrap();
+            assert_eq!(val.as_bytes().unwrap(), b"old");
+        }
+        // post00–post14 should have "batch_post"
+        for i in 0..15 {
+            let val = ns.get(format!("post{i:02}")).unwrap();
+            assert_eq!(val.as_bytes().unwrap(), b"batch_post");
+        }
+
+        assert_eq!(ns.count().unwrap(), 35);
+        db.close().unwrap();
+    }
+}
+
+// =========================================================================
+// 6. TTL across restart
+// =========================================================================
+
+#[test]
+fn ttl_survives_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("ttl_restart");
+
+    {
+        let db = open_db(&db_path);
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        // Key with long TTL (should survive restart)
+        ns.put("long_ttl", "alive", Some(Duration::from_secs(3600)))
+            .unwrap();
+
+        // Key with no TTL
+        ns.put("no_ttl", "permanent", None).unwrap();
+
+        drop(db); // crash
+    }
+
+    {
+        let db = reopen_db(&db_path);
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        // Long TTL key should still be alive
+        let val = ns.get("long_ttl").unwrap();
+        assert_eq!(val.as_bytes().unwrap(), b"alive");
+
+        // No-TTL key should be permanent
+        let val = ns.get("no_ttl").unwrap();
+        assert_eq!(val.as_bytes().unwrap(), b"permanent");
+
+        // TTL should still be set (>0 seconds remaining)
+        let ttl = ns.ttl("long_ttl").unwrap();
+        assert!(
+            ttl.is_some(),
+            "long_ttl should still have TTL after restart"
+        );
+        let remaining = ttl.unwrap();
+        assert!(
+            remaining.as_secs() > 3500,
+            "TTL should be ~3600s, got {}s",
+            remaining.as_secs()
+        );
+
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn expired_ttl_after_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("ttl_expired");
+
+    {
+        let db = open_db(&db_path);
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        // Key with very short TTL
+        ns.put("short", "will_expire", Some(Duration::from_millis(50)))
+            .unwrap();
+
+        // Key with no TTL for comparison
+        ns.put("keeper", "stays", None).unwrap();
+
+        // Wait for TTL to expire
+        std::thread::sleep(Duration::from_millis(100));
+
+        drop(db); // crash
+    }
+
+    {
+        let db = reopen_db(&db_path);
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        // Expired key should not be found (AOL replay filters expired entries)
+        assert!(
+            ns.get("short").is_err(),
+            "expired key should not be found after restart"
+        );
+
+        // Non-TTL key should still be there
+        let val = ns.get("keeper").unwrap();
+        assert_eq!(val.as_bytes().unwrap(), b"stays");
+
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn ttl_after_flush_and_crash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("ttl_flush_crash");
+
+    {
+        let db = open_db(&db_path);
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        // Flush TTL key to SSTable
+        ns.put("flushed_ttl", "value", Some(Duration::from_secs(3600)))
+            .unwrap();
+        ns.put("flushed_no_ttl", "permanent", None).unwrap();
+        db.flush().unwrap();
+
+        // Add more in AOL only
+        ns.put("aol_ttl", "aol_val", Some(Duration::from_secs(3600)))
+            .unwrap();
+
+        drop(db); // crash
+    }
+
+    {
+        let db = reopen_db(&db_path);
+        let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+        // Both flushed and AOL keys should be present
+        let val = ns.get("flushed_ttl").unwrap();
+        assert_eq!(val.as_bytes().unwrap(), b"value");
+
+        let val = ns.get("flushed_no_ttl").unwrap();
+        assert_eq!(val.as_bytes().unwrap(), b"permanent");
+
+        let val = ns.get("aol_ttl").unwrap();
+        assert_eq!(val.as_bytes().unwrap(), b"aol_val");
+
+        // TTL preserved for AOL-recovered key (in memtable)
+        let ttl2 = ns.ttl("aol_ttl").unwrap();
+        assert!(ttl2.is_some());
+        // Note: ttl() only checks memtable, so flushed keys' TTL
+        // is not queryable via this API (SSTable stores it internally
+        // and uses it for expiry filtering, but doesn't expose it).
+
         db.close().unwrap();
     }
 }
