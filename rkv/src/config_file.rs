@@ -164,7 +164,7 @@ fn deserialize_role<'de, D: Deserializer<'de>>(d: D) -> Result<Role, D::Error> {
 // FileConfig — the top-level config file structure
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
     #[serde(default)]
@@ -380,6 +380,187 @@ impl FileConfig {
         // Cluster
         config.shard_group = self.cluster.shard_group;
         config.owned_namespaces = self.cluster.owned_namespaces.clone();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Environment variable overrides
+// ---------------------------------------------------------------------------
+
+/// Read an env var, returning `None` if unset or empty.
+fn env_opt(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|s| !s.is_empty())
+}
+
+impl FileConfig {
+    /// Override fields from `RKV_*` environment variables.
+    ///
+    /// Env vars use the format `RKV_<SECTION>_<FIELD>` in uppercase, e.g.:
+    /// - `RKV_STORAGE_PATH=/data/rkv`
+    /// - `RKV_STORAGE_WRITE_BUFFER_SIZE=16mb`
+    /// - `RKV_SERVER_PORT=9000`
+    /// - `RKV_REPLICATION_ROLE=primary`
+    /// - `RKV_CLUSTER_SHARD_GROUP=2`
+    ///
+    /// Size fields accept the same human-readable format as config files.
+    /// Boolean fields accept `true`/`false`/`1`/`0`.
+    /// Errors in env var values are printed to stderr and ignored.
+    pub fn apply_env_overrides(&mut self) {
+        // Storage
+        if let Some(v) = env_opt("RKV_STORAGE_PATH") {
+            self.storage.path = Some(PathBuf::from(v));
+        }
+        if let Some(v) = env_opt("RKV_STORAGE_CREATE_IF_MISSING") {
+            if let Some(b) = parse_bool(&v) {
+                self.storage.create_if_missing = b;
+            }
+        }
+        apply_env_size(
+            "RKV_STORAGE_WRITE_BUFFER_SIZE",
+            &mut self.storage.write_buffer_size,
+        );
+        apply_env_usize("RKV_STORAGE_MAX_LEVELS", &mut self.storage.max_levels);
+        apply_env_size("RKV_STORAGE_BLOCK_SIZE", &mut self.storage.block_size);
+        apply_env_size("RKV_STORAGE_CACHE_SIZE", &mut self.storage.cache_size);
+        apply_env_size("RKV_STORAGE_OBJECT_SIZE", &mut self.storage.object_size);
+        if let Some(v) = env_opt("RKV_STORAGE_COMPRESS") {
+            if let Some(b) = parse_bool(&v) {
+                self.storage.compress = b;
+            }
+        }
+        apply_env_usize("RKV_STORAGE_BLOOM_BITS", &mut self.storage.bloom_bits);
+        apply_env_usize(
+            "RKV_STORAGE_BLOOM_PREFIX_LEN",
+            &mut self.storage.bloom_prefix_len,
+        );
+        if let Some(v) = env_opt("RKV_STORAGE_VERIFY_CHECKSUMS") {
+            if let Some(b) = parse_bool(&v) {
+                self.storage.verify_checksums = b;
+            }
+        }
+        if let Some(v) = env_opt("RKV_STORAGE_COMPRESSION") {
+            match v.to_ascii_lowercase().as_str() {
+                "none" => self.storage.compression = Compression::None,
+                "lz4" => self.storage.compression = Compression::LZ4,
+                "zstd" => self.storage.compression = Compression::Zstd,
+                _ => eprintln!("warning: invalid RKV_STORAGE_COMPRESSION={v}"),
+            }
+        }
+        if let Some(v) = env_opt("RKV_STORAGE_IO_MODEL") {
+            match v.to_ascii_lowercase().as_str() {
+                "none" | "buffered" => self.storage.io_model = IoModel::None,
+                "directio" | "direct" => self.storage.io_model = IoModel::DirectIO,
+                "mmap" => self.storage.io_model = IoModel::Mmap,
+                _ => eprintln!("warning: invalid RKV_STORAGE_IO_MODEL={v}"),
+            }
+        }
+        apply_env_usize(
+            "RKV_STORAGE_AOL_BUFFER_SIZE",
+            &mut self.storage.aol_buffer_size,
+        );
+        apply_env_usize("RKV_STORAGE_L0_MAX_COUNT", &mut self.storage.l0_max_count);
+        apply_env_size("RKV_STORAGE_L0_MAX_SIZE", &mut self.storage.l0_max_size);
+        apply_env_size("RKV_STORAGE_L1_MAX_SIZE", &mut self.storage.l1_max_size);
+        apply_env_size(
+            "RKV_STORAGE_DEFAULT_MAX_SIZE",
+            &mut self.storage.default_max_size,
+        );
+        apply_env_size(
+            "RKV_STORAGE_WRITE_STALL_SIZE",
+            &mut self.storage.write_stall_size,
+        );
+
+        // Server
+        if let Some(v) = env_opt("RKV_SERVER_BIND") {
+            self.server.bind = v;
+        }
+        apply_env_u16("RKV_SERVER_PORT", &mut self.server.port);
+        apply_env_size("RKV_SERVER_BODY_LIMIT", &mut self.server.body_limit);
+        apply_env_u64("RKV_SERVER_TIMEOUT", &mut self.server.timeout);
+        if let Some(v) = env_opt("RKV_SERVER_UI") {
+            if let Some(b) = parse_bool(&v) {
+                self.server.ui = b;
+            }
+        }
+        if let Some(v) = env_opt("RKV_SERVER_ALLOW_ALL") {
+            if let Some(b) = parse_bool(&v) {
+                self.server.allow_all = b;
+            }
+        }
+
+        // Replication
+        if let Some(v) = env_opt("RKV_REPLICATION_ROLE") {
+            if let Ok(role) = v.parse::<Role>() {
+                self.replication.role = role;
+            } else {
+                eprintln!("warning: invalid RKV_REPLICATION_ROLE={v}");
+            }
+        }
+        if let Some(v) = env_opt("RKV_REPLICATION_CLUSTER_ID") {
+            if let Ok(id) = v.parse::<u16>() {
+                self.replication.cluster_id = Some(id);
+            }
+        }
+        apply_env_u16("RKV_REPLICATION_REPL_PORT", &mut self.replication.repl_port);
+        if let Some(v) = env_opt("RKV_REPLICATION_PRIMARY_ADDR") {
+            self.replication.primary_addr = Some(v);
+        }
+        if let Some(v) = env_opt("RKV_REPLICATION_PEERS") {
+            self.replication.peers = v.split(',').map(|s| s.trim().to_owned()).collect();
+        }
+
+        // Cluster
+        apply_env_u16("RKV_CLUSTER_SHARD_GROUP", &mut self.cluster.shard_group);
+        if let Some(v) = env_opt("RKV_CLUSTER_OWNED_NAMESPACES") {
+            self.cluster.owned_namespaces = v.split(',').map(|s| s.trim().to_owned()).collect();
+        }
+    }
+}
+
+fn parse_bool(s: &str) -> Option<bool> {
+    match s.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => {
+            eprintln!("warning: invalid boolean value: {s}");
+            None
+        }
+    }
+}
+
+fn apply_env_size(name: &str, target: &mut Size) {
+    if let Some(v) = env_opt(name) {
+        match parse_size(&v) {
+            Ok(n) => target.0 = n,
+            Err(e) => eprintln!("warning: invalid {name}={v}: {e}"),
+        }
+    }
+}
+
+fn apply_env_usize(name: &str, target: &mut usize) {
+    if let Some(v) = env_opt(name) {
+        match v.parse::<usize>() {
+            Ok(n) => *target = n,
+            Err(_) => eprintln!("warning: invalid {name}={v}"),
+        }
+    }
+}
+
+fn apply_env_u16(name: &str, target: &mut u16) {
+    if let Some(v) = env_opt(name) {
+        match v.parse::<u16>() {
+            Ok(n) => *target = n,
+            Err(_) => eprintln!("warning: invalid {name}={v}"),
+        }
+    }
+}
+
+fn apply_env_u64(name: &str, target: &mut u64) {
+    if let Some(v) = env_opt(name) {
+        match v.parse::<u64>() {
+            Ok(n) => *target = n,
+            Err(_) => eprintln!("warning: invalid {name}={v}"),
+        }
     }
 }
 
@@ -733,5 +914,125 @@ cluster:
         assert_eq!(config.max_levels, 10);
         // block_size should still be the default since StorageSection default matches Config default
         assert_eq!(config.block_size, original_block_size);
+    }
+
+    /// Serialize env-var tests so they don't interfere with each other.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Helper to set env vars, run a closure, and clean up.
+    fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
+        f();
+        for (k, _) in vars {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn env_override_storage_path() {
+        with_env_vars(&[("RKV_STORAGE_PATH", "/tmp/env-test")], || {
+            let mut fc = FileConfig::default();
+            fc.apply_env_overrides();
+            assert_eq!(fc.storage.path, Some(PathBuf::from("/tmp/env-test")));
+        });
+    }
+
+    #[test]
+    fn env_override_server_port() {
+        with_env_vars(&[("RKV_SERVER_PORT", "9999")], || {
+            let mut fc = FileConfig::default();
+            fc.apply_env_overrides();
+            assert_eq!(fc.server.port, 9999);
+        });
+    }
+
+    #[test]
+    fn env_override_size_field() {
+        with_env_vars(&[("RKV_STORAGE_WRITE_BUFFER_SIZE", "16mb")], || {
+            let mut fc = FileConfig::default();
+            fc.apply_env_overrides();
+            assert_eq!(fc.storage.write_buffer_size, Size(16 * 1024 * 1024));
+        });
+    }
+
+    #[test]
+    fn env_override_bool_field() {
+        with_env_vars(&[("RKV_SERVER_UI", "true")], || {
+            let mut fc = FileConfig::default();
+            fc.apply_env_overrides();
+            assert!(fc.server.ui);
+        });
+    }
+
+    #[test]
+    fn env_override_compression() {
+        with_env_vars(&[("RKV_STORAGE_COMPRESSION", "zstd")], || {
+            let mut fc = FileConfig::default();
+            fc.apply_env_overrides();
+            assert!(matches!(fc.storage.compression, Compression::Zstd));
+        });
+    }
+
+    #[test]
+    fn env_override_role() {
+        with_env_vars(&[("RKV_REPLICATION_ROLE", "primary")], || {
+            let mut fc = FileConfig::default();
+            fc.apply_env_overrides();
+            assert!(matches!(fc.replication.role, Role::Primary));
+        });
+    }
+
+    #[test]
+    fn env_override_peers_comma_separated() {
+        with_env_vars(
+            &[("RKV_REPLICATION_PEERS", "10.0.0.1:8322, 10.0.0.2:8322")],
+            || {
+                let mut fc = FileConfig::default();
+                fc.apply_env_overrides();
+                assert_eq!(fc.replication.peers, vec!["10.0.0.1:8322", "10.0.0.2:8322"]);
+            },
+        );
+    }
+
+    #[test]
+    fn env_override_cluster() {
+        with_env_vars(
+            &[
+                ("RKV_CLUSTER_SHARD_GROUP", "5"),
+                ("RKV_CLUSTER_OWNED_NAMESPACES", "users,orders"),
+            ],
+            || {
+                let mut fc = FileConfig::default();
+                fc.apply_env_overrides();
+                assert_eq!(fc.cluster.shard_group, 5);
+                assert_eq!(fc.cluster.owned_namespaces, vec!["users", "orders"]);
+            },
+        );
+    }
+
+    #[test]
+    fn env_override_invalid_ignored() {
+        with_env_vars(&[("RKV_SERVER_PORT", "not_a_number")], || {
+            let mut fc = FileConfig::default();
+            let original_port = fc.server.port;
+            fc.apply_env_overrides();
+            // Invalid value should be ignored, keeping the default
+            assert_eq!(fc.server.port, original_port);
+        });
+    }
+
+    #[test]
+    fn env_overrides_file_config() {
+        // Env vars override values from config file
+        with_env_vars(&[("RKV_SERVER_PORT", "7777")], || {
+            let yaml = "server:\n  port: 5555\n";
+            let mut fc = parse(yaml, ConfigFormat::Yaml).unwrap();
+            assert_eq!(fc.server.port, 5555);
+            fc.apply_env_overrides();
+            assert_eq!(fc.server.port, 7777);
+        });
     }
 }

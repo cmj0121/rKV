@@ -34,7 +34,7 @@ struct Args {
 enum Command {
     /// Start the HTTP server
     #[cfg(feature = "server")]
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
 
     /// Print a template configuration file to stdout
     Init {
@@ -1473,7 +1473,11 @@ fn main() {
         Some(ref p) => (p.clone(), true),
         None => (default_config_path(), false),
     };
-    let file_config = load_file_config(&config_path, explicit);
+    let file_config = {
+        let mut fc = load_file_config(&config_path, explicit).unwrap_or_default();
+        fc.apply_env_overrides();
+        fc
+    };
 
     match args.command {
         Some(Command::Init { format }) => {
@@ -1490,7 +1494,7 @@ fn main() {
         }
         #[cfg(feature = "server")]
         Some(Command::Serve(serve_args)) => {
-            run_serve(serve_args, file_config);
+            run_serve(*serve_args, file_config);
             return;
         }
         None => {}
@@ -1504,21 +1508,21 @@ fn main() {
 
     let cli_path = args.path.map(PathBuf::from);
 
-    // Resolve DB path: CLI arg > config file > default
+    // Resolve DB path: CLI arg > env/config file > default
     let path = if let Some(ref p) = cli_path {
         p.clone()
-    } else if let Some(ref fc) = file_config {
-        fc.storage.path.clone().unwrap_or_else(&default_path)
     } else {
-        default_path()
+        file_config
+            .storage
+            .path
+            .clone()
+            .unwrap_or_else(&default_path)
     };
 
     let mut config = Config::new(&path);
-    if let Some(ref fc) = file_config {
-        fc.apply_to_config(&mut config);
-        // Ensure path is from the resolution above, not apply_to_config
-        config.path = path;
-    }
+    file_config.apply_to_config(&mut config);
+    // Ensure path is from the resolution above, not apply_to_config
+    config.path = path;
     config.create_if_missing = args.create;
 
     let mut db = match DB::open(config) {
@@ -1537,8 +1541,8 @@ fn main() {
 }
 
 #[cfg(feature = "server")]
-fn run_serve(serve_args: ServeArgs, file_config: Option<rkv::config_file::FileConfig>) {
+fn run_serve(serve_args: ServeArgs, file_config: rkv::config_file::FileConfig) {
     let mut server_config = serve_args.server;
-    server_config.file_config = file_config;
+    server_config.file_config = Some(file_config);
     server::run(server_config);
 }
