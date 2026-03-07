@@ -1450,9 +1450,6 @@ fn default_config_path() -> PathBuf {
 /// Load config file. If `explicit` is true (user specified --config), errors
 /// are fatal. If false (default path), missing files are silently ignored.
 fn load_file_config(path: &Path, explicit: bool) -> Option<rkv::config_file::FileConfig> {
-    if !explicit && !path.exists() {
-        return None;
-    }
     match rkv::config_file::load_file(path) {
         Ok(fc) => Some(fc),
         Err(e) => {
@@ -1468,6 +1465,20 @@ fn load_file_config(path: &Path, explicit: bool) -> Option<rkv::config_file::Fil
 fn main() {
     let args = Args::parse();
 
+    // Handle init subcommand early (no config loading needed)
+    if let Some(Command::Init { format }) = &args.command {
+        let fmt = match format.to_ascii_lowercase().as_str() {
+            "yaml" | "yml" => rkv::config_file::ConfigFormat::Yaml,
+            "toml" => rkv::config_file::ConfigFormat::Toml,
+            other => {
+                eprintln!("unknown format: {other} (expected: yaml, toml)");
+                std::process::exit(1);
+            }
+        };
+        print!("{}", rkv::config_file::template(fmt));
+        return;
+    }
+
     // Load config: explicit --config flag, or default ~/.rkv_config.yaml
     let (config_path, explicit) = match args.config {
         Some(ref p) => (p.clone(), true),
@@ -1480,18 +1491,7 @@ fn main() {
     };
 
     match args.command {
-        Some(Command::Init { format }) => {
-            let fmt = match format.to_ascii_lowercase().as_str() {
-                "yaml" | "yml" => rkv::config_file::ConfigFormat::Yaml,
-                "toml" => rkv::config_file::ConfigFormat::Toml,
-                other => {
-                    eprintln!("unknown format: {other} (expected: yaml, toml)");
-                    std::process::exit(1);
-                }
-            };
-            print!("{}", rkv::config_file::template(fmt));
-            return;
-        }
+        Some(Command::Init { .. }) => unreachable!(),
         #[cfg(feature = "server")]
         Some(Command::Serve(serve_args)) => {
             run_serve(*serve_args, file_config);

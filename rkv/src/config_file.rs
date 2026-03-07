@@ -104,55 +104,29 @@ pub fn format_size(bytes: usize) -> String {
 // ---------------------------------------------------------------------------
 
 fn serialize_compression<S: Serializer>(c: &Compression, s: S) -> Result<S::Ok, S::Error> {
-    let label = match c {
-        Compression::None => "none",
-        Compression::LZ4 => "lz4",
-        Compression::Zstd => "zstd",
-    };
-    s.serialize_str(label)
+    s.serialize_str(&c.to_string())
 }
 
 fn deserialize_compression<'de, D: Deserializer<'de>>(d: D) -> Result<Compression, D::Error> {
     let s = String::deserialize(d)?;
-    match s.to_ascii_lowercase().as_str() {
-        "none" => Ok(Compression::None),
-        "lz4" => Ok(Compression::LZ4),
-        "zstd" | "zstandard" => Ok(Compression::Zstd),
-        _ => Err(de::Error::custom(format!(
-            "unknown compression: {s} (expected: none, lz4, zstd)"
-        ))),
-    }
+    s.to_ascii_lowercase()
+        .parse::<Compression>()
+        .map_err(de::Error::custom)
 }
 
 fn serialize_io_model<S: Serializer>(m: &IoModel, s: S) -> Result<S::Ok, S::Error> {
-    let label = match m {
-        IoModel::None => "none",
-        IoModel::DirectIO => "directio",
-        IoModel::Mmap => "mmap",
-    };
-    s.serialize_str(label)
+    s.serialize_str(&m.to_string())
 }
 
 fn deserialize_io_model<'de, D: Deserializer<'de>>(d: D) -> Result<IoModel, D::Error> {
     let s = String::deserialize(d)?;
-    match s.to_ascii_lowercase().as_str() {
-        "none" | "buffered" => Ok(IoModel::None),
-        "directio" | "direct" => Ok(IoModel::DirectIO),
-        "mmap" => Ok(IoModel::Mmap),
-        _ => Err(de::Error::custom(format!(
-            "unknown io_model: {s} (expected: none, directio, mmap)"
-        ))),
-    }
+    s.to_ascii_lowercase()
+        .parse::<IoModel>()
+        .map_err(de::Error::custom)
 }
 
 fn serialize_role<S: Serializer>(r: &Role, s: S) -> Result<S::Ok, S::Error> {
-    let label = match r {
-        Role::Standalone => "standalone",
-        Role::Primary => "primary",
-        Role::Replica => "replica",
-        Role::Peer => "peer",
-    };
-    s.serialize_str(label)
+    s.serialize_str(&r.to_string())
 }
 
 fn deserialize_role<'de, D: Deserializer<'de>>(d: D) -> Result<Role, D::Error> {
@@ -211,27 +185,27 @@ pub struct StorageSection {
 
 impl Default for StorageSection {
     fn default() -> Self {
-        let c = Config::new("/tmp/default");
+        // Values must match Config::new() defaults in engine/mod.rs
         Self {
             path: None,
-            create_if_missing: c.create_if_missing,
-            write_buffer_size: Size(c.write_buffer_size),
-            max_levels: c.max_levels,
-            block_size: Size(c.block_size),
-            cache_size: Size(c.cache_size),
-            object_size: Size(c.object_size),
-            compress: c.compress,
-            bloom_bits: c.bloom_bits,
-            bloom_prefix_len: c.bloom_prefix_len,
-            verify_checksums: c.verify_checksums,
-            compression: c.compression,
-            io_model: c.io_model,
-            aol_buffer_size: c.aol_buffer_size,
-            l0_max_count: c.l0_max_count,
-            l0_max_size: Size(c.l0_max_size),
-            l1_max_size: Size(c.l1_max_size),
-            default_max_size: Size(c.default_max_size),
-            write_stall_size: Size(c.write_stall_size),
+            create_if_missing: true,
+            write_buffer_size: Size(4 * 1024 * 1024),
+            max_levels: 3,
+            block_size: Size(4 * 1024),
+            cache_size: Size(8 * 1024 * 1024),
+            object_size: Size(1024),
+            compress: true,
+            bloom_bits: 10,
+            bloom_prefix_len: 0,
+            verify_checksums: true,
+            compression: Compression::default(),
+            io_model: IoModel::default(),
+            aol_buffer_size: 128,
+            l0_max_count: 4,
+            l0_max_size: Size(64 * 1024 * 1024),
+            l1_max_size: Size(256 * 1024 * 1024),
+            default_max_size: Size(2 * 1024 * 1024 * 1024),
+            write_stall_size: Size(8 * 1024 * 1024),
         }
     }
 }
@@ -419,7 +393,7 @@ impl FileConfig {
             "RKV_STORAGE_WRITE_BUFFER_SIZE",
             &mut self.storage.write_buffer_size,
         );
-        apply_env_usize("RKV_STORAGE_MAX_LEVELS", &mut self.storage.max_levels);
+        apply_env_num("RKV_STORAGE_MAX_LEVELS", &mut self.storage.max_levels);
         apply_env_size("RKV_STORAGE_BLOCK_SIZE", &mut self.storage.block_size);
         apply_env_size("RKV_STORAGE_CACHE_SIZE", &mut self.storage.cache_size);
         apply_env_size("RKV_STORAGE_OBJECT_SIZE", &mut self.storage.object_size);
@@ -428,8 +402,8 @@ impl FileConfig {
                 self.storage.compress = b;
             }
         }
-        apply_env_usize("RKV_STORAGE_BLOOM_BITS", &mut self.storage.bloom_bits);
-        apply_env_usize(
+        apply_env_num("RKV_STORAGE_BLOOM_BITS", &mut self.storage.bloom_bits);
+        apply_env_num(
             "RKV_STORAGE_BLOOM_PREFIX_LEN",
             &mut self.storage.bloom_prefix_len,
         );
@@ -439,26 +413,22 @@ impl FileConfig {
             }
         }
         if let Some(v) = env_opt("RKV_STORAGE_COMPRESSION") {
-            match v.to_ascii_lowercase().as_str() {
-                "none" => self.storage.compression = Compression::None,
-                "lz4" => self.storage.compression = Compression::LZ4,
-                "zstd" => self.storage.compression = Compression::Zstd,
-                _ => eprintln!("warning: invalid RKV_STORAGE_COMPRESSION={v}"),
+            match v.to_ascii_lowercase().parse::<Compression>() {
+                Ok(c) => self.storage.compression = c,
+                Err(_) => eprintln!("warning: invalid RKV_STORAGE_COMPRESSION={v}"),
             }
         }
         if let Some(v) = env_opt("RKV_STORAGE_IO_MODEL") {
-            match v.to_ascii_lowercase().as_str() {
-                "none" | "buffered" => self.storage.io_model = IoModel::None,
-                "directio" | "direct" => self.storage.io_model = IoModel::DirectIO,
-                "mmap" => self.storage.io_model = IoModel::Mmap,
-                _ => eprintln!("warning: invalid RKV_STORAGE_IO_MODEL={v}"),
+            match v.to_ascii_lowercase().parse::<IoModel>() {
+                Ok(m) => self.storage.io_model = m,
+                Err(_) => eprintln!("warning: invalid RKV_STORAGE_IO_MODEL={v}"),
             }
         }
-        apply_env_usize(
+        apply_env_num(
             "RKV_STORAGE_AOL_BUFFER_SIZE",
             &mut self.storage.aol_buffer_size,
         );
-        apply_env_usize("RKV_STORAGE_L0_MAX_COUNT", &mut self.storage.l0_max_count);
+        apply_env_num("RKV_STORAGE_L0_MAX_COUNT", &mut self.storage.l0_max_count);
         apply_env_size("RKV_STORAGE_L0_MAX_SIZE", &mut self.storage.l0_max_size);
         apply_env_size("RKV_STORAGE_L1_MAX_SIZE", &mut self.storage.l1_max_size);
         apply_env_size(
@@ -474,9 +444,9 @@ impl FileConfig {
         if let Some(v) = env_opt("RKV_SERVER_BIND") {
             self.server.bind = v;
         }
-        apply_env_u16("RKV_SERVER_PORT", &mut self.server.port);
+        apply_env_num("RKV_SERVER_PORT", &mut self.server.port);
         apply_env_size("RKV_SERVER_BODY_LIMIT", &mut self.server.body_limit);
-        apply_env_u64("RKV_SERVER_TIMEOUT", &mut self.server.timeout);
+        apply_env_num("RKV_SERVER_TIMEOUT", &mut self.server.timeout);
         if let Some(v) = env_opt("RKV_SERVER_UI") {
             if let Some(b) = parse_bool(&v) {
                 self.server.ui = b;
@@ -501,7 +471,7 @@ impl FileConfig {
                 self.replication.cluster_id = Some(id);
             }
         }
-        apply_env_u16("RKV_REPLICATION_REPL_PORT", &mut self.replication.repl_port);
+        apply_env_num("RKV_REPLICATION_REPL_PORT", &mut self.replication.repl_port);
         if let Some(v) = env_opt("RKV_REPLICATION_PRIMARY_ADDR") {
             self.replication.primary_addr = Some(v);
         }
@@ -510,7 +480,7 @@ impl FileConfig {
         }
 
         // Cluster
-        apply_env_u16("RKV_CLUSTER_SHARD_GROUP", &mut self.cluster.shard_group);
+        apply_env_num("RKV_CLUSTER_SHARD_GROUP", &mut self.cluster.shard_group);
         if let Some(v) = env_opt("RKV_CLUSTER_OWNED_NAMESPACES") {
             self.cluster.owned_namespaces = v.split(',').map(|s| s.trim().to_owned()).collect();
         }
@@ -537,27 +507,9 @@ fn apply_env_size(name: &str, target: &mut Size) {
     }
 }
 
-fn apply_env_usize(name: &str, target: &mut usize) {
+fn apply_env_num<T: std::str::FromStr>(name: &str, target: &mut T) {
     if let Some(v) = env_opt(name) {
-        match v.parse::<usize>() {
-            Ok(n) => *target = n,
-            Err(_) => eprintln!("warning: invalid {name}={v}"),
-        }
-    }
-}
-
-fn apply_env_u16(name: &str, target: &mut u16) {
-    if let Some(v) = env_opt(name) {
-        match v.parse::<u16>() {
-            Ok(n) => *target = n,
-            Err(_) => eprintln!("warning: invalid {name}={v}"),
-        }
-    }
-}
-
-fn apply_env_u64(name: &str, target: &mut u64) {
-    if let Some(v) = env_opt(name) {
-        match v.parse::<u64>() {
+        match v.parse::<T>() {
             Ok(n) => *target = n,
             Err(_) => eprintln!("warning: invalid {name}={v}"),
         }

@@ -118,8 +118,8 @@ impl FromStr for IoModel {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
-            "none" => Ok(Self::None),
-            "directio" => Ok(Self::DirectIO),
+            "none" | "buffered" => Ok(Self::None),
+            "directio" | "direct" => Ok(Self::DirectIO),
             "mmap" => Ok(Self::Mmap),
             _ => Err(Error::InvalidConfig(format!(
                 "unknown io_model '{s}' (expected: none, directio, mmap)"
@@ -165,7 +165,7 @@ impl FromStr for Compression {
         match s {
             "none" => Ok(Self::None),
             "lz4" => Ok(Self::LZ4),
-            "zstd" => Ok(Self::Zstd),
+            "zstd" | "zstandard" => Ok(Self::Zstd),
             _ => Err(Error::InvalidConfig(format!(
                 "unknown compression '{s}' (expected: none, lz4, zstd)"
             ))),
