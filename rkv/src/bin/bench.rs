@@ -229,6 +229,73 @@ fn bench_scan(n: usize) -> std::time::Duration {
     start.elapsed()
 }
 
+// ---------------------------------------------------------------------------
+// In-memory bench functions
+// ---------------------------------------------------------------------------
+
+const MEM_SIZES: &[usize] = &[1_000, 8_000, 16_000, 1_000_000];
+
+fn bench_mem_put(n: usize) -> std::time::Duration {
+    let config = Config::in_memory();
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let start = Instant::now();
+    for i in 0..n {
+        ns.put(i as i64, VALUE.as_slice(), None).unwrap();
+    }
+    start.elapsed()
+}
+
+fn bench_mem_get(n: usize) -> std::time::Duration {
+    let config = Config::in_memory();
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 0..n {
+        ns.put(i as i64, VALUE.as_slice(), None).unwrap();
+    }
+
+    let mut indices: Vec<i64> = (0..n as i64).collect();
+    fastrand::shuffle(&mut indices);
+
+    let start = Instant::now();
+    for &i in &indices {
+        ns.get(i).unwrap();
+    }
+    start.elapsed()
+}
+
+fn bench_mem_delete(n: usize) -> std::time::Duration {
+    let config = Config::in_memory();
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 0..n {
+        ns.put(i as i64, VALUE.as_slice(), None).unwrap();
+    }
+
+    let start = Instant::now();
+    for i in 0..n {
+        ns.delete(i as i64).unwrap();
+    }
+    start.elapsed()
+}
+
+fn bench_mem_scan(n: usize) -> std::time::Duration {
+    let config = Config::in_memory();
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 0..n {
+        ns.put(i as i64, VALUE.as_slice(), None).unwrap();
+    }
+
+    let start = Instant::now();
+    let _ = ns.scan(&Key::Int(0), n, 0, false).unwrap();
+    start.elapsed()
+}
+
 fn format_size(n: usize) -> String {
     if n >= 1_000_000 {
         format!("{}M", n / 1_000_000)
@@ -256,7 +323,17 @@ fn main() {
     // header row
     let size_headers: Vec<String> = SIZES.iter().map(|&s| format_size(s)).collect();
 
-    // run benchmarks
+    let mem_operations: Vec<(&str, BenchFn)> = vec![
+        ("put", bench_mem_put),
+        ("get", bench_mem_get),
+        ("delete", bench_mem_delete),
+        ("scan", bench_mem_scan),
+    ];
+
+    let mem_size_headers: Vec<String> = MEM_SIZES.iter().map(|&s| format_size(s)).collect();
+
+    // run disk benchmarks
+    eprintln!("Running disk benchmarks...");
     let mut results: Vec<Vec<String>> = Vec::new();
     for (name, func) in &operations {
         let mut row = Vec::new();
@@ -266,6 +343,19 @@ fn main() {
             row.push(format_duration(elapsed));
         }
         results.push(row);
+    }
+
+    // run in-memory benchmarks
+    eprintln!("Running in-memory benchmarks...");
+    let mut mem_results: Vec<Vec<String>> = Vec::new();
+    for (name, func) in &mem_operations {
+        let mut row = Vec::new();
+        for &size in MEM_SIZES {
+            eprintln!("  mem_{name:<8} n={size}...");
+            let elapsed = func(size);
+            row.push(format_duration(elapsed));
+        }
+        mem_results.push(row);
     }
 
     // Build markdown
@@ -295,8 +385,11 @@ fn main() {
     md.push_str("| get_sst   | Random reads of N keys from SSTable (after flush) |\n");
     md.push_str("| put_obj   | Sequential inserts of N keys with 4 KB values via ObjectStore |\n");
     md.push_str("| get_obj   | Random reads of N keys resolved from ObjectStore |\n");
+    md.push_str(
+        "\n**In-memory** variants run the same operations with `Config::in_memory()` (no disk).\n",
+    );
 
-    md.push_str("\n## Results\n\n");
+    md.push_str("\n## Results (Disk)\n\n");
 
     // Results table header
     md.push_str("| Operation |");
@@ -315,6 +408,29 @@ fn main() {
     for (i, (name, _)) in operations.iter().enumerate() {
         md.push_str(&format!("| {name:<9} |"));
         for cell in &results[i] {
+            md.push_str(&format!(" {cell:<10} |"));
+        }
+        md.push('\n');
+    }
+
+    md.push_str("\n## Results (In-Memory)\n\n");
+    md.push_str("> Pure in-memory mode — no disk I/O, no AOL, no SSTables.\n\n");
+
+    md.push_str("| Operation |");
+    for h in &mem_size_headers {
+        md.push_str(&format!(" {h:<10} |"));
+    }
+    md.push('\n');
+
+    md.push_str("|-----------|");
+    for _ in &mem_size_headers {
+        md.push_str("------------|");
+    }
+    md.push('\n');
+
+    for (i, (name, _)) in mem_operations.iter().enumerate() {
+        md.push_str(&format!("| {name:<9} |"));
+        for cell in &mem_results[i] {
             md.push_str(&format!(" {cell:<10} |"));
         }
         md.push('\n');
