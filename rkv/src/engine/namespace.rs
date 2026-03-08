@@ -4,8 +4,10 @@ use std::time::Duration;
 use super::batch::{BatchOp, WriteBatch};
 use super::crypto;
 use super::error::{Error, Result};
+use super::iterator::{EntryIterator, KeyIterator};
 use super::key::Key;
 use super::memtable::{MemLookup, MemLookupRev};
+use super::merge_iter;
 use super::metrics;
 use super::revision::RevisionID;
 use super::value::Value;
@@ -645,5 +647,78 @@ impl<'db> Namespace<'db> {
         let mt = self.db.get_or_create_memtable(&self.name)?;
         let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
         mt.ttl(&key).ok_or(Error::KeyNotFound)
+    }
+
+    // --- Iterator API ---
+
+    /// Returns a lazy forward iterator over keys matching `prefix`.
+    ///
+    /// Tombstoned keys are skipped automatically. In ordered mode (integer keys),
+    /// `prefix` acts as a range start. In unordered mode (string keys), it acts
+    /// as a prefix filter.
+    pub fn keys(&self, prefix: &Key) -> Result<KeyIterator> {
+        let ordered_mode = {
+            let mt = self.db.get_or_create_memtable(&self.name)?;
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            mt.is_ordered()
+        };
+        let iter = self
+            .db
+            .build_merge_iterator(&self.name, prefix, ordered_mode)?;
+        Ok(KeyIterator::forward(iter))
+    }
+
+    /// Returns a lazy forward iterator over (key, value) pairs matching `prefix`.
+    ///
+    /// Tombstoned keys are skipped. `ValuePointer`s are resolved transparently
+    /// and encrypted values are decrypted.
+    pub fn entries(&self, prefix: &Key) -> Result<EntryIterator<'db>> {
+        let ordered_mode = {
+            let mt = self.db.get_or_create_memtable(&self.name)?;
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            mt.is_ordered()
+        };
+        let iter = self
+            .db
+            .build_merge_iterator(&self.name, prefix, ordered_mode)?;
+        Ok(EntryIterator::forward(
+            iter,
+            self.db,
+            self.name.clone(),
+            self.encryption_key,
+        ))
+    }
+
+    /// Returns a lazy reverse iterator over keys matching `prefix`.
+    pub fn rkeys(&self, prefix: &Key) -> Result<KeyIterator> {
+        let ordered_mode = {
+            let mt = self.db.get_or_create_memtable(&self.name)?;
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            mt.is_ordered()
+        };
+        let merge = self
+            .db
+            .build_rscan_merge_iterator(&self.name, prefix, ordered_mode)?;
+        let adapter = merge_iter::RScanAdapter::from_merge_iter(merge)?;
+        Ok(KeyIterator::reverse(adapter))
+    }
+
+    /// Returns a lazy reverse iterator over (key, value) pairs matching `prefix`.
+    pub fn rentries(&self, prefix: &Key) -> Result<EntryIterator<'db>> {
+        let ordered_mode = {
+            let mt = self.db.get_or_create_memtable(&self.name)?;
+            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            mt.is_ordered()
+        };
+        let merge = self
+            .db
+            .build_rscan_merge_iterator(&self.name, prefix, ordered_mode)?;
+        let adapter = merge_iter::RScanAdapter::from_merge_iter(merge)?;
+        Ok(EntryIterator::reverse(
+            adapter,
+            self.db,
+            self.name.clone(),
+            self.encryption_key,
+        ))
     }
 }
