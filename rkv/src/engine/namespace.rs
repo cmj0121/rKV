@@ -117,11 +117,13 @@ impl<'db> Namespace<'db> {
             let stall = config.write_stall_size > 0 && size >= config.write_stall_size;
             (actual_rev, size >= config.write_buffer_size, stall)
         };
-        if should_stall {
-            // Backpressure: flush synchronously and block the writer
-            self.db.flush()?;
-        } else if should_flush {
-            let _ = self.db.flush(); // best-effort; data is safe in AOL
+        if !self.db.config().in_memory {
+            if should_stall {
+                // Backpressure: flush synchronously and block the writer
+                self.db.flush()?;
+            } else if should_flush {
+                let _ = self.db.flush(); // best-effort; data is safe in AOL
+            }
         }
         Ok(actual_rev)
     }
@@ -163,16 +165,17 @@ impl<'db> Namespace<'db> {
 
         // 2. Append all ops to AOL under a single lock
         {
-            let mut aol = self.db.aol_lock(&self.name)?;
-            for (i, (key, value, ttl)) in prepared.iter().enumerate() {
-                self.db.append_to_aol_locked(
-                    &mut aol,
-                    &self.name,
-                    revisions[i].as_u128(),
-                    key,
-                    value,
-                    *ttl,
-                )?;
+            if let Some(mut aol) = self.db.aol_lock(&self.name)? {
+                for (i, (key, value, ttl)) in prepared.iter().enumerate() {
+                    self.db.append_to_aol_locked(
+                        &mut aol,
+                        &self.name,
+                        revisions[i].as_u128(),
+                        key,
+                        value,
+                        *ttl,
+                    )?;
+                }
             }
         }
 
@@ -203,10 +206,12 @@ impl<'db> Namespace<'db> {
         };
 
         // 4. Flush if needed
-        if should_stall {
-            self.db.flush()?;
-        } else if should_flush {
-            let _ = self.db.flush();
+        if !self.db.config().in_memory {
+            if should_stall {
+                self.db.flush()?;
+            } else if should_flush {
+                let _ = self.db.flush();
+            }
         }
 
         Ok(actual_revs)
