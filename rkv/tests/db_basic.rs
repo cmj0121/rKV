@@ -5960,3 +5960,169 @@ fn sstable_partial_write_cleanup() {
 
     db.close().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// In-Memory Mode Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn in_memory_crud() {
+    let db = DB::open(Config::in_memory()).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    // Put / get
+    ns.put("hello", "world", None).unwrap();
+    assert_eq!(ns.get("hello").unwrap(), Value::from("world"));
+
+    // Overwrite
+    ns.put("hello", "earth", None).unwrap();
+    assert_eq!(ns.get("hello").unwrap(), Value::from("earth"));
+
+    // Delete
+    ns.delete("hello").unwrap();
+    let err = ns.get("hello").unwrap_err();
+    assert!(matches!(err, Error::KeyNotFound));
+
+    // Integer keys
+    ns.put(42_i64, "answer", None).unwrap();
+    assert_eq!(ns.get(42_i64).unwrap(), Value::from("answer"));
+
+    // Exists
+    assert!(ns.exists(42_i64).unwrap());
+    assert!(!ns.exists(99_i64).unwrap());
+}
+
+#[test]
+fn in_memory_no_disk_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::in_memory();
+    config.path = dir.path().to_path_buf();
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+    ns.put("key", "value", None).unwrap();
+    drop(db);
+
+    // No files should be created in the temp dir
+    let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+    assert!(
+        entries.is_empty(),
+        "in-memory mode should not create any files"
+    );
+}
+
+#[test]
+fn in_memory_noop_maintenance() {
+    let db = DB::open(Config::in_memory()).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+    ns.put("a", "1", None).unwrap();
+
+    // flush, compact, sync should all no-op without error
+    db.flush().unwrap();
+    db.compact().unwrap();
+    db.sync().unwrap();
+
+    // Data should still be readable (not flushed away)
+    assert_eq!(ns.get("a").unwrap(), Value::from("1"));
+}
+
+#[test]
+fn in_memory_dump_returns_error() {
+    let db = DB::open(Config::in_memory()).unwrap();
+    let err = db.dump("/tmp/should-not-exist.dump").unwrap_err();
+    assert!(matches!(err, Error::InvalidConfig(_)));
+}
+
+#[test]
+fn in_memory_large_values_inline() {
+    let mut config = Config::in_memory();
+    config.object_size = 10; // very small threshold
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    // Write a value larger than object_size — should stay inline, no bin objects
+    let big_value = "x".repeat(100);
+    ns.put("big", big_value.as_str(), None).unwrap();
+    assert_eq!(ns.get("big").unwrap(), Value::from(big_value.as_str()));
+}
+
+#[test]
+fn in_memory_scan_and_count() {
+    let db = DB::open(Config::in_memory()).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    for i in 0..10 {
+        ns.put(i as i64, format!("v{i}").as_str(), None).unwrap();
+    }
+
+    let keys = ns.scan(&Key::Int(0), 100, 0, false).unwrap();
+    assert_eq!(keys.len(), 10);
+
+    assert_eq!(ns.count().unwrap(), 10);
+}
+
+#[test]
+fn in_memory_multiple_namespaces() {
+    let db = DB::open(Config::in_memory()).unwrap();
+    let ns1 = db.namespace("ns1", None).unwrap();
+    let ns2 = db.namespace("ns2", None).unwrap();
+
+    ns1.put("key", "from-ns1", None).unwrap();
+    ns2.put("key", "from-ns2", None).unwrap();
+
+    assert_eq!(ns1.get("key").unwrap(), Value::from("from-ns1"));
+    assert_eq!(ns2.get("key").unwrap(), Value::from("from-ns2"));
+
+    let namespaces = db.list_namespaces().unwrap();
+    assert!(namespaces.contains(&"ns1".to_string()));
+    assert!(namespaces.contains(&"ns2".to_string()));
+}
+
+#[test]
+fn in_memory_write_batch() {
+    let db = DB::open(Config::in_memory()).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let batch = WriteBatch::new()
+        .put("a", "1", None)
+        .put("b", "2", None)
+        .delete("a");
+    let revs = ns.write_batch(batch).unwrap();
+    assert_eq!(revs.len(), 3);
+
+    assert!(matches!(ns.get("a"), Err(Error::KeyNotFound)));
+    assert_eq!(ns.get("b").unwrap(), Value::from("2"));
+}
+
+#[test]
+fn in_memory_replication_rejected() {
+    let mut config = Config::in_memory();
+    config.role = rkv::Role::Primary;
+    let Err(err) = DB::open(config) else {
+        panic!("expected error for in-memory + replication");
+    };
+    assert!(matches!(err, Error::InvalidConfig(_)));
+}
+
+#[test]
+fn in_memory_encryption_rejected() {
+    let db = DB::open(Config::in_memory()).unwrap();
+    let err = db.namespace("secret", Some("password")).unwrap_err();
+    assert!(matches!(err, Error::InvalidConfig(_)));
+}
+
+#[test]
+fn in_memory_ttl() {
+    let db = DB::open(Config::in_memory()).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    // Key with TTL should be readable before expiry
+    ns.put("ephemeral", "gone-soon", Some(Duration::from_millis(50)))
+        .unwrap();
+    assert_eq!(ns.get("ephemeral").unwrap(), Value::from("gone-soon"));
+    let ttl = ns.ttl("ephemeral").unwrap();
+    assert!(ttl.is_some());
+
+    // After expiry, key should be gone
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(matches!(ns.get("ephemeral"), Err(Error::KeyNotFound)));
+}
