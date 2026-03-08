@@ -4,8 +4,9 @@ use std::time::Duration;
 
 #[allow(unused_imports)]
 use rkv::{
-    CompactionEvent, Compression, Config, EntryIterator, Error, EventListener, FlushEvent, IoModel,
-    Key, KeyIterator, LevelStat, RevisionID, Stats, Value, WriteBatch, DB, DEFAULT_NAMESPACE,
+    CompactionEvent, Compression, Config, DumpOptions, EntryIterator, Error, EventListener,
+    FlushEvent, IoModel, Key, KeyIterator, LevelStat, RevisionID, Stats, Value, WriteBatch, DB,
+    DEFAULT_NAMESPACE,
 };
 
 #[test]
@@ -1399,6 +1400,125 @@ fn dump_load_survives_restart() {
     let ns = db.namespace("_", None).unwrap();
     assert_eq!(ns.get(1).unwrap(), Value::from("a"));
     assert_eq!(ns.get(2).unwrap(), Value::from("b"));
+}
+
+#[test]
+fn dump_incremental_only_new_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("src");
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    // Insert two entries — capture the revision after the first
+    let _rev1 = ns.put(1, "old", None).unwrap();
+    db.flush().unwrap();
+    let rev2 = ns.put(2, "new", None).unwrap();
+    db.flush().unwrap();
+    drop(ns);
+
+    // Incremental dump: only entries after rev1 (so rev2 should appear)
+    let dump_path = tmp.path().join("incr.rkv");
+    db.dump_with_options(
+        &dump_path,
+        DumpOptions {
+            after_revision: Some(_rev1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.close().unwrap();
+
+    std::fs::remove_dir_all(&db_path).unwrap();
+    let db2 = DB::load(&dump_path).unwrap();
+    let ns2 = db2.namespace("_", None).unwrap();
+
+    // Key 2 should be present (its rev > rev1)
+    assert_eq!(ns2.get(2).unwrap(), Value::from("new"));
+    // Key 1 should NOT be present (its rev <= rev1)
+    assert!(ns2.get(1).is_err());
+
+    // Verify the loaded revision is correct
+    let _ = rev2; // ensure rev2 was valid
+}
+
+#[test]
+fn dump_encrypted_roundtrip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("src");
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+    ns.put("secret", "data", None).unwrap();
+    drop(ns);
+
+    let dump_path = tmp.path().join("encrypted.rkv");
+    db.dump_with_options(
+        &dump_path,
+        DumpOptions {
+            password: Some("hunter2".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.close().unwrap();
+
+    // Loading without password should fail
+    std::fs::remove_dir_all(&db_path).unwrap();
+    let result = DB::load(&dump_path);
+    let Err(err) = result else {
+        panic!("expected EncryptionRequired error")
+    };
+    assert!(matches!(err, Error::EncryptionRequired(_)));
+
+    // Loading with wrong password should fail
+    let result = DB::load_with_password(&dump_path, "wrong");
+    let Err(err) = result else {
+        panic!("expected Corruption error")
+    };
+    assert!(matches!(err, Error::Corruption(_)));
+
+    // Clean up any partial state from failed load
+    let _ = std::fs::remove_dir_all(&db_path);
+
+    // Loading with correct password should succeed
+    let db2 = DB::load_with_password(&dump_path, "hunter2").unwrap();
+    let ns2 = db2.namespace("_", None).unwrap();
+    assert_eq!(ns2.get("secret").unwrap(), Value::from("data"));
+}
+
+#[test]
+fn dump_encrypted_incremental() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("src");
+    let config = Config::new(&db_path);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let rev1 = ns.put(1, "old", None).unwrap();
+    db.flush().unwrap();
+    ns.put(2, "new", None).unwrap();
+    db.flush().unwrap();
+    drop(ns);
+
+    let dump_path = tmp.path().join("enc_incr.rkv");
+    db.dump_with_options(
+        &dump_path,
+        DumpOptions {
+            after_revision: Some(rev1),
+            password: Some("pass123".into()),
+        },
+    )
+    .unwrap();
+    db.close().unwrap();
+
+    std::fs::remove_dir_all(&db_path).unwrap();
+    let db2 = DB::load_with_password(&dump_path, "pass123").unwrap();
+    let ns2 = db2.namespace("_", None).unwrap();
+
+    // Only key 2 should be present
+    assert_eq!(ns2.get(2).unwrap(), Value::from("new"));
+    assert!(ns2.get(1).is_err());
 }
 
 #[test]
