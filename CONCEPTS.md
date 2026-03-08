@@ -727,13 +727,8 @@ This section catalogs known dead code, missing API exposure, and architectural l
 - **AOL durability gap**: The AOL buffers writes (default: flush every 128 records).
   A crash before the buffer is flushed loses uncommitted records. Set
   `aol_buffer_size = 0` for every-record flush at the cost of throughput.
-- **No encrypted dump/load**: `DB::dump()` and `DB::load()` do not encrypt the dump
-  file even for namespaces that use encryption at rest.
 - **Unbounded key size**: Keys are limited to `u16::MAX` (65,535) bytes by the SSTable
   entry format, but there is no Config-level limit or early validation.
-- **No public iterator API**: The internal `MergeIterator` streams entries lazily with
-  early termination, but is not exposed as a public cursor. Library users get results
-  as `Vec` via `scan()`/`rscan()` with limit/offset.
 
 ### Embeddable Library
 
