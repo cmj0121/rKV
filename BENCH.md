@@ -38,17 +38,17 @@ Wall-clock time is measured via `std::time::Instant`.
 
 | Operation | 1K        | 8K       | 16K       | 1M        |
 | --------- | --------- | -------- | --------- | --------- |
-| put       | 778 µs    | 8.03 ms  | 15.53 ms  | 2.31 s    |
-| get       | 236 µs    | 2.26 ms  | 4.81 ms   | 12.57 s   |
-| delete    | 517 µs    | 4.23 ms  | 8.82 ms   | 880.02 ms |
-| scan      | 126 µs    | 1.01 ms  | 2.21 ms   | 228.29 ms |
-| batch     | 621 µs    | 4.40 ms  | 8.84 ms   | 2.11 s    |
-| keys      | 130 µs    | 1.24 ms  | 2.60 ms   | 236.22 ms |
-| flush     | 1.61 ms   | 3.98 ms  | 6.99 ms   | 6.97 ms   |
-| get_sst   | 3.76 ms   | 26.41 ms | 52.40 ms  | 11.24 s   |
-| get_cpt   | 3.34 ms   | 25.68 ms | 50.59 ms  | 11.12 s   |
-| put_obj   | 517.24 ms | 3.07 s   | 6.99 s    | 459.94 s  |
-| get_obj   | 7.93 ms   | 64.27 ms | 128.05 ms | 20.43 s   |
+| put       | 1.06 ms   | 8.16 ms  | 15.86 ms  | 3.02 s    |
+| get       | 288 µs    | 2.78 ms  | 6.25 ms   | 13.77 s   |
+| delete    | 514 µs    | 4.58 ms  | 9.81 ms   | 922.00 ms |
+| scan      | 156 µs    | 1.17 ms  | 2.59 ms   | 229.68 ms |
+| batch     | 584 µs    | 4.21 ms  | 8.59 ms   | 2.17 s    |
+| keys      | 134 µs    | 1.27 ms  | 2.62 ms   | 241.41 ms |
+| flush     | 1.32 ms   | 4.42 ms  | 8.13 ms   | 7.85 ms   |
+| get_sst   | 3.71 ms   | 26.20 ms | 54.87 ms  | 14.46 s   |
+| get_cpt   | 3.39 ms   | 25.11 ms | 50.52 ms  | 14.29 s   |
+| put_obj   | 414.96 ms | 3.27 s   | 6.33 s    | 413.45 s  |
+| get_obj   | 7.99 ms   | 64.36 ms | 130.55 ms | 26.29 s   |
 
 ## Results (In-Memory)
 
@@ -56,15 +56,81 @@ Wall-clock time is measured via `std::time::Instant`.
 
 | Operation | 1K     | 8K      | 16K     | 1M        |
 | --------- | ------ | ------- | ------- | --------- |
-| put       | 545 µs | 3.57 ms | 7.07 ms | 702.52 ms |
-| get       | 255 µs | 2.25 ms | 4.61 ms | 700.69 ms |
-| delete    | 306 µs | 2.45 ms | 4.96 ms | 472.10 ms |
-| scan      | 134 µs | 963 µs  | 1.89 ms | 195.21 ms |
-| batch     | 490 µs | 2.86 ms | 5.26 ms | 416.77 ms |
-| keys      | 141 µs | 965 µs  | 1.94 ms | 163.57 ms |
+| put       | 528 µs | 3.41 ms | 7.50 ms | 761.11 ms |
+| get       | 252 µs | 3.08 ms | 6.18 ms | 842.20 ms |
+| delete    | 300 µs | 2.74 ms | 5.91 ms | 550.51 ms |
+| scan      | 127 µs | 1.22 ms | 2.54 ms | 201.99 ms |
+| batch     | 434 µs | 2.64 ms | 5.19 ms | 463.63 ms |
+| keys      | 133 µs | 1.17 ms | 2.55 ms | 166.20 ms |
 
 ## Reproduce
 
 ```sh
 make bench
+```
+
+## Comparison
+
+> rKV vs redb vs sled vs fjall — same pre-defined dataset.
+
+### Environment
+
+| Field  | Value                           |
+| ------ | ------------------------------- |
+| OS     | linux x86_64                    |
+| CPU    | AMD EPYC 7763 64-Core Processor |
+| Cores  | 4                               |
+| Memory | 15 GB                           |
+| Rust   | 1.94.0 (4a4ef493e 2026-03-02)   |
+| Date   | 2026-03-08                      |
+
+### Sequential Put
+
+| N   | rKV      | redb     | sled     | fjall    |
+| --- | -------- | -------- | -------- | -------- |
+| 1K  | 746 µs   | 1.92 ms  | 3.23 ms  | 1.98 ms  |
+| 8K  | 6.71 ms  | 13.43 ms | 27.37 ms | 15.20 ms |
+| 16K | 12.49 ms | 26.09 ms | 58.87 ms | 30.35 ms |
+| 1M  | 2.40 s   | 1.98 s   | 4.58 s   | 2.07 s   |
+
+### Random Get
+
+| N   | rKV     | redb    | sled     | fjall    |
+| --- | ------- | ------- | -------- | -------- |
+| 1K  | 271 µs  | 219 µs  | 452 µs   | 391 µs   |
+| 8K  | 3.32 ms | 2.71 ms | 4.52 ms  | 4.78 ms  |
+| 16K | 7.29 ms | 5.96 ms | 11.03 ms | 12.04 ms |
+| 1M  | 15.12 s | 1.19 s  | 2.22 s   | 6.88 s   |
+
+### Sequential Delete
+
+| N   | rKV       | redb     | sled     | fjall    |
+| --- | --------- | -------- | -------- | -------- |
+| 1K  | 572 µs    | 1.72 ms  | 1.91 ms  | 2.02 ms  |
+| 8K  | 4.88 ms   | 12.08 ms | 19.59 ms | 16.63 ms |
+| 16K | 10.70 ms  | 24.82 ms | 39.63 ms | 33.27 ms |
+| 1M  | 827.83 ms | 1.82 s   | 6.05 s   | 2.00 s   |
+
+### Forward Scan
+
+| N   | rKV       | redb      | sled      | fjall     |
+| --- | --------- | --------- | --------- | --------- |
+| 1K  | 189 µs    | 77 µs     | 343 µs    | 161 µs    |
+| 8K  | 1.50 ms   | 598 µs    | 2.47 ms   | 1.30 ms   |
+| 16K | 3.23 ms   | 1.19 ms   | 4.87 ms   | 2.52 ms   |
+| 1M  | 230.94 ms | 102.93 ms | 353.82 ms | 328.71 ms |
+
+### Batch Write
+
+| N   | rKV     | redb      | sled     | fjall     |
+| --- | ------- | --------- | -------- | --------- |
+| 1K  | 775 µs  | 5.79 ms   | 4.75 ms  | 567 µs    |
+| 8K  | 4.86 ms | 61.31 ms  | 43.13 ms | 4.50 ms   |
+| 16K | 9.58 ms | 113.64 ms | 84.98 ms | 8.60 ms   |
+| 1M  | 2.24 s  | 8.50 s    | 5.74 s   | 638.20 ms |
+
+### Reproduce
+
+```sh
+make bench-compare
 ```
