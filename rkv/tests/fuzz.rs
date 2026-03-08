@@ -11,13 +11,9 @@
 //!
 //! # Scope
 //!
-//! Tests pure memtable + AOL operations: `put`, `get`, `delete`, `exists`,
+//! Tests all DB operations including `put`, `get`, `delete`, `exists`,
 //! `count`, `scan`, `rscan`, `delete_range`, `delete_prefix`, `rev_count`,
-//! `close+reopen`, and namespace switching.
-//!
-//! `flush()` and `compact()` are excluded because `MemTable::get()` returns
-//! `None` for tombstones, causing `Namespace::get()` to fall through to
-//! SSTables and return stale pre-flush data after a delete.
+//! `close+reopen`, `flush`, `compact`, and namespace switching.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -199,22 +195,24 @@ fn gen_prefix(rng: &mut fastrand::Rng) -> String {
     }
 }
 
-/// Pick a weighted random operation index (0..12).
+/// Pick a weighted random operation index (0..14).
 fn gen_op(rng: &mut fastrand::Rng) -> u32 {
     let roll = rng.u32(0..100);
     match roll {
-        0..30 => 0,   // put            30%
-        30..50 => 1,  // get            20%
-        50..60 => 2,  // delete         10%
-        60..65 => 3,  // exists          5%
-        65..70 => 4,  // count           5%
-        70..77 => 5,  // scan            7%
-        77..84 => 6,  // rscan           7%
-        84..88 => 7,  // delete_range    4%
-        88..92 => 8,  // delete_prefix   4%
-        92..95 => 9,  // close+reopen    3%
-        95..98 => 10, // switch ns       3%
-        _ => 11,      // rev_count       2%
+        0..28 => 0,   // put            28%
+        28..46 => 1,  // get            18%
+        46..56 => 2,  // delete         10%
+        56..61 => 3,  // exists          5%
+        61..66 => 4,  // count           5%
+        66..73 => 5,  // scan            7%
+        73..80 => 6,  // rscan           7%
+        80..84 => 7,  // delete_range    4%
+        84..88 => 8,  // delete_prefix   4%
+        88..91 => 9,  // close+reopen    3%
+        91..94 => 10, // switch ns       3%
+        94..96 => 11, // rev_count       2%
+        96..98 => 12, // flush           2%
+        _ => 13,      // compact         2%
     }
 }
 
@@ -452,6 +450,17 @@ fn fuzz_random_ops() {
                         "op#{op_count} rev_count({key_str}): db={db_revs} < oracle_writes={oracle_writes}"
                     );
                 }
+            }
+
+            // --- flush ---
+            12 => {
+                db.flush().unwrap();
+            }
+
+            // --- compact ---
+            13 => {
+                db.compact().unwrap();
+                db.wait_for_compaction();
             }
 
             _ => unreachable!(),
