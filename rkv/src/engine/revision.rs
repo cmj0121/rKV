@@ -53,6 +53,17 @@ impl fmt::Display for RevisionID {
     }
 }
 
+impl std::str::FromStr for RevisionID {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        CROCKFORD_LOWER
+            .decode_u128(s.as_bytes())
+            .map(RevisionID)
+            .map_err(|e| format!("invalid revision ID: {e}"))
+    }
+}
+
 impl From<u128> for RevisionID {
     fn from(v: u128) -> Self {
         RevisionID(v)
