@@ -16,6 +16,15 @@ name = "bench_server"
 path = "src/bin/bench_server.rs"
 required-features = ["server"]
 
+[[bin]]
+name = "bench_compare"
+path = "src/bin/bench_compare.rs"
+required-features = ["bench-compare"]
+
+[[bin]]
+name = "bench_gen_data"
+path = "src/bin/bench_gen_data.rs"
+
 [lib]
 name = "rkv"
 path = "src/lib.rs"
@@ -23,6 +32,8 @@ path = "src/lib.rs"
 [features]
 default = []
 server = ["dep:axum", "dep:tokio", "dep:serde_json", "dep:tower", "dep:tower-http", "dep:httpdate", "dep:http-body-util", "dep:tracing", "dep:tracing-subscriber"]
+bench-compare = ["dep:redb", "dep:sled", "dep:fjall"]
+bench-rocksdb = ["bench-compare", "dep:rocksdb"]
 
 [dependencies]
 aes-gcm = "0.10"
@@ -56,3 +67,9 @@ httpdate = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+# Comparison benchmarks (optional — enabled by `bench-compare` feature)
+redb = { version = "2", optional = true }
+sled = { version = "0.34", optional = true }
+fjall = { version = "2", optional = true }
+rocksdb = { version = "0.22", optional = true }
