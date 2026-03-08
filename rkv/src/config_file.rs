@@ -181,6 +181,7 @@ pub struct StorageSection {
     pub l1_max_size: Size,
     pub default_max_size: Size,
     pub write_stall_size: Size,
+    pub in_memory: bool,
 }
 
 impl Default for StorageSection {
@@ -206,6 +207,7 @@ impl Default for StorageSection {
             l1_max_size: Size(256 * 1024 * 1024),
             default_max_size: Size(2 * 1024 * 1024 * 1024),
             write_stall_size: Size(8 * 1024 * 1024),
+            in_memory: false,
         }
     }
 }
@@ -342,6 +344,7 @@ impl FileConfig {
         config.l1_max_size = s.l1_max_size.0;
         config.default_max_size = s.default_max_size.0;
         config.write_stall_size = s.write_stall_size.0;
+        config.in_memory = s.in_memory;
 
         // Replication
         let r = &self.replication;
@@ -439,6 +442,11 @@ impl FileConfig {
             "RKV_STORAGE_WRITE_STALL_SIZE",
             &mut self.storage.write_stall_size,
         );
+        if let Some(v) = env_opt("RKV_STORAGE_IN_MEMORY") {
+            if let Some(b) = parse_bool(&v) {
+                self.storage.in_memory = b;
+            }
+        }
 
         // Server
         if let Some(v) = env_opt("RKV_SERVER_BIND") {
@@ -543,6 +551,7 @@ storage:
   l1_max_size: 256mb
   default_max_size: 2gb
   write_stall_size: 8mb
+  in_memory: false
 
 server:
   bind: 127.0.0.1
@@ -588,6 +597,7 @@ l0_max_size = "64mb"
 l1_max_size = "256mb"
 default_max_size = "2gb"
 write_stall_size = "8mb"
+in_memory = false
 
 [server]
 bind = "127.0.0.1"

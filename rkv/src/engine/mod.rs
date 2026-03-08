@@ -8,6 +8,7 @@ pub(crate) mod crypto;
 mod dump;
 mod error;
 mod io;
+mod iterator;
 mod key;
 mod memtable;
 mod merge_iter;
@@ -27,6 +28,7 @@ mod value;
 pub use batch::{BatchOp, WriteBatch};
 pub use cluster::{NodeInfo, RoutingTable, ShardGroup};
 pub use error::{Error, Result};
+pub use iterator::{EntryIterator, KeyIterator};
 pub use key::Key;
 pub use metrics::{CompactionEvent, EventListener, FlushEvent};
 pub use namespace::Namespace;
@@ -66,7 +68,8 @@ pub const DEFAULT_NAMESPACE: &str = "_";
 /// Per-namespace state: memtable + append-only log.
 pub(crate) struct NamespaceState {
     pub memtable: Mutex<memtable::MemTable>,
-    pub aol: Mutex<aol::Aol>,
+    /// `None` in in-memory mode (no disk I/O).
+    pub aol: Option<Mutex<aol::Aol>>,
 }
 
 impl NamespaceState {
@@ -78,8 +81,16 @@ impl NamespaceState {
         let ns_aol = aol::Aol::open_at(ns_dir.join(aol::AOL_FILENAME), aol_buffer_size)?;
         Ok(Self {
             memtable: Mutex::new(memtable::MemTable::new()),
-            aol: Mutex::new(ns_aol),
+            aol: Some(Mutex::new(ns_aol)),
         })
+    }
+
+    /// Create a new `NamespaceState` for in-memory mode (no AOL).
+    pub(crate) fn create_in_memory() -> Self {
+        Self {
+            memtable: Mutex::new(memtable::MemTable::new()),
+            aol: None,
+        }
     }
 }
 
@@ -243,6 +254,12 @@ pub struct Config {
     /// Namespaces owned by this node in cluster mode.
     /// Empty means all namespaces are accepted (standalone behavior).
     pub owned_namespaces: Vec<String>,
+    /// Run in pure in-memory mode with no disk I/O (default: false).
+    /// When enabled: no directories, AOL, SSTables, or bin objects are created;
+    /// all data lives in the memtable and grows unbounded. Background flush and
+    /// compaction threads are not started. Replication and encryption are
+    /// disallowed.
+    pub in_memory: bool,
 }
 
 impl fmt::Debug for Config {
@@ -289,6 +306,19 @@ impl Config {
             event_listener: None,
             shard_group: 0,
             owned_namespaces: Vec::new(),
+            in_memory: false,
+        }
+    }
+
+    /// Create a configuration for a pure in-memory database.
+    ///
+    /// No disk I/O is performed. Data lives only in memory and is lost
+    /// when the database is dropped.
+    pub fn in_memory() -> Self {
+        Self {
+            path: PathBuf::new(),
+            in_memory: true,
+            ..Self::new("")
         }
     }
 
@@ -314,6 +344,11 @@ impl Config {
         if self.role == Role::Peer && self.peers.is_empty() {
             return Err(Error::InvalidConfig(
                 "peer role requires at least one peer address".into(),
+            ));
+        }
+        if self.in_memory && self.role != Role::Standalone {
+            return Err(Error::InvalidConfig(
+                "in-memory mode is incompatible with replication".into(),
             ));
         }
         Ok(())
@@ -397,6 +432,11 @@ impl DB {
     /// 5. Start replication if configured (primary/replica/peer).
     pub fn open(config: Config) -> Result<Self> {
         config.validate()?;
+
+        if config.in_memory {
+            return Self::open_in_memory(config);
+        }
+
         if config.create_if_missing {
             fs::create_dir_all(&config.path)?;
         }
@@ -453,7 +493,7 @@ impl DB {
                 ns_name,
                 NamespaceState {
                     memtable: Mutex::new(mt),
-                    aol: Mutex::new(ns_aol),
+                    aol: Some(Mutex::new(ns_aol)),
                 },
             );
         }
@@ -468,7 +508,12 @@ impl DB {
                     continue;
                 }
                 if let Some(ns_state) = ns_map.get(&record.namespace) {
-                    let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut aol = ns_state
+                        .aol
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
                     aol.append_raw(
                         &record.namespace,
                         record.revision,
@@ -515,16 +560,20 @@ impl DB {
                         tick = 0;
                         let map = ns_data.read().unwrap_or_else(|e| e.into_inner());
                         for ns_state in map.values() {
-                            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
-                            let _ = aol.flush_if_dirty();
+                            if let Some(ref aol_mutex) = ns_state.aol {
+                                let mut aol = aol_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                                let _ = aol.flush_if_dirty();
+                            }
                         }
                     }
                 }
                 // Final flush on shutdown
                 let map = ns_data.read().unwrap_or_else(|e| e.into_inner());
                 for ns_state in map.values() {
-                    let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
-                    let _ = aol.flush_if_dirty();
+                    if let Some(ref aol_mutex) = ns_state.aol {
+                        let mut aol = aol_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                        let _ = aol.flush_if_dirty();
+                    }
                 }
             }))
         };
@@ -657,11 +706,63 @@ impl DB {
         Ok(db)
     }
 
+    /// Open a pure in-memory database. Called from `open()` when `config.in_memory` is true.
+    fn open_in_memory(config: Config) -> Result<Self> {
+        let io_backend = io::create_backend(&config.io_model);
+        let revision_gen = revision::RevisionGen::new(config.cluster_id);
+        let metrics_arc = Arc::new(metrics::Metrics::new());
+        let event_listener = config.event_listener.clone();
+
+        let mut ns_map: HashMap<String, NamespaceState> = HashMap::new();
+        ns_map.insert(
+            DEFAULT_NAMESPACE.to_owned(),
+            NamespaceState::create_in_memory(),
+        );
+
+        let db = Self {
+            config,
+            opened_at: Instant::now(),
+            encrypted_namespaces: Mutex::new(HashMap::new()),
+            io_backend,
+            revision_gen,
+            namespace_data: Arc::new(RwLock::new(ns_map)),
+            object_stores: Arc::new(RwLock::new(HashMap::new())),
+            sstables: Arc::new(RwLock::new(HashMap::new())),
+            sst_sequence: Arc::new(AtomicU64::new(0)),
+            block_cache: None,
+            flush_stop: Arc::new(AtomicBool::new(false)),
+            flush_thread: None,
+            compaction_stop: Arc::new(AtomicBool::new(false)),
+            compaction_notify: Arc::new((Mutex::new(false), Condvar::new())),
+            compaction_mutex: Arc::new(Mutex::new(())),
+            compaction_done: Arc::new((Mutex::new(false), Condvar::new())),
+            compaction_thread: None,
+            op_puts: AtomicU64::new(0),
+            op_gets: AtomicU64::new(0),
+            op_deletes: AtomicU64::new(0),
+            metrics: metrics_arc,
+            event_listener,
+            repl_sender: None,
+            repl_receiver: None,
+            repl_force_sync: None,
+            conflicts_resolved: Arc::new(AtomicU64::new(0)),
+            peer_sessions: Arc::new(Mutex::new(Vec::new())),
+            peer_listener: None,
+            peer_connectors: Vec::new(),
+            peer_last_revision: None,
+        };
+
+        Ok(db)
+    }
+
     /// Shut down the database gracefully.
     ///
     /// Stops replication threads, signals background flush/compaction to exit,
     /// joins all threads, and persists operation counters to `stats.meta`.
     pub fn close(mut self) -> Result<()> {
+        if self.config.in_memory {
+            return Ok(());
+        }
         self.stop_replication();
         self.flush_stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.flush_thread.take() {
@@ -784,7 +885,12 @@ impl DB {
                 {
                     let map = ns_data.read().unwrap_or_else(|e| e.into_inner());
                     if let Some(ns_state) = map.get(ns_name) {
-                        let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut aol = ns_state
+                            .aol
+                            .as_ref()
+                            .unwrap()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         aol.truncate()?;
                     }
                 }
@@ -818,7 +924,12 @@ impl DB {
                     // Flush all per-namespace AOL buffers so data is on disk
                     let map = ns_data_for_flush.read().unwrap_or_else(|e| e.into_inner());
                     for ns_state in map.values() {
-                        let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut aol = ns_state
+                            .aol
+                            .as_ref()
+                            .unwrap()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         aol.flush_if_dirty()?;
                     }
                     Ok(())
@@ -871,7 +982,12 @@ impl DB {
                     {
                         let map = ns_data.read().unwrap_or_else(|e| e.into_inner());
                         if let Some(ns_state) = map.get(&record.namespace) {
-                            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut aol = ns_state
+                                .aol
+                                .as_ref()
+                                .unwrap()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
                             aol.append_encoded(payload)?;
                         } else {
                             drop(map);
@@ -885,7 +1001,12 @@ impl DB {
                                 map.insert(record.namespace.clone(), ns_state);
                             }
                             let ns_state = map.get(&record.namespace).unwrap();
-                            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut aol = ns_state
+                                .aol
+                                .as_ref()
+                                .unwrap()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
                             aol.append_encoded(payload)?;
                         }
                     }
@@ -946,7 +1067,12 @@ impl DB {
                             let mut mt =
                                 ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
                             *mt = memtable::MemTable::new();
-                            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut aol = ns_state
+                                .aol
+                                .as_ref()
+                                .unwrap()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
                             let _ = aol.truncate();
                         }
                         // Register new SST namespaces (HashMap only grows)
@@ -1038,7 +1164,12 @@ impl DB {
                             let mut mt =
                                 ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
                             *mt = memtable::MemTable::new();
-                            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut aol = ns_state
+                                .aol
+                                .as_ref()
+                                .unwrap()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
                             let _ = aol.truncate();
                         }
                     }
@@ -1067,7 +1198,12 @@ impl DB {
                     {
                         let map = cleanup_ns_data.read().unwrap_or_else(|e| e.into_inner());
                         for ns_state in map.values() {
-                            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut aol = ns_state
+                                .aol
+                                .as_ref()
+                                .unwrap()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
                             let _ = aol.truncate();
                         }
                     }
@@ -1194,7 +1330,12 @@ impl DB {
                         // Write to per-namespace AOL
                         let map = db_ns_data.read().unwrap_or_else(|e| e.into_inner());
                         if let Some(ns_state) = map.get(&record.namespace) {
-                            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut aol = ns_state
+                                .aol
+                                .as_ref()
+                                .unwrap()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
                             aol.append_encoded(payload)?;
                         }
                     } else {
@@ -1245,7 +1386,12 @@ impl DB {
                             let mut mt =
                                 ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
                             *mt = memtable::MemTable::new();
-                            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut aol = ns_state
+                                .aol
+                                .as_ref()
+                                .unwrap()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
                             let _ = aol.truncate();
                         }
                         for ns_name in new_sst.keys() {
@@ -1285,7 +1431,12 @@ impl DB {
                 let flush_fn: repl_peer::PeerFlushFn = Arc::new(move || {
                     let ns_map = flush_ns_data.read().unwrap_or_else(|e| e.into_inner());
                     for ns_state in ns_map.values() {
-                        let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut aol = ns_state
+                            .aol
+                            .as_ref()
+                            .unwrap()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         aol.flush_if_dirty()?;
                     }
                     Ok(())
@@ -1546,6 +1697,11 @@ impl DB {
     /// for a non-encrypted one. The encryption state is recorded on first
     /// access and enforced on subsequent calls within the same session.
     pub fn namespace(&self, name: &str, password: Option<&str>) -> Result<Namespace<'_>> {
+        if self.config.in_memory && password.is_some() {
+            return Err(Error::InvalidConfig(
+                "encryption is not supported in in-memory mode".into(),
+            ));
+        }
         let encrypted = password.is_some();
         let mut map = self
             .encrypted_namespaces
@@ -1703,28 +1859,30 @@ impl DB {
             map.remove(name);
         }
 
-        // 2. Delete on-disk data
-        let sst_dir = self.sst_namespace_dir(name);
-        if sst_dir.exists() {
-            fs::remove_dir_all(&sst_dir)?;
-        }
-        let obj_dir = self.config.path.join("objects").join(name);
-        if obj_dir.exists() {
-            fs::remove_dir_all(&obj_dir)?;
-        }
-        let salt_path = self.config.path.join("crypto").join(format!("{name}.salt"));
-        if salt_path.exists() {
-            fs::remove_file(&salt_path)?;
-        }
+        if !self.config.in_memory {
+            // 2. Delete on-disk data
+            let sst_dir = self.sst_namespace_dir(name);
+            if sst_dir.exists() {
+                fs::remove_dir_all(&sst_dir)?;
+            }
+            let obj_dir = self.config.path.join("objects").join(name);
+            if obj_dir.exists() {
+                fs::remove_dir_all(&obj_dir)?;
+            }
+            let salt_path = self.config.path.join("crypto").join(format!("{name}.salt"));
+            if salt_path.exists() {
+                fs::remove_file(&salt_path)?;
+            }
 
-        // 3. Broadcast to replicas/peers before AOL truncation
-        if let Some(ref sender) = self.repl_sender {
-            sender.broadcast_drop_namespace(name);
-        }
-        {
-            let sessions = self.peer_sessions.lock().unwrap_or_else(|e| e.into_inner());
-            for session in sessions.iter() {
-                session.send_drop_namespace(name);
+            // 3. Broadcast to replicas/peers before AOL truncation
+            if let Some(ref sender) = self.repl_sender {
+                sender.broadcast_drop_namespace(name);
+            }
+            {
+                let sessions = self.peer_sessions.lock().unwrap_or_else(|e| e.into_inner());
+                for session in sessions.iter() {
+                    session.send_drop_namespace(name);
+                }
             }
         }
 
@@ -1758,6 +1916,9 @@ impl DB {
     /// flushes (triggered by a remote `FlushNotify`) pass `false` to avoid
     /// infinite broadcast loops.
     fn flush_internal(&self, broadcast: bool) -> Result<()> {
+        if self.config.in_memory {
+            return Ok(());
+        }
         let flush_start = Instant::now();
         let namespaces: Vec<String> = {
             let map = self
@@ -1840,7 +2001,12 @@ impl DB {
             // Truncate this namespace's AOL — its data is now in the SSTable
             {
                 let ns_state = self.get_or_create_ns(ns_name)?;
-                let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+                let mut aol = ns_state
+                    .aol
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 aol.truncate()?;
             }
 
@@ -1889,13 +2055,18 @@ impl DB {
     /// underlying file descriptor, guaranteeing that all committed data
     /// is persisted to the storage device.
     pub fn sync(&self) -> Result<()> {
+        if self.config.in_memory {
+            return Ok(());
+        }
         let map = self
             .namespace_data
             .read()
             .unwrap_or_else(|e| e.into_inner());
         for ns_state in map.values() {
-            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
-            aol.sync()?;
+            if let Some(ref aol_mutex) = ns_state.aol {
+                let mut aol = aol_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                aol.sync()?;
+            }
         }
         Ok(())
     }
@@ -2146,6 +2317,11 @@ impl DB {
     /// are skipped. Encrypted namespaces are skipped (no password available
     /// for decryption during raw iteration).
     pub fn dump(&self, path: impl Into<PathBuf>) -> Result<()> {
+        if self.config.in_memory {
+            return Err(Error::InvalidConfig(
+                "dump is not supported in in-memory mode".into(),
+            ));
+        }
         let dump_path = path.into();
 
         // Flush memtables so all data is in SSTables
@@ -2263,6 +2439,9 @@ impl DB {
     /// deeper levels when a level exceeds its size threshold. Tombstones
     /// are dropped only at the bottommost level (`max_levels - 1`).
     pub fn compact(&self) -> Result<()> {
+        if self.config.in_memory {
+            return Ok(());
+        }
         let _guard = self
             .compaction_mutex
             .lock()
@@ -2285,6 +2464,9 @@ impl DB {
     /// processing. Useful for deterministic testing — ensures all pending
     /// compaction is done before asserting on-disk state.
     pub fn wait_for_compaction(&self) {
+        if self.config.in_memory {
+            return;
+        }
         // Clear done flag to ensure we wait for the NEXT cycle, not a stale one
         {
             let (lock, _cvar) = &*self.compaction_done;
@@ -2773,6 +2955,9 @@ impl DB {
     /// If the value exceeds the configured `object_size`, write it to the
     /// namespace's object store and return a `Value::Pointer`. Otherwise pass through.
     pub(crate) fn maybe_separate_value(&self, ns: &str, value: Value) -> Result<Value> {
+        if self.config.in_memory {
+            return Ok(value);
+        }
         if let Value::Data(ref data) = value {
             if data.len() > self.config.object_size {
                 let store = self.get_or_create_object_store(ns)?;
@@ -2799,9 +2984,20 @@ impl DB {
     }
 
     /// Acquire the per-namespace AOL lock for batch operations.
-    pub(crate) fn aol_lock(&self, ns: &str) -> Result<std::sync::MutexGuard<'_, aol::Aol>> {
+    /// Returns `None` in in-memory mode (no AOL).
+    pub(crate) fn aol_lock(&self, ns: &str) -> Result<Option<std::sync::MutexGuard<'_, aol::Aol>>> {
+        if self.config.in_memory {
+            return Ok(None);
+        }
         let ns_state = self.get_or_create_ns(ns)?;
-        Ok(ns_state.aol.lock().unwrap_or_else(|e| e.into_inner()))
+        Ok(Some(
+            ns_state
+                .aol
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        ))
     }
 
     pub(crate) fn append_to_aol(
@@ -2812,8 +3008,11 @@ impl DB {
         value: &Value,
         ttl: Option<Duration>,
     ) -> Result<()> {
-        let mut aol = self.aol_lock(ns)?;
-        self.append_to_aol_locked(&mut aol, ns, rev, key, value, ttl)
+        let aol = self.aol_lock(ns)?;
+        match aol {
+            Some(mut aol) => self.append_to_aol_locked(&mut aol, ns, rev, key, value, ttl),
+            None => Ok(()), // in-memory mode
+        }
     }
 
     /// Append to AOL using an already-acquired lock, then broadcast to
@@ -2917,7 +3116,12 @@ impl DB {
         if applied {
             // Write to local per-namespace AOL for crash recovery
             let ns_state = self.get_or_create_ns(&record.namespace)?;
-            let mut aol = ns_state.aol.lock().unwrap_or_else(|e| e.into_inner());
+            let mut aol = ns_state
+                .aol
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             aol.append_encoded(payload)?;
         } else {
             self.conflicts_resolved.fetch_add(1, Ordering::Relaxed);
@@ -3413,8 +3617,11 @@ impl DB {
             .write()
             .unwrap_or_else(|e| e.into_inner());
         if !map.contains_key(name) {
-            let ns_state =
-                NamespaceState::create(&self.config.path, name, self.config.aol_buffer_size)?;
+            let ns_state = if self.config.in_memory {
+                NamespaceState::create_in_memory()
+            } else {
+                NamespaceState::create(&self.config.path, name, self.config.aol_buffer_size)?
+            };
             map.insert(name.to_owned(), ns_state);
         }
         let ptr = map.get(name).unwrap() as *const NamespaceState;
@@ -3430,6 +3637,9 @@ impl DB {
 
 impl Drop for DB {
     fn drop(&mut self) {
+        if self.config.in_memory {
+            return;
+        }
         self.stop_replication();
         self.flush_stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.flush_thread.take() {

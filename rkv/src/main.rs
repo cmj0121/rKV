@@ -26,6 +26,10 @@ struct Args {
     #[arg(short, long, default_value_t = true)]
     create: bool,
 
+    /// Run in pure in-memory mode (no disk I/O)
+    #[arg(long)]
+    in_memory: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -721,6 +725,11 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                     "create dir if absent",
                     c.create_if_missing.to_string(),
                 ),
+                (
+                    "  storage.in_memory",
+                    "no disk I/O",
+                    c.in_memory.to_string(),
+                ),
                 ("", "", String::new()),
                 ("LSM", "", String::new()),
                 (
@@ -1163,6 +1172,7 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
             }
             Err(_) => eprintln!("error: expected a number"),
         },
+        "storage.in_memory" => eprintln!("error: in_memory cannot be changed at runtime"),
         "storage.path" => eprintln!("error: path cannot be changed at runtime"),
         "repl.role" => match value.parse::<rkv::Role>() {
             Ok(v) => {
@@ -1519,10 +1529,19 @@ fn main() {
             .unwrap_or_else(&default_path)
     };
 
-    let mut config = Config::new(&path);
+    let mut config = if args.in_memory {
+        Config::in_memory()
+    } else {
+        Config::new(&path)
+    };
     file_config.apply_to_config(&mut config);
-    // Ensure path is from the resolution above, not apply_to_config
-    config.path = path;
+    if args.in_memory {
+        config.in_memory = true;
+        config.path = PathBuf::new();
+    } else {
+        // Ensure path is from the resolution above, not apply_to_config
+        config.path = path;
+    }
     config.create_if_missing = args.create;
 
     let mut db = match DB::open(config) {
