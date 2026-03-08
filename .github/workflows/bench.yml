@@ -26,6 +26,9 @@ jobs:
       - name: Run benchmarks
         run: cargo run --bin bench --release
 
+      - name: Run comparison benchmarks
+        run: cargo run --bin bench_compare --features bench-compare --release
+
       - name: Format BENCH.md
         run: npx prettier@3 --write BENCH.md
 
