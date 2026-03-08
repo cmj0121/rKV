@@ -2,9 +2,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[allow(unused_imports)]
 use rkv::{
-    CompactionEvent, Compression, Config, Error, EventListener, FlushEvent, IoModel, Key,
-    LevelStat, RevisionID, Stats, Value, WriteBatch, DB, DEFAULT_NAMESPACE,
+    CompactionEvent, Compression, Config, EntryIterator, Error, EventListener, FlushEvent, IoModel,
+    Key, KeyIterator, LevelStat, RevisionID, Stats, Value, WriteBatch, DB, DEFAULT_NAMESPACE,
 };
 
 #[test]
@@ -6125,4 +6126,191 @@ fn in_memory_ttl() {
     // After expiry, key should be gone
     std::thread::sleep(Duration::from_millis(60));
     assert!(matches!(ns.get("ephemeral"), Err(Error::KeyNotFound)));
+}
+
+// ---------------------------------------------------------------------------
+// Iterator API Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn iterator_keys_forward() {
+    let db = DB::open(Config::in_memory()).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1_i64, "a", None).unwrap();
+    ns.put(2_i64, "b", None).unwrap();
+    ns.put(3_i64, "c", None).unwrap();
+
+    let keys: Vec<Key> = ns
+        .keys(&Key::Int(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(keys, vec![Key::Int(1), Key::Int(2), Key::Int(3)]);
+}
+
+#[test]
+fn iterator_keys_reverse() {
+    let db = DB::open(Config::in_memory()).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1_i64, "a", None).unwrap();
+    ns.put(2_i64, "b", None).unwrap();
+    ns.put(3_i64, "c", None).unwrap();
+
+    // For ordered (Int) mode, rscan prefix is the upper bound
+    let keys: Vec<Key> = ns
+        .rkeys(&Key::Int(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(keys, vec![Key::Int(3), Key::Int(2), Key::Int(1)]);
+}
+
+#[test]
+fn iterator_entries_forward() {
+    let db = DB::open(Config::in_memory()).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put("x", "1", None).unwrap();
+    ns.put("y", "2", None).unwrap();
+    ns.put("z", "3", None).unwrap();
+
+    let entries: Vec<(Key, Value)> = ns
+        .entries(&Key::from(""))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0], (Key::from("x"), Value::from("1")));
+    assert_eq!(entries[1], (Key::from("y"), Value::from("2")));
+    assert_eq!(entries[2], (Key::from("z"), Value::from("3")));
+}
+
+#[test]
+fn iterator_entries_reverse() {
+    let db = DB::open(Config::in_memory()).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put("a", "1", None).unwrap();
+    ns.put("b", "2", None).unwrap();
+    ns.put("c", "3", None).unwrap();
+
+    let entries: Vec<(Key, Value)> = ns
+        .rentries(&Key::from(""))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0], (Key::from("c"), Value::from("3")));
+    assert_eq!(entries[1], (Key::from("b"), Value::from("2")));
+    assert_eq!(entries[2], (Key::from("a"), Value::from("1")));
+}
+
+#[test]
+fn iterator_skips_tombstones() {
+    let db = DB::open(Config::in_memory()).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put(1_i64, "a", None).unwrap();
+    ns.put(2_i64, "b", None).unwrap();
+    ns.put(3_i64, "c", None).unwrap();
+    ns.delete(2_i64).unwrap();
+
+    // keys() should skip the deleted key
+    let keys: Vec<Key> = ns
+        .keys(&Key::Int(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(keys, vec![Key::Int(1), Key::Int(3)]);
+
+    // entries() should also skip
+    let entries: Vec<(Key, Value)> = ns
+        .entries(&Key::Int(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].0, Key::Int(1));
+    assert_eq!(entries[1].0, Key::Int(3));
+}
+
+#[test]
+fn iterator_prefix_filter() {
+    let db = DB::open(Config::in_memory()).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put("user:1", "alice", None).unwrap();
+    ns.put("user:2", "bob", None).unwrap();
+    ns.put("post:1", "hello", None).unwrap();
+
+    let keys: Vec<Key> = ns
+        .keys(&Key::from("user:"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(keys.len(), 2);
+    assert!(keys.contains(&Key::from("user:1")));
+    assert!(keys.contains(&Key::from("user:2")));
+}
+
+#[test]
+fn iterator_lazy_semantics() {
+    let db = DB::open(Config::in_memory()).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    for i in 0..100 {
+        ns.put(i as i64, format!("v{i}").as_str(), None).unwrap();
+    }
+
+    // Take only first 3 — lazy, should not materialize all 100
+    let keys: Vec<Key> = ns
+        .keys(&Key::Int(0))
+        .unwrap()
+        .take(3)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(keys.len(), 3);
+    assert_eq!(keys[0], Key::Int(0));
+    assert_eq!(keys[1], Key::Int(1));
+    assert_eq!(keys[2], Key::Int(2));
+}
+
+#[test]
+fn iterator_with_disk_sstables() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::new(dir.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    // Write some data and flush to SSTables
+    for i in 0..5 {
+        ns.put(i as i64, format!("v{i}").as_str(), None).unwrap();
+    }
+    db.flush().unwrap();
+
+    // Write more data to memtable
+    for i in 5..10 {
+        ns.put(i as i64, format!("v{i}").as_str(), None).unwrap();
+    }
+
+    // Iterator should merge memtable + SSTable data
+    let keys: Vec<Key> = ns
+        .keys(&Key::Int(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(keys.len(), 10);
+
+    let entries: Vec<(Key, Value)> = ns
+        .entries(&Key::Int(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 10);
+    assert_eq!(entries[0], (Key::Int(0), Value::from("v0")));
+    assert_eq!(entries[9], (Key::Int(9), Value::from("v9")));
+
+    db.close().unwrap();
 }

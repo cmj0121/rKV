@@ -66,6 +66,30 @@ alongside live keys; when `false` (default), tombstones are filtered out.
   representation starts with `prefix`; `rscan` returns the same prefix-matched keys in reverse order.
   Ordering-based range queries are not available.
 
+**Lazy iterators** provide an alternative to `scan`/`rscan` that avoids materializing all results into a `Vec`.
+Four methods return standard Rust `Iterator` implementations:
+
+- `ns.keys(prefix)` — forward `KeyIterator` yielding `Result<Key>`
+- `ns.entries(prefix)` — forward `EntryIterator` yielding `Result<(Key, Value)>`
+- `ns.rkeys(prefix)` — reverse `KeyIterator`
+- `ns.rentries(prefix)` — reverse `EntryIterator`
+
+All iterators skip tombstoned keys automatically. `EntryIterator` resolves `ValuePointer`s and decrypts
+encrypted values transparently. Iterators are lazy — they only read blocks on demand, so `take(n)` is
+efficient even on large datasets. Once an I/O error occurs, the iterator becomes sticky (returns `None`
+on subsequent calls).
+
+```rust
+// Collect first 5 keys starting from prefix "user:"
+let keys: Vec<Key> = ns.keys(&Key::from("user:"))?.take(5).collect::<Result<_>>()?;
+
+// Iterate over all entries
+for result in ns.entries(&Key::from(""))? {
+    let (key, value) = result?;
+    println!("{key}: {value:?}");
+}
+```
+
 ### Value
 
 A Value is the payload associated with a key. It has three internal states:
