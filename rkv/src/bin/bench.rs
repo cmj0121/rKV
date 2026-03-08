@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::time::Instant;
 
-use rkv::{Config, Key, DB, DEFAULT_NAMESPACE};
+use rkv::{Config, Key, WriteBatch, DB, DEFAULT_NAMESPACE};
 use sysinfo::System;
 
 const SIZES: &[usize] = &[1_000, 8_000, 16_000, 1_000_000];
@@ -229,6 +229,69 @@ fn bench_scan(n: usize) -> std::time::Duration {
     start.elapsed()
 }
 
+fn bench_get_compact(n: usize) -> std::time::Duration {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // Write in batches and flush multiple times to create multiple L0 SSTables,
+    // then compact to push data into deeper levels.
+    let chunk = n / 4;
+    for c in 0..4 {
+        for i in (c * chunk)..((c + 1) * chunk) {
+            ns.put(i as i64, VALUE.as_slice(), None).unwrap();
+        }
+        db.flush().unwrap();
+    }
+    db.compact().unwrap();
+    db.wait_for_compaction();
+
+    let mut indices: Vec<i64> = (0..n as i64).collect();
+    fastrand::shuffle(&mut indices);
+
+    let start = Instant::now();
+    for &i in &indices {
+        ns.get(i).unwrap();
+    }
+    start.elapsed()
+}
+
+fn bench_batch(n: usize) -> std::time::Duration {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let start = Instant::now();
+    // Write in batches of 100
+    for chunk_start in (0..n).step_by(100) {
+        let chunk_end = (chunk_start + 100).min(n);
+        let mut batch = WriteBatch::new();
+        for i in chunk_start..chunk_end {
+            batch = batch.put(Key::Int(i as i64), VALUE.as_slice(), None);
+        }
+        ns.write_batch(batch).unwrap();
+    }
+    start.elapsed()
+}
+
+fn bench_keys(n: usize) -> std::time::Duration {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 0..n {
+        ns.put(i as i64, VALUE.as_slice(), None).unwrap();
+    }
+
+    let start = Instant::now();
+    let count = ns.keys(&Key::Int(0)).unwrap().count();
+    assert_eq!(count, n);
+    start.elapsed()
+}
+
 // ---------------------------------------------------------------------------
 // In-memory bench functions
 // ---------------------------------------------------------------------------
@@ -296,6 +359,38 @@ fn bench_mem_scan(n: usize) -> std::time::Duration {
     start.elapsed()
 }
 
+fn bench_mem_batch(n: usize) -> std::time::Duration {
+    let config = Config::in_memory();
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    let start = Instant::now();
+    for chunk_start in (0..n).step_by(100) {
+        let chunk_end = (chunk_start + 100).min(n);
+        let mut batch = WriteBatch::new();
+        for i in chunk_start..chunk_end {
+            batch = batch.put(Key::Int(i as i64), VALUE.as_slice(), None);
+        }
+        ns.write_batch(batch).unwrap();
+    }
+    start.elapsed()
+}
+
+fn bench_mem_keys(n: usize) -> std::time::Duration {
+    let config = Config::in_memory();
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 0..n {
+        ns.put(i as i64, VALUE.as_slice(), None).unwrap();
+    }
+
+    let start = Instant::now();
+    let count = ns.keys(&Key::Int(0)).unwrap().count();
+    assert_eq!(count, n);
+    start.elapsed()
+}
+
 fn format_size(n: usize) -> String {
     if n >= 1_000_000 {
         format!("{}M", n / 1_000_000)
@@ -314,8 +409,11 @@ fn main() {
         ("get", bench_get),
         ("delete", bench_delete),
         ("scan", bench_scan),
+        ("batch", bench_batch),
+        ("keys", bench_keys),
         ("flush", bench_flush),
         ("get_sst", bench_get_sst),
+        ("get_cpt", bench_get_compact),
         ("put_obj", bench_put_objects),
         ("get_obj", bench_get_objects),
     ];
@@ -328,6 +426,8 @@ fn main() {
         ("get", bench_mem_get),
         ("delete", bench_mem_delete),
         ("scan", bench_mem_scan),
+        ("batch", bench_mem_batch),
+        ("keys", bench_mem_keys),
     ];
 
     let mem_size_headers: Vec<String> = MEM_SIZES.iter().map(|&s| format_size(s)).collect();
@@ -381,8 +481,11 @@ fn main() {
     md.push_str("| get       | Random reads of N existing keys (shuffled order) |\n");
     md.push_str("| delete    | Sequential deletes of N existing keys |\n");
     md.push_str("| scan      | Forward scan of all keys (limit=N, offset=0) |\n");
+    md.push_str("| batch     | WriteBatch inserts in chunks of 100 |\n");
+    md.push_str("| keys      | Lazy KeyIterator full drain of N keys |\n");
     md.push_str("| flush     | Flush N keys from MemTable to L0 SSTable |\n");
     md.push_str("| get_sst   | Random reads of N keys from SSTable (after flush) |\n");
+    md.push_str("| get_cpt   | Random reads of N keys after flush + compaction (multi-level) |\n");
     md.push_str("| put_obj   | Sequential inserts of N keys with 4 KB values via ObjectStore |\n");
     md.push_str("| get_obj   | Random reads of N keys resolved from ObjectStore |\n");
     md.push_str(
