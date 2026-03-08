@@ -63,28 +63,45 @@ below). The database is openable after repair.
 
 ### Dump / Load
 
-| Method | Kind     | Signature                                       | Description                               |
-| ------ | -------- | ----------------------------------------------- | ----------------------------------------- |
-| `dump` | instance | `&self, path: impl Into<PathBuf> -> Result<()>` | Export database to a portable backup file |
-| `load` | static   | `(path: impl Into<PathBuf>) -> Result<DB>`      | Import database from a backup file        |
+| Method               | Kind     | Signature                                | Description           |
+| -------------------- | -------- | ---------------------------------------- | --------------------- |
+| `dump`               | instance | `&self, path -> Result<()>`              | Export (V1)           |
+| `dump_with_options`  | instance | `&self, path, DumpOptions -> Result<()>` | Export (V2)           |
+| `load`               | static   | `(path) -> Result<DB>`                   | Import dump           |
+| `load_with_password` | static   | `(path, &str) -> Result<DB>`             | Import encrypted dump |
 
 `dump` flushes all in-memory write buffers, merges SSTable levels per namespace
 (same strategy as compaction), filters tombstones, resolves `Pointer` values to
 inline `Data`, and writes each entry to the dump file with a CRC32C checksum.
-Encrypted namespaces are skipped (v1 limitation).
+Encrypted namespaces are skipped.
+
+`dump_with_options` accepts a `DumpOptions` struct:
+
+- **`after_revision`**: Only include entries whose revision ID is greater than
+  the given threshold. Enables incremental backups — dump only what changed
+  since the last backup.
+- **`password`**: Encrypt records with AES-256-GCM (key derived via Argon2id).
+  The salt is stored in the V2 header; the password is required to restore.
+
+When either option is set, the V2 format is used automatically.
 
 `load` reads the dump file, creates a fresh DB at the stored path, replays all
 records via `namespace.put()`, and flushes. Returns `InvalidConfig` if the target
-path already contains data.
+path already contains data. Returns `EncryptionRequired` if the dump is encrypted.
 
-`load` is not exposed in the CLI because it would require replacing the live DB
-handle mid-session.
+`load_with_password` decrypts each record using the provided password. Returns
+`Corruption` if the password is wrong (AES-GCM tag verification failure).
+
+`load` / `load_with_password` are not exposed in the CLI because they would
+require replacing the live DB handle mid-session.
 
 #### Dump File Format
 
+**V1** (produced by `dump`):
+
 ```text
 Header:
-  [magic: 4B "rKVD"]  [version: 2B BE]
+  [magic: 4B "rKVD"]  [version: 2B BE = 1]
   [path_len: 2B BE]   [path: UTF-8 bytes]
 
 Records (repeating):
@@ -100,8 +117,35 @@ EOF sentinel:
   [payload_len: 4B = 0x00000000]
 ```
 
+**V2** (produced by `dump_with_options`):
+
+```text
+Header:
+  [magic: 4B "rKVD"]  [version: 2B BE = 2]
+  [path_len: 2B BE]   [path: UTF-8 bytes]
+  [flags: 1B]         [after_revision: 16B BE u128]
+  [salt: 16B]         (only if flags & 0x01, for encryption)
+
+Records (repeating):
+  [payload_len: 4B BE] [payload or encrypted_payload] [checksum: 5B CRC32C]
+
+V2 Payload (before encryption):
+  [ns_len: 2B BE]  [namespace]
+  [key_len: 2B BE] [key_bytes]
+  [value_tag: 1B]  [value_data_len: 4B BE] [value_data]
+  [expires_at_ms: 8B BE]
+  [revision: 16B BE u128]
+
+EOF sentinel:
+  [payload_len: 4B = 0x00000000]
+```
+
+Flags: bit 0 = encrypted. When encrypted, each record payload is individually
+encrypted with AES-256-GCM (12-byte nonce prepended to ciphertext + 16-byte tag).
+
 The format mirrors the AOL record layout for consistency. Each record is
-self-describing and independently verifiable via its checksum.
+self-describing and independently verifiable via its checksum. V1 and V2 are
+backward-compatible — the reader auto-detects the version from the header.
 
 ### Compaction
 

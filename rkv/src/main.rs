@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Parser;
-use rkv::{Config, Key, Namespace, WriteBatch, DB, DEFAULT_NAMESPACE};
+use rkv::{Config, DumpOptions, Key, Namespace, RevisionID, WriteBatch, DB, DEFAULT_NAMESPACE};
 use rustyline::DefaultEditor;
 
 #[cfg(feature = "server")]
@@ -385,12 +385,18 @@ fn print_command_help(cmd: &str) {
             println!("  See also: destroy, dump");
         }
         "dump" => {
-            println!("dump <path>");
+            println!("dump <path> [--after <revision>] [--encrypt]");
             println!();
             println!("  Export the database to a backup file.");
             println!();
+            println!("  Options:");
+            println!("    --after <revision>  Only include entries after this revision ID");
+            println!("    --encrypt           Encrypt the dump file (prompts for password)");
+            println!();
             println!("  Examples:");
             println!("    dump /tmp/backup.rkv");
+            println!("    dump /tmp/incr.rkv --after 7z");
+            println!("    dump /tmp/secret.rkv --encrypt");
             println!();
             println!("  See also: repair");
         }
@@ -961,10 +967,61 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
         }
         "dump" => {
             if tokens.len() < 2 {
-                eprintln!("usage: dump <path>");
+                eprintln!("usage: dump <path> [--after <revision>] [--encrypt]");
                 return Action::Continue;
             }
-            match db.dump(tokens[1]) {
+            let path = tokens[1];
+
+            // Parse optional flags
+            let mut after_revision = None;
+            let mut password = None;
+            let mut i = 2;
+            while i < tokens.len() {
+                match tokens[i] {
+                    "--after" => {
+                        i += 1;
+                        if i >= tokens.len() {
+                            eprintln!("error: --after requires a revision ID");
+                            return Action::Continue;
+                        }
+                        match tokens[i].parse::<RevisionID>() {
+                            Ok(rev) => after_revision = Some(rev),
+                            Err(e) => {
+                                eprintln!("error: {e}");
+                                return Action::Continue;
+                            }
+                        }
+                    }
+                    "--encrypt" => {
+                        eprint!("Dump password: ");
+                        let pw = rpassword::read_password().unwrap_or_default();
+                        if pw.is_empty() {
+                            eprintln!("error: password cannot be empty");
+                            return Action::Continue;
+                        }
+                        password = Some(pw);
+                    }
+                    _ => {
+                        eprintln!("error: unknown flag '{}'", tokens[i]);
+                        return Action::Continue;
+                    }
+                }
+                i += 1;
+            }
+
+            let use_options = after_revision.is_some() || password.is_some();
+            let result = if use_options {
+                db.dump_with_options(
+                    path,
+                    DumpOptions {
+                        after_revision,
+                        password,
+                    },
+                )
+            } else {
+                db.dump(path)
+            };
+            match result {
                 Ok(()) => println!("OK"),
                 Err(e) => eprintln!("error: {e}"),
             }

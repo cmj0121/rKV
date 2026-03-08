@@ -27,6 +27,7 @@ mod value;
 
 pub use batch::{BatchOp, WriteBatch};
 pub use cluster::{NodeInfo, RoutingTable, ShardGroup};
+pub use dump::DumpOptions;
 pub use error::{Error, Result};
 pub use iterator::{EntryIterator, KeyIterator};
 pub use key::Key;
@@ -2309,7 +2310,7 @@ impl DB {
 
     // --- Dump / Load ---
 
-    /// Export the database to a portable backup file.
+    /// Export the database to a portable backup file (V1 format, full dump).
     ///
     /// Flushes all in-memory write buffers, then iterates every namespace's
     /// SSTables to produce a self-contained dump. Tombstones are filtered,
@@ -2317,6 +2318,18 @@ impl DB {
     /// are skipped. Encrypted namespaces are skipped (no password available
     /// for decryption during raw iteration).
     pub fn dump(&self, path: impl Into<PathBuf>) -> Result<()> {
+        self.dump_with_options(path, dump::DumpOptions::default())
+    }
+
+    /// Export the database with options (V2 format).
+    ///
+    /// Supports incremental dump (only entries after a given revision) and
+    /// encrypted dump files. See [`DumpOptions`] for details.
+    pub fn dump_with_options(
+        &self,
+        path: impl Into<PathBuf>,
+        options: dump::DumpOptions,
+    ) -> Result<()> {
         if self.config.in_memory {
             return Err(Error::InvalidConfig(
                 "dump is not supported in in-memory mode".into(),
@@ -2328,7 +2341,15 @@ impl DB {
         self.flush()?;
 
         let mut writer = dump::DumpWriter::new(&dump_path, &*self.io_backend)?;
-        writer.write_header(&self.config.path)?;
+        let is_v2 = options.after_revision.is_some() || options.password.is_some();
+
+        if is_v2 {
+            writer.write_header_v2(&self.config.path, &options)?;
+        } else {
+            writer.write_header(&self.config.path)?;
+        }
+
+        let after_rev = options.after_revision.unwrap_or(RevisionID::ZERO).as_u128();
 
         let namespaces = self.list_namespaces()?;
 
@@ -2346,6 +2367,7 @@ impl DB {
 
             // Merge all SSTable levels into a single sorted map (bottom-up,
             // newest wins) — same merge strategy as compaction.
+            // V2 tracks per-key revision for incremental filtering.
             let merged = {
                 let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
                 let levels = match sst.get(ns_name) {
@@ -2353,40 +2375,47 @@ impl DB {
                     None => continue,
                 };
 
-                let mut merged = std::collections::BTreeMap::<Key, Value>::new();
+                let mut merged = std::collections::BTreeMap::<Key, (Value, RevisionID)>::new();
 
                 // Process levels from bottom (oldest) to top (newest)
                 for (level_idx, level_readers) in levels.iter().enumerate().rev() {
                     if level_idx == 0 {
                         // L0: reverse (oldest-to-newest within L0)
                         for reader in level_readers.iter().rev() {
-                            for (key, value, _rev, _exp) in
+                            for (key, value, rev, _exp) in
                                 reader.iter_entries(self.config.verify_checksums)?
                             {
-                                merged.insert(key, value);
+                                merged.insert(key, (value, rev));
                             }
                         }
                     } else {
                         for reader in level_readers {
-                            for (key, value, _rev, _exp) in
+                            for (key, value, rev, _exp) in
                                 reader.iter_entries(self.config.verify_checksums)?
                             {
-                                merged.insert(key, value);
+                                merged.insert(key, (value, rev));
                             }
                         }
                     }
                 }
 
-                // Filter tombstones
-                merged.retain(|_, v| !v.is_tombstone());
+                // Filter tombstones and apply revision threshold (incremental dump)
+                merged.retain(|_, (v, rev)| {
+                    !v.is_tombstone() && (after_rev == 0 || rev.as_u128() > after_rev)
+                });
+
                 merged
             };
 
-            for (key, value) in &merged {
+            for (key, (value, rev)) in &merged {
                 // Resolve Pointer → inline Data
                 let resolved = self.resolve_value(ns_name, value)?;
-                // TTL is not preserved — SSTables don't store expiry.
-                writer.write_record(ns_name, key, &resolved, 0)?;
+                if is_v2 {
+                    writer.write_record_v2(ns_name, key, &resolved, 0, *rev)?;
+                } else {
+                    // TTL is not preserved — SSTables don't store expiry.
+                    writer.write_record(ns_name, key, &resolved, 0)?;
+                }
             }
         }
 
@@ -2401,12 +2430,35 @@ impl DB {
     /// populated `DB` handle. Expired entries are skipped during import.
     ///
     /// Returns `InvalidConfig` if the target path already contains data.
+    /// For encrypted dumps, use [`DB::load_with_password`].
     pub fn load(path: impl Into<PathBuf>) -> Result<DB> {
-        let dump_path = path.into();
+        Self::load_internal(path.into(), None)
+    }
 
+    /// Import a database from an encrypted dump file.
+    ///
+    /// Same as [`DB::load`] but provides a password for decryption.
+    /// Returns `Corruption` error if the password is wrong.
+    pub fn load_with_password(path: impl Into<PathBuf>, password: &str) -> Result<DB> {
+        Self::load_internal(path.into(), Some(password))
+    }
+
+    fn load_internal(dump_path: PathBuf, password: Option<&str>) -> Result<DB> {
         let load_io = io::BufferedIo;
         let mut reader = dump::DumpReader::open(&dump_path, &load_io)?;
         let header = reader.read_header()?;
+
+        if header.is_encrypted() && password.is_none() {
+            return Err(Error::EncryptionRequired(
+                "dump file is encrypted — use load_with_password".into(),
+            ));
+        }
+
+        if let Some(pw) = password {
+            if header.is_encrypted() {
+                reader.set_password(pw)?;
+            }
+        }
 
         let db_path = PathBuf::from(&header.db_path);
 
