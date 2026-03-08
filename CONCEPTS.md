@@ -443,41 +443,43 @@ The `Config` struct controls database behavior and LSM tuning parameters:
 | `event_listener`    | `Option<Arc<..>>` | `None`     | Callback for flush/compaction events       |
 | `shard_group`       | `u16`             | 0          | Shard group ID (0 = standalone)            |
 | `owned_namespaces`  | `Vec<String>`     | `[]`       | Namespaces owned by this shard node        |
+| `in_memory`         | `bool`            | `false`    | Pure in-memory mode (no disk I/O)          |
 
 The CLI uses dot-notation keys for `config <key> <value>`:
 
-| Config field        | CLI key                     |
-| ------------------- | --------------------------- |
-| `path`              | `storage.path` (read-only)  |
-| `create_if_missing` | `storage.create_if_missing` |
-| `write_buffer_size` | `lsm.write_buffer_size`     |
-| `max_levels`        | `lsm.max_levels`            |
-| `block_size`        | `lsm.block_size`            |
-| `cache_size`        | `lsm.cache_size`            |
-| `bloom_bits`        | `lsm.bloom_bits`            |
-| `verify_checksums`  | `lsm.verify_checksums`      |
-| `compression`       | `lsm.compression`           |
-| `object_size`       | `object.size`               |
-| `compress`          | `object.compress`           |
-| `io_model`          | `io.model`                  |
-| `cluster_id`        | `revision.cluster_id`       |
-| `aol_buffer_size`   | `aol.buffer_size`           |
-| `l0_max_count`      | `lsm.l0_max_count`          |
-| `l0_max_size`       | `lsm.l0_max_size`           |
-| `l1_max_size`       | `lsm.l1_max_size`           |
-| `default_max_size`  | `lsm.default_max_size`      |
-| `bloom_prefix_len`  | `lsm.bloom_prefix_len`      |
-| `write_stall_size`  | `lsm.write_stall_size`      |
-| `role`              | `repl.role`                 |
-| `repl_bind`         | `repl.bind`                 |
-| `repl_port`         | `repl.port`                 |
-| `primary_addr`      | `repl.primary_addr`         |
-| `peers`             | `repl.peers`                |
-| `shard_group`       | `cluster.shard_group`       |
-| `owned_namespaces`  | `cluster.owned_namespaces`  |
+| Config field        | CLI key                         |
+| ------------------- | ------------------------------- |
+| `path`              | `storage.path` (read-only)      |
+| `create_if_missing` | `storage.create_if_missing`     |
+| `write_buffer_size` | `lsm.write_buffer_size`         |
+| `max_levels`        | `lsm.max_levels`                |
+| `block_size`        | `lsm.block_size`                |
+| `cache_size`        | `lsm.cache_size`                |
+| `bloom_bits`        | `lsm.bloom_bits`                |
+| `verify_checksums`  | `lsm.verify_checksums`          |
+| `compression`       | `lsm.compression`               |
+| `object_size`       | `object.size`                   |
+| `compress`          | `object.compress`               |
+| `io_model`          | `io.model`                      |
+| `cluster_id`        | `revision.cluster_id`           |
+| `aol_buffer_size`   | `aol.buffer_size`               |
+| `l0_max_count`      | `lsm.l0_max_count`              |
+| `l0_max_size`       | `lsm.l0_max_size`               |
+| `l1_max_size`       | `lsm.l1_max_size`               |
+| `default_max_size`  | `lsm.default_max_size`          |
+| `bloom_prefix_len`  | `lsm.bloom_prefix_len`          |
+| `write_stall_size`  | `lsm.write_stall_size`          |
+| `role`              | `repl.role`                     |
+| `repl_bind`         | `repl.bind`                     |
+| `repl_port`         | `repl.port`                     |
+| `primary_addr`      | `repl.primary_addr`             |
+| `peers`             | `repl.peers`                    |
+| `shard_group`       | `cluster.shard_group`           |
+| `owned_namespaces`  | `cluster.owned_namespaces`      |
+| `in_memory`         | `storage.in_memory` (read-only) |
 
-`Config::new(path)` initializes all fields to their defaults. Fields can be overridden before
-passing the config to `DB::open`.
+`Config::new(path)` initializes all fields to their defaults. `Config::in_memory()` creates
+a pure in-memory configuration. Fields can be overridden before passing the config to `DB::open`.
 
 ### I/O Modes
 
@@ -504,6 +506,40 @@ and the engine has less control over I/O scheduling.
 
 **Stub status**: All three backends are defined but return `NotImplemented`. The actual
 I/O logic will be implemented when the storage layer is built.
+
+### In-Memory Mode
+
+When `in_memory` is `true` (or `Config::in_memory()` is used), the database runs entirely
+in RAM with zero disk I/O:
+
+- No directories, AOL files, SSTables, or bin objects are created on disk
+- All data lives in the memtable (`BTreeMap`) and grows unbounded
+- No background threads (flush, compaction) are started
+- `flush()`, `compact()`, and `sync()` are no-ops returning `Ok(())`
+- `dump()` returns `Err(InvalidConfig)`
+- Value separation is disabled — all values are stored inline regardless of `object_size`
+- Write stall / backpressure is disabled
+
+**Limitations:**
+
+- Replication is incompatible with in-memory mode (rejected at validation time)
+- Encryption is incompatible with in-memory mode (requires disk for salt/verification token)
+- Data is lost when the database is dropped — there is no persistence
+
+**CLI usage:**
+
+```sh
+rkv --in-memory          # REPL mode, no path needed
+```
+
+**Programmatic usage:**
+
+```rust
+let db = DB::open(Config::in_memory())?;
+let ns = db.namespace("_", None)?;
+ns.put("key", "value", None)?;
+// Data lives only in memory — no files on disk
+```
 
 ### Statistics
 
