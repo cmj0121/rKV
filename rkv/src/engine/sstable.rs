@@ -415,7 +415,6 @@ struct LazyMeta {
     filter: KeyFilter,
     prefix_filter: Option<KeyFilter>,
     filter_prefix_len: usize,
-    #[allow(dead_code)] // accessed via #[cfg(test)] first_key() method
     first_key: Option<Vec<u8>>,
 }
 
@@ -816,6 +815,18 @@ impl SSTableReader {
         #[cfg(feature = "profiling")]
         let prof_m = self.metrics.as_deref();
 
+        // Key-range pre-filter: skip if key is outside [first_key, last_key]
+        if let Some(ref first_key) = meta.first_key {
+            if key_buf < first_key.as_slice() {
+                return Ok(None);
+            }
+        }
+        if let Some(last_ie) = meta.index.last() {
+            if key_buf > last_ie.last_key.as_slice() {
+                return Ok(None);
+            }
+        }
+
         // Bloom filter check: skip this SSTable if the key is definitely absent
         {
             super::metrics::prof_opt_timer!(prof_m, prof_sst_bloom_check);
@@ -940,6 +951,18 @@ impl SSTableReader {
 
         let mut key_buf = Vec::with_capacity(key.encoded_len());
         key.write_bytes_to(&mut key_buf);
+
+        // Key-range pre-filter
+        if let Some(ref first_key) = meta.first_key {
+            if key_buf.as_slice() < first_key.as_slice() {
+                return Ok(Vec::new());
+            }
+        }
+        if let Some(last_ie) = meta.index.last() {
+            if key_buf.as_slice() > last_ie.last_key.as_slice() {
+                return Ok(Vec::new());
+            }
+        }
 
         if !meta.filter.may_contain(&key_buf) {
             return Ok(Vec::new());
