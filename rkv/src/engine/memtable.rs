@@ -260,12 +260,9 @@ impl MemTable {
                 .take(limit)
                 .collect()
         } else {
-            let prefix_str = prefix.to_string();
             self.entries
                 .iter()
-                .filter(|(k, entries)| {
-                    k.to_string().starts_with(&prefix_str) && self.is_live(entries)
-                })
+                .filter(|(k, entries)| k.has_prefix(prefix) && self.is_live(entries))
                 .map(|(k, _)| k.clone())
                 .skip(offset)
                 .take(limit)
@@ -291,13 +288,10 @@ impl MemTable {
                 .take(limit)
                 .collect()
         } else {
-            let prefix_str = prefix.to_string();
             self.entries
                 .iter()
                 .rev()
-                .filter(|(k, entries)| {
-                    k.to_string().starts_with(&prefix_str) && self.is_live(entries)
-                })
+                .filter(|(k, entries)| k.has_prefix(prefix) && self.is_live(entries))
                 .map(|(k, _)| k.clone())
                 .skip(offset)
                 .take(limit)
@@ -327,10 +321,9 @@ impl MemTable {
                     .collect()
             }
         } else {
-            let prefix_str = prefix.to_string();
             self.entries
                 .iter()
-                .filter(|(k, _)| k.to_string().starts_with(&prefix_str))
+                .filter(|(k, _)| k.has_prefix(prefix))
                 .map(|(k, entries)| (k.clone(), Self::latest_or_tombstone(entries)))
                 .collect()
         }
@@ -348,10 +341,9 @@ impl MemTable {
                 .map(|(k, entries)| (k.clone(), Self::latest_or_tombstone(entries)))
                 .collect()
         } else {
-            let prefix_str = prefix.to_string();
             self.entries
                 .iter()
-                .filter(|(k, _)| k.to_string().starts_with(&prefix_str))
+                .filter(|(k, _)| k.has_prefix(prefix))
                 .map(|(k, entries)| (k.clone(), Self::latest_or_tombstone(entries)))
                 .collect()
         }
@@ -372,12 +364,9 @@ impl MemTable {
                 .take(limit)
                 .collect()
         } else {
-            let prefix_str = prefix.to_string();
             self.entries
                 .iter()
-                .filter(|(k, entries)| {
-                    k.to_string().starts_with(&prefix_str) && self.is_not_expired(entries)
-                })
+                .filter(|(k, entries)| k.has_prefix(prefix) && self.is_not_expired(entries))
                 .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
                 .skip(offset)
                 .take(limit)
@@ -400,13 +389,10 @@ impl MemTable {
                 .take(limit)
                 .collect()
         } else {
-            let prefix_str = prefix.to_string();
             self.entries
                 .iter()
                 .rev()
-                .filter(|(k, entries)| {
-                    k.to_string().starts_with(&prefix_str) && self.is_not_expired(entries)
-                })
+                .filter(|(k, entries)| k.has_prefix(prefix) && self.is_not_expired(entries))
                 .map(|(k, entries)| (k.clone(), entries.last().unwrap().value.clone()))
                 .skip(offset)
                 .take(limit)
