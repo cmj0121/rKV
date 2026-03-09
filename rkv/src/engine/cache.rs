@@ -506,4 +506,84 @@ mod tests {
         assert_eq!(cache.hits(), 0);
         assert_eq!(cache.misses(), 0);
     }
+
+    // --- ShardedBlockCache ---
+
+    #[test]
+    fn sharded_insert_and_get() {
+        let cache = ShardedBlockCache::new(65536);
+        let entries = Arc::new(make_entries(3));
+        let size = estimate_block_size(&entries);
+        cache.insert_arc(1, 0, Arc::clone(&entries), size);
+
+        let got = cache.get(1, 0).unwrap();
+        assert_eq!(*got, *entries);
+    }
+
+    #[test]
+    fn sharded_miss_returns_none() {
+        let cache = ShardedBlockCache::new(65536);
+        assert!(cache.get(1, 0).is_none());
+    }
+
+    #[test]
+    fn sharded_evict_sst_removes_across_shards() {
+        let cache = ShardedBlockCache::new(1_000_000);
+        // Insert blocks for sst 1 with different block indices (likely different shards)
+        for bi in 0..32 {
+            cache.insert_arc(1, bi, Arc::new(make_entries(1)), 100);
+        }
+        cache.insert_arc(2, 0, Arc::new(make_entries(1)), 100);
+
+        cache.evict_sst(1);
+
+        for bi in 0..32 {
+            assert!(
+                cache.get(1, bi).is_none(),
+                "sst 1 block {bi} should be evicted"
+            );
+        }
+        assert!(cache.get(2, 0).is_some());
+    }
+
+    #[test]
+    fn sharded_hit_miss_aggregation() {
+        let cache = ShardedBlockCache::new(65536);
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(cache.misses(), 0);
+
+        // Miss
+        cache.get(1, 0);
+        assert_eq!(cache.misses(), 1);
+
+        // Insert and hit
+        cache.insert_arc(1, 0, Arc::new(make_entries(1)), 100);
+        cache.get(1, 0);
+        assert_eq!(cache.hits(), 1);
+        assert_eq!(cache.misses(), 1);
+    }
+
+    #[test]
+    fn sharded_zero_capacity_disabled() {
+        let cache = ShardedBlockCache::new(0);
+        cache.insert_arc(1, 0, Arc::new(make_entries(1)), 100);
+        assert!(cache.get(1, 0).is_none());
+    }
+
+    #[test]
+    fn sharded_distributes_across_shards() {
+        // Different (sst_id, block_index) pairs should map to different shards
+        let mut seen = std::collections::HashSet::new();
+        for sst_id in 0..8u64 {
+            for bi in 0..4u32 {
+                seen.insert(ShardedBlockCache::shard_index(sst_id, bi));
+            }
+        }
+        // With 32 distinct keys, we should hit at least 8 of 16 shards
+        assert!(
+            seen.len() >= 8,
+            "expected >=8 shards used, got {}",
+            seen.len()
+        );
+    }
 }

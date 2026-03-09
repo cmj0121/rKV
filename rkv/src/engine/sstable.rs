@@ -751,17 +751,18 @@ impl SSTableReader {
             return Ok(None);
         }
 
-        let key_bytes = key.to_bytes();
+        let mut key_buf = Vec::with_capacity(key.encoded_len());
+        key.write_bytes_to(&mut key_buf);
 
         // Bloom filter check: skip this SSTable if the key is definitely absent
-        if !meta.filter.may_contain(&key_bytes) {
+        if !meta.filter.may_contain(&key_buf) {
             return Ok(None);
         }
 
         // Binary search: find the first block whose last_key >= target
         let block_idx = match meta
             .index
-            .binary_search_by(|e| e.last_key.as_slice().cmp(&key_bytes))
+            .binary_search_by(|e| e.last_key.as_slice().cmp(&key_buf))
         {
             Ok(i) => i,
             Err(i) => {
@@ -779,10 +780,10 @@ impl SSTableReader {
         for bi in block_idx..meta.index.len() {
             let ie = &meta.index[bi];
             let found_in_block =
-                self.get_from_block(ie, bi, &key_bytes, verify_checksums, &mut last_match)?;
+                self.get_from_block(ie, bi, &key_buf, verify_checksums, &mut last_match)?;
 
             if found_in_block {
-                if ie.last_key.as_slice() != key_bytes {
+                if ie.last_key.as_slice() != key_buf.as_slice() {
                     return Ok(last_match);
                 }
                 // last_key == target → entries may continue in next block
@@ -875,15 +876,16 @@ impl SSTableReader {
             return Ok(Vec::new());
         }
 
-        let key_bytes = key.to_bytes();
+        let mut key_buf = Vec::with_capacity(key.encoded_len());
+        key.write_bytes_to(&mut key_buf);
 
-        if !meta.filter.may_contain(&key_bytes) {
+        if !meta.filter.may_contain(&key_buf) {
             return Ok(Vec::new());
         }
 
         let block_idx = match meta
             .index
-            .binary_search_by(|e| e.last_key.as_slice().cmp(&key_bytes))
+            .binary_search_by(|e| e.last_key.as_slice().cmp(&key_buf))
         {
             Ok(i) => i,
             Err(i) => {
@@ -899,10 +901,10 @@ impl SSTableReader {
         for bi in block_idx..meta.index.len() {
             let ie = &meta.index[bi];
             let found_in_block =
-                self.get_all_from_block(ie, bi, &key_bytes, verify_checksums, &mut result)?;
+                self.get_all_from_block(ie, bi, &key_buf, verify_checksums, &mut result)?;
 
             if found_in_block {
-                if ie.last_key.as_slice() != key_bytes {
+                if ie.last_key.as_slice() != key_buf.as_slice() {
                     return Ok(result);
                 }
             } else {
