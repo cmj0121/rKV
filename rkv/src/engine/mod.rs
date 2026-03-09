@@ -7,6 +7,7 @@ mod cluster;
 pub(crate) mod crypto;
 mod dump;
 mod error;
+mod filter;
 mod io;
 mod iterator;
 mod key;
@@ -21,6 +22,7 @@ mod repl_receiver;
 mod repl_sender;
 pub(crate) mod replication;
 mod revision;
+mod ribbon;
 mod sstable;
 mod stats;
 mod value;
@@ -170,6 +172,47 @@ impl fmt::Display for Compression {
     }
 }
 
+/// Filter policy for SSTable key membership testing.
+///
+/// Controls which probabilistic data structure is used to skip SSTables
+/// that definitely do not contain a queried key.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FilterPolicy {
+    /// Classic Bloom filter — fast construction, ~10 bits/key for 1% FPR (default).
+    Bloom,
+    /// Ribbon filter — ~30% smaller than Bloom at the same FPR, slower to build.
+    Ribbon,
+}
+
+impl Default for FilterPolicy {
+    fn default() -> Self {
+        Self::Bloom
+    }
+}
+
+impl fmt::Display for FilterPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bloom => write!(f, "bloom"),
+            Self::Ribbon => write!(f, "ribbon"),
+        }
+    }
+}
+
+impl FromStr for FilterPolicy {
+    type Err = Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "bloom" => Ok(Self::Bloom),
+            "ribbon" => Ok(Self::Ribbon),
+            _ => Err(Error::InvalidConfig(format!(
+                "unknown filter_policy '{s}' (expected: bloom, ribbon)"
+            ))),
+        }
+    }
+}
+
 impl FromStr for Compression {
     type Err = Error;
 
@@ -203,15 +246,19 @@ pub struct Config {
     pub object_size: usize,
     /// Whether to LZ4-compress bin objects on disk (default: true).
     pub compress: bool,
-    /// Bloom filter bits per key (default: 10, ~1% false-positive rate).
-    /// Set to 0 to disable bloom filters.
+    /// Filter bits per key (default: 10, ~1% false-positive rate).
+    /// Set to 0 to disable filters. Applies to both Bloom and Ribbon.
     pub bloom_bits: usize,
-    /// Bloom filter prefix length for scan optimization (default: 0 = disabled).
+    /// Filter prefix length for scan optimization (default: 0 = disabled).
     /// When > 0, the first `bloom_prefix_len` bytes of each key's serialized
-    /// form are hashed into a prefix bloom filter per SSTable. Scans check
+    /// form are hashed into a prefix filter per SSTable. Scans check
     /// this filter to skip SSTables that definitely don't contain matching
     /// prefixes.
     pub bloom_prefix_len: usize,
+    /// Filter policy for SSTable key lookup (default: Bloom).
+    /// Bloom: fast build, ~10 bits/key for 1% FPR.
+    /// Ribbon: ~30% smaller at same FPR, slower to build.
+    pub filter_policy: FilterPolicy,
     /// Verify checksums on read (default: true).
     /// When enabled, every WAL entry and SSTable block is verified against
     /// its stored checksum during reads. Disabling trades safety for speed.
@@ -289,6 +336,7 @@ impl Config {
             compress: true,
             bloom_bits: 10,
             bloom_prefix_len: 0,
+            filter_policy: FilterPolicy::default(),
             verify_checksums: true,
             compression: Compression::default(),
             io_model: IoModel::default(),
@@ -823,6 +871,7 @@ impl DB {
         let compression = self.config.compression;
         let bloom_bits = self.config.bloom_bits;
         let bloom_prefix_len = self.config.bloom_prefix_len;
+        let filter_policy = self.config.filter_policy;
 
         Arc::new(move || {
             let namespaces: Vec<String> = {
@@ -860,6 +909,7 @@ impl DB {
                     compression,
                     bloom_bits,
                     bloom_prefix_len,
+                    filter_policy,
                     &*io_backend,
                 )?;
                 for (key, value, revision, expires_at_ms) in &entries {
@@ -1959,6 +2009,7 @@ impl DB {
                 self.config.compression,
                 self.config.bloom_bits,
                 self.config.bloom_prefix_len,
+                self.config.filter_policy,
                 &*self.io_backend,
             )?;
             for (key, value, revision, expires_at_ms) in &entries {
@@ -2879,6 +2930,7 @@ impl DB {
             config.compression,
             config.bloom_bits,
             config.bloom_prefix_len,
+            config.filter_policy,
             &**io,
         )?;
         for (key, revisions) in &merged {

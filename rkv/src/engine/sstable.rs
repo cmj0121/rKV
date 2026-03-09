@@ -3,10 +3,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::bloom::BloomFilter;
 use super::cache::{self, BlockCache};
 use super::checksum::Checksum;
 use super::error::{bytes_to_array, Error, Result};
+use super::filter::KeyFilter;
 use super::io::{IoBackend, IoBytes};
 use super::key::Key;
 use super::revision::RevisionID;
@@ -75,12 +75,12 @@ pub(crate) struct SSTableWriter {
     index: Vec<(Vec<u8>, u64, u32)>,
     /// Total entry count across all blocks.
     entry_count: u64,
-    /// Bloom filter builder (collects key hashes during writes).
-    bloom: BloomFilter,
-    /// Prefix bloom filter builder (collects prefix hashes during writes).
-    prefix_bloom: Option<BloomFilter>,
-    /// Prefix length for prefix bloom (0 = disabled).
-    bloom_prefix_len: usize,
+    /// Key filter builder (collects key hashes during writes).
+    filter: KeyFilter,
+    /// Prefix filter builder (collects prefix hashes during writes).
+    prefix_filter: Option<KeyFilter>,
+    /// Prefix length for prefix filter (0 = disabled).
+    filter_prefix_len: usize,
     /// Restart point byte offsets within the current block.
     restarts: Vec<u32>,
 }
@@ -88,19 +88,25 @@ pub(crate) struct SSTableWriter {
 impl SSTableWriter {
     /// Create a new SSTable writer at the given path.
     ///
-    /// `bloom_bits` controls the bloom filter: 10 = ~1% FPR, 0 = disabled.
-    /// `bloom_prefix_len` controls the prefix bloom (0 = disabled).
+    /// `bloom_bits` controls the filter: 10 = ~1% FPR, 0 = disabled.
+    /// `bloom_prefix_len` controls the prefix filter (0 = disabled).
+    /// `filter_policy` selects Bloom or Ribbon.
     pub(crate) fn new(
         path: &Path,
         block_size: usize,
         compression: Compression,
         bloom_bits: usize,
         bloom_prefix_len: usize,
+        filter_policy: super::FilterPolicy,
         io: &dyn IoBackend,
     ) -> Result<Self> {
         let file = io.create_file(path)?;
-        let prefix_bloom = if bloom_prefix_len > 0 && bloom_bits > 0 {
-            Some(BloomFilter::new(bloom_bits))
+        let make_filter = |bits: usize| match filter_policy {
+            super::FilterPolicy::Bloom => KeyFilter::bloom(bits),
+            super::FilterPolicy::Ribbon => KeyFilter::ribbon(bits),
+        };
+        let prefix_filter = if bloom_prefix_len > 0 && bloom_bits > 0 {
+            Some(make_filter(bloom_bits))
         } else {
             None
         };
@@ -115,9 +121,9 @@ impl SSTableWriter {
             offset: 0,
             index: Vec::new(),
             entry_count: 0,
-            bloom: BloomFilter::new(bloom_bits),
-            prefix_bloom,
-            bloom_prefix_len,
+            filter: make_filter(bloom_bits),
+            prefix_filter,
+            filter_prefix_len: bloom_prefix_len,
             restarts: Vec::new(),
         })
     }
@@ -134,11 +140,11 @@ impl SSTableWriter {
         expires_at_ms: u64,
     ) -> Result<()> {
         let key_bytes = key.to_bytes();
-        self.bloom.insert(&key_bytes);
+        self.filter.insert(&key_bytes);
 
-        // Insert prefix into prefix bloom if enabled
-        if let Some(ref mut pf) = self.prefix_bloom {
-            let prefix_len = self.bloom_prefix_len.min(key_bytes.len());
+        // Insert prefix into prefix filter if enabled
+        if let Some(ref mut pf) = self.prefix_filter {
+            let prefix_len = self.filter_prefix_len.min(key_bytes.len());
             pf.insert(&key_bytes[..prefix_len]);
         }
 
@@ -195,29 +201,29 @@ impl SSTableWriter {
         }
 
         // Build filter block
-        let key_bloom_data = self.bloom.build();
-        let prefix_bloom_data = self
-            .prefix_bloom
+        let key_filter_data = self.filter.build();
+        let prefix_filter_data = self
+            .prefix_filter
             .as_mut()
             .map(|pf| pf.build())
             .unwrap_or_default();
 
         // Write filter block:
-        //   Legacy (0x00): filter block = key bloom only
-        //   Compound (0x01): [key_bloom_len: u32 LE][key_bloom_data][prefix_bloom_data]
+        //   Legacy (0x00): filter block = key filter only
+        //   Compound (0x01): [key_filter_len: u32 LE][key_filter_data][prefix_filter_data]
         let filter_offset = self.offset;
-        let has_prefix = !prefix_bloom_data.is_empty();
+        let has_prefix = !prefix_filter_data.is_empty();
         let filter_data = if has_prefix {
             // Compound format:
-            // [key_bloom_len: u32 LE][key_bloom_data][prefix_len: u8][prefix_bloom_data]
+            // [key_filter_len: u32 LE][key_filter_data][prefix_len: u8][prefix_filter_data]
             let mut buf = Vec::new();
-            buf.extend_from_slice(&(key_bloom_data.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&key_bloom_data);
-            buf.push(self.bloom_prefix_len as u8);
-            buf.extend_from_slice(&prefix_bloom_data);
+            buf.extend_from_slice(&(key_filter_data.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&key_filter_data);
+            buf.push(self.filter_prefix_len as u8);
+            buf.extend_from_slice(&prefix_filter_data);
             buf
         } else {
-            key_bloom_data
+            key_filter_data
         };
         let filter_size = filter_data.len() as u32;
         if !filter_data.is_empty() {
@@ -398,14 +404,14 @@ pub(crate) struct IndexEntry {
     pub(crate) size: u32,
 }
 
-/// Lazily-parsed SSTable metadata: index, bloom filters, and first key.
+/// Lazily-parsed SSTable metadata: index, filters, and first key.
 ///
 /// Stored inside `OnceLock` and initialized on first access.
 struct LazyMeta {
     index: Vec<IndexEntry>,
-    bloom: BloomFilter,
-    prefix_bloom: Option<BloomFilter>,
-    bloom_prefix_len: usize,
+    filter: KeyFilter,
+    prefix_filter: Option<KeyFilter>,
+    filter_prefix_len: usize,
     #[allow(dead_code)] // accessed via #[cfg(test)] first_key() method
     first_key: Option<Vec<u8>>,
 }
@@ -598,8 +604,8 @@ impl SSTableReader {
         let index_data = &data[fo.index_offset..fo.index_offset + fo.index_size];
         let index = Self::parse_index(index_data).map_err(|e| e.to_string())?;
 
-        // Parse bloom filters
-        let (bloom, prefix_bloom, bloom_prefix_len) =
+        // Parse filters
+        let (filter, prefix_filter, filter_prefix_len) =
             Self::parse_filters(data, fo).map_err(|e| e.to_string())?;
 
         // Extract first key from first block
@@ -607,52 +613,53 @@ impl SSTableReader {
 
         Ok(LazyMeta {
             index,
-            bloom,
-            prefix_bloom,
-            bloom_prefix_len,
+            filter,
+            prefix_filter,
+            filter_prefix_len,
             first_key,
         })
     }
 
-    /// Parse bloom filters from the filter block region.
+    /// Parse filters from the filter block region.
+    /// Auto-detects Bloom vs Ribbon via `KeyFilter::from_bytes`.
     fn parse_filters(
         data: &[u8],
         fo: &FooterOffsets,
-    ) -> Result<(BloomFilter, Option<BloomFilter>, usize)> {
+    ) -> Result<(KeyFilter, Option<KeyFilter>, usize)> {
         if fo.filter_size == 0 || fo.filter_offset + fo.filter_size > data.len() {
-            return Ok((BloomFilter::new(0), None, 0));
+            return Ok((KeyFilter::bloom(0), None, 0));
         }
 
         let filter_data = &data[fo.filter_offset..fo.filter_offset + fo.filter_size];
 
         match fo.filter_format {
             0x01 => {
-                // Compound: [key_bloom_len: u32 LE][key_bloom_data]
-                //           [prefix_len: u8][prefix_bloom_data]
+                // Compound: [key_filter_len: u32 LE][key_filter_data]
+                //           [prefix_len: u8][prefix_filter_data]
                 if filter_data.len() < 4 {
-                    return Ok((BloomFilter::new(0), None, 0));
+                    return Ok((KeyFilter::bloom(0), None, 0));
                 }
-                let key_bloom_len = u32::from_le_bytes(bytes_to_array(
+                let key_filter_len = u32::from_le_bytes(bytes_to_array(
                     &filter_data[0..4],
-                    "SSTable filter key_bloom_len",
+                    "SSTable filter key_filter_len",
                 )?) as usize;
-                let key_bloom_end = 4 + key_bloom_len;
-                if key_bloom_end >= filter_data.len() {
-                    return Ok((BloomFilter::new(0), None, 0));
+                let key_filter_end = 4 + key_filter_len;
+                if key_filter_end >= filter_data.len() {
+                    return Ok((KeyFilter::bloom(0), None, 0));
                 }
-                let key_bloom = BloomFilter::from_bytes(&filter_data[4..key_bloom_end])?;
-                let prefix_len = filter_data[key_bloom_end] as usize;
-                let prefix_bloom_start = key_bloom_end + 1;
-                let prefix_bloom = if prefix_bloom_start < filter_data.len() {
-                    Some(BloomFilter::from_bytes(&filter_data[prefix_bloom_start..])?)
+                let key_filter = KeyFilter::from_bytes(&filter_data[4..key_filter_end])?;
+                let prefix_len = filter_data[key_filter_end] as usize;
+                let prefix_filter_start = key_filter_end + 1;
+                let prefix_filter = if prefix_filter_start < filter_data.len() {
+                    Some(KeyFilter::from_bytes(&filter_data[prefix_filter_start..])?)
                 } else {
                     None
                 };
-                Ok((key_bloom, prefix_bloom, prefix_len))
+                Ok((key_filter, prefix_filter, prefix_len))
             }
             _ => {
-                // Legacy (0x00): filter block = key bloom only
-                Ok((BloomFilter::from_bytes(filter_data)?, None, 0))
+                // Legacy (0x00): filter block = key filter only
+                Ok((KeyFilter::from_bytes(filter_data)?, None, 0))
             }
         }
     }
@@ -747,7 +754,7 @@ impl SSTableReader {
         let key_bytes = key.to_bytes();
 
         // Bloom filter check: skip this SSTable if the key is definitely absent
-        if !meta.bloom.may_contain(&key_bytes) {
+        if !meta.filter.may_contain(&key_bytes) {
             return Ok(None);
         }
 
@@ -872,7 +879,7 @@ impl SSTableReader {
 
         let key_bytes = key.to_bytes();
 
-        if !meta.bloom.may_contain(&key_bytes) {
+        if !meta.filter.may_contain(&key_bytes) {
             return Ok(Vec::new());
         }
 
@@ -1336,17 +1343,17 @@ impl SSTableReader {
         if prefix_bytes.is_empty() {
             return true; // empty prefix matches everything
         }
-        match &meta.prefix_bloom {
+        match &meta.prefix_filter {
             Some(pf) => {
                 let query =
-                    if meta.bloom_prefix_len > 0 && prefix_bytes.len() >= meta.bloom_prefix_len {
-                        &prefix_bytes[..meta.bloom_prefix_len]
+                    if meta.filter_prefix_len > 0 && prefix_bytes.len() >= meta.filter_prefix_len {
+                        &prefix_bytes[..meta.filter_prefix_len]
                     } else {
                         prefix_bytes
                     };
                 pf.may_contain(query)
             }
-            None => true, // no prefix bloom — conservative
+            None => true, // no prefix filter — conservative
         }
     }
 
@@ -1540,6 +1547,7 @@ pub(crate) fn read_block_from_data(
 
 #[cfg(test)]
 mod tests {
+    use super::super::FilterPolicy;
     use super::*;
 
     fn io() -> super::super::io::BufferedIo {
@@ -1583,7 +1591,16 @@ mod tests {
     fn footer_is_fixed_size() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.sst");
-        let mut writer = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let mut writer = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         writer
             .add(&Key::Int(1), &Value::from("a"), RevisionID::ZERO, 0)
             .unwrap();
@@ -1601,7 +1618,16 @@ mod tests {
     fn writer_creates_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.sst");
-        let mut writer = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let mut writer = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         writer
             .add(&Key::Int(1), &Value::from("hello"), RevisionID::ZERO, 0)
             .unwrap();
@@ -1620,7 +1646,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("multi.sst");
         // Very small block size to force multiple blocks
-        let mut writer = SSTableWriter::new(&path, 32, Compression::None, 0, 0, &io()).unwrap();
+        let mut writer = SSTableWriter::new(
+            &path,
+            32,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         for i in 0..20 {
             writer
                 .add(
@@ -1645,7 +1680,16 @@ mod tests {
     fn reader_open_single_block() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         w.add(&Key::Int(1), &Value::from("a"), RevisionID::ZERO, 0)
             .unwrap();
         w.add(&Key::Int(2), &Value::from("b"), RevisionID::ZERO, 0)
@@ -1661,7 +1705,16 @@ mod tests {
     fn reader_open_multi_block() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("multi.sst");
-        let mut w = SSTableWriter::new(&path, 32, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            32,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         for i in 0..20 {
             w.add(
                 &Key::Int(i),
@@ -1684,7 +1737,16 @@ mod tests {
     fn roundtrip_single_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("rt.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         w.add(&Key::Int(42), &Value::from("hello"), RevisionID::ZERO, 0)
             .unwrap();
         w.finish().unwrap();
@@ -1698,7 +1760,16 @@ mod tests {
     fn roundtrip_multiple_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("rt.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         for i in 0..10 {
             w.add(
                 &Key::Int(i),
@@ -1725,7 +1796,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("rt.sst");
         // Small block size forces multiple blocks
-        let mut w = SSTableWriter::new(&path, 32, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            32,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         for i in 0..50 {
             w.add(
                 &Key::Int(i),
@@ -1752,7 +1832,16 @@ mod tests {
     fn roundtrip_with_lz4() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("lz4.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::LZ4, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::LZ4,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         for i in 0..10 {
             w.add(
                 &Key::Int(i),
@@ -1777,7 +1866,16 @@ mod tests {
     fn roundtrip_with_zstd() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("zstd.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::Zstd, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::Zstd,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         for i in 0..10 {
             w.add(
                 &Key::Int(i),
@@ -1802,7 +1900,16 @@ mod tests {
     fn roundtrip_str_keys() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("str.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         // Str keys must be added in sorted order
         w.add(
             &Key::from("aaa"),
@@ -1846,7 +1953,16 @@ mod tests {
     fn roundtrip_null_and_tombstone() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("special.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         w.add(&Key::Int(1), &Value::Null, RevisionID::ZERO, 0)
             .unwrap();
         w.add(&Key::Int(2), &Value::tombstone(), RevisionID::ZERO, 0)
@@ -1876,7 +1992,16 @@ mod tests {
     fn get_missing_key_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         w.add(&Key::Int(1), &Value::from("a"), RevisionID::ZERO, 0)
             .unwrap();
         w.add(&Key::Int(3), &Value::from("c"), RevisionID::ZERO, 0)
@@ -1891,7 +2016,16 @@ mod tests {
     fn get_key_beyond_last_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         w.add(&Key::Int(1), &Value::from("a"), RevisionID::ZERO, 0)
             .unwrap();
         w.finish().unwrap();
@@ -1904,7 +2038,16 @@ mod tests {
     fn get_key_before_first_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         w.add(&Key::Int(10), &Value::from("a"), RevisionID::ZERO, 0)
             .unwrap();
         w.finish().unwrap();
@@ -1945,7 +2088,16 @@ mod tests {
     fn reader_detects_corrupt_block() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("corrupt.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         w.add(&Key::Int(1), &Value::from("hello"), RevisionID::ZERO, 0)
             .unwrap();
         w.finish().unwrap();
@@ -1964,7 +2116,16 @@ mod tests {
     fn reader_skips_checksum_when_disabled() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("skip.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         w.add(&Key::Int(1), &Value::from("hello"), RevisionID::ZERO, 0)
             .unwrap();
         w.finish().unwrap();
@@ -1991,7 +2152,16 @@ mod tests {
     fn get_first_and_last_key_multi_block() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("boundary.sst");
-        let mut w = SSTableWriter::new(&path, 32, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            32,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         for i in 0..100 {
             w.add(
                 &Key::Int(i),
@@ -2021,7 +2191,16 @@ mod tests {
     fn iter_entries_single_block() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("iter.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         w.add(&Key::Int(1), &Value::from("a"), RevisionID::ZERO, 0)
             .unwrap();
         w.add(&Key::Int(2), &Value::from("b"), RevisionID::ZERO, 0)
@@ -2051,7 +2230,16 @@ mod tests {
     fn iter_entries_multi_block() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("iter_multi.sst");
-        let mut w = SSTableWriter::new(&path, 32, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            32,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         for i in 0..20 {
             w.add(
                 &Key::Int(i),
@@ -2076,7 +2264,16 @@ mod tests {
     fn iter_entries_with_tombstones() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("iter_tomb.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         w.add(&Key::Int(1), &Value::from("live"), RevisionID::ZERO, 0)
             .unwrap();
         w.add(&Key::Int(2), &Value::tombstone(), RevisionID::ZERO, 0)
@@ -2096,7 +2293,16 @@ mod tests {
     fn iter_entries_empty_sstable() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("empty.sst");
-        let w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
@@ -2108,7 +2314,16 @@ mod tests {
     fn iter_entries_with_compression() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("iter_lz4.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::LZ4, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::LZ4,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         for i in 0..10 {
             w.add(
                 &Key::Int(i),
@@ -2137,7 +2352,16 @@ mod tests {
     fn size_bytes_nonzero() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("size.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         w.add(&Key::Int(1), &Value::from("data"), RevisionID::ZERO, 0)
             .unwrap();
         w.finish().unwrap();
@@ -2249,7 +2473,16 @@ mod tests {
     fn iter_entries_empty_sstable_scan() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("empty_scan.sst");
-        let w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         w.finish().unwrap();
 
         let r = SSTableReader::open(&path, 1, None, &io()).unwrap();
@@ -2262,7 +2495,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("bloom_scan.sst");
         // bloom_bits=10, bloom_prefix_len=3
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 10, 3, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            10,
+            3,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         w.add(&Key::from("aaa:1"), &Value::from("v"), RevisionID::ZERO, 0)
             .unwrap();
         w.add(&Key::from("aaa:2"), &Value::from("v"), RevisionID::ZERO, 0)
@@ -2284,7 +2526,16 @@ mod tests {
     fn v4_footer_size() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("v4.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         w.add(&Key::Int(1), &Value::from("a"), RevisionID::ZERO, 0)
             .unwrap();
         w.finish().unwrap();
@@ -2300,7 +2551,16 @@ mod tests {
     fn v3_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("v2rt.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 10, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            10,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         for i in 0..10 {
             w.add(
                 &Key::Int(i),
@@ -2398,7 +2658,16 @@ mod tests {
         // Write a valid V2 SSTable, then patch the features field with unknown bits
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("feat.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         w.add(&Key::Int(1), &Value::from("a"), RevisionID::ZERO, 0)
             .unwrap();
         w.finish().unwrap();
@@ -2429,7 +2698,16 @@ mod tests {
         // Write a valid V2 SSTable, then patch the version to 99
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("ver99.sst");
-        let mut w = SSTableWriter::new(&path, 4096, Compression::None, 0, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            4096,
+            Compression::None,
+            0,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         w.add(&Key::Int(1), &Value::from("a"), RevisionID::ZERO, 0)
             .unwrap();
         w.finish().unwrap();
@@ -2457,7 +2735,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("restart.sst");
         // Small block size to get multiple blocks with restart points
-        let mut w = SSTableWriter::new(&path, 64, Compression::None, 10, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            64,
+            Compression::None,
+            10,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         for i in 0..50 {
             w.add(
                 &Key::Int(i),
@@ -2510,7 +2797,16 @@ mod tests {
         for compression in [Compression::LZ4, Compression::Zstd] {
             let tmp = tempfile::tempdir().unwrap();
             let path = tmp.path().join("compressed_restart.sst");
-            let mut w = SSTableWriter::new(&path, 128, compression.clone(), 10, 0, &io()).unwrap();
+            let mut w = SSTableWriter::new(
+                &path,
+                128,
+                compression.clone(),
+                10,
+                0,
+                FilterPolicy::Bloom,
+                &io(),
+            )
+            .unwrap();
             for i in 0..100 {
                 w.add(
                     &Key::Int(i),
@@ -2537,7 +2833,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("single.sst");
         // Very large block size so all entries fit in one block
-        let mut w = SSTableWriter::new(&path, 1_000_000, Compression::None, 10, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            1_000_000,
+            Compression::None,
+            10,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         w.add(&Key::Int(42), &Value::from("only"), RevisionID::ZERO, 0)
             .unwrap();
         w.finish().unwrap();
@@ -2556,7 +2861,16 @@ mod tests {
         // Exactly RESTART_INTERVAL entries in a single block — 1 restart point
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("exact.sst");
-        let mut w = SSTableWriter::new(&path, 1_000_000, Compression::None, 10, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            1_000_000,
+            Compression::None,
+            10,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         for i in 0..RESTART_INTERVAL {
             w.add(&Key::Int(i as i64), &Value::from("v"), RevisionID::ZERO, 0)
                 .unwrap();
@@ -2579,7 +2893,16 @@ mod tests {
         // Multiple revisions of the same key in one block
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("multirev.sst");
-        let mut w = SSTableWriter::new(&path, 1_000_000, Compression::None, 10, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            1_000_000,
+            Compression::None,
+            10,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         for rev in 1..=5u128 {
             w.add(
                 &Key::Int(1),
@@ -2609,7 +2932,16 @@ mod tests {
         // Verify restart points work with Str keys (variable length, different ordering)
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("strkeys.sst");
-        let mut w = SSTableWriter::new(&path, 128, Compression::None, 10, 0, &io()).unwrap();
+        let mut w = SSTableWriter::new(
+            &path,
+            128,
+            Compression::None,
+            10,
+            0,
+            FilterPolicy::Bloom,
+            &io(),
+        )
+        .unwrap();
         let keys: Vec<String> = (0..60).map(|i| format!("key_{i:04}")).collect();
         for k in &keys {
             w.add(
