@@ -114,6 +114,32 @@ fn deserialize_compression<'de, D: Deserializer<'de>>(d: D) -> Result<Compressio
         .map_err(de::Error::custom)
 }
 
+fn serialize_compression_per_level<S: Serializer>(
+    v: &[Compression],
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let mut seq = s.serialize_seq(Some(v.len()))?;
+    for c in v {
+        seq.serialize_element(&c.to_string())?;
+    }
+    seq.end()
+}
+
+fn deserialize_compression_per_level<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<Compression>, D::Error> {
+    let strings: Vec<String> = Vec::deserialize(d)?;
+    strings
+        .iter()
+        .map(|s| {
+            s.to_ascii_lowercase()
+                .parse::<Compression>()
+                .map_err(de::Error::custom)
+        })
+        .collect()
+}
+
 fn serialize_filter_policy<S: Serializer>(p: &FilterPolicy, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&p.to_string())
 }
@@ -187,6 +213,11 @@ pub struct StorageSection {
     )]
     pub compression: Compression,
     #[serde(
+        serialize_with = "serialize_compression_per_level",
+        deserialize_with = "deserialize_compression_per_level"
+    )]
+    pub compression_per_level: Vec<Compression>,
+    #[serde(
         serialize_with = "serialize_io_model",
         deserialize_with = "deserialize_io_model"
     )]
@@ -217,6 +248,7 @@ impl Default for StorageSection {
             filter_policy: FilterPolicy::default(),
             verify_checksums: true,
             compression: Compression::default(),
+            compression_per_level: Vec::new(),
             io_model: IoModel::default(),
             aol_buffer_size: 128,
             l0_max_count: 4,
@@ -355,6 +387,7 @@ impl FileConfig {
         config.filter_policy = s.filter_policy;
         config.verify_checksums = s.verify_checksums;
         config.compression = s.compression;
+        config.compression_per_level = s.compression_per_level.clone();
         config.io_model = s.io_model;
         config.aol_buffer_size = s.aol_buffer_size;
         config.l0_max_count = s.l0_max_count;

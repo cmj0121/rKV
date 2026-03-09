@@ -759,6 +759,19 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                     c.compression.to_string(),
                 ),
                 (
+                    "  lsm.compression_per_level",
+                    "per-level compression",
+                    if c.compression_per_level.is_empty() {
+                        "(default)".to_string()
+                    } else {
+                        c.compression_per_level
+                            .iter()
+                            .map(|c| c.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    },
+                ),
+                (
                     "  lsm.cache_size",
                     "block cache size",
                     format_bytes(c.cache_size),
@@ -1130,6 +1143,29 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
             }
             Err(e) => eprintln!("error: {e}"),
         },
+        "lsm.compression_per_level" => {
+            if value == "(default)" || value.is_empty() {
+                c.compression_per_level = Vec::new();
+                println!("OK");
+            } else {
+                let mut levels = Vec::new();
+                let mut ok = true;
+                for part in value.split(',') {
+                    match part.trim().parse::<rkv::Compression>() {
+                        Ok(v) => levels.push(v),
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    c.compression_per_level = levels;
+                    println!("OK");
+                }
+            }
+        }
         "lsm.cache_size" => match value.parse::<usize>() {
             Ok(v) => {
                 c.cache_size = v;

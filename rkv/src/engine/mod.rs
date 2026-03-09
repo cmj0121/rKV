@@ -271,6 +271,12 @@ pub struct Config {
     pub verify_checksums: bool,
     /// SSTable block compression algorithm (default: LZ4).
     pub compression: Compression,
+    /// Per-level compression override (default: empty = use `compression` for all).
+    ///
+    /// When non-empty, `compression_per_level[level]` overrides the global
+    /// `compression` setting for that level. Levels beyond the vec length use
+    /// the last entry. Example: `vec![LZ4, LZ4, Zstd]` → L0=LZ4, L1=LZ4, L2+=Zstd.
+    pub compression_per_level: Vec<Compression>,
     /// I/O model for file access (default: Mmap).
     pub io_model: IoModel,
     /// Cluster ID for RevisionID generation (default: None = random at startup).
@@ -345,6 +351,7 @@ impl Config {
             filter_policy: FilterPolicy::default(),
             verify_checksums: true,
             compression: Compression::default(),
+            compression_per_level: Vec::new(),
             io_model: IoModel::default(),
             cluster_id: None,
             aol_buffer_size: 128,
@@ -407,6 +414,19 @@ impl Config {
             ));
         }
         Ok(())
+    }
+
+    /// Return the compression algorithm for a given LSM level.
+    ///
+    /// If `compression_per_level` is non-empty, uses the entry at `level`
+    /// (or the last entry for levels beyond the vec length). Otherwise
+    /// falls back to the global `compression` setting.
+    pub fn compression_for_level(&self, level: usize) -> Compression {
+        if self.compression_per_level.is_empty() {
+            return self.compression;
+        }
+        let idx = level.min(self.compression_per_level.len() - 1);
+        self.compression_per_level[idx]
     }
 }
 
@@ -872,7 +892,7 @@ impl DB {
         let compaction_notify = Arc::clone(&self.compaction_notify);
         let db_path = self.config.path.clone();
         let block_size = self.config.block_size;
-        let compression = self.config.compression;
+        let compression = self.config.compression_for_level(0);
         let bloom_bits = self.config.bloom_bits;
         let bloom_prefix_len = self.config.bloom_prefix_len;
         let filter_policy = self.config.filter_policy;
@@ -2009,7 +2029,7 @@ impl DB {
             let mut writer = sstable::SSTableWriter::new(
                 &sst_path,
                 self.config.block_size,
-                self.config.compression,
+                self.config.compression_for_level(0),
                 self.config.bloom_bits,
                 self.config.bloom_prefix_len,
                 self.config.filter_policy,
@@ -2978,7 +2998,7 @@ impl DB {
         let mut writer = sstable::SSTableWriter::new(
             &output_path,
             config.block_size,
-            config.compression,
+            config.compression_for_level(target_level),
             config.bloom_bits,
             config.bloom_prefix_len,
             config.filter_policy,
