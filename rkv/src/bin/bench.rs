@@ -388,7 +388,7 @@ fn bench_mem_keys(n: usize) -> std::time::Duration {
     start.elapsed()
 }
 
-const FILTER_SIZES: &[usize] = &[1_000, 1_000_000, 8_000_000];
+const FILTER_SIZES: &[usize] = &[1_000, 16_000, 1_000_000];
 
 fn format_size(n: usize) -> String {
     if n >= 1_000_000 {
