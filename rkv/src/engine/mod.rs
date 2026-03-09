@@ -65,6 +65,12 @@ fn is_expired(expires_at_ms: u64) -> bool {
     expires_at_ms != 0 && now_epoch_ms() >= expires_at_ms
 }
 
+/// Like `is_expired`, but uses a pre-computed "now" timestamp to avoid
+/// repeated `SystemTime::now()` syscalls in tight loops.
+fn is_expired_at(expires_at_ms: u64, now_ms: u64) -> bool {
+    expires_at_ms != 0 && now_ms >= expires_at_ms
+}
+
 /// Default namespace name.
 pub const DEFAULT_NAMESPACE: &str = "_";
 
@@ -2877,15 +2883,16 @@ impl DB {
                 // At the bottom level, drop entire keys whose latest revision
                 // is a tombstone or expired — that key is fully deleted.
                 // For other keys, remove only individual expired entries.
+                let now_ms = now_epoch_ms();
                 merged.retain(|_, revisions| {
                     if let Some((v, _, expires_at_ms)) = revisions.last() {
-                        if v.is_tombstone() || is_expired(*expires_at_ms) {
+                        if v.is_tombstone() || is_expired_at(*expires_at_ms, now_ms) {
                             return false; // drop entire key
                         }
                     }
                     // Remove individual expired entries (intermediate revisions)
                     revisions.retain(|(v, _, expires_at_ms)| {
-                        !v.is_tombstone() && !is_expired(*expires_at_ms)
+                        !v.is_tombstone() && !is_expired_at(*expires_at_ms, now_ms)
                     });
                     !revisions.is_empty()
                 });
@@ -3112,11 +3119,30 @@ impl DB {
         value: &Value,
         ttl: Option<Duration>,
     ) -> Result<()> {
-        let aol = self.aol_lock(ns)?;
-        match aol {
-            Some(mut aol) => self.append_to_aol_locked(&mut aol, ns, rev, key, value, ttl),
-            None => Ok(()), // in-memory mode
+        if self.config.in_memory {
+            return Ok(());
         }
+
+        // Pre-encode payload outside the lock to reduce critical section time.
+        // The same payload is reused for replication broadcast (no re-encoding).
+        let expires_at_ms = Self::ttl_to_epoch_ms(ttl);
+        let payload = aol::encode_payload(ns, rev, expires_at_ms, key, value);
+
+        // Short critical section: just write pre-encoded bytes
+        {
+            let ns_state = self.get_or_create_ns(ns)?;
+            let mut aol = ns_state
+                .aol
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            aol.append_encoded(&payload)?;
+        }
+
+        // Broadcast outside the AOL lock
+        self.broadcast_payload(&payload);
+        Ok(())
     }
 
     /// Append to AOL using an already-acquired lock, then broadcast to
@@ -3131,28 +3157,32 @@ impl DB {
         value: &Value,
         ttl: Option<Duration>,
     ) -> Result<()> {
-        aol.append(ns, rev, key, value, ttl)?;
+        // Pre-encode payload once, reuse for both AOL write and replication.
+        let expires_at_ms = Self::ttl_to_epoch_ms(ttl);
+        let payload = aol::encode_payload(ns, rev, expires_at_ms, key, value);
+        aol.append_encoded(&payload)?;
 
+        self.broadcast_payload(&payload);
+        Ok(())
+    }
+
+    /// Broadcast a pre-encoded AOL payload to replicas and/or peers.
+    fn broadcast_payload(&self, payload: &[u8]) {
         // Broadcast to replicas if this node is a primary
         if let Some(ref sender) = self.repl_sender {
-            let expires_at_ms = Self::ttl_to_epoch_ms(ttl);
-            let payload = aol::encode_payload(ns, rev, expires_at_ms, key, value);
-            sender.broadcast_aol(&payload);
+            sender.broadcast_aol(payload);
         }
 
         // Broadcast to peers if this node is a peer (master-master)
         if self.config.role == replication::Role::Peer {
-            let expires_at_ms = Self::ttl_to_epoch_ms(ttl);
-            let payload = aol::encode_payload(ns, rev, expires_at_ms, key, value);
             let local_cluster = self.revision_gen.cluster_id();
             let sessions = self.peer_sessions.lock().unwrap_or_else(|e| e.into_inner());
             for session in sessions.iter() {
                 if session.remote_cluster_id() != local_cluster {
-                    session.send(&payload);
+                    session.send(payload);
                 }
             }
         }
-        Ok(())
     }
 
     /// Convert an optional TTL duration to an absolute epoch timestamp in ms.

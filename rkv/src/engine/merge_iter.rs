@@ -196,7 +196,7 @@ impl SSTableScanIter {
                     let value = if expires_at_ms != 0 && now_ms >= expires_at_ms {
                         Value::tombstone()
                     } else {
-                        Value::from_tag(value_tag, &value_data)?
+                        Value::from_tag_owned(value_tag, value_data)?
                     };
                     self.current_entries.push((key, value));
                 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Cache key: (SSTable ID, block index within the SSTable).
 type CacheKey = (u64, u32);
@@ -9,7 +10,7 @@ pub(crate) type RawEntry = (Vec<u8>, u128, u64, u8, Vec<u8>);
 /// Node in the slab-backed doubly-linked LRU list.
 struct LruNode {
     key: CacheKey,
-    entries: Vec<RawEntry>,
+    entries: Arc<Vec<RawEntry>>,
     size: usize,
     prev: usize,
     next: usize,
@@ -57,8 +58,8 @@ impl BlockCache {
 
     /// Look up a cached block and promote it to MRU position.
     ///
-    /// Returns a clone of the cached entries, or `None` on miss.
-    pub(crate) fn get(&mut self, sst_id: u64, block_index: u32) -> Option<Vec<RawEntry>> {
+    /// Returns a shared reference to the cached entries, or `None` on miss.
+    pub(crate) fn get(&mut self, sst_id: u64, block_index: u32) -> Option<Arc<Vec<RawEntry>>> {
         if self.capacity == 0 {
             return None;
         }
@@ -67,7 +68,7 @@ impl BlockCache {
             self.hits += 1;
             self.detach(idx);
             self.push_front(idx);
-            Some(self.nodes[idx].entries.clone())
+            Some(Arc::clone(&self.nodes[idx].entries))
         } else {
             self.misses += 1;
             None
@@ -84,13 +85,28 @@ impl BlockCache {
 
     /// Insert a block into the cache, evicting LRU entries if needed.
     ///
-    /// Blocks larger than the total capacity are silently skipped to
-    /// prevent thrashing.
+    /// Convenience wrapper that wraps entries in `Arc`.
+    #[cfg(test)]
     pub(crate) fn insert(
         &mut self,
         sst_id: u64,
         block_index: u32,
         entries: Vec<RawEntry>,
+        size: usize,
+    ) {
+        self.insert_arc(sst_id, block_index, Arc::new(entries), size);
+    }
+
+    /// Insert a pre-wrapped `Arc` block into the cache, evicting LRU
+    /// entries if needed.
+    ///
+    /// Blocks larger than the total capacity are silently skipped to
+    /// prevent thrashing.
+    pub(crate) fn insert_arc(
+        &mut self,
+        sst_id: u64,
+        block_index: u32,
+        entries: Arc<Vec<RawEntry>>,
         size: usize,
     ) {
         if self.capacity == 0 || size > self.capacity {
@@ -102,7 +118,7 @@ impl BlockCache {
         // If already present, update in place and promote
         if let Some(&idx) = self.map.get(&key) {
             self.current_size -= self.nodes[idx].size;
-            self.nodes[idx].entries = entries;
+            self.nodes[idx].entries = Arc::clone(&entries);
             self.nodes[idx].size = size;
             self.current_size += size;
             self.detach(idx);
@@ -272,7 +288,7 @@ mod tests {
 
         assert_eq!(cache.len(), 1);
         let got = cache.get(1, 0).unwrap();
-        assert_eq!(got, entries);
+        assert_eq!(*got, entries);
     }
 
     #[test]
@@ -359,7 +375,7 @@ mod tests {
 
         assert_eq!(cache.len(), 1);
         let got = cache.get(1, 0).unwrap();
-        assert_eq!(got, e2);
+        assert_eq!(*got, e2);
     }
 
     #[test]

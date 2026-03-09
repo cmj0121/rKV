@@ -49,6 +49,21 @@ impl Value {
         }
     }
 
+    /// Reconstruct a `Value` from its tag byte with owned data.
+    ///
+    /// Like `from_tag` but takes ownership of `data` to avoid cloning.
+    pub(crate) fn from_tag_owned(tag: u8, data: Vec<u8>) -> super::error::Result<Self> {
+        match tag {
+            0x00 => Ok(Value::Data(data)),
+            0x01 => Ok(Value::Null),
+            0x02 => Ok(Value::Tombstone),
+            0x03 => Ok(Value::Pointer(ValuePointer::from_bytes(&data)?)),
+            _ => Err(super::error::Error::Corruption(format!(
+                "unknown value tag: 0x{tag:02x}"
+            ))),
+        }
+    }
+
     /// Check whether this value is a tombstone (crate-internal only).
     pub(crate) fn is_tombstone(&self) -> bool {
         matches!(self, Value::Tombstone)

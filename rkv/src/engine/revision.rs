@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fast32::base32::CROCKFORD_LOWER;
@@ -77,16 +78,31 @@ impl From<RevisionID> for u128 {
 }
 
 /// Generates ULID-like RevisionIDs with a 48-16-16-48 bit layout.
+///
+/// Uses a monotonic atomic counter for the sequence field instead of
+/// per-call RNG. The timestamp is cached and only refreshed from the
+/// system clock when the counter wraps or when >1ms has likely elapsed
+/// (every 4096 increments).
 pub(crate) struct RevisionGen {
     cluster_id: u16,
     process_id: u16,
+    /// Cached timestamp (ms since epoch). Updated lazily.
+    cached_ts: AtomicU64,
+    /// Monotonic sequence counter (48-bit effective range).
+    sequence: AtomicU64,
 }
 
 impl RevisionGen {
     pub(crate) fn new(cluster_id: Option<u16>) -> Self {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         Self {
             cluster_id: cluster_id.unwrap_or_else(|| fastrand::u16(..)),
             process_id: std::process::id() as u16,
+            cached_ts: AtomicU64::new(ts),
+            sequence: AtomicU64::new(0),
         }
     }
 
@@ -95,11 +111,21 @@ impl RevisionGen {
     }
 
     pub(crate) fn generate(&self) -> RevisionID {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let seq: u64 = fastrand::u64(..);
+        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+
+        // Refresh the cached timestamp periodically (every 4096 ops)
+        // to avoid a syscall per write while keeping timestamps fresh.
+        let ts = if seq.is_multiple_of(4096) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            self.cached_ts.store(now, Ordering::Relaxed);
+            now
+        } else {
+            self.cached_ts.load(Ordering::Relaxed)
+        };
+
         let raw: u128 = ((ts as u128 & 0xFFFF_FFFF_FFFF) << 80)
             | ((self.cluster_id as u128) << 64)
             | ((self.process_id as u128) << 48)

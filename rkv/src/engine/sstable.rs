@@ -1372,7 +1372,7 @@ impl SSTableReader {
         ie: &IndexEntry,
         block_index: usize,
         verify_checksums: bool,
-    ) -> Result<Vec<RawEntry>> {
+    ) -> Result<Arc<Vec<RawEntry>>> {
         // 1. Cache lookup (brief lock)
         if let Some(ref c) = self.cache {
             let mut cache = c.lock().unwrap_or_else(|e| e.into_inner());
@@ -1412,12 +1412,17 @@ impl SSTableReader {
         };
         let entries = Self::parse_block_entries(entry_data, self.version)?;
 
-        // 3. Cache insert (brief lock)
+        let entries = Arc::new(entries);
+
+        // 3. Cache insert (brief lock) — shares the Arc with the cache
         if let Some(ref c) = self.cache {
             let size = cache::estimate_block_size(&entries);
-            c.lock()
-                .unwrap()
-                .insert(self.sst_id, block_index as u32, entries.clone(), size);
+            c.lock().unwrap().insert_arc(
+                self.sst_id,
+                block_index as u32,
+                Arc::clone(&entries),
+                size,
+            );
         }
 
         Ok(entries)
@@ -1434,12 +1439,11 @@ impl SSTableReader {
         let mut result = Vec::with_capacity(self.entry_count as usize);
 
         for (bi, ie) in meta.index.iter().enumerate() {
-            for (key_bytes, revision, expires_at_ms, value_tag, value_data) in
-                self.read_block(ie, bi, verify_checksums)?
-            {
-                let key = Key::from_bytes(&key_bytes)?;
-                let value = Value::from_tag(value_tag, &value_data)?;
-                result.push((key, value, RevisionID::from(revision), expires_at_ms));
+            let entries = self.read_block(ie, bi, verify_checksums)?;
+            for (key_bytes, revision, expires_at_ms, value_tag, value_data) in entries.iter() {
+                let key = Key::from_bytes(key_bytes)?;
+                let value = Value::from_tag(*value_tag, value_data)?;
+                result.push((key, value, RevisionID::from(*revision), *expires_at_ms));
             }
         }
 
