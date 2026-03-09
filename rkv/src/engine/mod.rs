@@ -446,7 +446,7 @@ pub struct DB {
     /// Monotonically increasing counter for SSTable file naming.
     sst_sequence: Arc<AtomicU64>,
     /// Shared LRU block cache for decompressed SSTable blocks.
-    block_cache: Option<Arc<Mutex<cache::BlockCache>>>,
+    block_cache: Option<Arc<cache::ShardedBlockCache>>,
     flush_stop: Arc<AtomicBool>,
     flush_thread: Option<JoinHandle<()>>,
     compaction_stop: Arc<AtomicBool>,
@@ -589,9 +589,7 @@ impl DB {
 
         // Block cache for decompressed SSTable blocks
         let block_cache = if config.cache_size > 0 {
-            Some(Arc::new(Mutex::new(cache::BlockCache::new(
-                config.cache_size,
-            ))))
+            Some(Arc::new(cache::ShardedBlockCache::new(config.cache_size)))
         } else {
             None
         };
@@ -1690,8 +1688,7 @@ impl DB {
 
         // Cache hit/miss counters
         let (cache_hits, cache_misses) = if let Some(ref bc) = self.block_cache {
-            let cache = bc.lock().unwrap_or_else(|e| e.into_inner());
-            (cache.hits(), cache.misses())
+            (bc.hits(), bc.misses())
         } else {
             (0, 0)
         };
@@ -2633,7 +2630,7 @@ impl DB {
         config: &Config,
         sstables: &RwLock<LeveledSSTables>,
         sst_sequence: &AtomicU64,
-        block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
+        block_cache: &Option<Arc<cache::ShardedBlockCache>>,
         io: &Arc<dyn io::IoBackend>,
         namespace_data: &RwLock<HashMap<String, NamespaceState>>,
         m: &Arc<metrics::Metrics>,
@@ -2677,7 +2674,7 @@ impl DB {
         config: &Config,
         sstables: &RwLock<LeveledSSTables>,
         sst_sequence: &AtomicU64,
-        block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
+        block_cache: &Option<Arc<cache::ShardedBlockCache>>,
         io: &Arc<dyn io::IoBackend>,
         namespace_data: &RwLock<HashMap<String, NamespaceState>>,
         m: &Arc<metrics::Metrics>,
@@ -2790,7 +2787,7 @@ impl DB {
         config: &Config,
         sstables: &RwLock<LeveledSSTables>,
         sst_sequence: &AtomicU64,
-        block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
+        block_cache: &Option<Arc<cache::ShardedBlockCache>>,
         io: &Arc<dyn io::IoBackend>,
     ) -> Result<usize> {
         let (merged_sst_ids, source_paths, merged) = {
@@ -2909,9 +2906,8 @@ impl DB {
             let mut sst = sstables.write().unwrap_or_else(|e| e.into_inner());
             if let Some(levels) = sst.get_mut(ns) {
                 if let Some(ref bc) = block_cache {
-                    let mut cache = bc.lock().unwrap_or_else(|e| e.into_inner());
                     for id in &merged_sst_ids {
-                        cache.evict_sst(*id);
+                        bc.evict_sst(*id);
                     }
                 }
                 // Only remove readers that were part of this merge
@@ -2960,9 +2956,8 @@ impl DB {
 
         // Evict only the merged readers' blocks from the cache
         if let Some(ref bc) = block_cache {
-            let mut cache = bc.lock().unwrap_or_else(|e| e.into_inner());
             for id in &merged_sst_ids {
-                cache.evict_sst(*id);
+                bc.evict_sst(*id);
             }
         }
 
@@ -3595,7 +3590,7 @@ impl DB {
     fn scan_sstables(
         db_path: &Path,
         max_levels: usize,
-        block_cache: &Option<Arc<Mutex<cache::BlockCache>>>,
+        block_cache: &Option<Arc<cache::ShardedBlockCache>>,
         io: &dyn io::IoBackend,
     ) -> Result<(LeveledSSTables, u64)> {
         let sst_root = db_path.join("sst");

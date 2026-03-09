@@ -1,9 +1,9 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
-use super::cache::{self, BlockCache};
+use super::cache::{self, ShardedBlockCache};
 use super::checksum::Checksum;
 use super::error::{bytes_to_array, Error, Result};
 use super::filter::KeyFilter;
@@ -437,7 +437,7 @@ pub(crate) struct SSTableReader {
     /// Unique SSTable identifier (sequence number from file naming).
     sst_id: u64,
     /// Shared LRU block cache for decompressed data blocks.
-    cache: Option<Arc<Mutex<BlockCache>>>,
+    cache: Option<Arc<ShardedBlockCache>>,
     /// Feature flags bitmask from the footer (0 for V1 files).
     #[allow(dead_code)] // accessed via #[cfg(test)] features() method
     features: u32,
@@ -456,7 +456,7 @@ impl SSTableReader {
     pub(crate) fn open(
         path: &Path,
         sst_id: u64,
-        cache: Option<Arc<Mutex<BlockCache>>>,
+        cache: Option<Arc<ShardedBlockCache>>,
         io: &dyn IoBackend,
     ) -> Result<Self> {
         let data = Arc::new(io.read_file(path)?);
@@ -751,17 +751,18 @@ impl SSTableReader {
             return Ok(None);
         }
 
-        let key_bytes = key.to_bytes();
+        let mut key_buf = Vec::with_capacity(key.encoded_len());
+        key.write_bytes_to(&mut key_buf);
 
         // Bloom filter check: skip this SSTable if the key is definitely absent
-        if !meta.filter.may_contain(&key_bytes) {
+        if !meta.filter.may_contain(&key_buf) {
             return Ok(None);
         }
 
         // Binary search: find the first block whose last_key >= target
         let block_idx = match meta
             .index
-            .binary_search_by(|e| e.last_key.as_slice().cmp(&key_bytes))
+            .binary_search_by(|e| e.last_key.as_slice().cmp(&key_buf))
         {
             Ok(i) => i,
             Err(i) => {
@@ -779,10 +780,10 @@ impl SSTableReader {
         for bi in block_idx..meta.index.len() {
             let ie = &meta.index[bi];
             let found_in_block =
-                self.get_from_block(ie, bi, &key_bytes, verify_checksums, &mut last_match)?;
+                self.get_from_block(ie, bi, &key_buf, verify_checksums, &mut last_match)?;
 
             if found_in_block {
-                if ie.last_key.as_slice() != key_bytes {
+                if ie.last_key.as_slice() != key_buf.as_slice() {
                     return Ok(last_match);
                 }
                 // last_key == target → entries may continue in next block
@@ -811,9 +812,7 @@ impl SSTableReader {
     ) -> Result<bool> {
         // 1. Cache hit → binary search on parsed entries
         if let Some(ref c) = self.cache {
-            let mut cache = c.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(entries) = cache.get(self.sst_id, block_index as u32) {
-                drop(cache);
+            if let Some(entries) = c.get(self.sst_id, block_index as u32) {
                 return Self::binary_search_entries(&entries, key_bytes, last_match);
             }
         }
@@ -877,15 +876,16 @@ impl SSTableReader {
             return Ok(Vec::new());
         }
 
-        let key_bytes = key.to_bytes();
+        let mut key_buf = Vec::with_capacity(key.encoded_len());
+        key.write_bytes_to(&mut key_buf);
 
-        if !meta.filter.may_contain(&key_bytes) {
+        if !meta.filter.may_contain(&key_buf) {
             return Ok(Vec::new());
         }
 
         let block_idx = match meta
             .index
-            .binary_search_by(|e| e.last_key.as_slice().cmp(&key_bytes))
+            .binary_search_by(|e| e.last_key.as_slice().cmp(&key_buf))
         {
             Ok(i) => i,
             Err(i) => {
@@ -901,10 +901,10 @@ impl SSTableReader {
         for bi in block_idx..meta.index.len() {
             let ie = &meta.index[bi];
             let found_in_block =
-                self.get_all_from_block(ie, bi, &key_bytes, verify_checksums, &mut result)?;
+                self.get_all_from_block(ie, bi, &key_buf, verify_checksums, &mut result)?;
 
             if found_in_block {
-                if ie.last_key.as_slice() != key_bytes {
+                if ie.last_key.as_slice() != key_buf.as_slice() {
                     return Ok(result);
                 }
             } else {
@@ -927,9 +927,7 @@ impl SSTableReader {
     ) -> Result<bool> {
         // 1. Cache hit → binary search on parsed entries
         if let Some(ref c) = self.cache {
-            let mut cache = c.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(entries) = cache.get(self.sst_id, block_index as u32) {
-                drop(cache);
+            if let Some(entries) = c.get(self.sst_id, block_index as u32) {
                 return Self::binary_search_all_entries(&entries, key_bytes, result);
             }
         }
@@ -1373,10 +1371,9 @@ impl SSTableReader {
         block_index: usize,
         verify_checksums: bool,
     ) -> Result<Arc<Vec<RawEntry>>> {
-        // 1. Cache lookup (brief lock)
+        // 1. Cache lookup
         if let Some(ref c) = self.cache {
-            let mut cache = c.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(entries) = cache.get(self.sst_id, block_index as u32) {
+            if let Some(entries) = c.get(self.sst_id, block_index as u32) {
                 return Ok(entries);
             }
         }
@@ -1414,15 +1411,10 @@ impl SSTableReader {
 
         let entries = Arc::new(entries);
 
-        // 3. Cache insert (brief lock) — shares the Arc with the cache
+        // 3. Cache insert — shares the Arc with the cache
         if let Some(ref c) = self.cache {
             let size = cache::estimate_block_size(&entries);
-            c.lock().unwrap().insert_arc(
-                self.sst_id,
-                block_index as u32,
-                Arc::clone(&entries),
-                size,
-            );
+            c.insert_arc(self.sst_id, block_index as u32, Arc::clone(&entries), size);
         }
 
         Ok(entries)

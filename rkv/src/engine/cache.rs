@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Cache key: (SSTable ID, block index within the SSTable).
 type CacheKey = (u64, u32);
@@ -241,6 +241,91 @@ impl BlockCache {
     }
 }
 
+/// Number of shards for the sharded block cache.
+///
+/// 16 shards provides good concurrency (up to 16 readers hitting
+/// different shards simultaneously) without excessive overhead.
+const NUM_SHARDS: usize = 16;
+
+/// Sharded block cache that distributes entries across multiple
+/// independent `BlockCache` shards, each with its own `Mutex`.
+///
+/// This reduces mutex contention under concurrent reads: two readers
+/// hitting different shards never block each other.
+pub(crate) struct ShardedBlockCache {
+    shards: Vec<Mutex<BlockCache>>,
+}
+
+impl ShardedBlockCache {
+    /// Create a new sharded cache. Total capacity is distributed
+    /// evenly across `NUM_SHARDS` shards.
+    pub(crate) fn new(total_capacity: usize) -> Self {
+        let per_shard = if total_capacity == 0 {
+            0
+        } else {
+            total_capacity.div_ceil(NUM_SHARDS)
+        };
+        let shards = (0..NUM_SHARDS)
+            .map(|_| Mutex::new(BlockCache::new(per_shard)))
+            .collect();
+        Self { shards }
+    }
+
+    /// Hash a cache key to a shard index.
+    fn shard_index(sst_id: u64, block_index: u32) -> usize {
+        // FxHash-style: multiply by a large odd constant, take high bits
+        let h = (sst_id as usize)
+            .wrapping_mul(0x517cc1b727220a95)
+            .wrapping_add(block_index as usize);
+        h % NUM_SHARDS
+    }
+
+    /// Look up a cached block and promote it to MRU position within
+    /// its shard.
+    pub(crate) fn get(&self, sst_id: u64, block_index: u32) -> Option<Arc<Vec<RawEntry>>> {
+        let idx = Self::shard_index(sst_id, block_index);
+        let mut shard = self.shards[idx].lock().unwrap_or_else(|e| e.into_inner());
+        shard.get(sst_id, block_index)
+    }
+
+    /// Insert a pre-wrapped `Arc` block into the appropriate shard.
+    pub(crate) fn insert_arc(
+        &self,
+        sst_id: u64,
+        block_index: u32,
+        entries: Arc<Vec<RawEntry>>,
+        size: usize,
+    ) {
+        let idx = Self::shard_index(sst_id, block_index);
+        let mut shard = self.shards[idx].lock().unwrap_or_else(|e| e.into_inner());
+        shard.insert_arc(sst_id, block_index, entries, size);
+    }
+
+    /// Remove all cached blocks for a given SSTable across all shards.
+    pub(crate) fn evict_sst(&self, sst_id: u64) {
+        for shard in &self.shards {
+            let mut s = shard.lock().unwrap_or_else(|e| e.into_inner());
+            s.evict_sst(sst_id);
+        }
+    }
+
+    /// Total cache hits across all shards.
+    pub(crate) fn hits(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).hits())
+            .sum()
+    }
+
+    /// Total cache misses across all shards.
+    pub(crate) fn misses(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).misses())
+            .sum()
+    }
+}
+
 /// Estimate the in-memory size of a block's raw entries.
 ///
 /// Per entry: key_bytes.len() + 16 (revision) + 8 (expires_at_ms) + 1 (tag) + value_data.len() + 48 (Vec overhead).
@@ -420,5 +505,85 @@ mod tests {
         cache.get(1, 0);
         assert_eq!(cache.hits(), 0);
         assert_eq!(cache.misses(), 0);
+    }
+
+    // --- ShardedBlockCache ---
+
+    #[test]
+    fn sharded_insert_and_get() {
+        let cache = ShardedBlockCache::new(65536);
+        let entries = Arc::new(make_entries(3));
+        let size = estimate_block_size(&entries);
+        cache.insert_arc(1, 0, Arc::clone(&entries), size);
+
+        let got = cache.get(1, 0).unwrap();
+        assert_eq!(*got, *entries);
+    }
+
+    #[test]
+    fn sharded_miss_returns_none() {
+        let cache = ShardedBlockCache::new(65536);
+        assert!(cache.get(1, 0).is_none());
+    }
+
+    #[test]
+    fn sharded_evict_sst_removes_across_shards() {
+        let cache = ShardedBlockCache::new(1_000_000);
+        // Insert blocks for sst 1 with different block indices (likely different shards)
+        for bi in 0..32 {
+            cache.insert_arc(1, bi, Arc::new(make_entries(1)), 100);
+        }
+        cache.insert_arc(2, 0, Arc::new(make_entries(1)), 100);
+
+        cache.evict_sst(1);
+
+        for bi in 0..32 {
+            assert!(
+                cache.get(1, bi).is_none(),
+                "sst 1 block {bi} should be evicted"
+            );
+        }
+        assert!(cache.get(2, 0).is_some());
+    }
+
+    #[test]
+    fn sharded_hit_miss_aggregation() {
+        let cache = ShardedBlockCache::new(65536);
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(cache.misses(), 0);
+
+        // Miss
+        cache.get(1, 0);
+        assert_eq!(cache.misses(), 1);
+
+        // Insert and hit
+        cache.insert_arc(1, 0, Arc::new(make_entries(1)), 100);
+        cache.get(1, 0);
+        assert_eq!(cache.hits(), 1);
+        assert_eq!(cache.misses(), 1);
+    }
+
+    #[test]
+    fn sharded_zero_capacity_disabled() {
+        let cache = ShardedBlockCache::new(0);
+        cache.insert_arc(1, 0, Arc::new(make_entries(1)), 100);
+        assert!(cache.get(1, 0).is_none());
+    }
+
+    #[test]
+    fn sharded_distributes_across_shards() {
+        // Different (sst_id, block_index) pairs should map to different shards
+        let mut seen = std::collections::HashSet::new();
+        for sst_id in 0..8u64 {
+            for bi in 0..4u32 {
+                seen.insert(ShardedBlockCache::shard_index(sst_id, bi));
+            }
+        }
+        // With 32 distinct keys, we should hit at least 8 of 16 shards
+        assert!(
+            seen.len() >= 8,
+            "expected >=8 shards used, got {}",
+            seen.len()
+        );
     }
 }

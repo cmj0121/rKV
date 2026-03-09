@@ -68,11 +68,9 @@ impl Checksum {
     ///
     /// The format is a 1-byte algorithm tag followed by the 4-byte
     /// big-endian checksum value.
-    pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(Self::encoded_size());
-        buf.push(self.algo as u8);
-        buf.extend_from_slice(&self.value.to_be_bytes());
-        buf
+    pub(crate) fn to_bytes(&self) -> [u8; 5] {
+        let v = self.value.to_be_bytes();
+        [self.algo as u8, v[0], v[1], v[2], v[3]]
     }
 
     /// Deserialize a checksum from bytes.

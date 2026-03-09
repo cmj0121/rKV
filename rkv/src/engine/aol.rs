@@ -323,7 +323,6 @@ pub(crate) fn encode_payload(
     key: &Key,
     value: &Value,
 ) -> Vec<u8> {
-    let key_bytes = key.to_bytes();
     let value_data_vec;
     let value_data: &[u8] = match value {
         Value::Data(d) => d.as_slice(),
@@ -334,13 +333,15 @@ pub(crate) fn encode_payload(
         _ => &[],
     };
 
+    let key_len = key.encoded_len();
+
     // Calculate total size
     let size = 2 // ns_len
         + ns.len()
         + 16 // revision
         + 8  // expires_at_ms
         + 2  // key_len
-        + key_bytes.len()
+        + key_len
         + 1  // value_tag
         + value_data.len();
 
@@ -357,8 +358,8 @@ pub(crate) fn encode_payload(
     buf.extend_from_slice(&expires_at_ms.to_be_bytes());
 
     // key
-    buf.extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
-    buf.extend_from_slice(&key_bytes);
+    buf.extend_from_slice(&(key_len as u16).to_be_bytes());
+    key.write_bytes_to(&mut buf);
 
     // value
     buf.push(value.to_tag());
