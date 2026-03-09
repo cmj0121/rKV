@@ -545,9 +545,9 @@ impl MemTable {
                         .unwrap_or_default()
                         .as_millis() as u64;
                     let epoch_expires = epoch_now + remaining.as_millis() as u64;
-                    result.push((key.clone(), entry.value.clone(), rev, epoch_expires));
+                    result.push((key.clone(), entry.value, rev, epoch_expires));
                 } else {
-                    result.push((key.clone(), entry.value.clone(), rev, 0));
+                    result.push((key.clone(), entry.value, rev, 0));
                 }
             }
         }
