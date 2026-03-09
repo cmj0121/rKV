@@ -478,6 +478,27 @@ impl FileConfig {
                 Err(_) => eprintln!("warning: invalid RKV_STORAGE_COMPRESSION={v}"),
             }
         }
+        if let Some(v) = env_opt("RKV_STORAGE_COMPRESSION_PER_LEVEL") {
+            if v.is_empty() {
+                self.storage.compression_per_level = Vec::new();
+            } else {
+                let mut levels = Vec::new();
+                let mut ok = true;
+                for part in v.split(',') {
+                    match part.trim().to_ascii_lowercase().parse::<Compression>() {
+                        Ok(c) => levels.push(c),
+                        Err(_) => {
+                            eprintln!("warning: invalid RKV_STORAGE_COMPRESSION_PER_LEVEL={v}");
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    self.storage.compression_per_level = levels;
+                }
+            }
+        }
         if let Some(v) = env_opt("RKV_STORAGE_IO_MODEL") {
             match v.to_ascii_lowercase().parse::<IoModel>() {
                 Ok(m) => self.storage.io_model = m,
@@ -601,8 +622,9 @@ storage:
   bloom_prefix_len: 0
   filter_policy: bloom       # bloom | ribbon
   verify_checksums: true
-  compression: lz4          # none | lz4 | zstd
-  io_model: mmap             # none | directio | mmap
+  compression: lz4            # none | lz4 | zstd
+  compression_per_level: []   # e.g. [lz4, lz4, zstd]
+  io_model: mmap              # none | directio | mmap
   aol_buffer_size: 128
   l0_max_count: 4
   l0_max_size: 64mb
@@ -649,6 +671,7 @@ bloom_prefix_len = 0
 filter_policy = "bloom"      # bloom | ribbon
 verify_checksums = true
 compression = "lz4"          # none | lz4 | zstd
+compression_per_level = []   # e.g. ["lz4", "lz4", "zstd"]
 io_model = "mmap"            # none | directio | mmap
 aol_buffer_size = 128
 l0_max_count = 4

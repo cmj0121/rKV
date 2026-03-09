@@ -276,6 +276,9 @@ pub struct Config {
     /// When non-empty, `compression_per_level[level]` overrides the global
     /// `compression` setting for that level. Levels beyond the vec length use
     /// the last entry. Example: `vec![LZ4, LZ4, Zstd]` → L0=LZ4, L1=LZ4, L2+=Zstd.
+    ///
+    /// Note: trivial-move compaction (rename without rewrite) preserves the
+    /// source level's compression. The per-level policy is best-effort.
     pub compression_per_level: Vec<Compression>,
     /// I/O model for file access (default: Mmap).
     pub io_model: IoModel,

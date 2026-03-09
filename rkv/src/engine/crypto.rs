@@ -275,7 +275,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let crypto_dir = tmp.path().join("crypto");
         fs::create_dir_all(&crypto_dir).unwrap();
-        fs::write(crypto_dir.join("bad.salt"), &[0u8; 5]).unwrap();
+        fs::write(crypto_dir.join("bad.salt"), [0u8; 5]).unwrap();
         let err = load_or_create_salt(tmp.path(), "bad").unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
     }
