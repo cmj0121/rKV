@@ -447,7 +447,8 @@ The `Config` struct controls database behavior and LSM tuning parameters:
 | `cache_size`        | `usize`           | 8 MB       | Block cache size for decompressed blocks   |
 | `object_size`       | `usize`           | 1 KB       | Bin object size threshold (see above)      |
 | `compress`          | `bool`            | `true`     | LZ4-compress bin objects on disk           |
-| `bloom_bits`        | `usize`           | 10         | Bloom filter bits per key (0 = disabled)   |
+| `bloom_bits`        | `usize`           | 10         | Filter bits per key (0 = disabled)         |
+| `filter_policy`     | `FilterPolicy`    | `Bloom`    | Filter type: `Bloom` or `Ribbon`           |
 | `verify_checksums`  | `bool`            | `true`     | Verify checksums on read                   |
 | `compression`       | `Compression`     | `LZ4`      | SSTable block compression                  |
 | `io_model`          | `IoModel`         | `Mmap`     | File I/O strategy (see I/O Modes below)    |
@@ -480,6 +481,7 @@ The CLI uses dot-notation keys for `config <key> <value>`:
 | `block_size`        | `lsm.block_size`                |
 | `cache_size`        | `lsm.cache_size`                |
 | `bloom_bits`        | `lsm.bloom_bits`                |
+| `filter_policy`     | `lsm.filter_policy`             |
 | `verify_checksums`  | `lsm.verify_checksums`          |
 | `compression`       | `lsm.compression`               |
 | `object_size`       | `object.size`                   |

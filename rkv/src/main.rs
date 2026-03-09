@@ -774,6 +774,11 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                     c.bloom_prefix_len.to_string(),
                 ),
                 (
+                    "  lsm.filter_policy",
+                    "bloom | ribbon",
+                    c.filter_policy.to_string(),
+                ),
+                (
                     "  lsm.verify_checksums",
                     "verify on read",
                     c.verify_checksums.to_string(),
@@ -1166,6 +1171,13 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected a number"),
+        },
+        "lsm.filter_policy" => match value.parse::<rkv::FilterPolicy>() {
+            Ok(v) => {
+                c.filter_policy = v;
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected 'bloom' or 'ribbon'"),
         },
         "io.model" => match value.parse::<rkv::IoModel>() {
             Ok(v) => {

@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::time::Instant;
 
-use rkv::{Config, Key, WriteBatch, DB, DEFAULT_NAMESPACE};
+use rkv::{Config, FilterPolicy, Key, WriteBatch, DB, DEFAULT_NAMESPACE};
 use sysinfo::System;
 
 const SIZES: &[usize] = &[1_000, 8_000, 16_000, 1_000_000];
@@ -63,10 +63,15 @@ fn format_duration(d: std::time::Duration) -> String {
     }
 }
 
-fn bench_put(n: usize) -> std::time::Duration {
+fn make_config(path: &std::path::Path, policy: FilterPolicy) -> Config {
+    let mut config = Config::new(path);
+    config.filter_policy = policy;
+    config
+}
+
+fn bench_put(n: usize, policy: FilterPolicy) -> std::time::Duration {
     let tmp = tempfile::tempdir().unwrap();
-    let config = Config::new(tmp.path());
-    let db = DB::open(config).unwrap();
+    let db = DB::open(make_config(tmp.path(), policy)).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
     let start = Instant::now();
@@ -76,10 +81,9 @@ fn bench_put(n: usize) -> std::time::Duration {
     start.elapsed()
 }
 
-fn bench_get(n: usize) -> std::time::Duration {
+fn bench_get(n: usize, policy: FilterPolicy) -> std::time::Duration {
     let tmp = tempfile::tempdir().unwrap();
-    let config = Config::new(tmp.path());
-    let db = DB::open(config).unwrap();
+    let db = DB::open(make_config(tmp.path(), policy)).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
     for i in 0..n {
@@ -111,10 +115,9 @@ fn bench_get(n: usize) -> std::time::Duration {
     start.elapsed()
 }
 
-fn bench_delete(n: usize) -> std::time::Duration {
+fn bench_delete(n: usize, policy: FilterPolicy) -> std::time::Duration {
     let tmp = tempfile::tempdir().unwrap();
-    let config = Config::new(tmp.path());
-    let db = DB::open(config).unwrap();
+    let db = DB::open(make_config(tmp.path(), policy)).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
     for i in 0..n {
@@ -139,9 +142,9 @@ fn make_object_value(i: usize) -> Vec<u8> {
 
 /// Sequential inserts of N distinct 4 KB values through the ObjectStore path.
 /// Each value has a unique BLAKE3 hash, so N object files are created on disk.
-fn bench_put_objects(n: usize) -> std::time::Duration {
+fn bench_put_objects(n: usize, policy: FilterPolicy) -> std::time::Duration {
     let tmp = tempfile::tempdir().unwrap();
-    let mut config = Config::new(tmp.path());
+    let mut config = make_config(tmp.path(), policy);
     config.object_size = 0; // force all values to bin objects
     let db = DB::open(config).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
@@ -155,9 +158,9 @@ fn bench_put_objects(n: usize) -> std::time::Duration {
 }
 
 /// Random reads of N keys, each resolving a distinct bin object from disk.
-fn bench_get_objects(n: usize) -> std::time::Duration {
+fn bench_get_objects(n: usize, policy: FilterPolicy) -> std::time::Duration {
     let tmp = tempfile::tempdir().unwrap();
-    let mut config = Config::new(tmp.path());
+    let mut config = make_config(tmp.path(), policy);
     config.object_size = 0;
     let db = DB::open(config).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
@@ -177,10 +180,9 @@ fn bench_get_objects(n: usize) -> std::time::Duration {
     start.elapsed()
 }
 
-fn bench_flush(n: usize) -> std::time::Duration {
+fn bench_flush(n: usize, policy: FilterPolicy) -> std::time::Duration {
     let tmp = tempfile::tempdir().unwrap();
-    let config = Config::new(tmp.path());
-    let db = DB::open(config).unwrap();
+    let db = DB::open(make_config(tmp.path(), policy)).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
     for i in 0..n {
@@ -192,10 +194,9 @@ fn bench_flush(n: usize) -> std::time::Duration {
     start.elapsed()
 }
 
-fn bench_get_sst(n: usize) -> std::time::Duration {
+fn bench_get_sst(n: usize, policy: FilterPolicy) -> std::time::Duration {
     let tmp = tempfile::tempdir().unwrap();
-    let config = Config::new(tmp.path());
-    let db = DB::open(config).unwrap();
+    let db = DB::open(make_config(tmp.path(), policy)).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
     for i in 0..n {
@@ -214,10 +215,9 @@ fn bench_get_sst(n: usize) -> std::time::Duration {
     start.elapsed()
 }
 
-fn bench_scan(n: usize) -> std::time::Duration {
+fn bench_scan(n: usize, policy: FilterPolicy) -> std::time::Duration {
     let tmp = tempfile::tempdir().unwrap();
-    let config = Config::new(tmp.path());
-    let db = DB::open(config).unwrap();
+    let db = DB::open(make_config(tmp.path(), policy)).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
     for i in 0..n {
@@ -229,10 +229,9 @@ fn bench_scan(n: usize) -> std::time::Duration {
     start.elapsed()
 }
 
-fn bench_get_compact(n: usize) -> std::time::Duration {
+fn bench_get_compact(n: usize, policy: FilterPolicy) -> std::time::Duration {
     let tmp = tempfile::tempdir().unwrap();
-    let config = Config::new(tmp.path());
-    let db = DB::open(config).unwrap();
+    let db = DB::open(make_config(tmp.path(), policy)).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
     // Write in batches and flush multiple times to create multiple L0 SSTables,
@@ -257,10 +256,9 @@ fn bench_get_compact(n: usize) -> std::time::Duration {
     start.elapsed()
 }
 
-fn bench_batch(n: usize) -> std::time::Duration {
+fn bench_batch(n: usize, policy: FilterPolicy) -> std::time::Duration {
     let tmp = tempfile::tempdir().unwrap();
-    let config = Config::new(tmp.path());
-    let db = DB::open(config).unwrap();
+    let db = DB::open(make_config(tmp.path(), policy)).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
     let start = Instant::now();
@@ -276,10 +274,9 @@ fn bench_batch(n: usize) -> std::time::Duration {
     start.elapsed()
 }
 
-fn bench_keys(n: usize) -> std::time::Duration {
+fn bench_keys(n: usize, policy: FilterPolicy) -> std::time::Duration {
     let tmp = tempfile::tempdir().unwrap();
-    let config = Config::new(tmp.path());
-    let db = DB::open(config).unwrap();
+    let db = DB::open(make_config(tmp.path(), policy)).unwrap();
     let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
 
     for i in 0..n {
@@ -391,6 +388,8 @@ fn bench_mem_keys(n: usize) -> std::time::Duration {
     start.elapsed()
 }
 
+const FILTER_SIZES: &[usize] = &[1_000, 8_000, 16_000];
+
 fn format_size(n: usize) -> String {
     if n >= 1_000_000 {
         format!("{}M", n / 1_000_000)
@@ -403,7 +402,7 @@ fn main() {
     eprintln!("Collecting machine info...");
     let info = collect_machine_info();
 
-    type BenchFn = fn(usize) -> std::time::Duration;
+    type BenchFn = fn(usize, FilterPolicy) -> std::time::Duration;
     let operations: Vec<(&str, BenchFn)> = vec![
         ("put", bench_put),
         ("get", bench_get),
@@ -421,7 +420,8 @@ fn main() {
     // header row
     let size_headers: Vec<String> = SIZES.iter().map(|&s| format_size(s)).collect();
 
-    let mem_operations: Vec<(&str, BenchFn)> = vec![
+    type MemBenchFn = fn(usize) -> std::time::Duration;
+    let mem_operations: Vec<(&str, MemBenchFn)> = vec![
         ("put", bench_mem_put),
         ("get", bench_mem_get),
         ("delete", bench_mem_delete),
@@ -431,6 +431,7 @@ fn main() {
     ];
 
     let mem_size_headers: Vec<String> = MEM_SIZES.iter().map(|&s| format_size(s)).collect();
+    let default_policy = FilterPolicy::default();
 
     // run disk benchmarks
     eprintln!("Running disk benchmarks...");
@@ -439,7 +440,7 @@ fn main() {
         let mut row = Vec::new();
         for &size in SIZES {
             eprintln!("  {name:<8} n={size}...");
-            let elapsed = func(size);
+            let elapsed = func(size, default_policy);
             row.push(format_duration(elapsed));
         }
         results.push(row);
@@ -535,6 +536,53 @@ fn main() {
         md.push_str(&format!("| {name:<9} |"));
         for cell in &mem_results[i] {
             md.push_str(&format!(" {cell:<10} |"));
+        }
+        md.push('\n');
+    }
+
+    // Filter comparison (Bloom vs Ribbon) — reuses the same bench functions
+    let filter_size_headers: Vec<String> = FILTER_SIZES.iter().map(|&s| format_size(s)).collect();
+
+    eprintln!("Running filter comparison benchmarks...");
+    let mut bloom_results: Vec<Vec<String>> = Vec::new();
+    let mut ribbon_results: Vec<Vec<String>> = Vec::new();
+    for (name, func) in &operations {
+        let mut bloom_row = Vec::new();
+        let mut ribbon_row = Vec::new();
+        for &size in FILTER_SIZES {
+            eprintln!("  {name:<8} bloom  n={size}...");
+            bloom_row.push(format_duration(func(size, FilterPolicy::Bloom)));
+            eprintln!("  {name:<8} ribbon n={size}...");
+            ribbon_row.push(format_duration(func(size, FilterPolicy::Ribbon)));
+        }
+        bloom_results.push(bloom_row);
+        ribbon_results.push(ribbon_row);
+    }
+
+    md.push_str("\n## Filter Comparison (Bloom vs Ribbon)\n\n");
+    md.push_str("> Same operations with different filter policies.\n");
+    md.push_str("> Bloom: ~10 bits/key, Ribbon: ~7 bits/key (both target ~1% FPR).\n\n");
+
+    // Header: Operation | 1K (B) | 1K (R) | 8K (B) | 8K (R) | ...
+    md.push_str("| Operation |");
+    for h in &filter_size_headers {
+        md.push_str(&format!(" {h} (B) | {h} (R) |"));
+    }
+    md.push('\n');
+
+    md.push_str("|-----------|");
+    for _ in &filter_size_headers {
+        md.push_str("---------|---------|");
+    }
+    md.push('\n');
+
+    for (i, (name, _)) in operations.iter().enumerate() {
+        md.push_str(&format!("| {name:<9} |"));
+        for j in 0..filter_size_headers.len() {
+            md.push_str(&format!(
+                " {} | {} |",
+                bloom_results[i][j], ribbon_results[i][j]
+            ));
         }
         md.push('\n');
     }

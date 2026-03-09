@@ -507,22 +507,42 @@ lazy reverse iteration over an LSM merge is deferred to a future optimization.
 **Tombstone handling**: The merge iterator emits tombstones — callers decide whether
 to filter them. This ensures tombstones correctly shadow values from deeper levels.
 
-### Bloom Filters
+### Key Filters
 
-Each SSTable embeds a bloom filter that enables skipping SSTables during point lookups.
+Each SSTable embeds a key filter that enables skipping SSTables during point lookups.
 The filter is built from all keys at flush/compaction time and serialized into the SSTable
-file between the data blocks and the index block.
+file between the data blocks and the index block. The `filter_policy` config selects
+between **Bloom** (default) and **Ribbon** filters.
+
+**Configuration**: `bloom_bits` (default 10) controls the bits-per-key. `filter_policy`
+(default `Bloom`) selects the algorithm. Set `bloom_bits` to 0 to disable filters entirely.
+
+#### Bloom Filter
 
 **Hash function**: LevelDB-compatible murmur-inspired 32-bit hash with double-hashing
 probe strategy (`h.rotate_left(15)` per probe). The number of hash probes is computed as
 `k = ln(2) * bits_per_key`, clamped to `[1, 30]`.
 
-**Serialization**: `[num_hashes: u8][bit_array...]`. Stored in the SSTable footer via
-`filter_offset` and `filter_size` fields (formerly reserved bytes). Old SSTables with
-`filter_size = 0` are backwards compatible — `may_contain()` returns `true`.
+**Serialization**: `[num_hashes: u8][bit_array...]`. At 10 bits/key, the false-positive
+rate is approximately 1%.
 
-**Configuration**: `bloom_bits` (default 10) controls the bits-per-key. At 10 bits/key,
-the false-positive rate is approximately 1%. Set to 0 to disable bloom filters entirely.
+#### Ribbon Filter
+
+Ribbon (Rapid Incremental Boolean Banding ON the fly) is an alternative filter based on
+solving a banded linear system over GF(2) (Dillinger & Walzer, 2021). It achieves ~30%
+smaller space than Bloom at the same false-positive rate.
+
+**Characteristics**: Width = 64 bits (u64 operations). Result bits `r` controls FPR =
+2^(-r). At `bloom_bits = 10`, r = 7 gives ~0.8% FPR. Build time is higher than Bloom;
+query time is comparable.
+
+**Serialization**: `[0x02][result_bits: u8][num_rows: u32 LE][solution...]`. The `0x02`
+tag byte enables auto-detection during deserialization.
+
+**Backward compatibility**: Old Bloom SSTables remain readable. A DB can contain mixed
+filter types — `KeyFilter::from_bytes()` auto-detects by the first byte tag. Stored in
+the SSTable footer via `filter_offset` and `filter_size` fields. Old SSTables with
+`filter_size = 0` are backwards compatible — `may_contain()` returns `true`.
 
 On `DB::open()`, the engine scans `<db>/sst/<namespace>/L<n>/` directories and opens all
 `.sst` files into an in-memory reader cache. L0 readers are ordered newest-first; L1+
