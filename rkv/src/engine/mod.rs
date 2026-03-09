@@ -2810,6 +2810,52 @@ impl DB {
                 return Ok(0);
             }
 
+            // Trivial move: when the target level is empty and we don't need
+            // to drop tombstones, just rename source files into the target
+            // directory — skip all decompression, merging, and recompression.
+            // L0 files may overlap each other so we only do this for L1+.
+            if source_level > 0 && target.is_empty() && !drop_tombstones {
+                let source_sst_ids: Vec<u64> = source.iter().map(|r| r.sst_id()).collect();
+                drop(sst); // release read lock before taking write lock
+
+                let target_dir = Self::static_sst_level_dir(&config.path, ns, target_level);
+                fs::create_dir_all(&target_dir)?;
+
+                let mut moved_readers = Vec::with_capacity(source_sst_ids.len());
+                let mut total_size = 0usize;
+                let source_dir = Self::static_sst_level_dir(&config.path, ns, source_level);
+
+                for &sst_id in &source_sst_ids {
+                    let src_path = source_dir.join(format!("{sst_id:06}.sst"));
+                    let seq = sst_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                    let dst_path = target_dir.join(format!("{seq:06}.sst"));
+                    fs::rename(&src_path, &dst_path)?;
+
+                    let reader =
+                        sstable::SSTableReader::open(&dst_path, seq, block_cache.clone(), &**io)?;
+                    total_size += reader.size_bytes();
+                    moved_readers.push(reader);
+                }
+
+                // Update in-memory level structure
+                let mut sst = sstables.write().unwrap_or_else(|e| e.into_inner());
+                if let Some(levels) = sst.get_mut(ns) {
+                    if let Some(ref bc) = block_cache {
+                        for &id in &source_sst_ids {
+                            bc.evict_sst(id);
+                        }
+                    }
+                    if let Some(s) = levels.get_mut(source_level) {
+                        s.retain(|r| !source_sst_ids.contains(&r.sst_id()));
+                    }
+                    while levels.len() <= target_level {
+                        levels.push(Vec::new());
+                    }
+                    levels[target_level].extend(moved_readers);
+                }
+                return Ok(total_size);
+            }
+
             // Record the sst_ids of readers being merged so we only clean up
             // exactly these files/readers (not ones added by concurrent flush).
             let mut merged_sst_ids: Vec<u64> = Vec::with_capacity(source.len() + target.len());
