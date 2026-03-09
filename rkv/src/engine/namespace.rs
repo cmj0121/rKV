@@ -412,7 +412,7 @@ impl<'db> Namespace<'db> {
             if value.is_tombstone() {
                 continue;
             }
-            if key.to_string().starts_with(prefix) {
+            if key.as_str().is_some_and(|s| s.starts_with(prefix)) {
                 keys.push(key);
             }
         }

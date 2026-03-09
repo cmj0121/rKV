@@ -2871,9 +2871,11 @@ impl DB {
                 }
             }
 
-            // Sort revisions within each key by revision ID
+            // Sort revisions within each key by revision ID (skip if already sorted)
             for revisions in merged.values_mut() {
-                revisions.sort_by_key(|(_, rev, _)| *rev);
+                if !revisions.windows(2).all(|w| w[0].1 <= w[1].1) {
+                    revisions.sort_by_key(|(_, rev, _)| *rev);
+                }
             }
 
             if drop_tombstones {

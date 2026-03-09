@@ -165,6 +165,27 @@ impl Key {
         }
     }
 
+    /// Borrow the inner string for `Str` keys, `None` for `Int`.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Key::Str(s) => Some(s.as_str()),
+            Key::Int(_) => None,
+        }
+    }
+
+    /// Check whether this key's display representation starts with `prefix`'s.
+    ///
+    /// For `Str` vs `Str`: direct string prefix check (no allocation).
+    /// For `Int` vs `Int`: exact match only (integers don't have meaningful prefixes).
+    /// Cross-variant: always false.
+    pub fn has_prefix(&self, prefix: &Key) -> bool {
+        match (self, prefix) {
+            (Key::Str(s), Key::Str(p)) => s.starts_with(p.as_str()),
+            (Key::Int(a), Key::Int(b)) => a == b,
+            _ => false,
+        }
+    }
+
     fn variant_order(&self) -> u8 {
         match self {
             Key::Int(_) => 0,
@@ -504,5 +525,45 @@ mod tests {
                 "prefix len mismatch for {key:?}"
             );
         }
+    }
+
+    // --- as_str ---
+
+    #[test]
+    fn as_str_returns_inner() {
+        assert_eq!(Key::Str("hello".into()).as_str(), Some("hello"));
+        assert_eq!(Key::Str(String::new()).as_str(), Some(""));
+    }
+
+    #[test]
+    fn as_str_none_for_int() {
+        assert_eq!(Key::Int(42).as_str(), None);
+    }
+
+    // --- has_prefix ---
+
+    #[test]
+    fn has_prefix_str_match() {
+        assert!(Key::from("user:123").has_prefix(&Key::from("user:")));
+        assert!(Key::from("user:123").has_prefix(&Key::from("")));
+        assert!(Key::from("abc").has_prefix(&Key::from("abc")));
+    }
+
+    #[test]
+    fn has_prefix_str_no_match() {
+        assert!(!Key::from("user:123").has_prefix(&Key::from("admin:")));
+        assert!(!Key::from("ab").has_prefix(&Key::from("abc")));
+    }
+
+    #[test]
+    fn has_prefix_int_exact() {
+        assert!(Key::Int(42).has_prefix(&Key::Int(42)));
+        assert!(!Key::Int(42).has_prefix(&Key::Int(4)));
+    }
+
+    #[test]
+    fn has_prefix_cross_variant() {
+        assert!(!Key::Int(42).has_prefix(&Key::from("42")));
+        assert!(!Key::from("42").has_prefix(&Key::Int(42)));
     }
 }
