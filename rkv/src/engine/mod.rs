@@ -773,6 +773,10 @@ impl DB {
             peer_last_revision: None,
         };
 
+        // Attach profiling metrics to all loaded SSTable readers
+        #[cfg(feature = "profiling")]
+        db.attach_profiling_metrics();
+
         // Eagerly register the default namespace so it always appears in
         // list_namespaces(), regardless of whether any data has been written.
         db.get_or_create_memtable(DEFAULT_NAMESPACE)?;
@@ -1768,6 +1772,28 @@ impl DB {
         metrics::render_prometheus(&stats, &self.metrics)
     }
 
+    /// Return profiling breakdown for the get hot path.
+    ///
+    /// Each entry is `(probe_name, count, total_ns)`. Only available with
+    /// the `profiling` feature; returns an empty vec otherwise.
+    pub fn profiling_report(&self) -> Vec<(&'static str, u64, u64)> {
+        #[cfg(feature = "profiling")]
+        {
+            self.metrics
+                .profiling_histograms()
+                .into_iter()
+                .map(|(name, h)| {
+                    let snap = h.snapshot();
+                    (name, snap.count, snap.sum_nanos)
+                })
+                .collect()
+        }
+        #[cfg(not(feature = "profiling"))]
+        {
+            Vec::new()
+        }
+    }
+
     /// Switch to a namespace, creating it if it does not exist.
     ///
     /// Pass `password: Some("...")` to open an encrypted namespace, or `None`
@@ -2044,12 +2070,15 @@ impl DB {
             writer.finish()?;
 
             // Open the reader and prepend to L0 cache (newest first)
-            let reader = sstable::SSTableReader::open(
+            #[allow(unused_mut)]
+            let mut reader = sstable::SSTableReader::open(
                 &sst_path,
                 seq,
                 self.block_cache.clone(),
                 &*self.io_backend,
             )?;
+            #[cfg(feature = "profiling")]
+            reader.set_metrics(Arc::clone(&self.metrics));
             let sst_bytes = reader.size_bytes() as u64;
             let mut sst = self.sstables.write().unwrap_or_else(|e| e.into_inner());
             let levels = sst
@@ -3529,12 +3558,21 @@ impl DB {
         ns: &str,
         key: &Key,
     ) -> Result<Option<(Value, revision::RevisionID)>> {
+        metrics::prof_timer!(self.metrics, prof_sst_total);
         let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
         if let Some(levels) = sst.get(ns) {
+            // Serialize key once, reuse across all SSTable lookups
+            let key_buf = {
+                metrics::prof_timer!(self.metrics, prof_key_serialize);
+                let mut buf = Vec::with_capacity(key.encoded_len());
+                key.write_bytes_to(&mut buf);
+                buf
+            };
+
             for level_readers in levels {
                 for reader in level_readers {
                     if let Some((value, rev, expires_at_ms)) =
-                        reader.get(key, self.config.verify_checksums)?
+                        reader.get_with_key_bytes(&key_buf, self.config.verify_checksums)?
                     {
                         if is_expired(expires_at_ms) {
                             return Ok(Some((Value::tombstone(), rev)));
@@ -3728,6 +3766,19 @@ impl DB {
         }
 
         Ok((result, max_seq))
+    }
+
+    /// Attach profiling metrics to all SSTable readers in the sstables map.
+    #[cfg(feature = "profiling")]
+    fn attach_profiling_metrics(&self) {
+        let mut sst = self.sstables.write().unwrap_or_else(|e| e.into_inner());
+        for levels in sst.values_mut() {
+            for level_readers in levels.iter_mut() {
+                for reader in level_readers.iter_mut() {
+                    reader.set_metrics(Arc::clone(&self.metrics));
+                }
+            }
+        }
     }
 
     pub(crate) fn inc_op_puts(&self) {

@@ -449,6 +449,9 @@ pub(crate) struct SSTableReader {
     footer_offsets: FooterOffsets,
     /// Lazily-parsed metadata (index, bloom, first key).
     lazy_meta: OnceLock<std::result::Result<LazyMeta, String>>,
+    /// Shared metrics for profiling instrumentation.
+    #[cfg(feature = "profiling")]
+    metrics: Option<Arc<super::metrics::Metrics>>,
 }
 
 impl SSTableReader {
@@ -569,6 +572,8 @@ impl SSTableReader {
             has_restarts,
             footer_offsets,
             lazy_meta: OnceLock::new(),
+            #[cfg(feature = "profiling")]
+            metrics: None,
         })
     }
 
@@ -740,6 +745,7 @@ impl SSTableReader {
     /// Uses the bloom filter for fast negative answers, binary search
     /// for block selection, and binary search within blocks via restart
     /// points (or `partition_point` on cached entries).
+    #[cfg(test)]
     pub(crate) fn get(
         &self,
         key: &Key,
@@ -751,25 +757,56 @@ impl SSTableReader {
             return Ok(None);
         }
 
-        let mut key_buf = Vec::with_capacity(key.encoded_len());
-        key.write_bytes_to(&mut key_buf);
+        let key_buf = {
+            super::metrics::prof_opt_timer!(self.metrics.as_deref(), prof_key_serialize);
+            let mut buf = Vec::with_capacity(key.encoded_len());
+            key.write_bytes_to(&mut buf);
+            buf
+        };
 
-        // Bloom filter check: skip this SSTable if the key is definitely absent
-        if !meta.filter.may_contain(&key_buf) {
+        self.get_with_key_bytes(&key_buf, verify_checksums)
+    }
+
+    /// Look up a key using pre-serialized key bytes.
+    ///
+    /// This avoids repeated key serialization when the same key is searched
+    /// across multiple SSTables.
+    pub(crate) fn get_with_key_bytes(
+        &self,
+        key_buf: &[u8],
+        verify_checksums: bool,
+    ) -> Result<Option<(Value, RevisionID, u64)>> {
+        let meta = self.ensure_meta()?;
+
+        if meta.index.is_empty() {
             return Ok(None);
         }
 
-        // Binary search: find the first block whose last_key >= target
-        let block_idx = match meta
-            .index
-            .binary_search_by(|e| e.last_key.as_slice().cmp(&key_buf))
+        #[cfg(feature = "profiling")]
+        let prof_m = self.metrics.as_deref();
+
+        // Bloom filter check: skip this SSTable if the key is definitely absent
         {
-            Ok(i) => i,
-            Err(i) => {
-                if i >= meta.index.len() {
-                    return Ok(None); // key beyond all blocks
+            super::metrics::prof_opt_timer!(prof_m, prof_sst_bloom_check);
+            if !meta.filter.may_contain(key_buf) {
+                return Ok(None);
+            }
+        }
+
+        // Binary search: find the first block whose last_key >= target
+        let block_idx = {
+            super::metrics::prof_opt_timer!(prof_m, prof_sst_index_search);
+            match meta
+                .index
+                .binary_search_by(|e| e.last_key.as_slice().cmp(key_buf))
+            {
+                Ok(i) => i,
+                Err(i) => {
+                    if i >= meta.index.len() {
+                        return Ok(None); // key beyond all blocks
+                    }
+                    i
                 }
-                i
             }
         };
 
@@ -779,11 +816,13 @@ impl SSTableReader {
         // contain more entries for the same key.
         for bi in block_idx..meta.index.len() {
             let ie = &meta.index[bi];
-            let found_in_block =
-                self.get_from_block(ie, bi, &key_buf, verify_checksums, &mut last_match)?;
+            let found_in_block = {
+                super::metrics::prof_opt_timer!(prof_m, prof_sst_block_read);
+                self.get_from_block(ie, bi, key_buf, verify_checksums, &mut last_match)?
+            };
 
             if found_in_block {
-                if ie.last_key.as_slice() != key_buf.as_slice() {
+                if ie.last_key.as_slice() != key_buf {
                     return Ok(last_match);
                 }
                 // last_key == target → entries may continue in next block
@@ -813,9 +852,12 @@ impl SSTableReader {
         // 1. Cache hit → binary search on parsed entries
         if let Some(ref c) = self.cache {
             if let Some(entries) = c.get(self.sst_id, block_index as u32) {
+                super::metrics::prof_opt_timer!(self.metrics.as_deref(), prof_sst_cache_hit);
                 return Self::binary_search_entries(&entries, key_bytes, last_match);
             }
         }
+
+        super::metrics::prof_opt_timer!(self.metrics.as_deref(), prof_sst_cache_miss);
 
         // 2. Cache miss, no cache, restart points → targeted parse (fastest cold path)
         if self.has_restarts && self.cache.is_none() {
@@ -1419,6 +1461,12 @@ impl SSTableReader {
     /// Return the total size of the SSTable data in bytes.
     pub(crate) fn size_bytes(&self) -> usize {
         self.data.len()
+    }
+
+    /// Attach shared metrics for profiling instrumentation.
+    #[cfg(feature = "profiling")]
+    pub(crate) fn set_metrics(&mut self, metrics: Arc<super::metrics::Metrics>) {
+        self.metrics = Some(metrics);
     }
 
     /// Return the total number of entries in this SSTable.

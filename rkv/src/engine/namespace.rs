@@ -231,6 +231,7 @@ impl<'db> Namespace<'db> {
 
         // 1. Check MemTable first (3-state lookup)
         let value = {
+            metrics::prof_timer!(self.db.metrics(), prof_memtable_lookup);
             let mt = self.db.get_or_create_memtable(&self.name)?;
             let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
             match mt.lookup(&key) {
@@ -248,8 +249,11 @@ impl<'db> Namespace<'db> {
             }
         };
 
-        let value = self.db.resolve_value(&self.name, &value)?;
-        self.decrypt_value(value)
+        {
+            metrics::prof_timer!(self.db.metrics(), prof_value_resolve);
+            let value = self.db.resolve_value(&self.name, &value)?;
+            self.decrypt_value(value)
+        }
     }
 
     /// Like `get()`, but also returns the `RevisionID` for the value.

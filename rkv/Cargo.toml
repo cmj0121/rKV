@@ -34,6 +34,7 @@ default = []
 server = ["dep:axum", "dep:tokio", "dep:serde_json", "dep:tower", "dep:tower-http", "dep:httpdate", "dep:http-body-util", "dep:tracing", "dep:tracing-subscriber"]
 bench-compare = ["dep:redb", "dep:sled", "dep:fjall"]
 bench-rocksdb = ["bench-compare", "dep:rocksdb"]
+profiling = []
 
 [dependencies]
 aes-gcm = "0.10"
