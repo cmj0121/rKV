@@ -38,17 +38,17 @@ Wall-clock time is measured via `std::time::Instant`.
 
 | Operation | 1K        | 8K       | 16K       | 1M        |
 | --------- | --------- | -------- | --------- | --------- |
-| put       | 757 µs    | 8.01 ms  | 15.54 ms  | 2.16 s    |
-| get       | 253 µs    | 2.27 ms  | 4.66 ms   | 9.10 s    |
-| delete    | 477 µs    | 4.00 ms  | 7.95 ms   | 862.13 ms |
-| scan      | 124 µs    | 944 µs   | 1.86 ms   | 229.90 ms |
-| batch     | 568 µs    | 4.22 ms  | 8.23 ms   | 2.06 s    |
-| keys      | 162 µs    | 1.02 ms  | 1.93 ms   | 235.78 ms |
-| flush     | 1.08 ms   | 3.58 ms  | 6.34 ms   | 6.55 ms   |
-| get_sst   | 3.52 ms   | 25.91 ms | 53.14 ms  | 9.38 s    |
-| get_cpt   | 3.25 ms   | 25.63 ms | 51.28 ms  | 8.61 s    |
-| put_obj   | 292.66 ms | 2.29 s   | 4.58 s    | 283.54 s  |
-| get_obj   | 7.77 ms   | 63.48 ms | 127.25 ms | 20.02 s   |
+| put       | 757 µs    | 8.06 ms  | 15.43 ms  | 2.19 s    |
+| get       | 234 µs    | 2.23 ms  | 4.68 ms   | 9.65 s    |
+| delete    | 533 µs    | 4.04 ms  | 8.10 ms   | 864.36 ms |
+| scan      | 127 µs    | 998 µs   | 2.01 ms   | 231.77 ms |
+| batch     | 559 µs    | 4.22 ms  | 8.37 ms   | 2.09 s    |
+| keys      | 128 µs    | 982 µs   | 2.18 ms   | 237.03 ms |
+| flush     | 1.33 ms   | 3.95 ms  | 7.06 ms   | 6.72 ms   |
+| get_sst   | 3.43 ms   | 26.98 ms | 53.14 ms  | 9.43 s    |
+| get_cpt   | 3.46 ms   | 27.48 ms | 50.61 ms  | 8.69 s    |
+| put_obj   | 508.62 ms | 3.81 s   | 7.52 s    | 454.97 s  |
+| get_obj   | 7.91 ms   | 63.55 ms | 126.88 ms | 20.22 s   |
 
 ## Results (In-Memory)
 
@@ -56,31 +56,31 @@ Wall-clock time is measured via `std::time::Instant`.
 
 | Operation | 1K     | 8K      | 16K     | 1M        |
 | --------- | ------ | ------- | ------- | --------- |
-| put       | 553 µs | 3.40 ms | 7.25 ms | 695.00 ms |
-| get       | 245 µs | 2.26 ms | 4.57 ms | 687.18 ms |
-| delete    | 311 µs | 2.46 ms | 4.93 ms | 468.67 ms |
-| scan      | 138 µs | 947 µs  | 1.84 ms | 195.78 ms |
-| batch     | 423 µs | 2.69 ms | 5.17 ms | 410.87 ms |
-| keys      | 129 µs | 955 µs  | 1.90 ms | 165.31 ms |
+| put       | 546 µs | 3.46 ms | 7.01 ms | 523.14 ms |
+| get       | 241 µs | 2.21 ms | 4.58 ms | 649.78 ms |
+| delete    | 312 µs | 2.44 ms | 4.95 ms | 469.09 ms |
+| scan      | 143 µs | 919 µs  | 1.84 ms | 204.00 ms |
+| batch     | 514 µs | 2.72 ms | 5.23 ms | 405.82 ms |
+| keys      | 148 µs | 960 µs  | 1.88 ms | 165.86 ms |
 
 ## Filter Comparison (Bloom vs Ribbon)
 
 > Same operations with different filter policies.
 > Bloom: ~10 bits/key, Ribbon: ~7 bits/key (both target ~1% FPR).
 
-| Operation | 1K (B)    | 1K (R)    | 8K (B)   | 8K (R)   | 16K (B)   | 16K (R)   |
-| --------- | --------- | --------- | -------- | -------- | --------- | --------- |
-| put       | 714 µs    | 705 µs    | 5.39 ms  | 5.33 ms  | 10.74 ms  | 10.72 ms  |
-| get       | 256 µs    | 228 µs    | 2.18 ms  | 2.17 ms  | 4.51 ms   | 4.49 ms   |
-| delete    | 511 µs    | 506 µs    | 3.99 ms  | 3.94 ms  | 8.73 ms   | 8.13 ms   |
-| scan      | 140 µs    | 126 µs    | 994 µs   | 920 µs   | 1.90 ms   | 1.81 ms   |
-| batch     | 560 µs    | 588 µs    | 4.31 ms  | 4.14 ms  | 8.29 ms   | 8.43 ms   |
-| keys      | 146 µs    | 127 µs    | 993 µs   | 960 µs   | 2.02 ms   | 1.89 ms   |
-| flush     | 1.18 ms   | 1.76 ms   | 3.60 ms  | 7.31 ms  | 6.40 ms   | 13.49 ms  |
-| get_sst   | 3.62 ms   | 3.88 ms   | 26.63 ms | 29.58 ms | 52.77 ms  | 59.59 ms  |
-| get_cpt   | 3.56 ms   | 3.89 ms   | 25.64 ms | 29.53 ms | 50.40 ms  | 58.40 ms  |
-| put_obj   | 281.87 ms | 284.66 ms | 2.27 s   | 2.30 s   | 4.62 s    | 4.57 s    |
-| get_obj   | 7.79 ms   | 7.85 ms   | 63.05 ms | 63.27 ms | 126.42 ms | 126.45 ms |
+| Operation | 1K (B)    | 1K (R)    | 16K (B)   | 16K (R)   | 100K (B)  | 100K (R)  |
+| --------- | --------- | --------- | --------- | --------- | --------- | --------- |
+| put       | 741 µs    | 703 µs    | 10.86 ms  | 10.77 ms  | 104.92 ms | 144.29 ms |
+| get       | 232 µs    | 244 µs    | 4.53 ms   | 4.53 ms   | 512.87 ms | 590.45 ms |
+| delete    | 503 µs    | 499 µs    | 8.40 ms   | 7.97 ms   | 59.38 ms  | 58.14 ms  |
+| scan      | 120 µs    | 135 µs    | 2.15 ms   | 1.82 ms   | 22.08 ms  | 22.24 ms  |
+| batch     | 549 µs    | 560 µs    | 8.39 ms   | 8.34 ms   | 87.97 ms  | 127.88 ms |
+| keys      | 126 µs    | 128 µs    | 2.75 ms   | 1.93 ms   | 22.42 ms  | 22.88 ms  |
+| flush     | 1.33 ms   | 1.82 ms   | 6.75 ms   | 13.70 ms  | 3.14 ms   | 6.75 ms   |
+| get_sst   | 3.81 ms   | 4.02 ms   | 52.71 ms  | 59.82 ms  | 612.60 ms | 667.23 ms |
+| get_cpt   | 3.44 ms   | 3.76 ms   | 51.06 ms  | 59.07 ms  | 591.53 ms | 650.99 ms |
+| put_obj   | 347.16 ms | 394.31 ms | 6.84 s    | 6.96 s    | 41.41 s   | 41.47 s   |
+| get_obj   | 7.82 ms   | 7.82 ms   | 127.44 ms | 127.47 ms | 1.19 s    | 1.24 s    |
 
 ## Reproduce
 
@@ -107,46 +107,46 @@ make bench
 
 | N   | rKV      | redb     | sled     | fjall    |
 | --- | -------- | -------- | -------- | -------- |
-| 1K  | 753 µs   | 1.67 ms  | 3.11 ms  | 1.93 ms  |
-| 8K  | 7.23 ms  | 12.20 ms | 26.74 ms | 15.18 ms |
-| 16K | 12.22 ms | 25.06 ms | 54.17 ms | 30.12 ms |
-| 1M  | 2.27 s   | 1.97 s   | 4.04 s   | 2.03 s   |
+| 1K  | 749 µs   | 1.80 ms  | 3.12 ms  | 1.93 ms  |
+| 8K  | 6.02 ms  | 12.24 ms | 26.14 ms | 15.05 ms |
+| 16K | 12.20 ms | 25.13 ms | 55.25 ms | 29.91 ms |
+| 1M  | 2.31 s   | 1.99 s   | 4.10 s   | 2.02 s   |
 
 ### Random Get
 
 | N   | rKV     | redb      | sled    | fjall   |
 | --- | ------- | --------- | ------- | ------- |
-| 1K  | 259 µs  | 230 µs    | 425 µs  | 408 µs  |
-| 8K  | 2.39 ms | 2.74 ms   | 4.02 ms | 4.11 ms |
-| 16K | 5.25 ms | 5.98 ms   | 8.64 ms | 8.87 ms |
-| 1M  | 10.87 s | 954.35 ms | 1.81 s  | 6.29 s  |
+| 1K  | 275 µs  | 224 µs    | 442 µs  | 380 µs  |
+| 8K  | 2.33 ms | 2.66 ms   | 3.88 ms | 4.36 ms |
+| 16K | 5.16 ms | 5.77 ms   | 8.46 ms | 8.98 ms |
+| 1M  | 10.42 s | 990.24 ms | 1.73 s  | 5.98 s  |
 
 ### Sequential Delete
 
 | N   | rKV       | redb     | sled     | fjall    |
 | --- | --------- | -------- | -------- | -------- |
-| 1K  | 561 µs    | 1.55 ms  | 1.89 ms  | 1.98 ms  |
-| 8K  | 4.13 ms   | 12.08 ms | 18.02 ms | 16.13 ms |
-| 16K | 8.30 ms   | 24.84 ms | 36.69 ms | 32.70 ms |
-| 1M  | 770.97 ms | 1.81 s   | 5.14 s   | 1.95 s   |
+| 1K  | 553 µs    | 1.70 ms  | 1.89 ms  | 1.95 ms  |
+| 8K  | 4.07 ms   | 11.76 ms | 17.45 ms | 15.79 ms |
+| 16K | 8.48 ms   | 24.08 ms | 35.20 ms | 32.12 ms |
+| 1M  | 772.78 ms | 1.81 s   | 4.96 s   | 1.96 s   |
 
 ### Forward Scan
 
 | N   | rKV       | redb     | sled      | fjall     |
 | --- | --------- | -------- | --------- | --------- |
-| 1K  | 140 µs    | 80 µs    | 326 µs    | 151 µs    |
-| 8K  | 1.05 ms   | 572 µs   | 2.14 ms   | 1.13 ms   |
-| 16K | 2.14 ms   | 1.17 ms  | 4.04 ms   | 2.20 ms   |
-| 1M  | 233.65 ms | 98.77 ms | 313.60 ms | 323.12 ms |
+| 1K  | 166 µs    | 76 µs    | 355 µs    | 172 µs    |
+| 8K  | 1.14 ms   | 565 µs   | 2.18 ms   | 1.13 ms   |
+| 16K | 2.34 ms   | 1.16 ms  | 4.28 ms   | 2.33 ms   |
+| 1M  | 234.17 ms | 99.02 ms | 329.31 ms | 316.09 ms |
 
 ### Batch Write
 
-| N   | rKV     | redb     | sled     | fjall     |
-| --- | ------- | -------- | -------- | --------- |
-| 1K  | 731 µs  | 5.05 ms  | 4.64 ms  | 563 µs    |
-| 8K  | 4.55 ms | 44.84 ms | 39.86 ms | 4.42 ms   |
-| 16K | 8.58 ms | 91.64 ms | 80.91 ms | 8.78 ms   |
-| 1M  | 2.09 s  | 6.45 s   | 5.25 s   | 661.92 ms |
+| N   | rKV     | redb      | sled     | fjall     |
+| --- | ------- | --------- | -------- | --------- |
+| 1K  | 632 µs  | 5.83 ms   | 4.68 ms  | 534 µs    |
+| 8K  | 4.59 ms | 61.52 ms  | 38.68 ms | 4.17 ms   |
+| 16K | 8.82 ms | 113.53 ms | 79.36 ms | 8.38 ms   |
+| 1M  | 2.06 s  | 8.16 s    | 5.12 s   | 634.41 ms |
 
 ### Reproduce
 
