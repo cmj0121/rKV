@@ -45,21 +45,35 @@ impl Key {
 
     /// Serialize the key to bytes. The encoding preserves ordering under `memcmp`.
     pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.encoded_len());
+        self.write_bytes_to(&mut buf);
+        buf
+    }
+
+    /// Append the key's byte encoding to an existing buffer.
+    ///
+    /// Same encoding as [`to_bytes`] but avoids allocating a new `Vec`.
+    /// Useful in hot loops where a buffer can be reused across calls.
+    pub fn write_bytes_to(&self, buf: &mut Vec<u8>) {
         match self {
             Key::Int(v) => {
                 let flipped = (*v as u64) ^ SIGN_FLIP;
-                let mut buf = Vec::with_capacity(9);
                 buf.push(TAG_INT);
                 buf.extend_from_slice(&flipped.to_be_bytes());
-                buf
             }
             Key::Str(s) => {
-                let mut buf = Vec::with_capacity(1 + s.len() + 1);
                 buf.push(TAG_STR);
                 buf.extend_from_slice(s.as_bytes());
                 buf.push(0x00); // null terminator
-                buf
             }
+        }
+    }
+
+    /// Returns the byte length of the encoded key (without allocating).
+    pub fn encoded_len(&self) -> usize {
+        match self {
+            Key::Int(_) => 9,               // 1 tag + 8 bytes
+            Key::Str(s) => 1 + s.len() + 1, // 1 tag + data + null
         }
     }
 
@@ -100,21 +114,35 @@ impl Key {
     /// so that `other.to_bytes().starts_with(prefix.to_prefix_bytes())` works
     /// correctly.
     pub fn to_prefix_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.prefix_encoded_len());
+        self.write_prefix_bytes_to(&mut buf);
+        buf
+    }
+
+    /// Append the prefix byte encoding to an existing buffer.
+    ///
+    /// Same as [`write_bytes_to`] but omits the trailing null terminator
+    /// for Str keys.
+    pub fn write_prefix_bytes_to(&self, buf: &mut Vec<u8>) {
         match self {
             Key::Int(v) => {
                 let flipped = (*v as u64) ^ SIGN_FLIP;
-                let mut buf = Vec::with_capacity(9);
                 buf.push(TAG_INT);
                 buf.extend_from_slice(&flipped.to_be_bytes());
-                buf
             }
             Key::Str(s) => {
-                let mut buf = Vec::with_capacity(1 + s.len());
                 buf.push(TAG_STR);
                 buf.extend_from_slice(s.as_bytes());
                 // No null terminator — this is a prefix
-                buf
             }
+        }
+    }
+
+    /// Returns the byte length of the prefix-encoded key (without allocating).
+    pub fn prefix_encoded_len(&self) -> usize {
+        match self {
+            Key::Int(_) => 9,
+            Key::Str(s) => 1 + s.len(), // no null terminator
         }
     }
 
@@ -407,5 +435,74 @@ mod tests {
 
         // But full key bytes should NOT start with to_bytes (has null terminator)
         assert!(!full_bytes.starts_with(&prefix.to_bytes()));
+    }
+
+    // --- write_bytes_to / encoded_len ---
+
+    #[test]
+    fn write_bytes_to_matches_to_bytes() {
+        let keys = [
+            Key::Int(0),
+            Key::Int(-1),
+            Key::Int(i64::MAX),
+            Key::Str("hello".into()),
+            Key::Str(String::new()),
+        ];
+        for key in &keys {
+            let mut buf = Vec::new();
+            key.write_bytes_to(&mut buf);
+            assert_eq!(buf, key.to_bytes(), "mismatch for {key:?}");
+        }
+    }
+
+    #[test]
+    fn write_bytes_to_appends() {
+        let mut buf = vec![0xFF];
+        Key::Int(42).write_bytes_to(&mut buf);
+        assert_eq!(buf[0], 0xFF);
+        assert_eq!(&buf[1..], Key::Int(42).to_bytes().as_slice());
+    }
+
+    #[test]
+    fn encoded_len_matches() {
+        let keys = [
+            Key::Int(0),
+            Key::Int(i64::MIN),
+            Key::Str("abc".into()),
+            Key::Str(String::new()),
+        ];
+        for key in &keys {
+            assert_eq!(
+                key.encoded_len(),
+                key.to_bytes().len(),
+                "len mismatch for {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_prefix_bytes_to_matches() {
+        let keys = [
+            Key::Int(42),
+            Key::Str("user:".into()),
+            Key::Str(String::new()),
+        ];
+        for key in &keys {
+            let mut buf = Vec::new();
+            key.write_prefix_bytes_to(&mut buf);
+            assert_eq!(buf, key.to_prefix_bytes(), "prefix mismatch for {key:?}");
+        }
+    }
+
+    #[test]
+    fn prefix_encoded_len_matches() {
+        let keys = [Key::Int(0), Key::Str("abc".into()), Key::Str(String::new())];
+        for key in &keys {
+            assert_eq!(
+                key.prefix_encoded_len(),
+                key.to_prefix_bytes().len(),
+                "prefix len mismatch for {key:?}"
+            );
+        }
     }
 }

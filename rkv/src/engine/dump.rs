@@ -364,16 +364,16 @@ impl DumpReader {
 /// ```
 fn encode_payload_v1(namespace: &str, key: &Key, value: &Value, expires_at_ms: u64) -> Vec<u8> {
     let ns_bytes = namespace.as_bytes();
-    let key_bytes = key.to_bytes();
+    let key_len = key.encoded_len();
     let value_tag = value.to_tag();
     let value_data = value_to_data(value);
 
-    let capacity = 2 + ns_bytes.len() + 2 + key_bytes.len() + 1 + 4 + value_data.len() + 8;
+    let capacity = 2 + ns_bytes.len() + 2 + key_len + 1 + 4 + value_data.len() + 8;
     let mut buf = Vec::with_capacity(capacity);
     buf.extend_from_slice(&(ns_bytes.len() as u16).to_be_bytes());
     buf.extend_from_slice(ns_bytes);
-    buf.extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
-    buf.extend_from_slice(&key_bytes);
+    buf.extend_from_slice(&(key_len as u16).to_be_bytes());
+    key.write_bytes_to(&mut buf);
     buf.push(value_tag);
     buf.extend_from_slice(&(value_data.len() as u32).to_be_bytes());
     buf.extend_from_slice(&value_data);
