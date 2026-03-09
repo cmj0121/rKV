@@ -101,12 +101,25 @@ impl BloomFilter {
         let h = bloom_hash(key);
         let delta = h.rotate_left(15);
         let mut current = h;
-        for _ in 0..self.num_hashes {
-            let bit_pos = current % num_bits;
-            if self.bits[(bit_pos / 8) as usize] & (1 << (bit_pos % 8)) == 0 {
-                return false;
+
+        // Use bitmask instead of modulo when num_bits is a power of two.
+        if num_bits.is_power_of_two() {
+            let mask = num_bits - 1;
+            for _ in 0..self.num_hashes {
+                let bit_pos = current & mask;
+                if self.bits[(bit_pos >> 3) as usize] & (1 << (bit_pos & 7)) == 0 {
+                    return false;
+                }
+                current = current.wrapping_add(delta);
             }
-            current = current.wrapping_add(delta);
+        } else {
+            for _ in 0..self.num_hashes {
+                let bit_pos = current % num_bits;
+                if self.bits[(bit_pos / 8) as usize] & (1 << (bit_pos % 8)) == 0 {
+                    return false;
+                }
+                current = current.wrapping_add(delta);
+            }
         }
         true
     }
@@ -155,24 +168,28 @@ impl BloomFilter {
     ///
     /// Builds from collected key hashes, then returns
     /// `[num_hashes: u8][bit_array...]`. Returns empty vec if no keys.
+    ///
+    /// The bit array size is rounded up to a power of two so that
+    /// `may_contain` can use bitmask operations instead of modulo.
     pub(crate) fn build(&mut self) -> Vec<u8> {
         if self.key_hashes.is_empty() || self.bits_per_key == 0 {
             return Vec::new();
         }
 
-        // Compute bit array size (minimum 64 bits = 8 bytes)
-        let num_bits = std::cmp::max(self.key_hashes.len() * self.bits_per_key, 64);
-        let num_bytes = num_bits.div_ceil(8);
-        let num_bits = (num_bytes * 8) as u32;
+        // Compute bit array size (minimum 64 bits), rounded to power of two
+        let raw_bits = std::cmp::max(self.key_hashes.len() * self.bits_per_key, 64);
+        let num_bits = (raw_bits as u32).next_power_of_two();
+        let num_bytes = (num_bits / 8) as usize;
 
         self.bits = vec![0u8; num_bytes];
 
+        let mask = num_bits - 1;
         for &h in &self.key_hashes {
             let delta = h.rotate_left(15);
             let mut current = h;
             for _ in 0..self.num_hashes {
-                let bit_pos = current % num_bits;
-                self.bits[(bit_pos / 8) as usize] |= 1 << (bit_pos % 8);
+                let bit_pos = current & mask;
+                self.bits[(bit_pos >> 3) as usize] |= 1 << (bit_pos & 7);
                 current = current.wrapping_add(delta);
             }
         }
