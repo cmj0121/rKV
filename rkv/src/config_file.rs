@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{Compression, Config, IoModel, Role};
+use crate::{Compression, Config, FilterPolicy, IoModel, Role};
 
 /// A size value that can be deserialized from either an integer (bytes) or a
 /// human-readable string like `"4mb"`, `"1kb"`, `"2gb"`.
@@ -114,6 +114,17 @@ fn deserialize_compression<'de, D: Deserializer<'de>>(d: D) -> Result<Compressio
         .map_err(de::Error::custom)
 }
 
+fn serialize_filter_policy<S: Serializer>(p: &FilterPolicy, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&p.to_string())
+}
+
+fn deserialize_filter_policy<'de, D: Deserializer<'de>>(d: D) -> Result<FilterPolicy, D::Error> {
+    let s = String::deserialize(d)?;
+    s.to_ascii_lowercase()
+        .parse::<FilterPolicy>()
+        .map_err(de::Error::custom)
+}
+
 fn serialize_io_model<S: Serializer>(m: &IoModel, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&m.to_string())
 }
@@ -164,6 +175,11 @@ pub struct StorageSection {
     pub compress: bool,
     pub bloom_bits: usize,
     pub bloom_prefix_len: usize,
+    #[serde(
+        serialize_with = "serialize_filter_policy",
+        deserialize_with = "deserialize_filter_policy"
+    )]
+    pub filter_policy: FilterPolicy,
     pub verify_checksums: bool,
     #[serde(
         serialize_with = "serialize_compression",
@@ -198,6 +214,7 @@ impl Default for StorageSection {
             compress: true,
             bloom_bits: 10,
             bloom_prefix_len: 0,
+            filter_policy: FilterPolicy::default(),
             verify_checksums: true,
             compression: Compression::default(),
             io_model: IoModel::default(),
@@ -335,6 +352,7 @@ impl FileConfig {
         config.compress = s.compress;
         config.bloom_bits = s.bloom_bits;
         config.bloom_prefix_len = s.bloom_prefix_len;
+        config.filter_policy = s.filter_policy;
         config.verify_checksums = s.verify_checksums;
         config.compression = s.compression;
         config.io_model = s.io_model;
@@ -410,6 +428,12 @@ impl FileConfig {
             "RKV_STORAGE_BLOOM_PREFIX_LEN",
             &mut self.storage.bloom_prefix_len,
         );
+        if let Some(v) = env_opt("RKV_STORAGE_FILTER_POLICY") {
+            match v.to_ascii_lowercase().parse::<FilterPolicy>() {
+                Ok(p) => self.storage.filter_policy = p,
+                Err(_) => eprintln!("warning: invalid RKV_STORAGE_FILTER_POLICY={v}"),
+            }
+        }
         if let Some(v) = env_opt("RKV_STORAGE_VERIFY_CHECKSUMS") {
             if let Some(b) = parse_bool(&v) {
                 self.storage.verify_checksums = b;
@@ -542,6 +566,7 @@ storage:
   compress: true
   bloom_bits: 10
   bloom_prefix_len: 0
+  filter_policy: bloom       # bloom | ribbon
   verify_checksums: true
   compression: lz4          # none | lz4 | zstd
   io_model: mmap             # none | directio | mmap
@@ -588,6 +613,7 @@ object_size = "1kb"
 compress = true
 bloom_bits = 10
 bloom_prefix_len = 0
+filter_policy = "bloom"      # bloom | ribbon
 verify_checksums = true
 compression = "lz4"          # none | lz4 | zstd
 io_model = "mmap"            # none | directio | mmap
