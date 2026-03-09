@@ -1,6 +1,8 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::checksum::Checksum;
@@ -71,6 +73,7 @@ impl Aol {
     ///
     /// Converts the optional TTL `Duration` to an absolute expiry timestamp
     /// (ms since Unix epoch). A `None` TTL is encoded as 0.
+    #[cfg(test)]
     pub(crate) fn append(
         &mut self,
         ns: &str,
