@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Cache key: (SSTable ID, block index within the SSTable).
 type CacheKey = (u64, u32);
@@ -238,6 +238,91 @@ impl BlockCache {
         while self.current_size > self.capacity && self.tail != SENTINEL {
             self.evict_tail();
         }
+    }
+}
+
+/// Number of shards for the sharded block cache.
+///
+/// 16 shards provides good concurrency (up to 16 readers hitting
+/// different shards simultaneously) without excessive overhead.
+const NUM_SHARDS: usize = 16;
+
+/// Sharded block cache that distributes entries across multiple
+/// independent `BlockCache` shards, each with its own `Mutex`.
+///
+/// This reduces mutex contention under concurrent reads: two readers
+/// hitting different shards never block each other.
+pub(crate) struct ShardedBlockCache {
+    shards: Vec<Mutex<BlockCache>>,
+}
+
+impl ShardedBlockCache {
+    /// Create a new sharded cache. Total capacity is distributed
+    /// evenly across `NUM_SHARDS` shards.
+    pub(crate) fn new(total_capacity: usize) -> Self {
+        let per_shard = if total_capacity == 0 {
+            0
+        } else {
+            total_capacity.div_ceil(NUM_SHARDS)
+        };
+        let shards = (0..NUM_SHARDS)
+            .map(|_| Mutex::new(BlockCache::new(per_shard)))
+            .collect();
+        Self { shards }
+    }
+
+    /// Hash a cache key to a shard index.
+    fn shard_index(sst_id: u64, block_index: u32) -> usize {
+        // FxHash-style: multiply by a large odd constant, take high bits
+        let h = (sst_id as usize)
+            .wrapping_mul(0x517cc1b727220a95)
+            .wrapping_add(block_index as usize);
+        h % NUM_SHARDS
+    }
+
+    /// Look up a cached block and promote it to MRU position within
+    /// its shard.
+    pub(crate) fn get(&self, sst_id: u64, block_index: u32) -> Option<Arc<Vec<RawEntry>>> {
+        let idx = Self::shard_index(sst_id, block_index);
+        let mut shard = self.shards[idx].lock().unwrap_or_else(|e| e.into_inner());
+        shard.get(sst_id, block_index)
+    }
+
+    /// Insert a pre-wrapped `Arc` block into the appropriate shard.
+    pub(crate) fn insert_arc(
+        &self,
+        sst_id: u64,
+        block_index: u32,
+        entries: Arc<Vec<RawEntry>>,
+        size: usize,
+    ) {
+        let idx = Self::shard_index(sst_id, block_index);
+        let mut shard = self.shards[idx].lock().unwrap_or_else(|e| e.into_inner());
+        shard.insert_arc(sst_id, block_index, entries, size);
+    }
+
+    /// Remove all cached blocks for a given SSTable across all shards.
+    pub(crate) fn evict_sst(&self, sst_id: u64) {
+        for shard in &self.shards {
+            let mut s = shard.lock().unwrap_or_else(|e| e.into_inner());
+            s.evict_sst(sst_id);
+        }
+    }
+
+    /// Total cache hits across all shards.
+    pub(crate) fn hits(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).hits())
+            .sum()
+    }
+
+    /// Total cache misses across all shards.
+    pub(crate) fn misses(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).misses())
+            .sum()
     }
 }
 
