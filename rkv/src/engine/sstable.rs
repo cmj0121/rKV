@@ -1324,43 +1324,6 @@ impl SSTableReader {
         decompress_block(compression_tag, compressed_payload)
     }
 
-    /// Test whether the prefix bloom filter may contain the given prefix.
-    ///
-    /// Returns `true` (conservative) on metadata parse error — the actual
-    /// read will surface the error.
-    #[cfg(test)]
-    pub(crate) fn may_contain_prefix(&self, prefix_bytes: &[u8]) -> bool {
-        match self.ensure_meta() {
-            Ok(meta) => Self::may_contain_prefix_inner(meta, prefix_bytes),
-            Err(_) => true, // conservative: don't skip, let actual read surface error
-        }
-    }
-
-    /// Inner prefix bloom check on already-loaded metadata.
-    fn may_contain_prefix_inner(meta: &LazyMeta, prefix_bytes: &[u8]) -> bool {
-        if prefix_bytes.is_empty() {
-            return true; // empty prefix matches everything
-        }
-        match &meta.prefix_filter {
-            Some(pf) => {
-                let query =
-                    if meta.filter_prefix_len > 0 && prefix_bytes.len() >= meta.filter_prefix_len {
-                        &prefix_bytes[..meta.filter_prefix_len]
-                    } else {
-                        prefix_bytes
-                    };
-                pf.may_contain(query)
-            }
-            None => true, // no prefix filter — conservative
-        }
-    }
-
-    /// Return the first key in this SSTable (serialized bytes), if any.
-    #[cfg(test)]
-    pub(crate) fn first_key(&self) -> Result<Option<&[u8]>> {
-        Ok(self.ensure_meta()?.first_key.as_deref())
-    }
-
     /// Read and decompress a single block, returning raw entries.
     ///
     /// When a block cache is present, checks for a cached copy first and
@@ -1492,9 +1455,24 @@ impl SSTableReader {
 
     /// Check prefix bloom filter for scan skip.
     pub(crate) fn may_contain_prefix_for_scan(&self, prefix_bytes: &[u8]) -> bool {
-        match self.ensure_meta() {
-            Ok(meta) => Self::may_contain_prefix_inner(meta, prefix_bytes),
-            Err(_) => true,
+        let meta = match self.ensure_meta() {
+            Ok(meta) => meta,
+            Err(_) => return true,
+        };
+        if prefix_bytes.is_empty() {
+            return true;
+        }
+        match &meta.prefix_filter {
+            Some(pf) => {
+                let query =
+                    if meta.filter_prefix_len > 0 && prefix_bytes.len() >= meta.filter_prefix_len {
+                        &prefix_bytes[..meta.filter_prefix_len]
+                    } else {
+                        prefix_bytes
+                    };
+                pf.may_contain(query)
+            }
+            None => true,
         }
     }
 }
@@ -2793,16 +2771,9 @@ mod tests {
         for compression in [Compression::LZ4, Compression::Zstd] {
             let tmp = tempfile::tempdir().unwrap();
             let path = tmp.path().join("compressed_restart.sst");
-            let mut w = SSTableWriter::new(
-                &path,
-                128,
-                compression.clone(),
-                10,
-                0,
-                FilterPolicy::Bloom,
-                &io(),
-            )
-            .unwrap();
+            let mut w =
+                SSTableWriter::new(&path, 128, compression, 10, 0, FilterPolicy::Bloom, &io())
+                    .unwrap();
             for i in 0..100 {
                 w.add(
                     &Key::Int(i),

@@ -931,13 +931,12 @@ mod tests {
 
         let forwarded = Arc::new(std::sync::Mutex::new(Vec::new()));
         let forwarded_clone = Arc::clone(&forwarded);
-        let broadcast: Arc<dyn Fn(&[u8], u16) + Send + Sync> =
-            Arc::new(move |payload: &[u8], from: u16| {
-                forwarded_clone
-                    .lock()
-                    .unwrap()
-                    .push((payload.to_vec(), from));
-            });
+        let broadcast: PeerBroadcastFn = Arc::new(move |payload: &[u8], from: u16| {
+            forwarded_clone
+                .lock()
+                .unwrap()
+                .push((payload.to_vec(), from));
+        });
 
         let drop_ns_fn: PeerDropNsFn = Arc::new(|_| Ok(()));
         let flush_fn: PeerFlushFn = Arc::new(|| Ok(()));
@@ -978,10 +977,9 @@ mod tests {
 
         let forwarded = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
         let forwarded_clone = Arc::clone(&forwarded);
-        let broadcast: Arc<dyn Fn(&[u8], u16) + Send + Sync> =
-            Arc::new(move |payload: &[u8], _| {
-                forwarded_clone.lock().unwrap().push(payload.to_vec());
-            });
+        let broadcast: PeerBroadcastFn = Arc::new(move |payload: &[u8], _| {
+            forwarded_clone.lock().unwrap().push(payload.to_vec());
+        });
 
         let drop_ns_fn: PeerDropNsFn = Arc::new(|_| Ok(()));
         let flush_fn: PeerFlushFn = Arc::new(|| Ok(()));
@@ -1013,7 +1011,7 @@ mod tests {
         .unwrap();
 
         let replay_fn: PeerReplayFn = Arc::new(|_| Ok(true));
-        let broadcast: Arc<dyn Fn(&[u8], u16) + Send + Sync> = Arc::new(|_, _| {});
+        let broadcast: PeerBroadcastFn = Arc::new(|_, _| {});
 
         let drop_ns_fn: PeerDropNsFn = Arc::new(|_| Ok(()));
         let flush_fn: PeerFlushFn = Arc::new(|| Ok(()));
@@ -1037,7 +1035,7 @@ mod tests {
     fn reader_loop_stops_on_flag() {
         let buf = Vec::new();
         let replay_fn: PeerReplayFn = Arc::new(|_| Ok(true));
-        let broadcast: Arc<dyn Fn(&[u8], u16) + Send + Sync> = Arc::new(|_, _| {});
+        let broadcast: PeerBroadcastFn = Arc::new(|_, _| {});
 
         let drop_ns_fn: PeerDropNsFn = Arc::new(|_| Ok(()));
         let flush_fn: PeerFlushFn = Arc::new(|| Ok(()));
@@ -1082,7 +1080,7 @@ mod tests {
         .unwrap();
 
         let replay_fn: PeerReplayFn = Arc::new(|_| Ok(true));
-        let broadcast: Arc<dyn Fn(&[u8], u16) + Send + Sync> = Arc::new(|_, _| {});
+        let broadcast: PeerBroadcastFn = Arc::new(|_, _| {});
 
         let dropped = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let dropped_clone = Arc::clone(&dropped);

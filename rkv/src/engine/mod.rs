@@ -271,6 +271,15 @@ pub struct Config {
     pub verify_checksums: bool,
     /// SSTable block compression algorithm (default: LZ4).
     pub compression: Compression,
+    /// Per-level compression override (default: empty = use `compression` for all).
+    ///
+    /// When non-empty, `compression_per_level[level]` overrides the global
+    /// `compression` setting for that level. Levels beyond the vec length use
+    /// the last entry. Example: `vec![LZ4, LZ4, Zstd]` → L0=LZ4, L1=LZ4, L2+=Zstd.
+    ///
+    /// Note: trivial-move compaction (rename without rewrite) preserves the
+    /// source level's compression. The per-level policy is best-effort.
+    pub compression_per_level: Vec<Compression>,
     /// I/O model for file access (default: Mmap).
     pub io_model: IoModel,
     /// Cluster ID for RevisionID generation (default: None = random at startup).
@@ -345,6 +354,7 @@ impl Config {
             filter_policy: FilterPolicy::default(),
             verify_checksums: true,
             compression: Compression::default(),
+            compression_per_level: Vec::new(),
             io_model: IoModel::default(),
             cluster_id: None,
             aol_buffer_size: 128,
@@ -407,6 +417,19 @@ impl Config {
             ));
         }
         Ok(())
+    }
+
+    /// Return the compression algorithm for a given LSM level.
+    ///
+    /// If `compression_per_level` is non-empty, uses the entry at `level`
+    /// (or the last entry for levels beyond the vec length). Otherwise
+    /// falls back to the global `compression` setting.
+    pub fn compression_for_level(&self, level: usize) -> Compression {
+        if self.compression_per_level.is_empty() {
+            return self.compression;
+        }
+        let idx = level.min(self.compression_per_level.len() - 1);
+        self.compression_per_level[idx]
     }
 }
 
@@ -872,7 +895,7 @@ impl DB {
         let compaction_notify = Arc::clone(&self.compaction_notify);
         let db_path = self.config.path.clone();
         let block_size = self.config.block_size;
-        let compression = self.config.compression;
+        let compression = self.config.compression_for_level(0);
         let bloom_bits = self.config.bloom_bits;
         let bloom_prefix_len = self.config.bloom_prefix_len;
         let filter_policy = self.config.filter_policy;
@@ -2009,7 +2032,7 @@ impl DB {
             let mut writer = sstable::SSTableWriter::new(
                 &sst_path,
                 self.config.block_size,
-                self.config.compression,
+                self.config.compression_for_level(0),
                 self.config.bloom_bits,
                 self.config.bloom_prefix_len,
                 self.config.filter_policy,
@@ -2810,6 +2833,52 @@ impl DB {
                 return Ok(0);
             }
 
+            // Trivial move: when the target level is empty and we don't need
+            // to drop tombstones, just rename source files into the target
+            // directory — skip all decompression, merging, and recompression.
+            // L0 files may overlap each other so we only do this for L1+.
+            if source_level > 0 && target.is_empty() && !drop_tombstones {
+                let source_sst_ids: Vec<u64> = source.iter().map(|r| r.sst_id()).collect();
+                drop(sst); // release read lock before taking write lock
+
+                let target_dir = Self::static_sst_level_dir(&config.path, ns, target_level);
+                fs::create_dir_all(&target_dir)?;
+
+                let mut moved_readers = Vec::with_capacity(source_sst_ids.len());
+                let mut total_size = 0usize;
+                let source_dir = Self::static_sst_level_dir(&config.path, ns, source_level);
+
+                for &sst_id in &source_sst_ids {
+                    let src_path = source_dir.join(format!("{sst_id:06}.sst"));
+                    let seq = sst_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                    let dst_path = target_dir.join(format!("{seq:06}.sst"));
+                    fs::rename(&src_path, &dst_path)?;
+
+                    let reader =
+                        sstable::SSTableReader::open(&dst_path, seq, block_cache.clone(), &**io)?;
+                    total_size += reader.size_bytes();
+                    moved_readers.push(reader);
+                }
+
+                // Update in-memory level structure
+                let mut sst = sstables.write().unwrap_or_else(|e| e.into_inner());
+                if let Some(levels) = sst.get_mut(ns) {
+                    if let Some(ref bc) = block_cache {
+                        for &id in &source_sst_ids {
+                            bc.evict_sst(id);
+                        }
+                    }
+                    if let Some(s) = levels.get_mut(source_level) {
+                        s.retain(|r| !source_sst_ids.contains(&r.sst_id()));
+                    }
+                    while levels.len() <= target_level {
+                        levels.push(Vec::new());
+                    }
+                    levels[target_level].extend(moved_readers);
+                }
+                return Ok(total_size);
+            }
+
             // Record the sst_ids of readers being merged so we only clean up
             // exactly these files/readers (not ones added by concurrent flush).
             let mut merged_sst_ids: Vec<u64> = Vec::with_capacity(source.len() + target.len());
@@ -2932,7 +3001,7 @@ impl DB {
         let mut writer = sstable::SSTableWriter::new(
             &output_path,
             config.block_size,
-            config.compression,
+            config.compression_for_level(target_level),
             config.bloom_bits,
             config.bloom_prefix_len,
             config.filter_policy,

@@ -4530,7 +4530,7 @@ fn stats_meta_too_small() {
 
     // Truncate stats.meta to only 10 bytes (needs 30)
     let meta_path = db_path.join("stats.meta");
-    std::fs::write(&meta_path, &[0u8; 10]).unwrap();
+    std::fs::write(&meta_path, [0u8; 10]).unwrap();
 
     // Reopen — should silently reset counters to 0
     let config = Config::new(&db_path);
