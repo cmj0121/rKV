@@ -14,6 +14,7 @@ use rill::config::{BackendMode, RillConfig};
 use rkv::DB;
 use serde::Deserialize;
 use serde_json::json;
+use tracing::{info, warn};
 
 #[derive(Parser)]
 #[command(name = "rill", about = "Message queue powered by rKV")]
@@ -330,6 +331,8 @@ fn build_router(state: Arc<AppState>) -> Router {
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
+
     let cli = Cli::parse();
 
     // Load config file if provided, otherwise use defaults
@@ -392,7 +395,7 @@ async fn main() {
                     "embed" => BackendMode::Embed,
                     "remote" => BackendMode::Remote,
                     _ => {
-                        eprintln!("invalid rkv mode: {m} (use 'embed' or 'remote')");
+                        warn!("invalid rkv mode: {m} (use 'embed' or 'remote')");
                         std::process::exit(1);
                     }
                 };
@@ -408,11 +411,11 @@ async fn main() {
                 BackendMode::Embed => {
                     let rkv_config = cfg.rkv.to_rkv_config();
                     let db = DB::open(rkv_config).expect("failed to open rKV database");
-                    println!("rKV database opened at {}", cfg.rkv.data);
+                    info!("rKV database opened at {}", cfg.rkv.data);
                     Backend::Embed(Box::new(db))
                 }
                 BackendMode::Remote => {
-                    println!("connecting to rKV server at {}", cfg.rkv.url);
+                    info!("connecting to rKV server at {}", cfg.rkv.url);
                     Backend::Remote(RkvClient::new(&cfg.rkv.url))
                 }
             };
@@ -427,7 +430,7 @@ async fn main() {
 
             let app = build_router(state.clone());
             let addr = format!("{}:{}", cfg.host, cfg.port);
-            println!("rill listening on {addr}");
+            info!("rill listening on {addr}");
             let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
             axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown_signal())
@@ -436,10 +439,10 @@ async fn main() {
 
             // Flush embedded DB on shutdown
             if let Backend::Embed(db) = &state.backend {
-                println!("flushing database...");
+                info!("flushing database...");
                 let _ = db.flush();
             }
-            println!("rill stopped");
+            info!("rill stopped");
         }
     }
 }
@@ -465,8 +468,8 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        () = ctrl_c => { println!("received SIGINT, shutting down..."); }
-        () = terminate => { println!("received SIGTERM, shutting down..."); }
+        () = ctrl_c => { info!("received SIGINT, shutting down..."); }
+        () = terminate => { info!("received SIGTERM, shutting down..."); }
     }
 }
 
