@@ -98,22 +98,14 @@ enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, body) = match self {
-            Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, format!(r#"{{"error":"{msg}"}}"#)),
-            Self::Unauthorized => (
-                StatusCode::UNAUTHORIZED,
-                r#"{"error":"unauthorized"}"#.to_string(),
-            ),
-            Self::Forbidden => (
-                StatusCode::FORBIDDEN,
-                r#"{"error":"forbidden"}"#.to_string(),
-            ),
+        let (status, msg) = match self {
+            Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.to_string()),
+            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
+            Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden".to_string()),
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg.to_string()),
-            Self::Internal(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(r#"{{"error":"{msg}"}}"#),
-            ),
+            Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
+        let body = serde_json::json!({"error": msg}).to_string();
         (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
     }
 }

@@ -2,6 +2,8 @@ use reqwest::Client;
 use rkv::{Key, DB};
 
 const NS_PREFIX: &str = "rill_";
+/// Reserved key for the monotonic sequence counter (sorts before all message keys >= 0).
+const SEQ_KEY: i64 = i64::MIN;
 
 /// Remote rKV HTTP client.
 pub struct RkvClient {
@@ -34,6 +36,10 @@ impl RkvClient {
     fn key_url(&self, ns: &str, key: &str) -> String {
         format!("{}/api/{}/keys/{}", self.base_url, ns, key)
     }
+}
+
+fn is_message_key(key: &Key) -> bool {
+    !matches!(key, Key::Int(SEQ_KEY))
 }
 
 fn queue_ns(name: &str) -> String {
@@ -95,16 +101,8 @@ impl Backend {
         let ns_name = queue_ns(name);
         match self {
             Backend::Embed(db) => {
-                let ns = db.namespace(&ns_name, None).map_err(|e| e.to_string())?;
-                let prefix = Key::Str(String::new());
-                let keys: Vec<_> = ns
-                    .keys(&prefix)
-                    .map_err(|e| e.to_string())?
-                    .filter_map(|k| k.ok())
-                    .collect();
-                for key in keys {
-                    let _ = ns.delete(key);
-                }
+                // Ignore "does not exist" errors — deleting a non-existent queue is a no-op
+                let _ = db.drop_namespace(&ns_name);
                 Ok(())
             }
             Backend::Remote(client) => {
@@ -130,12 +128,22 @@ impl Backend {
         match self {
             Backend::Embed(db) => {
                 let ns = db.namespace(&ns_name, None).map_err(|e| e.to_string())?;
-                let prefix = Key::Str(String::new());
-                let next_id = match ns.rkeys(&prefix).map_err(|e| e.to_string())?.next() {
-                    Some(Ok(Key::Int(n))) => n + 1,
-                    _ => 0,
+                // Use a reserved negative key to store the next sequence number.
+                // Message keys are always >= 0, so SEQ_KEY sorts before all messages.
+                let seq_key = Key::Int(SEQ_KEY);
+                let next_id: i64 = match ns.get(seq_key.clone()) {
+                    Ok(v) => match v.as_bytes() {
+                        Some(bytes) => {
+                            let s = std::str::from_utf8(bytes).unwrap_or("0");
+                            s.parse::<i64>().unwrap_or(0)
+                        }
+                        None => 0,
+                    },
+                    Err(_) => 0, // key not found — start at 0
                 };
                 ns.put(Key::Int(next_id), body.as_bytes(), None)
+                    .map_err(|e| e.to_string())?;
+                ns.put(seq_key, (next_id + 1).to_string().as_bytes(), None)
                     .map_err(|e| e.to_string())?;
                 Ok(())
             }
@@ -181,9 +189,13 @@ impl Backend {
             Backend::Embed(db) => {
                 let ns = db.namespace(&ns_name, None).map_err(|e| e.to_string())?;
                 let prefix = Key::Str(String::new());
-                let mut entries = ns.entries(&prefix).map_err(|e| e.to_string())?;
-                match entries.next() {
-                    Some(Ok((key, value))) => {
+                let entry = ns
+                    .entries(&prefix)
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|e| e.ok())
+                    .find(|(k, _)| is_message_key(k));
+                match entry {
+                    Some((key, value)) => {
                         let data = value
                             .as_bytes()
                             .map(|b| String::from_utf8_lossy(b).to_string());
@@ -253,6 +265,7 @@ impl Backend {
                     .keys(&prefix)
                     .map_err(|e| e.to_string())?
                     .filter_map(|k| k.ok())
+                    .filter(is_message_key)
                     .count();
                 Ok(count)
             }
@@ -288,6 +301,7 @@ impl Backend {
                     .entries(&prefix)
                     .map_err(|e| e.to_string())?
                     .filter_map(|e| e.ok())
+                    .filter(|(k, _)| is_message_key(k))
                     .skip(offset)
                     .take(limit)
                     .map(|(key, value)| {
