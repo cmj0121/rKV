@@ -466,6 +466,49 @@ mod tests {
         assert_eq!(queue_ns("tasks"), "rill_tasks");
     }
 
+    #[test]
+    fn is_message_key_filters_seq_key() {
+        assert!(!is_message_key(&Key::Int(SEQ_KEY)));
+        assert!(is_message_key(&Key::Int(0)));
+        assert!(is_message_key(&Key::Int(1)));
+        assert!(is_message_key(&Key::Int(-1)));
+        assert!(is_message_key(&Key::Int(i64::MAX)));
+    }
+
+    #[test]
+    fn filter_queue_names_empty_input() {
+        assert!(filter_queue_names(vec![]).is_empty());
+    }
+
+    #[test]
+    fn filter_queue_names_no_matches() {
+        let names = vec!["foo".into(), "bar".into()];
+        assert!(filter_queue_names(names).is_empty());
+    }
+
+    #[test]
+    fn rkv_client_url_builders() {
+        let client = RkvClient::new("http://localhost:8321/");
+        assert_eq!(
+            client.api_url("namespaces"),
+            "http://localhost:8321/api/namespaces"
+        );
+        assert_eq!(
+            client.keys_url("rill_q1"),
+            "http://localhost:8321/api/rill_q1/keys"
+        );
+        assert_eq!(
+            client.key_url("rill_q1", "42"),
+            "http://localhost:8321/api/rill_q1/keys/42"
+        );
+    }
+
+    #[test]
+    fn rkv_client_strips_trailing_slash() {
+        let client = RkvClient::new("http://host:8321///");
+        assert_eq!(client.base_url, "http://host:8321");
+    }
+
     #[tokio::test]
     async fn queue_length_empty() {
         let b = embed_backend();
@@ -521,5 +564,120 @@ mod tests {
         let page3 = b.peek_messages("page", 4, 2).await.unwrap();
         assert_eq!(page3.len(), 1);
         assert_eq!(page3[0].1, "m4");
+    }
+
+    fn remote_backend() -> Backend {
+        // Points at a port nothing listens on — all requests will fail with connection error
+        Backend::Remote(RkvClient::new("http://127.0.0.1:1"))
+    }
+
+    #[tokio::test]
+    async fn remote_list_queues_returns_error() {
+        let b = remote_backend();
+        assert!(b.list_queues().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_create_queue_returns_error() {
+        let b = remote_backend();
+        assert!(b.create_queue("test").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_delete_queue_returns_error() {
+        let b = remote_backend();
+        assert!(b.delete_queue("test").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_push_message_returns_error() {
+        let b = remote_backend();
+        assert!(b.push_message("test", "msg").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_pop_message_returns_error() {
+        let b = remote_backend();
+        assert!(b.pop_message("test").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_queue_length_returns_error() {
+        let b = remote_backend();
+        assert!(b.queue_length("test").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_peek_messages_returns_error() {
+        let b = remote_backend();
+        assert!(b.peek_messages("test", 0, 10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_nonexistent_queue_is_noop() {
+        let b = embed_backend();
+        // Should not error
+        b.delete_queue("nonexistent").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queue_length_nonexistent_queue() {
+        let b = embed_backend();
+        // Namespace created lazily, length is 0
+        assert_eq!(b.queue_length("nope").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn peek_empty_queue() {
+        let b = embed_backend();
+        b.create_queue("empty").await.unwrap();
+        let msgs = b.peek_messages("empty", 0, 10).await.unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn peek_beyond_offset() {
+        let b = embed_backend();
+        b.create_queue("off").await.unwrap();
+        b.push_message("off", "a").await.unwrap();
+        let msgs = b.peek_messages("off", 100, 10).await.unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn push_many_then_peek_ids_are_sequential() {
+        let b = embed_backend();
+        b.create_queue("ids").await.unwrap();
+        for _ in 0..5 {
+            b.push_message("ids", "x").await.unwrap();
+        }
+        let msgs = b.peek_messages("ids", 0, 10).await.unwrap();
+        let ids: Vec<&str> = msgs.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["0", "1", "2", "3", "4"]);
+    }
+
+    #[tokio::test]
+    async fn create_queue_idempotent() {
+        let b = embed_backend();
+        b.create_queue("idem").await.unwrap();
+        b.create_queue("idem").await.unwrap(); // no error
+        let queues = b.list_queues().await.unwrap();
+        assert_eq!(queues.iter().filter(|q| *q == "idem").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_then_recreate_queue() {
+        let b = embed_backend();
+        b.create_queue("rc").await.unwrap();
+        b.push_message("rc", "old").await.unwrap();
+        b.delete_queue("rc").await.unwrap();
+        b.create_queue("rc").await.unwrap();
+        // Queue is fresh, pop returns None
+        assert_eq!(b.pop_message("rc").await.unwrap(), None);
+        // Push starts from 0 again
+        b.push_message("rc", "new").await.unwrap();
+        let msgs = b.peek_messages("rc", 0, 10).await.unwrap();
+        assert_eq!(msgs[0].0, "0");
+        assert_eq!(msgs[0].1, "new");
     }
 }

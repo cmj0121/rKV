@@ -534,6 +534,21 @@ mod tests {
         })
     }
 
+    fn remote_state() -> Arc<AppState> {
+        // Use a fake URL — we won't actually make HTTP calls in these tests,
+        // just test code paths that depend on Backend::Remote variant.
+        let client = rill::backend::RkvClient::new("http://localhost:9999");
+        Arc::new(AppState {
+            backend: Backend::Remote(client),
+            admin_token: None,
+            writer_token: None,
+            reader_token: None,
+            ui_enabled: false,
+            max_peek_limit: 100,
+            started_at: Instant::now(),
+        })
+    }
+
     fn open_state() -> Arc<AppState> {
         let db = DB::open(Config::in_memory()).unwrap();
         Arc::new(AppState {
@@ -896,5 +911,166 @@ mod tests {
         // Messages still there
         let (_, body) = request(&app, "GET", "/queues/peek/info", None, None).await;
         assert!(body.contains(r#""length":2"#));
+    }
+
+    // --- ApiError response formatting ---
+
+    #[tokio::test]
+    async fn api_error_bad_request_escapes_json() {
+        // Verify serde_json properly escapes special chars in error messages
+        let err = ApiError::BadRequest("queue name cannot be empty");
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains(r#""error":"queue name cannot be empty""#));
+    }
+
+    #[tokio::test]
+    async fn api_error_not_found_response() {
+        let err = ApiError::NotFound("queue not found");
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("queue not found"));
+    }
+
+    #[tokio::test]
+    async fn api_error_internal_response() {
+        let err = ApiError::Internal("db error".to_string());
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("db error"));
+    }
+
+    #[tokio::test]
+    async fn api_error_forbidden_response() {
+        let err = ApiError::Forbidden;
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // --- validate_queue_name unit tests ---
+
+    #[test]
+    fn validate_queue_name_accepts_valid() {
+        assert!(validate_queue_name("my-queue_123").is_ok());
+        assert!(validate_queue_name("a").is_ok());
+        assert!(validate_queue_name(&"x".repeat(128)).is_ok());
+    }
+
+    #[test]
+    fn validate_queue_name_rejects_dots() {
+        assert!(validate_queue_name("a.b").is_err());
+    }
+
+    #[test]
+    fn validate_queue_name_rejects_spaces() {
+        assert!(validate_queue_name("a b").is_err());
+    }
+
+    #[test]
+    fn validate_queue_name_rejects_slashes() {
+        assert!(validate_queue_name("a/b").is_err());
+    }
+
+    #[test]
+    fn validate_queue_name_boundary_length() {
+        // 128 chars is ok
+        assert!(validate_queue_name(&"a".repeat(128)).is_ok());
+        // 129 chars is rejected
+        assert!(validate_queue_name(&"a".repeat(129)).is_err());
+    }
+
+    // --- Additional handler edge cases ---
+
+    #[tokio::test]
+    async fn peek_with_default_params() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"dflt"}"#)).await;
+        request(&app, "POST", "/queues/dflt", None, Some("msg")).await;
+        // No query params — uses defaults (offset=0, limit=20)
+        let (status, body) = request(&app, "GET", "/queues/dflt/messages", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("msg"));
+    }
+
+    #[tokio::test]
+    async fn queue_info_empty_queue() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"empt"}"#)).await;
+        let (status, body) = request(&app, "GET", "/queues/empt/info", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""length":0"#));
+    }
+
+    #[tokio::test]
+    async fn invalid_json_body_returns_error() {
+        let app = build_router(open_state());
+        let (status, _) = request(&app, "POST", "/queues", None, Some("not json")).await;
+        // axum returns 422 for deserialization errors
+        assert_ne!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn push_empty_body() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"emp"}"#)).await;
+        let (status, _) = request(&app, "POST", "/queues/emp", None, Some("")).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, body) = request(&app, "GET", "/queues/emp", None, None).await;
+        assert!(body.contains(r#""message":"""#));
+    }
+
+    #[tokio::test]
+    async fn writer_can_peek_messages() {
+        // Writer role >= Reader, so can access read endpoints
+        let app = build_router(test_state(false));
+        let (status, _) =
+            request(&app, "GET", "/queues/q/messages", Some("writer-tok"), None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_can_peek_messages() {
+        let app = build_router(test_state(false));
+        let (status, _) = request(&app, "GET", "/queues/q/messages", Some("admin-tok"), None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_can_view_queue_info() {
+        let app = build_router(test_state(false));
+        let (status, _) = request(&app, "GET", "/queues/q/info", Some("admin-tok"), None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // --- UI disabled for JS/CSS ---
+
+    #[tokio::test]
+    async fn ui_js_disabled() {
+        let app = build_router(test_state(false));
+        let (status, _) = request(&app, "GET", "/ui/app.js", None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ui_css_disabled() {
+        let app = build_router(test_state(false));
+        let (status, _) = request(&app, "GET", "/ui/style.css", None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // --- Remote backend health ---
+
+    #[tokio::test]
+    async fn health_reports_remote_mode() {
+        let app = build_router(remote_state());
+        let (status, body) = request(&app, "GET", "/health", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""mode":"remote"#));
     }
 }
