@@ -9,12 +9,11 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
+use rill::backend::{Backend, RkvClient};
 use rill::config::{BackendMode, RillConfig};
 use rkv::DB;
 use serde::Deserialize;
 use serde_json::json;
-
-const NS_PREFIX: &str = "rill_";
 
 #[derive(Parser)]
 #[command(name = "rill", about = "Message queue powered by rKV")]
@@ -77,7 +76,7 @@ enum Role {
 }
 
 struct AppState {
-    db: DB,
+    backend: Backend,
     admin_token: Option<String>,
     writer_token: Option<String>,
     reader_token: Option<String>,
@@ -110,10 +109,6 @@ impl IntoResponse for ApiError {
         };
         (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
     }
-}
-
-fn queue_ns(name: &str) -> String {
-    format!("{NS_PREFIX}{name}")
 }
 
 impl AppState {
@@ -174,12 +169,11 @@ async fn create_queue(
     Json(body): Json<CreateQueueRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Admin)?;
-    let ns_name = queue_ns(&body.name);
-    // Touch the namespace to ensure it exists
     state
-        .db
-        .namespace(&ns_name, None)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        .backend
+        .create_queue(&body.name)
+        .await
+        .map_err(ApiError::Internal)?;
     Ok(Json(json!({"queue": body.name, "created": true})))
 }
 
@@ -189,20 +183,11 @@ async fn delete_queue(
     AxumPath(name): AxumPath<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Admin)?;
-    let ns_name = queue_ns(&name);
-    let ns = state
-        .db
-        .namespace(&ns_name, None)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let prefix = rkv::Key::Str(String::new());
-    let keys: Vec<_> = ns
-        .keys(&prefix)
-        .map_err(|e| ApiError::Internal(e.to_string()))?
-        .filter_map(|k| k.ok())
-        .collect();
-    for key in keys {
-        let _ = ns.delete(key);
-    }
+    state
+        .backend
+        .delete_queue(&name)
+        .await
+        .map_err(ApiError::Internal)?;
     Ok(Json(json!({"queue": name, "deleted": true})))
 }
 
@@ -211,14 +196,11 @@ async fn list_queues(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Reader)?;
-    let all = state
-        .db
-        .list_namespaces()
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let queues: Vec<&str> = all
-        .iter()
-        .filter_map(|ns| ns.strip_prefix(NS_PREFIX))
-        .collect();
+    let queues = state
+        .backend
+        .list_queues()
+        .await
+        .map_err(ApiError::Internal)?;
     Ok(Json(json!({"queues": queues})))
 }
 
@@ -229,23 +211,11 @@ async fn push_message(
     body: String,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Writer)?;
-    let ns_name = queue_ns(&name);
-    let ns = state
-        .db
-        .namespace(&ns_name, None)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    // Use reverse scan to find the highest key, then increment
-    let prefix = rkv::Key::Str(String::new());
-    let next_id = match ns
-        .rkeys(&prefix)
-        .map_err(|e| ApiError::Internal(e.to_string()))?
-        .next()
-    {
-        Some(Ok(rkv::Key::Int(n))) => n + 1,
-        _ => 0,
-    };
-    ns.put(rkv::Key::Int(next_id), body.as_bytes(), None)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    state
+        .backend
+        .push_message(&name, &body)
+        .await
+        .map_err(ApiError::Internal)?;
     Ok(Json(json!({"pushed": true})))
 }
 
@@ -255,26 +225,57 @@ async fn pop_message(
     AxumPath(name): AxumPath<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Reader)?;
-    let ns_name = queue_ns(&name);
-    let ns = state
-        .db
-        .namespace(&ns_name, None)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    // Scan first key (head of FIFO)
-    let prefix = rkv::Key::Str(String::new());
-    let mut entries = ns
-        .entries(&prefix)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    match entries.next() {
-        Some(Ok((key, value))) => {
-            let data = value
-                .as_bytes()
-                .map(|b| String::from_utf8_lossy(b).to_string());
-            let _ = ns.delete(key);
-            Ok(Json(json!({"message": data})))
-        }
-        _ => Ok(Json(json!({"message": null}))),
-    }
+    let msg = state
+        .backend
+        .pop_message(&name)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(json!({"message": msg})))
+}
+
+#[derive(Deserialize)]
+struct PeekQuery {
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+
+fn default_limit() -> usize {
+    20
+}
+
+async fn queue_info(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    state.require_role(&headers, Role::Reader)?;
+    let length = state
+        .backend
+        .queue_length(&name)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(json!({"queue": name, "length": length})))
+}
+
+async fn peek_messages(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    axum::extract::Query(query): axum::extract::Query<PeekQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    state.require_role(&headers, Role::Reader)?;
+    let messages = state
+        .backend
+        .peek_messages(&name, query.offset, query.limit)
+        .await
+        .map_err(ApiError::Internal)?;
+    let items: Vec<_> = messages
+        .into_iter()
+        .map(|(id, body)| json!({"id": id, "body": body}))
+        .collect();
+    Ok(Json(json!({"messages": items, "queue": name})))
 }
 
 async fn ui_index(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
@@ -322,6 +323,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/queues/{name}", post(push_message))
         .route("/queues/{name}", get(pop_message))
         .route("/queues/{name}", delete(delete_queue))
+        .route("/queues/{name}/info", get(queue_info))
+        .route("/queues/{name}/messages", get(peek_messages))
         .with_state(state)
 }
 
@@ -401,21 +404,21 @@ async fn main() {
                 cfg.rkv.url = u;
             }
 
-            let db = match cfg.rkv.mode {
+            let backend = match cfg.rkv.mode {
                 BackendMode::Embed => {
                     let rkv_config = cfg.rkv.to_rkv_config();
                     let db = DB::open(rkv_config).expect("failed to open rKV database");
                     println!("rKV database opened at {}", cfg.rkv.data);
-                    db
+                    Backend::Embed(Box::new(db))
                 }
                 BackendMode::Remote => {
-                    eprintln!("remote mode not yet implemented (url: {})", cfg.rkv.url);
-                    std::process::exit(1);
+                    println!("connecting to rKV server at {}", cfg.rkv.url);
+                    Backend::Remote(RkvClient::new(&cfg.rkv.url))
                 }
             };
 
             let state = Arc::new(AppState {
-                db,
+                backend,
                 admin_token: cfg.auth.admin_token,
                 writer_token: cfg.auth.writer_token,
                 reader_token: cfg.auth.reader_token,
@@ -442,7 +445,7 @@ mod tests {
     fn test_state(ui: bool) -> Arc<AppState> {
         let db = DB::open(Config::in_memory()).unwrap();
         Arc::new(AppState {
-            db,
+            backend: Backend::Embed(Box::new(db)),
             admin_token: Some("admin-tok".to_string()),
             writer_token: Some("writer-tok".to_string()),
             reader_token: Some("reader-tok".to_string()),
@@ -453,7 +456,7 @@ mod tests {
     fn open_state() -> Arc<AppState> {
         let db = DB::open(Config::in_memory()).unwrap();
         Arc::new(AppState {
-            db,
+            backend: Backend::Embed(Box::new(db)),
             admin_token: None,
             writer_token: None,
             reader_token: None,
@@ -647,5 +650,80 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("myq"));
         assert!(body.contains("deleted"));
+    }
+
+    // --- E2E: push, pop, FIFO through HTTP ---
+
+    #[tokio::test]
+    async fn e2e_push_pop_fifo() {
+        let app = build_router(open_state());
+        // Create queue
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"e2e"}"#)).await;
+        // Push two messages
+        request(&app, "POST", "/queues/e2e", None, Some("msg-a")).await;
+        request(&app, "POST", "/queues/e2e", None, Some("msg-b")).await;
+        // Pop in FIFO order
+        let (_, body) = request(&app, "GET", "/queues/e2e", None, None).await;
+        assert!(body.contains("msg-a"));
+        let (_, body) = request(&app, "GET", "/queues/e2e", None, None).await;
+        assert!(body.contains("msg-b"));
+        // Pop empty returns null
+        let (_, body) = request(&app, "GET", "/queues/e2e", None, None).await;
+        assert!(body.contains("null"));
+    }
+
+    #[tokio::test]
+    async fn e2e_create_list_delete() {
+        let app = build_router(open_state());
+        // Create two queues
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"q1"}"#)).await;
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"q2"}"#)).await;
+        // List should contain both
+        let (_, body) = request(&app, "GET", "/queues", None, None).await;
+        assert!(body.contains("q1"));
+        assert!(body.contains("q2"));
+        // Push to q1 then delete it
+        request(&app, "POST", "/queues/q1", None, Some("data")).await;
+        request(&app, "DELETE", "/queues/q1", None, None).await;
+        // Pop from deleted queue returns null
+        let (_, body) = request(&app, "GET", "/queues/q1", None, None).await;
+        assert!(body.contains("null"));
+    }
+
+    #[tokio::test]
+    async fn e2e_pop_nonexistent_queue() {
+        let app = build_router(open_state());
+        let (status, body) = request(&app, "GET", "/queues/nope", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("null"));
+    }
+
+    // --- Queue info and peek ---
+
+    #[tokio::test]
+    async fn e2e_queue_info() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"info"}"#)).await;
+        request(&app, "POST", "/queues/info", None, Some("a")).await;
+        request(&app, "POST", "/queues/info", None, Some("b")).await;
+        let (status, body) = request(&app, "GET", "/queues/info/info", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""length":2"#));
+    }
+
+    #[tokio::test]
+    async fn e2e_peek_messages() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"peek"}"#)).await;
+        request(&app, "POST", "/queues/peek", None, Some("x")).await;
+        request(&app, "POST", "/queues/peek", None, Some("y")).await;
+        // Peek without consuming
+        let (status, body) = request(&app, "GET", "/queues/peek/messages", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"x\""));
+        assert!(body.contains("\"y\""));
+        // Messages still there
+        let (_, body) = request(&app, "GET", "/queues/peek/info", None, None).await;
+        assert!(body.contains(r#""length":2"#));
     }
 }

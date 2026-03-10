@@ -17,6 +17,8 @@ function el(tag, attrs, children) {
     Object.keys(attrs).forEach(function (k) {
       if (k === "textContent") {
         node.textContent = attrs[k];
+      } else if (k === "innerHTML") {
+        node.innerHTML = attrs[k];
       } else if (k === "className") {
         node.className = attrs[k];
       } else if (k.slice(0, 2) === "on") {
@@ -87,7 +89,11 @@ function api(method, path, body) {
 // ---------------------------------------------------------------------------
 var state = {
   queues: [],
+  queueLengths: {},
   selectedQueue: null,
+  messages: [],
+  msgOffset: 0,
+  msgLimit: 20,
 };
 
 // ---------------------------------------------------------------------------
@@ -119,11 +125,12 @@ function renderQueues(app) {
 
   var toolbar = el("div", { className: "toolbar" }, [
     el("button", {
-      className: "btn-blue",
+      className: "btn btn-blue",
       textContent: "+ New Queue",
       onClick: openCreateQueueDialog,
     }),
     el("button", {
+      className: "btn",
       textContent: "Refresh",
       onClick: function () {
         loadQueues();
@@ -132,7 +139,6 @@ function renderQueues(app) {
   ]);
   app.appendChild(toolbar);
 
-  // Stats
   var statsGrid = el("div", { className: "stat-grid", id: "stats-grid" });
   app.appendChild(statsGrid);
 
@@ -148,6 +154,16 @@ function loadQueues() {
       state.queues = (r.data && r.data.queues) || [];
       renderQueueList();
       renderQueueStats();
+      // Load lengths for each queue
+      state.queues.forEach(function (name) {
+        api("GET", "/queues/" + encodeURIComponent(name) + "/info")
+          .then(function (r) {
+            state.queueLengths[name] = r.data.length;
+            renderQueueList();
+            renderQueueStats();
+          })
+          .catch(function () {});
+      });
     })
     .catch(function (e) {
       toast("Load queues: " + e.message);
@@ -158,12 +174,27 @@ function renderQueueStats() {
   var grid = $("#stats-grid");
   if (!grid) return;
   grid.innerHTML = "";
+
+  var totalMessages = 0;
+  state.queues.forEach(function (name) {
+    totalMessages += state.queueLengths[name] || 0;
+  });
+
   grid.appendChild(
     el("div", { className: "stat-card" }, [
-      el("div", { className: "label", textContent: "Total Queues" }),
+      el("div", { className: "label", textContent: "Queues" }),
       el("div", {
         className: "value",
         textContent: String(state.queues.length),
+      }),
+    ]),
+  );
+  grid.appendChild(
+    el("div", { className: "stat-card" }, [
+      el("div", { className: "label", textContent: "Total Messages" }),
+      el("div", {
+        className: "value",
+        textContent: String(totalMessages),
       }),
     ]),
   );
@@ -182,20 +213,30 @@ function renderQueueList() {
   }
 
   state.queues.forEach(function (name) {
+    var len = state.queueLengths[name];
+    var badge =
+      len !== undefined
+        ? el("span", { className: "queue-badge", textContent: len + " msgs" })
+        : el("span", { className: "queue-badge dim", textContent: "..." });
+
     var item = el("div", { className: "queue-item" }, [
-      el("span", { className: "queue-name", textContent: name }),
+      el("div", { className: "queue-left" }, [
+        el("span", { className: "queue-name", textContent: name }),
+        badge,
+      ]),
       el("div", { className: "actions" }, [
         el("button", {
-          className: "btn-green",
-          textContent: "Open",
+          className: "btn btn-green btn-sm",
+          textContent: "Browse",
           onClick: function (e) {
             e.stopPropagation();
             state.selectedQueue = name;
+            state.msgOffset = 0;
             location.hash = "#messages";
           },
         }),
         el("button", {
-          className: "btn-red",
+          className: "btn btn-red btn-sm",
           textContent: "Delete",
           onClick: function (e) {
             e.stopPropagation();
@@ -221,6 +262,7 @@ function openCreateQueueDialog() {
 
   var actions = el("div", { className: "dialog-actions" }, [
     el("button", {
+      className: "btn",
       textContent: "Cancel",
       onClick: function () {
         dlg.close();
@@ -228,7 +270,7 @@ function openCreateQueueDialog() {
       },
     }),
     el("button", {
-      className: "btn-blue",
+      className: "btn btn-blue",
       textContent: "Create",
       onClick: function () {
         var name = nameInput.value.trim();
@@ -253,6 +295,7 @@ function openCreateQueueDialog() {
 
   document.body.appendChild(dlg);
   dlg.showModal();
+  nameInput.focus();
 }
 
 function deleteQueue(name) {
@@ -261,6 +304,7 @@ function deleteQueue(name) {
     .then(function () {
       toast("Deleted queue: " + name, true);
       if (state.selectedQueue === name) state.selectedQueue = null;
+      delete state.queueLengths[name];
       loadQueues();
     })
     .catch(function (e) {
@@ -272,47 +316,66 @@ function deleteQueue(name) {
 // Messages view
 // ---------------------------------------------------------------------------
 function renderMessages(app) {
+  if (!state.selectedQueue && state.queues.length > 0) {
+    state.selectedQueue = state.queues[0];
+  }
+
   app.appendChild(el("h2", { textContent: "Messages" }));
 
-  // Queue selector
-  var toolbar = el("div", { className: "toolbar" });
-
+  // Queue selector toolbar
   var queueSelect = el("select", {
     id: "msg-queue-select",
     onChange: function () {
       state.selectedQueue = this.value;
+      state.msgOffset = 0;
+      loadMessages();
     },
   });
-  toolbar.appendChild(queueSelect);
 
-  toolbar.appendChild(
+  var toolbar = el("div", { className: "toolbar" }, [
+    queueSelect,
     el("button", {
-      className: "btn-green",
-      textContent: "Push Message",
+      className: "btn btn-green",
+      textContent: "Push",
       onClick: openPushDialog,
     }),
-  );
-
-  toolbar.appendChild(
     el("button", {
-      className: "btn-yellow",
-      textContent: "Pop Message",
+      className: "btn btn-yellow",
+      textContent: "Pop",
       onClick: popMessage,
     }),
-  );
-
-  toolbar.appendChild(
     el("button", {
+      className: "btn",
       textContent: "Refresh",
       onClick: function () {
-        loadMessagesView();
+        loadMessages();
       },
     }),
-  );
-
+  ]);
   app.appendChild(toolbar);
 
-  // Recent activity
+  // Queue info bar
+  app.appendChild(el("div", { className: "queue-info", id: "queue-info" }));
+
+  // Messages table
+  var table = el("table", { id: "msg-table" });
+  table.appendChild(
+    el("thead", null, [
+      el("tr", null, [
+        el("th", { textContent: "#" }),
+        el("th", { textContent: "ID" }),
+        el("th", { textContent: "Message" }),
+      ]),
+    ]),
+  );
+  table.appendChild(el("tbody", { id: "msg-body" }));
+  app.appendChild(table);
+
+  // Pagination
+  app.appendChild(el("div", { className: "pagination", id: "pagination" }));
+
+  // Activity log
+  app.appendChild(el("h2", { textContent: "Activity Log" }));
   var activityTable = el("table", { id: "activity-table" });
   activityTable.appendChild(
     el("thead", null, [
@@ -330,6 +393,163 @@ function renderMessages(app) {
   loadMessagesView();
 }
 
+function loadMessagesView() {
+  api("GET", "/queues")
+    .then(function (r) {
+      state.queues = (r.data && r.data.queues) || [];
+      var sel = $("#msg-queue-select");
+      if (!sel) return;
+      sel.innerHTML = "";
+      if (state.queues.length === 0) {
+        sel.appendChild(
+          el("option", { textContent: "(no queues)", disabled: true }),
+        );
+        return;
+      }
+      state.queues.forEach(function (name) {
+        var opt = el("option", { value: name, textContent: name });
+        if (name === state.selectedQueue) opt.selected = true;
+        sel.appendChild(opt);
+      });
+      if (!state.selectedQueue && state.queues.length > 0) {
+        state.selectedQueue = state.queues[0];
+      }
+      loadMessages();
+    })
+    .catch(function (e) {
+      toast("Load queues: " + e.message);
+    });
+
+  renderActivity();
+}
+
+function loadMessages() {
+  if (!state.selectedQueue) return;
+
+  var q = encodeURIComponent(state.selectedQueue);
+
+  // Load queue info
+  api("GET", "/queues/" + q + "/info")
+    .then(function (r) {
+      var info = $("#queue-info");
+      if (!info) return;
+      var len = r.data.length;
+      state.queueLengths[state.selectedQueue] = len;
+      info.innerHTML = "";
+      info.appendChild(
+        el("span", {
+          className: "info-label",
+          textContent:
+            state.selectedQueue +
+            " \u2014 " +
+            len +
+            " message" +
+            (len !== 1 ? "s" : ""),
+        }),
+      );
+    })
+    .catch(function () {});
+
+  // Load messages (peek)
+  api(
+    "GET",
+    "/queues/" +
+      q +
+      "/messages?offset=" +
+      state.msgOffset +
+      "&limit=" +
+      state.msgLimit,
+  )
+    .then(function (r) {
+      state.messages = (r.data && r.data.messages) || [];
+      renderMessageTable();
+      renderPagination();
+    })
+    .catch(function (e) {
+      toast("Load messages: " + e.message);
+    });
+}
+
+function renderMessageTable() {
+  var tbody = $("#msg-body");
+  if (!tbody) return;
+  tbody.innerHTML = "";
+
+  if (state.messages.length === 0) {
+    tbody.appendChild(
+      el("tr", null, [
+        el("td", {
+          colSpan: "3",
+          className: "empty",
+          textContent: "No messages in queue",
+        }),
+      ]),
+    );
+    return;
+  }
+
+  state.messages.forEach(function (msg, i) {
+    var preview =
+      msg.body.length > 120 ? msg.body.slice(0, 117) + "..." : msg.body;
+    tbody.appendChild(
+      el("tr", null, [
+        el("td", {
+          className: "row-num",
+          textContent: String(state.msgOffset + i + 1),
+        }),
+        el("td", { className: "msg-id", textContent: msg.id }),
+        el("td", { className: "msg-preview", textContent: preview }),
+      ]),
+    );
+  });
+}
+
+function renderPagination() {
+  var pag = $("#pagination");
+  if (!pag) return;
+  pag.innerHTML = "";
+
+  if (state.msgOffset > 0) {
+    pag.appendChild(
+      el("button", {
+        className: "btn btn-sm",
+        textContent: "\u2190 Prev",
+        onClick: function () {
+          state.msgOffset = Math.max(0, state.msgOffset - state.msgLimit);
+          loadMessages();
+        },
+      }),
+    );
+  }
+
+  pag.appendChild(
+    el("span", {
+      className: "page-info",
+      textContent:
+        "Showing " +
+        (state.msgOffset + 1) +
+        "-" +
+        (state.msgOffset + state.messages.length),
+    }),
+  );
+
+  if (state.messages.length === state.msgLimit) {
+    pag.appendChild(
+      el("button", {
+        className: "btn btn-sm",
+        textContent: "Next \u2192",
+        onClick: function () {
+          state.msgOffset += state.msgLimit;
+          loadMessages();
+        },
+      }),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Activity log
+// ---------------------------------------------------------------------------
 var activityLog = [];
 
 function addActivity(action, queue, message) {
@@ -368,44 +588,25 @@ function renderActivity() {
         : entry.message || "-";
     tbody.appendChild(
       el("tr", null, [
-        el("td", { textContent: entry.action }),
+        el("td", null, [
+          el("span", {
+            className:
+              "action-badge " +
+              (entry.action === "push" ? "badge-green" : "badge-yellow"),
+            textContent: entry.action,
+          }),
+        ]),
         el("td", { textContent: entry.queue }),
         el("td", { className: "msg-preview", textContent: preview }),
-        el("td", { textContent: entry.time }),
+        el("td", { className: "dim", textContent: entry.time }),
       ]),
     );
   });
 }
 
-function loadMessagesView() {
-  api("GET", "/queues")
-    .then(function (r) {
-      state.queues = (r.data && r.data.queues) || [];
-      var sel = $("#msg-queue-select");
-      if (!sel) return;
-      sel.innerHTML = "";
-      if (state.queues.length === 0) {
-        sel.appendChild(
-          el("option", { textContent: "(no queues)", disabled: true }),
-        );
-        return;
-      }
-      state.queues.forEach(function (name) {
-        var opt = el("option", { value: name, textContent: name });
-        if (name === state.selectedQueue) opt.selected = true;
-        sel.appendChild(opt);
-      });
-      if (!state.selectedQueue && state.queues.length > 0) {
-        state.selectedQueue = state.queues[0];
-      }
-    })
-    .catch(function (e) {
-      toast("Load queues: " + e.message);
-    });
-
-  renderActivity();
-}
-
+// ---------------------------------------------------------------------------
+// Push / Pop
+// ---------------------------------------------------------------------------
 function openPushDialog() {
   if (!state.selectedQueue) {
     toast("Select a queue first");
@@ -424,6 +625,7 @@ function openPushDialog() {
 
   var actions = el("div", { className: "dialog-actions" }, [
     el("button", {
+      className: "btn",
       textContent: "Cancel",
       onClick: function () {
         dlg.close();
@@ -431,16 +633,21 @@ function openPushDialog() {
       },
     }),
     el("button", {
-      className: "btn-green",
+      className: "btn btn-green",
       textContent: "Push",
       onClick: function () {
         var msg = msgInput.value;
+        if (!msg) {
+          toast("Message cannot be empty");
+          return;
+        }
         dlg.close();
         dlg.remove();
         api("POST", "/queues/" + encodeURIComponent(state.selectedQueue), msg)
           .then(function () {
             toast("Pushed message", true);
             addActivity("push", state.selectedQueue, msg);
+            loadMessages();
           })
           .catch(function (e) {
             toast("Push: " + e.message);
@@ -452,6 +659,7 @@ function openPushDialog() {
 
   document.body.appendChild(dlg);
   dlg.showModal();
+  msgInput.focus();
 }
 
 function popMessage() {
@@ -470,6 +678,7 @@ function popMessage() {
         toast("Popped message", true);
         addActivity("pop", state.selectedQueue, String(msg));
       }
+      loadMessages();
     })
     .catch(function (e) {
       toast("Pop: " + e.message);
@@ -479,19 +688,66 @@ function popMessage() {
 // ---------------------------------------------------------------------------
 // Auth token dialog
 // ---------------------------------------------------------------------------
-function checkAuth() {
-  if (authToken) return;
-  var token = prompt("Enter auth token (leave empty for open mode):");
-  if (token) {
-    authToken = token;
-    localStorage.setItem("rill_token", token);
-  }
+function showAuthDialog() {
+  var old = $("#auth-dialog");
+  if (old) old.remove();
+
+  var dlg = el("dialog", { id: "auth-dialog" });
+  dlg.appendChild(el("h3", { textContent: "Authentication" }));
+  dlg.appendChild(
+    el("label", { textContent: "Bearer Token (leave empty for open mode)" }),
+  );
+  var tokenInput = el("input", {
+    type: "password",
+    placeholder: "Enter token...",
+    value: authToken,
+  });
+  dlg.appendChild(tokenInput);
+
+  var actions = el("div", { className: "dialog-actions" }, [
+    el("button", {
+      className: "btn",
+      textContent: "Clear",
+      onClick: function () {
+        authToken = "";
+        localStorage.removeItem("rill_token");
+        dlg.close();
+        dlg.remove();
+        toast("Token cleared", true);
+        route();
+      },
+    }),
+    el("button", {
+      className: "btn btn-blue",
+      textContent: "Save",
+      onClick: function () {
+        authToken = tokenInput.value.trim();
+        if (authToken) {
+          localStorage.setItem("rill_token", authToken);
+        } else {
+          localStorage.removeItem("rill_token");
+        }
+        dlg.close();
+        dlg.remove();
+        toast("Token saved", true);
+        route();
+      },
+    }),
+  ]);
+  dlg.appendChild(actions);
+
+  document.body.appendChild(dlg);
+  dlg.showModal();
+  tokenInput.focus();
 }
 
 // ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 document.addEventListener("DOMContentLoaded", function () {
-  checkAuth();
+  // Auth button in sidebar
+  var authBtn = $("#auth-btn");
+  if (authBtn) authBtn.addEventListener("click", showAuthDialog);
+
   route();
 });
