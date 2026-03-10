@@ -31,6 +31,18 @@ impl Checksum {
         }
     }
 
+    /// Compute a CRC32C checksum over multiple slices without concatenation.
+    pub(crate) fn compute_slices(slices: &[&[u8]]) -> Self {
+        let mut crc = 0u32;
+        for slice in slices {
+            crc = crc32c::crc32c_append(crc, slice);
+        }
+        Self {
+            algo: ChecksumAlgo::Crc32c,
+            value: crc,
+        }
+    }
+
     /// Verify this checksum against `data`.
     ///
     /// Returns `Ok(())` if the recomputed checksum matches, or
@@ -122,6 +134,29 @@ mod tests {
         let cs = Checksum::compute(b"");
         assert_eq!(cs.algo(), ChecksumAlgo::Crc32c);
         assert_eq!(cs.value(), crc32c::crc32c(b""));
+    }
+
+    #[test]
+    fn compute_slices_matches_compute() {
+        let a = b"hello ";
+        let b = b"world";
+        let c = b"!";
+        let combined = [&a[..], &b[..], &c[..]].concat();
+        assert_eq!(
+            Checksum::compute_slices(&[a, b, c]),
+            Checksum::compute(&combined)
+        );
+    }
+
+    #[test]
+    fn compute_slices_single_slice() {
+        let data = b"single";
+        assert_eq!(Checksum::compute_slices(&[data]), Checksum::compute(data));
+    }
+
+    #[test]
+    fn compute_slices_empty() {
+        assert_eq!(Checksum::compute_slices(&[]), Checksum::compute(b""));
     }
 
     #[test]

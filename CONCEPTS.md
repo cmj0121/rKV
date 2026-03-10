@@ -505,72 +505,74 @@ An empty `ops` array returns 400 Bad Request. Replica nodes return 403 Forbidden
 
 The `Config` struct controls database behavior and LSM tuning parameters:
 
-| Field               | Type              | Default    | Description                                |
-| ------------------- | ----------------- | ---------- | ------------------------------------------ |
-| `path`              | `PathBuf`         | (required) | Database directory path                    |
-| `create_if_missing` | `bool`            | `true`     | Create the directory if it doesn't exist   |
-| `write_buffer_size` | `usize`           | 4 MB       | In-memory write buffer size before flush   |
-| `max_levels`        | `usize`           | 3          | Maximum number of LSM levels               |
-| `block_size`        | `usize`           | 4 KB       | SSTable block size                         |
-| `cache_size`        | `usize`           | 8 MB       | Block cache size for decompressed blocks   |
-| `object_size`       | `usize`           | 1 KB       | Bin object size threshold (see above)      |
-| `compress`          | `bool`            | `true`     | LZ4-compress bin objects on disk           |
-| `bloom_bits`        | `usize`           | 10         | Filter bits per key (0 = disabled)         |
-| `filter_policy`     | `FilterPolicy`    | `Bloom`    | Filter type: `Bloom` or `Ribbon`           |
-| `verify_checksums`  | `bool`            | `true`     | Verify checksums on read                   |
-| `compression`       | `Compression`     | `LZ4`      | SSTable block compression                  |
-| `io_model`          | `IoModel`         | `Mmap`     | File I/O strategy (see I/O Modes below)    |
-| `cluster_id`        | `Option<u16>`     | `None`     | Cluster ID for RevisionID (random if None) |
-| `aol_buffer_size`   | `usize`           | 128        | AOL flush threshold in records (0 = every) |
-| `l0_max_count`      | `usize`           | 4          | Max L0 SSTable count before compaction     |
-| `l0_max_size`       | `usize`           | 64 MB      | Max total L0 size before compaction        |
-| `l1_max_size`       | `usize`           | 256 MB     | Max L1 size before merge to L2             |
-| `default_max_size`  | `usize`           | 2 GB       | Default max size for L2+ levels            |
-| `bloom_prefix_len`  | `usize`           | 0          | Prefix bloom filter length (0 = disabled)  |
-| `write_stall_size`  | `usize`           | 8 MB       | Backpressure threshold (0 = disabled)      |
-| `role`              | `Role`            | Standalone | Replication role                           |
-| `repl_bind`         | `String`          | `0.0.0.0`  | Replication listen address                 |
-| `repl_port`         | `u16`             | 8322       | Replication listen port                    |
-| `primary_addr`      | `Option<String>`  | `None`     | Primary address for replica to connect to  |
-| `peers`             | `Vec<String>`     | `[]`       | Peer addresses (peer mode only)            |
-| `event_listener`    | `Option<Arc<..>>` | `None`     | Callback for flush/compaction events       |
-| `shard_group`       | `u16`             | 0          | Shard group ID (0 = standalone)            |
-| `owned_namespaces`  | `Vec<String>`     | `[]`       | Namespaces owned by this shard node        |
-| `in_memory`         | `bool`            | `false`    | Pure in-memory mode (no disk I/O)          |
+| Field                  | Type              | Default    | Description                                |
+| ---------------------- | ----------------- | ---------- | ------------------------------------------ |
+| `path`                 | `PathBuf`         | (required) | Database directory path                    |
+| `create_if_missing`    | `bool`            | `true`     | Create the directory if it doesn't exist   |
+| `write_buffer_size`    | `usize`           | 4 MB       | In-memory write buffer size before flush   |
+| `max_levels`           | `usize`           | 3          | Maximum number of LSM levels               |
+| `block_size`           | `usize`           | 4 KB       | SSTable block size                         |
+| `cache_size`           | `usize`           | 8 MB       | Block cache size for decompressed blocks   |
+| `object_size`          | `usize`           | 1 KB       | Bin object size threshold (see above)      |
+| `compress`             | `bool`            | `true`     | LZ4-compress bin objects on disk           |
+| `object_sync_interval` | `usize`           | 128        | Pack sync threshold (0 = per-record)       |
+| `bloom_bits`           | `usize`           | 10         | Filter bits per key (0 = disabled)         |
+| `filter_policy`        | `FilterPolicy`    | `Bloom`    | Filter type: `Bloom` or `Ribbon`           |
+| `verify_checksums`     | `bool`            | `true`     | Verify checksums on read                   |
+| `compression`          | `Compression`     | `LZ4`      | SSTable block compression                  |
+| `io_model`             | `IoModel`         | `Mmap`     | File I/O strategy (see I/O Modes below)    |
+| `cluster_id`           | `Option<u16>`     | `None`     | Cluster ID for RevisionID (random if None) |
+| `aol_buffer_size`      | `usize`           | 128        | AOL flush threshold in records (0 = every) |
+| `l0_max_count`         | `usize`           | 4          | Max L0 SSTable count before compaction     |
+| `l0_max_size`          | `usize`           | 64 MB      | Max total L0 size before compaction        |
+| `l1_max_size`          | `usize`           | 256 MB     | Max L1 size before merge to L2             |
+| `default_max_size`     | `usize`           | 2 GB       | Default max size for L2+ levels            |
+| `bloom_prefix_len`     | `usize`           | 0          | Prefix bloom filter length (0 = disabled)  |
+| `write_stall_size`     | `usize`           | 8 MB       | Backpressure threshold (0 = disabled)      |
+| `role`                 | `Role`            | Standalone | Replication role                           |
+| `repl_bind`            | `String`          | `0.0.0.0`  | Replication listen address                 |
+| `repl_port`            | `u16`             | 8322       | Replication listen port                    |
+| `primary_addr`         | `Option<String>`  | `None`     | Primary address for replica to connect to  |
+| `peers`                | `Vec<String>`     | `[]`       | Peer addresses (peer mode only)            |
+| `event_listener`       | `Option<Arc<..>>` | `None`     | Callback for flush/compaction events       |
+| `shard_group`          | `u16`             | 0          | Shard group ID (0 = standalone)            |
+| `owned_namespaces`     | `Vec<String>`     | `[]`       | Namespaces owned by this shard node        |
+| `in_memory`            | `bool`            | `false`    | Pure in-memory mode (no disk I/O)          |
 
 The CLI uses dot-notation keys for `config <key> <value>`:
 
-| Config field        | CLI key                         |
-| ------------------- | ------------------------------- |
-| `path`              | `storage.path` (read-only)      |
-| `create_if_missing` | `storage.create_if_missing`     |
-| `write_buffer_size` | `lsm.write_buffer_size`         |
-| `max_levels`        | `lsm.max_levels`                |
-| `block_size`        | `lsm.block_size`                |
-| `cache_size`        | `lsm.cache_size`                |
-| `bloom_bits`        | `lsm.bloom_bits`                |
-| `filter_policy`     | `lsm.filter_policy`             |
-| `verify_checksums`  | `lsm.verify_checksums`          |
-| `compression`       | `lsm.compression`               |
-| `object_size`       | `object.size`                   |
-| `compress`          | `object.compress`               |
-| `io_model`          | `io.model`                      |
-| `cluster_id`        | `revision.cluster_id`           |
-| `aol_buffer_size`   | `aol.buffer_size`               |
-| `l0_max_count`      | `lsm.l0_max_count`              |
-| `l0_max_size`       | `lsm.l0_max_size`               |
-| `l1_max_size`       | `lsm.l1_max_size`               |
-| `default_max_size`  | `lsm.default_max_size`          |
-| `bloom_prefix_len`  | `lsm.bloom_prefix_len`          |
-| `write_stall_size`  | `lsm.write_stall_size`          |
-| `role`              | `repl.role`                     |
-| `repl_bind`         | `repl.bind`                     |
-| `repl_port`         | `repl.port`                     |
-| `primary_addr`      | `repl.primary_addr`             |
-| `peers`             | `repl.peers`                    |
-| `shard_group`       | `cluster.shard_group`           |
-| `owned_namespaces`  | `cluster.owned_namespaces`      |
-| `in_memory`         | `storage.in_memory` (read-only) |
+| Config field           | CLI key                         |
+| ---------------------- | ------------------------------- |
+| `path`                 | `storage.path` (read-only)      |
+| `create_if_missing`    | `storage.create_if_missing`     |
+| `write_buffer_size`    | `lsm.write_buffer_size`         |
+| `max_levels`           | `lsm.max_levels`                |
+| `block_size`           | `lsm.block_size`                |
+| `cache_size`           | `lsm.cache_size`                |
+| `bloom_bits`           | `lsm.bloom_bits`                |
+| `filter_policy`        | `lsm.filter_policy`             |
+| `verify_checksums`     | `lsm.verify_checksums`          |
+| `compression`          | `lsm.compression`               |
+| `object_size`          | `object.size`                   |
+| `compress`             | `object.compress`               |
+| `object_sync_interval` | `object.sync_interval`          |
+| `io_model`             | `io.model`                      |
+| `cluster_id`           | `revision.cluster_id`           |
+| `aol_buffer_size`      | `aol.buffer_size`               |
+| `l0_max_count`         | `lsm.l0_max_count`              |
+| `l0_max_size`          | `lsm.l0_max_size`               |
+| `l1_max_size`          | `lsm.l1_max_size`               |
+| `default_max_size`     | `lsm.default_max_size`          |
+| `bloom_prefix_len`     | `lsm.bloom_prefix_len`          |
+| `write_stall_size`     | `lsm.write_stall_size`          |
+| `role`                 | `repl.role`                     |
+| `repl_bind`            | `repl.bind`                     |
+| `repl_port`            | `repl.port`                     |
+| `primary_addr`         | `repl.primary_addr`             |
+| `peers`                | `repl.peers`                    |
+| `shard_group`          | `cluster.shard_group`           |
+| `owned_namespaces`     | `cluster.owned_namespaces`      |
+| `in_memory`            | `storage.in_memory` (read-only) |
 
 `Config::new(path)` initializes all fields to their defaults. `Config::in_memory()` creates
 a pure in-memory configuration. Fields can be overridden before passing the config to `DB::open`.

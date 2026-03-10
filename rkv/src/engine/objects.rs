@@ -55,20 +55,23 @@ struct PackWriter {
     file: std::io::BufWriter<fs::File>,
     seq: u64,
     offset: u64,
+    records_since_sync: usize,
+    sync_interval: usize,
 }
 
 impl PackWriter {
     /// Create a new pack file and write the header.
-    fn create(path: &Path, seq: u64) -> Result<Self> {
+    fn create(path: &Path, seq: u64, sync_interval: usize) -> Result<Self> {
         let file = fs::File::create(path)?;
         let mut bw = std::io::BufWriter::new(file);
         bw.write_all(&PACK_MAGIC)?;
         bw.write_all(&PACK_VERSION.to_be_bytes())?;
-        bw.flush()?;
         Ok(Self {
             file: bw,
             seq,
             offset: PACK_HEADER_SIZE as u64,
+            records_since_sync: 0,
+            sync_interval,
         })
     }
 
@@ -80,26 +83,35 @@ impl PackWriter {
         flags: u8,
         data: &[u8],
     ) -> Result<PackEntry> {
+        debug_assert!(
+            data.len() <= u32::MAX as usize,
+            "data exceeds pack u32 limit"
+        );
         let record_offset = self.offset;
         let data_len = data.len() as u32;
+        let original_size_be = original_size.to_be_bytes();
+        let data_len_be = data_len.to_be_bytes();
 
-        // Build checksummed payload: [hash][original_size][flags][data_len][data]
-        let payload_len = PACK_RECORD_HEADER_SIZE + data.len();
-        let mut payload = Vec::with_capacity(payload_len);
-        payload.extend_from_slice(hash);
-        payload.extend_from_slice(&original_size.to_be_bytes());
-        payload.push(flags);
-        payload.extend_from_slice(&data_len.to_be_bytes());
-        payload.extend_from_slice(data);
+        // Compute checksum over header+data without allocating a concatenation Vec.
+        let checksum =
+            Checksum::compute_slices(&[hash, &original_size_be, &[flags], &data_len_be, data]);
 
-        let checksum = Checksum::compute(&payload);
-
-        self.file.write_all(&payload)?;
+        // Write header fields + data + checksum directly to BufWriter.
+        self.file.write_all(hash)?;
+        self.file.write_all(&original_size_be)?;
+        self.file.write_all(&[flags])?;
+        self.file.write_all(&data_len_be)?;
+        self.file.write_all(data)?;
         self.file.write_all(&checksum.to_bytes())?;
-        self.file.flush()?;
-        self.file.get_ref().sync_all()?;
 
-        let record_len = payload_len + Checksum::encoded_size();
+        self.records_since_sync += 1;
+        if self.sync_interval == 0 || self.records_since_sync >= self.sync_interval {
+            self.file.flush()?;
+            self.file.get_ref().sync_all()?;
+            self.records_since_sync = 0;
+        }
+
+        let record_len = PACK_RECORD_HEADER_SIZE + data.len() + Checksum::encoded_size();
         self.offset += record_len as u64;
 
         Ok(PackEntry {
@@ -224,13 +236,19 @@ pub(crate) struct ObjectStore {
     base: PathBuf,
     io: Arc<dyn IoBackend>,
     packs: Mutex<PackState>,
+    sync_interval: usize,
 }
 
 impl ObjectStore {
     /// Open (or create) the object store directory for a namespace under `db_dir`.
     ///
     /// Scans existing pack files to rebuild the in-memory index.
-    pub(crate) fn open(db_dir: &Path, ns: &str, io: Arc<dyn IoBackend>) -> Result<Self> {
+    pub(crate) fn open(
+        db_dir: &Path,
+        ns: &str,
+        io: Arc<dyn IoBackend>,
+        sync_interval: usize,
+    ) -> Result<Self> {
         let base = db_dir.join("objects").join(ns);
         fs::create_dir_all(&base)?;
 
@@ -280,6 +298,7 @@ impl ObjectStore {
                 writer: None,
                 next_seq,
             }),
+            sync_interval,
         })
     }
 
@@ -311,24 +330,26 @@ impl ObjectStore {
             return Ok(vp);
         }
 
-        // Compress if requested
-        let (flags, payload) = if compress {
-            let compressed = lz4_flex::compress_prepend_size(data);
-            (FLAG_LZ4, compressed)
+        // Compress if requested — avoid cloning when uncompressed
+        let compressed;
+        let (flags, payload): (u8, &[u8]) = if compress {
+            compressed = lz4_flex::compress_prepend_size(data);
+            if compressed.len() > u32::MAX as usize {
+                return Err(Error::Corruption(
+                    "compressed payload too large for pack format (>4 GB)".into(),
+                ));
+            }
+            (FLAG_LZ4, &compressed)
         } else {
-            (0u8, data.to_vec())
+            (0u8, data)
         };
 
-        // Guard: compressed payload must also fit in u32
-        if payload.len() > u32::MAX as usize {
-            return Err(Error::Corruption(
-                "compressed payload too large for pack format (>4 GB)".into(),
-            ));
-        }
-
         // Rotate pack file if current one exceeds size threshold
-        if let Some(ref w) = state.writer {
+        if let Some(ref mut w) = state.writer {
             if w.offset >= PACK_MAX_SIZE {
+                // Flush and sync any buffered records before dropping the old writer
+                w.file.flush()?;
+                w.file.get_ref().sync_all()?;
                 state.writer = None;
             }
         }
@@ -338,13 +359,16 @@ impl ObjectStore {
             let seq = state.next_seq;
             state.next_seq += 1;
             let path = self.pack_path(seq);
-            state.writer = Some(PackWriter::create(&path, seq)?);
+            state.writer = Some(PackWriter::create(&path, seq, self.sync_interval)?);
         }
 
         let writer = state.writer.as_mut().ok_or_else(|| {
             Error::Corruption("pack writer unexpectedly None after initialization".into())
         })?;
-        let entry = writer.append(&hash, size, flags, &payload)?;
+        let entry = writer.append(&hash, size, flags, payload)?;
+        // Flush BufWriter before exposing the entry in the index, so
+        // concurrent readers that open the file directly can see the data.
+        writer.file.flush()?;
         state.index.insert(hash, entry);
 
         Ok(vp)
@@ -523,6 +547,10 @@ impl ObjectStore {
         let mut state = self.packs.lock().unwrap_or_else(|e| e.into_inner());
 
         // Close the active writer so all data is on disk
+        if let Some(ref mut w) = state.writer {
+            w.file.flush()?;
+            w.file.get_ref().sync_all()?;
+        }
         state.writer = None;
 
         // Scan pack files on disk to find all records (not the in-memory
@@ -580,7 +608,7 @@ impl ObjectStore {
         let new_seq = state.next_seq;
         state.next_seq += 1;
         let new_path = self.pack_path(new_seq);
-        let mut writer = PackWriter::create(&new_path, new_seq)?;
+        let mut writer = PackWriter::create(&new_path, new_seq, self.sync_interval)?;
 
         let mut new_index = HashMap::with_capacity(keep.len());
 
@@ -591,6 +619,10 @@ impl ObjectStore {
                 writer.append(hash, old_entry.original_size, old_entry.flags, &raw_data)?;
             new_index.insert(*hash, new_entry);
         }
+
+        // Ensure all records are durably written before updating the index
+        writer.file.flush()?;
+        writer.file.get_ref().sync_all()?;
 
         // Update index BEFORE deleting old packs (crash safety: if we crash
         // after index update but before deletion, the old packs remain on disk
@@ -613,6 +645,7 @@ impl ObjectStore {
         if let Some(ref mut writer) = state.writer {
             writer.file.flush()?;
             writer.file.get_ref().sync_all()?;
+            writer.records_since_sync = 0;
         }
         Ok(())
     }
@@ -699,7 +732,7 @@ mod tests {
     #[test]
     fn write_read_roundtrip_raw() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
 
         let data = b"hello world, this is a test value";
         let vp = store.write(data, false).unwrap();
@@ -712,7 +745,7 @@ mod tests {
     #[test]
     fn write_read_roundtrip_compressed() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
 
         let data = b"hello world, this is a test value for compression";
         let vp = store.write(data, true).unwrap();
@@ -725,7 +758,7 @@ mod tests {
     #[test]
     fn dedup_same_content() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
 
         let data = b"same content";
         let vp1 = store.write(data, true).unwrap();
@@ -738,7 +771,7 @@ mod tests {
     #[test]
     fn exists_after_write() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
 
         let data = b"some data";
         let vp = store.write(data, false).unwrap();
@@ -749,7 +782,7 @@ mod tests {
     #[test]
     fn exists_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
 
         let vp = ValuePointer::new([0xFFu8; 32], 100);
         assert!(!store.exists(&vp));
@@ -758,7 +791,7 @@ mod tests {
     #[test]
     fn read_missing_object_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
 
         let vp = ValuePointer::new([0xFFu8; 32], 100);
         let err = store.read(&vp, false).unwrap_err();
@@ -768,7 +801,7 @@ mod tests {
     #[test]
     fn blake3_verification_catches_corruption() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
 
         let data = b"test data for verification";
         let vp = store.write(data, false).unwrap();
@@ -788,7 +821,7 @@ mod tests {
         fs::write(&pack_path, &content).unwrap();
 
         // Re-open to rebuild index
-        let store2 = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store2 = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
         let err = store2.read(&vp, true).unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
     }
@@ -796,7 +829,7 @@ mod tests {
     #[test]
     fn list_object_hashes_includes_packed() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
 
         let vp1 = store.write(b"data1", false).unwrap();
         let vp2 = store.write(b"data2", false).unwrap();
@@ -810,7 +843,7 @@ mod tests {
     #[test]
     fn list_object_hashes_nonexistent_base() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "nonexistent_ns", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "nonexistent_ns", test_io(), 0).unwrap();
         let hashes = store.list_object_hashes().unwrap();
         assert!(hashes.is_empty());
     }
@@ -818,7 +851,7 @@ mod tests {
     #[test]
     fn list_object_hashes_skips_non_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
 
         // Create a regular file in the base dir (not a dir, not a pack)
         let non_dir = store.base.join("not_a_dir");
@@ -834,7 +867,7 @@ mod tests {
     #[test]
     fn large_value_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
 
         // 64 KB of data
         let data: Vec<u8> = (0..65536).map(|i| (i % 256) as u8).collect();
@@ -851,13 +884,13 @@ mod tests {
 
         let vp;
         {
-            let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+            let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
             vp = store.write(b"persistent data", true).unwrap();
             assert_eq!(store.pack_count(), 1);
         }
 
         // Re-open and verify
-        let store2 = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store2 = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
         assert_eq!(store2.pack_count(), 1);
         let data = store2.read(&vp, true).unwrap();
         assert_eq!(data, b"persistent data");
@@ -866,7 +899,7 @@ mod tests {
     #[test]
     fn multiple_objects_in_one_pack() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
 
         let mut vps = Vec::new();
         for i in 0..100u32 {
@@ -891,7 +924,7 @@ mod tests {
     #[test]
     fn delete_packed_object() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
 
         let vp = store.write(b"deleteme", false).unwrap();
         assert!(store.exists(&vp));
@@ -905,7 +938,7 @@ mod tests {
     #[test]
     fn repack_gc_removes_dead() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
 
         let vp_keep = store.write(b"keep this", false).unwrap();
         let vp_dead = store.write(b"remove this", false).unwrap();
@@ -946,7 +979,7 @@ mod tests {
         fs::write(fan_out_dir.join(vp.hex_hash()), &content).unwrap();
 
         // Open store — should find the loose object
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
         assert_eq!(store.pack_count(), 0); // not in pack index
 
         let result = store.read(&vp, true).unwrap();
@@ -974,7 +1007,7 @@ mod tests {
         fs::write(fan_out_dir.join(vp.hex_hash()), &content).unwrap();
 
         // Open store and try to write same data — should dedup
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
         let vp2 = store.write(data, false).unwrap();
         assert_eq!(vp, vp2);
         assert_eq!(store.pack_count(), 0); // not added to pack (dedup via loose)
@@ -983,7 +1016,7 @@ mod tests {
     #[test]
     fn scan_pack_truncated_tail_recovery() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
 
         let vp1 = store.write(b"first object", false).unwrap();
         let _vp2 = store.write(b"second object", false).unwrap();
@@ -998,7 +1031,7 @@ mod tests {
         fs::write(&pack_path, &content[..truncate_at]).unwrap();
 
         // Re-open — should recover first object, skip truncated second
-        let store2 = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store2 = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
         assert_eq!(store2.pack_count(), 1);
         let data = store2.read(&vp1, true).unwrap();
         assert_eq!(data, b"first object");
@@ -1029,7 +1062,7 @@ mod tests {
     #[test]
     fn empty_data_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
 
         let data = b"";
         let vp = store.write(data, false).unwrap();
@@ -1042,7 +1075,7 @@ mod tests {
     #[test]
     fn pack_crc32c_corruption_detected_on_read() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
 
         let vp = store.write(b"checksum test", false).unwrap();
 
@@ -1055,7 +1088,7 @@ mod tests {
         fs::write(&pack_path, &content).unwrap();
 
         // Re-open — scan should skip the corrupted record
-        let store2 = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store2 = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
         assert_eq!(store2.pack_count(), 0);
 
         // Direct read should fail with corruption error
@@ -1066,7 +1099,7 @@ mod tests {
     #[test]
     fn pack_rotation_at_size_threshold() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
 
         // Write enough data to trigger rotation.
         // Each object: ~1 KB data + 46 bytes overhead ≈ 1070 bytes.
@@ -1095,7 +1128,7 @@ mod tests {
     #[test]
     fn repack_gc_all_dead() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(tmp.path(), "_", test_io()).unwrap();
+        let store = ObjectStore::open(tmp.path(), "_", test_io(), 0).unwrap();
 
         store.write(b"obj1", false).unwrap();
         store.write(b"obj2", false).unwrap();
