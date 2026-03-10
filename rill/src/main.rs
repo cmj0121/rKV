@@ -233,6 +233,51 @@ async fn pop_message(
     Ok(Json(json!({"message": msg})))
 }
 
+#[derive(Deserialize)]
+struct PeekQuery {
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+
+fn default_limit() -> usize {
+    20
+}
+
+async fn queue_info(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    state.require_role(&headers, Role::Reader)?;
+    let length = state
+        .backend
+        .queue_length(&name)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(json!({"queue": name, "length": length})))
+}
+
+async fn peek_messages(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    axum::extract::Query(query): axum::extract::Query<PeekQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    state.require_role(&headers, Role::Reader)?;
+    let messages = state
+        .backend
+        .peek_messages(&name, query.offset, query.limit)
+        .await
+        .map_err(ApiError::Internal)?;
+    let items: Vec<_> = messages
+        .into_iter()
+        .map(|(id, body)| json!({"id": id, "body": body}))
+        .collect();
+    Ok(Json(json!({"messages": items, "queue": name})))
+}
+
 async fn ui_index(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     if !state.ui_enabled {
         return Err(ApiError::NotFound(
@@ -278,6 +323,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/queues/{name}", post(push_message))
         .route("/queues/{name}", get(pop_message))
         .route("/queues/{name}", delete(delete_queue))
+        .route("/queues/{name}/info", get(queue_info))
+        .route("/queues/{name}/messages", get(peek_messages))
         .with_state(state)
 }
 
@@ -649,5 +696,34 @@ mod tests {
         let (status, body) = request(&app, "GET", "/queues/nope", None, None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("null"));
+    }
+
+    // --- Queue info and peek ---
+
+    #[tokio::test]
+    async fn e2e_queue_info() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"info"}"#)).await;
+        request(&app, "POST", "/queues/info", None, Some("a")).await;
+        request(&app, "POST", "/queues/info", None, Some("b")).await;
+        let (status, body) = request(&app, "GET", "/queues/info/info", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""length":2"#));
+    }
+
+    #[tokio::test]
+    async fn e2e_peek_messages() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"peek"}"#)).await;
+        request(&app, "POST", "/queues/peek", None, Some("x")).await;
+        request(&app, "POST", "/queues/peek", None, Some("y")).await;
+        // Peek without consuming
+        let (status, body) = request(&app, "GET", "/queues/peek/messages", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"x\""));
+        assert!(body.contains("\"y\""));
+        // Messages still there
+        let (_, body) = request(&app, "GET", "/queues/peek/info", None, None).await;
+        assert!(body.contains(r#""length":2"#));
     }
 }

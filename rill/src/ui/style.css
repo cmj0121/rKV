@@ -68,6 +68,33 @@ body {
   border-left: 3px solid var(--accent);
 }
 
+.sidebar-spacer {
+  flex: 1;
+}
+
+.nav-btn {
+  display: block;
+  margin: 10px 16px;
+  padding: 8px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: center;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+
+.nav-btn:hover {
+  background: var(--bg-surface);
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+
 /* ---- Main ---- */
 #app {
   padding: 24px;
@@ -126,6 +153,11 @@ button,
 button:hover {
   background: var(--bg-surface);
   border-color: var(--text-dim);
+}
+
+.btn-sm {
+  padding: 4px 10px;
+  font-size: 12px;
 }
 
 .btn-green {
@@ -189,6 +221,17 @@ td .actions {
   gap: 4px;
 }
 
+.row-num {
+  color: var(--text-dim);
+  width: 40px;
+}
+
+.msg-id {
+  color: var(--accent);
+  font-size: 12px;
+  width: 80px;
+}
+
 /* ---- Cards / stat grid ---- */
 .stat-grid {
   display: grid;
@@ -223,7 +266,7 @@ td .actions {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-width: 500px;
+  max-width: 600px;
 }
 
 .queue-item {
@@ -234,7 +277,6 @@ td .actions {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 10px 14px;
-  cursor: pointer;
   transition: border-color 0.15s;
 }
 
@@ -242,13 +284,75 @@ td .actions {
   border-color: var(--accent);
 }
 
-.queue-item.active {
-  border-color: var(--accent);
-  background: var(--bg-surface);
+.queue-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 
 .queue-item .queue-name {
   font-weight: bold;
+}
+
+.queue-badge {
+  font-size: 11px;
+  color: var(--accent);
+  background: rgba(79, 195, 247, 0.1);
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+
+.queue-badge.dim {
+  color: var(--text-dim);
+  background: transparent;
+}
+
+/* ---- Queue info bar ---- */
+.queue-info {
+  margin-bottom: 12px;
+  padding: 8px 0;
+}
+
+.info-label {
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+/* ---- Pagination ---- */
+.pagination {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.page-info {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+/* ---- Action badges ---- */
+.action-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: bold;
+  text-transform: uppercase;
+}
+
+.badge-green {
+  color: var(--green);
+  background: rgba(102, 187, 106, 0.15);
+}
+
+.badge-yellow {
+  color: var(--yellow);
+  background: rgba(255, 202, 40, 0.15);
+}
+
+.dim {
+  color: var(--text-dim);
 }
 
 /* ---- Dialog ---- */
@@ -351,6 +455,7 @@ dialog .dialog-actions {
     border-bottom: 1px solid var(--border);
     padding: 10px;
     overflow-x: auto;
+    align-items: center;
   }
 
   .logo {
@@ -365,6 +470,13 @@ dialog .dialog-actions {
   .nav-link.active {
     border-left: none;
     border-bottom: 3px solid var(--accent);
+  }
+  .sidebar-spacer {
+    display: none;
+  }
+  .nav-btn {
+    margin: 0 8px;
+    white-space: nowrap;
   }
 
   #app {
