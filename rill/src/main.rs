@@ -15,6 +15,7 @@ use rill::config::{BackendMode, RillConfig};
 use rkv::DB;
 use serde::Deserialize;
 use serde_json::json;
+use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 #[derive(Parser)]
@@ -371,6 +372,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/queues/{name}", delete(delete_queue))
         .route("/queues/{name}/info", get(queue_info))
         .route("/queues/{name}/messages", get(peek_messages))
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
