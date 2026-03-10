@@ -9,28 +9,96 @@ Every write produces a new **revision**, enabling history queries without extern
 
 ## Architecture
 
+### System Overview
+
 ```text
-                     ┌───────┐   ┌──────────────┐
-   Client API ──────►│  AOL  │──►│  WriteBuffer │──► Response
-                     └───────┘   └──────┬───────┘
-                                        │ background flush
-                                 ┌──────▼───────┐
-                                 │   L1 SSTable │
-                                 └──────┬───────┘
-                                        │ merge
-                                 ┌──────▼───────┐
-                                 │   L2 SSTable │
-                                 └──────┬───────┘
-                                        │ merge
-                                 ┌──────▼───────┐
-                                 │   L3 SSTable │
-                                 └──────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                          CLIENT LAYER                               │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────────────┐   │
+│  │ CLI REPL │  │ HTTP API │  │ FFI (C)  │  │ Rust Library API   │   │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────────┬───────────┘   │
+└───────┼──────────────┼─────────────┼─────────────────┼──────────────┘
+        └──────────────┴─────────────┴─────────────────┘
+                                │
+┌───────────────────────────────┼─────────────────────────────────────┐
+│                          DB (Send+Sync)                             │
+│  ┌────────────────────────────┼──────────────────────────────────┐  │
+│  │                    Namespace Router                           │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐                        │  │
+│  │  │ default │  │  ns_a   │  │  ns_b   │  ...                   │  │
+│  │  │ (plain) │  │(encrypt)│  │ (plain) │                        │  │
+│  │  └────┬────┘  └────┬────┘  └────┬────┘                        │  │
+│  └───────┼────────────┼────────────┼─────────────────────────────┘  │
+│          │            │            │                                │
+│  ┌───────┼────────────┼────────────┼─────────────────────────────┐  │
+│  │       └────────────┴────────────┘                             │  │
+│  │                Per-Namespace State                            │  │
+│  │  ┌──────────────┐  ┌───────────────┐  ┌────────────────────┐  │  │
+│  │  │  Mutex<AOL>  │  │Mutex<MemTable>│  │  ObjectStore (bin) │  │  │
+│  │  │  (WAL file)  │  │  (BTreeMap)   │  │  (content-addr)    │  │  │
+│  │  └──────────────┘  └───────────────┘  └────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                    Shared Components                          │  │
+│  │  ┌────────────┐  ┌────────────────┐  ┌─────────────────────┐  │  │
+│  │  │RevisionGen │  │ ShardedCache   │  │ BG Compaction Thread│  │  │
+│  │  │(ULID-like) │  │ (16-way LRU)   │  │ (Condvar-signaled)  │  │  │
+│  │  └────────────┘  └────────────────┘  └─────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
+### Data Flow (Write)
+
+```text
+put(key, value, ttl)
+      │
+      ▼
+┌─────────────┐
+│  Namespace  │──── encrypt(value) if password set
+└──────┬──────┘
+       │
+       ▼
+┌───────────────┐     value > object_size?
+│ Value Separate├──── YES ──► ObjectStore.put(blake3, lz4(value))
+│               │              returns ValuePointer(hash, size)
+└──────┬────────┘
+       │ NO (or ValuePointer)
+       ▼
+┌──────────────┐     [payload_len:4][key|rev|val|ttl][crc32c:5]
+│  AOL Append  │──── Crash-safe: buffered write, periodic fsync
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐
+│   MemTable   │──── BTreeMap<Key, Vec<MemEntry>>
+│   Insert     │     Enforces per-key revision monotonicity
+└──────┬───────┘
+       │
+       ▼
+approximate_size > write_buffer_size?
+       │
+  YES ──► Signal BG compaction thread (Condvar)
+                  │
+                  ▼
+            ┌──────────┐
+            │  Flush   │──► MemTable → SSTable L0
+            └────┬─────┘    Truncate AOL
+                 │
+                 ▼
+            ┌──────────┐
+            │ Compact  │──► L0→L1→L2→... (size-tiered cascade)
+            └──────────┘    Trivial move if target level empty
+```
+
+### Summary
+
 - **Write path**: Client -> AOL (append-only log, fsync for durability) -> WriteBuffer (in-memory) -> respond to
-  caller. Background flush moves WriteBuffer to L1 SSTable; merge compacts L1->L2->L3.
+  caller. Background flush moves WriteBuffer to L0 SSTable; merge compacts L0->L1->L2->L3.
 - **Read path**: WriteBuffer -> SSTable files (newest first), with a block cache for decompressed blocks.
   Both point lookups (`get`) and range/prefix queries (`scan`, `rscan`) merge results across all sources.
+  See [SSTable Read Path](docs/storage.md#sstable-read-path) for the full optimized lookup diagram.
 - **Revisions**: Each key-value pair carries a monotonically increasing revision ID. Reads return the latest revision
   by default; history queries retrieve older revisions.
 

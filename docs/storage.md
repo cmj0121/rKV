@@ -302,6 +302,41 @@ flushed to sorted L0 SSTable files on disk via `DB::flush()`. `DB::compact()` me
 files into a single L1 SSTable. The read path checks the MemTable first, then searches
 SSTables from newest to oldest across all levels.
 
+```text
+┌──────────────────────────────────────────────────┐
+│                    MemTable                      │
+│  BTreeMap<Key, Vec<MemEntry{rev, val, expires}>> │
+│  approximate_size tracked for flush trigger      │
+└────────────────────┬─────────────────────────────┘
+               flush │
+                     ▼
+┌────────────────────────────────────────────────┐
+│  Level 0 (unsorted)     max: 4 files           │
+│  ┌────────┐ ┌────────┐ ┌────────┐              │
+│  │ SST-07 │ │ SST-06 │ │ SST-05 │              │
+│  │ newest │ │        │ │ oldest │              │
+│  └────────┘ └────────┘ └────────┘              │
+└────────────────────┬───────────────────────────┘
+             compact │  merge-sort + dedup
+                     ▼
+┌─────────────────────────────────────────────────┐
+│  Level 1             max: 10 MB (×10 per level) │
+│  ┌──────────────────────────────────────────┐   │
+│  │ SST-04  (sorted, non-overlapping ranges) │   │
+│  └──────────────────────────────────────────┘   │
+└────────────────────┬────────────────────────────┘
+             compact │  trivial move if target empty
+                     ▼
+┌─────────────────────────────────────────────────┐
+│  Level 2             max: 100 MB                │
+│  ┌──────────────────────────────────────────┐   │
+│  │ SST-02  SST-03                           │   │
+│  └──────────────────────────────────────────┘   │
+└────────────────────┬────────────────────────────┘
+                     ▼
+             Level 3, 4, ...  (×10 growth)
+```
+
 ### Block Compression
 
 SSTable data blocks can be compressed to reduce disk usage and I/O bandwidth. The `compression`
@@ -321,9 +356,27 @@ controls LZ4 compression of large values in the object store.
 
 ### LRU Block Cache
 
-An LRU (Least Recently Used) block cache stores decompressed and parsed SSTable data blocks
-in memory, keyed by `(sst_id, block_index)`. This avoids redundant decompression and parsing
-when the same block is read repeatedly (e.g., hot keys, repeated scans).
+An LRU (Least Recently Used) block cache stores **raw decompressed SSTable data blocks**
+in memory, keyed by `(sst_id, block_index)`. This avoids redundant disk I/O and decompression
+when the same block is read repeatedly (e.g., hot keys, repeated scans). The cache is sharded
+16 ways to reduce mutex contention under concurrent reads.
+
+```text
+┌──────────────────────────────────────────────────────┐
+│              ShardedBlockCache (16-way)              │
+│                                                      │
+│  shard = hash(sst_id, block_index) % 16              │
+│                                                      │
+│  ┌────────┐ ┌────────┐ ┌────────┐     ┌────────┐     │
+│  │Shard 0 │ │Shard 1 │ │Shard 2 │ ... │Shard 15│     │
+│  │Mutex<  │ │Mutex<  │ │Mutex<  │     │Mutex<  │     │
+│  │LRU>    │ │LRU>    │ │LRU>    │     │LRU>    │     │
+│  └────────┘ └────────┘ └────────┘     └────────┘     │
+│                                                      │
+│  Each LRU: slab-backed doubly-linked list            │
+│  Value: Arc<Vec<u8>> (raw decompressed block bytes)  │
+└──────────────────────────────────────────────────────┘
+```
 
 The `cache_size` config field controls the total byte budget (default 8 MB). Set to `0` to
 disable the cache entirely — all operations remain functionally correct but may be slower
@@ -331,18 +384,19 @@ for workloads with repeated block access.
 
 **Behavior:**
 
-- **Lookup**: On each `read_block()` call, the cache is checked first. A hit returns a clone
-  of the parsed entries and promotes the block to MRU (most recently used) position.
-- **Insert**: On a cache miss, after decompression and parsing, the block is inserted into the
-  cache. If the cache exceeds its capacity, LRU entries are evicted until the budget is met.
-  Blocks larger than the total capacity are silently skipped to prevent thrashing.
+- **Lookup**: On each block access, the cache is checked first. A hit returns a clone of the
+  raw decompressed bytes (`Arc<Vec<u8>>`) and promotes the block to MRU position. Point lookups
+  then use restart-point binary search directly on the cached bytes — no parsing step needed.
+- **Insert**: On a cache miss, after decompression, the raw bytes are inserted into the cache.
+  If the cache exceeds its capacity, LRU entries are evicted until the budget is met. Blocks
+  larger than the total capacity are silently skipped to prevent thrashing.
 - **Compaction eviction**: When SSTables are merged during compaction, all cached blocks for
   the old (replaced) SSTables are evicted, freeing memory for the new merged SSTable's blocks.
 - **Restart**: The cache is in-memory only. On `DB::open()`, the cache starts empty and warms
   up naturally through reads.
 
-**Size estimation** per cached block: `64 + Σ(key_bytes.len() + 1 + value_data.len() + 48)`
-bytes, where the sum runs over all entries in the block.
+**Size estimation** per cached block: `data.len() + 64` bytes, where `data.len()` is the
+decompressed block size and 64 bytes covers the slab node, Arc overhead, and hash entry.
 
 ### SSTable File Format
 
@@ -440,19 +494,56 @@ Point lookups (`get`) check the MemTable first, then search SSTables level by le
 (L0 newest-first, then L1, L2, ...). The first match wins:
 
 ```text
-Namespace::get(key)
-  1. MemTable lookup — if found, return value
-  2. For each level (L0, L1, L2, ...):
-     For each SSTable in the level (L0: newest first; L1+: ascending):
-       a. Bloom filter check — if key is definitely absent, skip SSTable
-       b. Binary search index for candidate block
-       c. Decompress + verify checksum
-       d. Binary search via restart points (or partition_point on cached entries)
-       e. If found:
-          - Tombstone → return KeyNotFound
-          - Pointer → resolve via ObjectStore
-          - Data/Null → return value
-  3. Not found in any SSTable → return KeyNotFound
+get(key)
+  │
+  ▼
+┌──────────────────┐
+│ 1. MemTable      │  BTreeMap lookup: O(log N)
+│    Lookup        │  Found? → resolve ValuePointer, decrypt, return
+└───────┬──────────┘
+        │ miss
+        ▼
+┌──────────────────────────────────────────────────────┐
+│ 2. SSTable Search (newest → oldest, L0 → Lmax)       │
+│                                                      │
+│   For each SSTable:                                  │
+│   ┌────────────────────────────┐                     │
+│   │ 2a. Key-Range Pre-Filter   │  2 byte cmps        │
+│   │     key < first_key? SKIP  │  96% skip rate      │
+│   │     key > last_key?  SKIP  │  at 1M keys         │
+│   └───────────┬────────────────┘                     │
+│               │ in range                             │
+│   ┌───────────▼────────────────┐                     │
+│   │ 2b. Bloom Filter Check     │  ~7 hash probes     │
+│   │     not in set? SKIP       │  ~1% FPR            │
+│   └───────────┬────────────────┘                     │
+│               │ maybe present                        │
+│   ┌───────────▼────────────────┐                     │
+│   │ 2c. Index Binary Search    │ O(log B)            │
+│   │     find candidate block   │ B = block count     │
+│   └───────────┬────────────────┘                     │
+│               │                                      │
+│   ┌───────────▼────────────────┐                     │
+│   │ 2d. Block Load             │                     │
+│   │     Cache hit? → raw bytes │  ShardedLRU         │
+│   │     Miss? → decompress     │  16-way, 8 MB       │
+│   │            + cache insert  │                     │
+│   └───────────┬────────────────┘                     │
+│               │                                      │
+│   ┌───────────▼────────────────┐                     │
+│   │ 2e. Restart-Point Search   │  O(log R + 16)      │
+│   │     Zero-copy RestartIndex │  R = restart count  │
+│   │     Binary search on keys  │  (every 16 entries) │
+│   └───────────┬────────────────┘                     │
+│               │                                      │
+│   Found? → break (newest revision wins)              │
+└──────────────────────────────────────────────────────┘
+  │
+  ▼
+┌──────────────────┐
+│ 3. Resolve       │  ValuePointer? → ObjectStore.get(hash)
+│    + Decrypt     │  Encrypted? → AES-256-GCM decrypt
+└──────────────────┘
 ```
 
 ### Merged Scan (MergeIterator)
