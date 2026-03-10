@@ -2896,6 +2896,7 @@ impl DB {
 
                     let reader =
                         sstable::SSTableReader::open(&dst_path, seq, block_cache.clone(), &**io)?;
+                    reader.warm_cache();
                     total_size += reader.size_bytes();
                     moved_readers.push(reader);
                 }
@@ -3061,6 +3062,7 @@ impl DB {
 
         // Open the new reader and update the in-memory level structure
         let reader = sstable::SSTableReader::open(&output_path, seq, block_cache.clone(), &**io)?;
+        reader.warm_cache();
         let output_size = reader.size_bytes();
         let mut sst = sstables.write().unwrap_or_else(|e| e.into_inner());
         let levels = sst.entry(ns.to_owned()).or_insert_with(|| vec![Vec::new()]);
