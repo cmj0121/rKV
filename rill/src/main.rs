@@ -1,32 +1,47 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path as AxumPath, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
 use clap::Parser;
+use rill::config::{BackendMode, RillConfig};
+use rkv::DB;
 use serde::Deserialize;
 use serde_json::json;
+
+const NS_PREFIX: &str = "rill_";
 
 #[derive(Parser)]
 #[command(name = "rill", about = "Message queue powered by rKV")]
 struct Cli {
+    /// Path to config file (YAML or TOML)
+    #[arg(long, short, global = true, env = "RILL_CONFIG")]
+    config: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(clap::Subcommand)]
 enum Command {
+    /// Dump config to stdout (default or from --config file)
+    Init {
+        /// Output format: yaml or toml
+        #[arg(long, default_value = "yaml")]
+        format: String,
+    },
     /// Start the HTTP server
     Serve {
-        #[arg(long, default_value = "0.0.0.0", env = "RILL_HOST")]
-        host: String,
+        #[arg(long, env = "RILL_HOST")]
+        host: Option<String>,
 
-        #[arg(long, default_value_t = 3000, env = "RILL_PORT")]
-        port: u16,
+        #[arg(long, env = "RILL_PORT")]
+        port: Option<u16>,
 
         #[arg(long, env = "RILL_ADMIN_TOKEN")]
         admin_token: Option<String>,
@@ -39,6 +54,18 @@ enum Command {
 
         #[arg(long, env = "RILL_UI")]
         ui: bool,
+
+        /// rKV backend mode: embed or remote
+        #[arg(long, env = "RILL_RKV_MODE")]
+        rkv_mode: Option<String>,
+
+        /// Data directory (embed mode)
+        #[arg(long, env = "RILL_DATA")]
+        data: Option<String>,
+
+        /// rKV server URL (remote mode)
+        #[arg(long, env = "RILL_RKV_URL")]
+        rkv_url: Option<String>,
     },
 }
 
@@ -49,8 +76,8 @@ enum Role {
     Admin = 2,
 }
 
-#[derive(Clone)]
 struct AppState {
+    db: DB,
     admin_token: Option<String>,
     writer_token: Option<String>,
     reader_token: Option<String>,
@@ -61,17 +88,32 @@ enum ApiError {
     Unauthorized,
     Forbidden,
     NotFound(&'static str),
+    Internal(String),
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, body) = match self {
-            Self::Unauthorized => (StatusCode::UNAUTHORIZED, r#"{"error":"unauthorized"}"#),
-            Self::Forbidden => (StatusCode::FORBIDDEN, r#"{"error":"forbidden"}"#),
-            Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            Self::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                r#"{"error":"unauthorized"}"#.to_string(),
+            ),
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                r#"{"error":"forbidden"}"#.to_string(),
+            ),
+            Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg.to_string()),
+            Self::Internal(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(r#"{{"error":"{msg}"}}"#),
+            ),
         };
         (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
     }
+}
+
+fn queue_ns(name: &str) -> String {
+    format!("{NS_PREFIX}{name}")
 }
 
 impl AppState {
@@ -132,15 +174,35 @@ async fn create_queue(
     Json(body): Json<CreateQueueRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Admin)?;
+    let ns_name = queue_ns(&body.name);
+    // Touch the namespace to ensure it exists
+    state
+        .db
+        .namespace(&ns_name, None)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(json!({"queue": body.name, "created": true})))
 }
 
 async fn delete_queue(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(name): Path<String>,
+    AxumPath(name): AxumPath<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Admin)?;
+    let ns_name = queue_ns(&name);
+    let ns = state
+        .db
+        .namespace(&ns_name, None)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let prefix = rkv::Key::Str(String::new());
+    let keys: Vec<_> = ns
+        .keys(&prefix)
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .filter_map(|k| k.ok())
+        .collect();
+    for key in keys {
+        let _ = ns.delete(key);
+    }
     Ok(Json(json!({"queue": name, "deleted": true})))
 }
 
@@ -149,46 +211,102 @@ async fn list_queues(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Reader)?;
-    Ok(Json(json!({"queues": []})))
+    let all = state
+        .db
+        .list_namespaces()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let queues: Vec<&str> = all
+        .iter()
+        .filter_map(|ns| ns.strip_prefix(NS_PREFIX))
+        .collect();
+    Ok(Json(json!({"queues": queues})))
 }
 
 async fn push_message(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(_name): Path<String>,
+    AxumPath(name): AxumPath<String>,
+    body: String,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Writer)?;
+    let ns_name = queue_ns(&name);
+    let ns = state
+        .db
+        .namespace(&ns_name, None)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    // Use reverse scan to find the highest key, then increment
+    let prefix = rkv::Key::Str(String::new());
+    let next_id = match ns
+        .rkeys(&prefix)
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .next()
+    {
+        Some(Ok(rkv::Key::Int(n))) => n + 1,
+        _ => 0,
+    };
+    ns.put(rkv::Key::Int(next_id), body.as_bytes(), None)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(json!({"pushed": true})))
 }
 
 async fn pop_message(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(_name): Path<String>,
+    AxumPath(name): AxumPath<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Reader)?;
-    Ok(Json(json!({"message": null})))
+    let ns_name = queue_ns(&name);
+    let ns = state
+        .db
+        .namespace(&ns_name, None)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    // Scan first key (head of FIFO)
+    let prefix = rkv::Key::Str(String::new());
+    let mut entries = ns
+        .entries(&prefix)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    match entries.next() {
+        Some(Ok((key, value))) => {
+            let data = value
+                .as_bytes()
+                .map(|b| String::from_utf8_lossy(b).to_string());
+            let _ = ns.delete(key);
+            Ok(Json(json!({"message": data})))
+        }
+        _ => Ok(Json(json!({"message": null}))),
+    }
 }
 
-async fn admin_ui(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, ApiError> {
-    state.require_role(&headers, Role::Admin)?;
+async fn ui_index(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     if !state.ui_enabled {
         return Err(ApiError::NotFound(
             r#"{"error":"UI not enabled. Start with --ui flag."}"#,
         ));
     }
-    Ok(Html(
-        r#"<!DOCTYPE html>
-<html>
-<head><title>Rill Admin</title></head>
-<body>
-  <h1>Rill Admin Dashboard</h1>
-  <p>Coming soon.</p>
-</body>
-</html>"#,
+    Ok(Html(include_str!("ui/index.html")))
+}
+
+async fn ui_app_js(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    if !state.ui_enabled {
+        return Err(ApiError::NotFound(
+            r#"{"error":"UI not enabled. Start with --ui flag."}"#,
+        ));
+    }
+    Ok((
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("ui/app.js"),
+    ))
+}
+
+async fn ui_style_css(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    if !state.ui_enabled {
+        return Err(ApiError::NotFound(
+            r#"{"error":"UI not enabled. Start with --ui flag."}"#,
+        ));
+    }
+    Ok((
+        [(header::CONTENT_TYPE, "text/css")],
+        include_str!("ui/style.css"),
     ))
 }
 
@@ -196,7 +314,9 @@ fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/health", get(health))
-        .route("/admin", get(admin_ui))
+        .route("/ui", get(ui_index))
+        .route("/ui/app.js", get(ui_app_js))
+        .route("/ui/style.css", get(ui_style_css))
         .route("/queues", post(create_queue))
         .route("/queues", get(list_queues))
         .route("/queues/{name}", post(push_message))
@@ -209,7 +329,31 @@ fn build_router(state: Arc<AppState>) -> Router {
 async fn main() {
     let cli = Cli::parse();
 
+    // Load config file if provided, otherwise use defaults
+    let mut cfg = match &cli.config {
+        Some(path) => RillConfig::load(Path::new(path)).expect("failed to load config"),
+        None => RillConfig::default(),
+    };
+
     match cli.command {
+        Command::Init { format } => {
+            let output = if cli.config.is_some() {
+                // Config file provided — dump the loaded (merged) config
+                cfg.dump(&format).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                })
+            } else {
+                // No config file — show annotated template
+                RillConfig::template(&format)
+                    .unwrap_or_else(|e| {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    })
+                    .to_string()
+            };
+            print!("{output}");
+        }
         Command::Serve {
             host,
             port,
@@ -217,16 +361,69 @@ async fn main() {
             writer_token,
             reader_token,
             ui,
+            rkv_mode,
+            data,
+            rkv_url,
         } => {
+            // CLI flags override config file
+            if let Some(h) = host {
+                cfg.host = h;
+            }
+            if let Some(p) = port {
+                cfg.port = p;
+            }
+            if let Some(t) = admin_token {
+                cfg.auth.admin_token = Some(t);
+            }
+            if let Some(t) = writer_token {
+                cfg.auth.writer_token = Some(t);
+            }
+            if let Some(t) = reader_token {
+                cfg.auth.reader_token = Some(t);
+            }
+            if ui {
+                cfg.ui = true;
+            }
+            if let Some(m) = rkv_mode {
+                cfg.rkv.mode = match m.as_str() {
+                    "embed" => BackendMode::Embed,
+                    "remote" => BackendMode::Remote,
+                    _ => {
+                        eprintln!("invalid rkv mode: {m} (use 'embed' or 'remote')");
+                        std::process::exit(1);
+                    }
+                };
+            }
+            if let Some(d) = data {
+                cfg.rkv.data = d;
+            }
+            if let Some(u) = rkv_url {
+                cfg.rkv.url = u;
+            }
+
+            let db = match cfg.rkv.mode {
+                BackendMode::Embed => {
+                    let rkv_config = cfg.rkv.to_rkv_config();
+                    let db = DB::open(rkv_config).expect("failed to open rKV database");
+                    println!("rKV database opened at {}", cfg.rkv.data);
+                    db
+                }
+                BackendMode::Remote => {
+                    eprintln!("remote mode not yet implemented (url: {})", cfg.rkv.url);
+                    std::process::exit(1);
+                }
+            };
+
             let state = Arc::new(AppState {
-                admin_token,
-                writer_token,
-                reader_token,
-                ui_enabled: ui,
+                db,
+                admin_token: cfg.auth.admin_token,
+                writer_token: cfg.auth.writer_token,
+                reader_token: cfg.auth.reader_token,
+                ui_enabled: cfg.ui,
             });
 
             let app = build_router(state);
-            let addr = format!("{host}:{port}");
+            let addr = format!("{}:{}", cfg.host, cfg.port);
             println!("rill listening on {addr}");
             let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
             axum::serve(listener, app).await.unwrap();
@@ -239,10 +436,13 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use rkv::Config;
     use tower::ServiceExt;
 
     fn test_state(ui: bool) -> Arc<AppState> {
+        let db = DB::open(Config::in_memory()).unwrap();
         Arc::new(AppState {
+            db,
             admin_token: Some("admin-tok".to_string()),
             writer_token: Some("writer-tok".to_string()),
             reader_token: Some("reader-tok".to_string()),
@@ -251,7 +451,9 @@ mod tests {
     }
 
     fn open_state() -> Arc<AppState> {
+        let db = DB::open(Config::in_memory()).unwrap();
         Arc::new(AppState {
+            db,
             admin_token: None,
             writer_token: None,
             reader_token: None,
@@ -403,21 +605,37 @@ mod tests {
         assert!(body.contains("queues"));
     }
 
-    // --- Admin UI ---
+    // --- UI ---
 
     #[tokio::test]
-    async fn admin_ui_disabled() {
+    async fn ui_disabled() {
         let app = build_router(test_state(false));
-        let (status, _) = request(&app, "GET", "/admin", Some("admin-tok"), None).await;
+        let (status, _) = request(&app, "GET", "/ui", None, None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
-    async fn admin_ui_enabled() {
+    async fn ui_enabled() {
         let app = build_router(test_state(true));
-        let (status, body) = request(&app, "GET", "/admin", Some("admin-tok"), None).await;
+        let (status, body) = request(&app, "GET", "/ui", None, None).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("Rill Admin Dashboard"));
+        assert!(body.contains("Rill"));
+    }
+
+    #[tokio::test]
+    async fn ui_serves_js() {
+        let app = build_router(test_state(true));
+        let (status, body) = request(&app, "GET", "/ui/app.js", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Rill Web UI"));
+    }
+
+    #[tokio::test]
+    async fn ui_serves_css() {
+        let app = build_router(test_state(true));
+        let (status, body) = request(&app, "GET", "/ui/style.css", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("--accent"));
     }
 
     // --- Delete queue ---
