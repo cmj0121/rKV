@@ -29,7 +29,7 @@ COPY rkv/src rkv/src
 COPY rkv-ffi/src rkv-ffi/src
 
 # Touch source to invalidate cargo fingerprints from the dependency-cache step
-RUN find rill/src -name '*.rs' -exec touch {} +
+RUN find rill/src rkv/src -name '*.rs' -exec touch {} +
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
