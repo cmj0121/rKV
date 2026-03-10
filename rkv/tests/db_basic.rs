@@ -724,7 +724,7 @@ fn config_defaults() {
     assert_eq!(config.write_buffer_size, 4 * 1024 * 1024);
     assert_eq!(config.max_levels, 3);
     assert_eq!(config.block_size, 4 * 1024);
-    assert_eq!(config.cache_size, 8 * 1024 * 1024);
+    assert_eq!(config.cache_size, 64 * 1024 * 1024);
 }
 
 #[test]

@@ -512,7 +512,7 @@ The `Config` struct controls database behavior and LSM tuning parameters:
 | `write_buffer_size`    | `usize`           | 4 MB       | In-memory write buffer size before flush   |
 | `max_levels`           | `usize`           | 3          | Maximum number of LSM levels               |
 | `block_size`           | `usize`           | 4 KB       | SSTable block size                         |
-| `cache_size`           | `usize`           | 8 MB       | Block cache size for decompressed blocks   |
+| `cache_size`           | `usize`           | 64 MB      | Block cache size for decompressed blocks   |
 | `object_size`          | `usize`           | 1 KB       | Bin object size threshold (see above)      |
 | `compress`             | `bool`            | `true`     | LZ4-compress bin objects on disk           |
 | `object_sync_interval` | `usize`           | 128        | Pack sync threshold (0 = per-record)       |

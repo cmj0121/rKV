@@ -244,7 +244,7 @@ pub struct Config {
     pub max_levels: usize,
     /// SSTable block size in bytes (default: 4 KB).
     pub block_size: usize,
-    /// Block cache size in bytes (default: 8 MB).
+    /// Block cache size in bytes (default: 64 MB).
     pub cache_size: usize,
     /// Object size threshold in bytes for value separation (default: 1 KB).
     /// Values larger than this are stored as bin objects in the value log;
@@ -351,7 +351,7 @@ impl Config {
             write_buffer_size: 4 * 1024 * 1024,
             max_levels: 3,
             block_size: 4 * 1024,
-            cache_size: 8 * 1024 * 1024,
+            cache_size: 64 * 1024 * 1024,
             object_size: 1024,
             compress: true,
             bloom_bits: 10,
