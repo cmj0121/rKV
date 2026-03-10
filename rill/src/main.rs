@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     extract::{Path as AxumPath, State},
@@ -82,6 +83,7 @@ struct AppState {
     writer_token: Option<String>,
     reader_token: Option<String>,
     ui_enabled: bool,
+    started_at: Instant,
 }
 
 enum ApiError {
@@ -157,11 +159,25 @@ async fn root() -> &'static str {
     ""
 }
 
-async fn health() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/json")],
-        r#"{"status":"ok"}"#,
-    )
+async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let uptime = state.started_at.elapsed().as_secs();
+    let mode = match &state.backend {
+        Backend::Embed(_) => "embed",
+        Backend::Remote(_) => "remote",
+    };
+    let queue_count = state
+        .backend
+        .list_queues()
+        .await
+        .map(|q| q.len())
+        .unwrap_or(0);
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "mode": mode,
+        "queues": queue_count,
+        "uptime_seconds": uptime,
+    }))
 }
 
 async fn create_queue(
@@ -426,6 +442,7 @@ async fn main() {
                 writer_token: cfg.auth.writer_token,
                 reader_token: cfg.auth.reader_token,
                 ui_enabled: cfg.ui,
+                started_at: Instant::now(),
             });
 
             let app = build_router(state.clone());
@@ -489,6 +506,7 @@ mod tests {
             writer_token: Some("writer-tok".to_string()),
             reader_token: Some("reader-tok".to_string()),
             ui_enabled: ui,
+            started_at: Instant::now(),
         })
     }
 
@@ -500,6 +518,7 @@ mod tests {
             writer_token: None,
             reader_token: None,
             ui_enabled: false,
+            started_at: Instant::now(),
         })
     }
 
@@ -539,11 +558,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_returns_ok() {
+    async fn health_returns_diagnostics() {
         let app = build_router(test_state(false));
         let (status, body) = request(&app, "GET", "/health", None, None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains(r#""status":"ok"#));
+        assert!(body.contains(r#""mode":"embed"#));
+        assert!(body.contains(r#""version""#));
+        assert!(body.contains(r#""uptime_seconds""#));
+        assert!(body.contains(r#""queues""#));
     }
 
     // --- Open mode (no tokens) ---
