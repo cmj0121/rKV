@@ -1,3 +1,433 @@
-fn main() {
-    println!("rill — message queue powered by rKV");
+use std::sync::Arc;
+
+use axum::{
+    extract::{Path, State},
+    http::{header, HeaderMap, StatusCode},
+    response::{Html, IntoResponse, Response},
+    routing::{delete, get, post},
+    Json, Router,
+};
+use clap::Parser;
+use serde::Deserialize;
+use serde_json::json;
+
+#[derive(Parser)]
+#[command(name = "rill", about = "Message queue powered by rKV")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Start the HTTP server
+    Serve {
+        #[arg(long, default_value = "0.0.0.0", env = "RILL_HOST")]
+        host: String,
+
+        #[arg(long, default_value_t = 3000, env = "RILL_PORT")]
+        port: u16,
+
+        #[arg(long, env = "RILL_ADMIN_TOKEN")]
+        admin_token: Option<String>,
+
+        #[arg(long, env = "RILL_WRITER_TOKEN")]
+        writer_token: Option<String>,
+
+        #[arg(long, env = "RILL_READER_TOKEN")]
+        reader_token: Option<String>,
+
+        #[arg(long, env = "RILL_UI")]
+        ui: bool,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Role {
+    Reader = 0,
+    Writer = 1,
+    Admin = 2,
+}
+
+#[derive(Clone)]
+struct AppState {
+    admin_token: Option<String>,
+    writer_token: Option<String>,
+    reader_token: Option<String>,
+    ui_enabled: bool,
+}
+
+enum ApiError {
+    Unauthorized,
+    Forbidden,
+    NotFound(&'static str),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, body) = match self {
+            Self::Unauthorized => (StatusCode::UNAUTHORIZED, r#"{"error":"unauthorized"}"#),
+            Self::Forbidden => (StatusCode::FORBIDDEN, r#"{"error":"forbidden"}"#),
+            Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+        };
+        (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
+    }
+}
+
+impl AppState {
+    fn authenticate(&self, headers: &HeaderMap) -> Option<Role> {
+        if self.admin_token.is_none() && self.writer_token.is_none() && self.reader_token.is_none()
+        {
+            return Some(Role::Admin);
+        }
+
+        let token = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))?;
+
+        if self.admin_token.as_deref() == Some(token) {
+            Some(Role::Admin)
+        } else if self.writer_token.as_deref() == Some(token) {
+            Some(Role::Writer)
+        } else if self.reader_token.as_deref() == Some(token) {
+            Some(Role::Reader)
+        } else {
+            None
+        }
+    }
+
+    fn require_role(&self, headers: &HeaderMap, minimum: Role) -> Result<(), ApiError> {
+        match self.authenticate(headers) {
+            None => Err(ApiError::Unauthorized),
+            Some(role) if role >= minimum => Ok(()),
+            Some(_) => Err(ApiError::Forbidden),
+        }
+    }
+}
+
+// --- Request types ---
+
+#[derive(Deserialize)]
+struct CreateQueueRequest {
+    name: String,
+}
+
+// --- Handlers ---
+
+async fn root() -> &'static str {
+    ""
+}
+
+async fn health() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"status":"ok"}"#,
+    )
+}
+
+async fn create_queue(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateQueueRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    state.require_role(&headers, Role::Admin)?;
+    Ok(Json(json!({"queue": body.name, "created": true})))
+}
+
+async fn delete_queue(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    state.require_role(&headers, Role::Admin)?;
+    Ok(Json(json!({"queue": name, "deleted": true})))
+}
+
+async fn list_queues(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    state.require_role(&headers, Role::Reader)?;
+    Ok(Json(json!({"queues": []})))
+}
+
+async fn push_message(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(_name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    state.require_role(&headers, Role::Writer)?;
+    Ok(Json(json!({"pushed": true})))
+}
+
+async fn pop_message(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(_name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    state.require_role(&headers, Role::Reader)?;
+    Ok(Json(json!({"message": null})))
+}
+
+async fn admin_ui(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    state.require_role(&headers, Role::Admin)?;
+    if !state.ui_enabled {
+        return Err(ApiError::NotFound(
+            r#"{"error":"UI not enabled. Start with --ui flag."}"#,
+        ));
+    }
+    Ok(Html(
+        r#"<!DOCTYPE html>
+<html>
+<head><title>Rill Admin</title></head>
+<body>
+  <h1>Rill Admin Dashboard</h1>
+  <p>Coming soon.</p>
+</body>
+</html>"#,
+    ))
+}
+
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/", get(root))
+        .route("/health", get(health))
+        .route("/admin", get(admin_ui))
+        .route("/queues", post(create_queue))
+        .route("/queues", get(list_queues))
+        .route("/queues/{name}", post(push_message))
+        .route("/queues/{name}", get(pop_message))
+        .route("/queues/{name}", delete(delete_queue))
+        .with_state(state)
+}
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Command::Serve {
+            host,
+            port,
+            admin_token,
+            writer_token,
+            reader_token,
+            ui,
+        } => {
+            let state = Arc::new(AppState {
+                admin_token,
+                writer_token,
+                reader_token,
+                ui_enabled: ui,
+            });
+
+            let app = build_router(state);
+            let addr = format!("{host}:{port}");
+            println!("rill listening on {addr}");
+            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+            axum::serve(listener, app).await.unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn test_state(ui: bool) -> Arc<AppState> {
+        Arc::new(AppState {
+            admin_token: Some("admin-tok".to_string()),
+            writer_token: Some("writer-tok".to_string()),
+            reader_token: Some("reader-tok".to_string()),
+            ui_enabled: ui,
+        })
+    }
+
+    fn open_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            admin_token: None,
+            writer_token: None,
+            reader_token: None,
+            ui_enabled: false,
+        })
+    }
+
+    async fn request(
+        app: &Router,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder().method(method).uri(path);
+        if let Some(tok) = token {
+            builder = builder.header("Authorization", format!("Bearer {tok}"));
+        }
+        if body.is_some() {
+            builder = builder.header("Content-Type", "application/json");
+        }
+        let req = builder
+            .body(Body::from(body.unwrap_or("").to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    // --- Public endpoints ---
+
+    #[tokio::test]
+    async fn root_returns_200_empty() {
+        let app = build_router(test_state(false));
+        let (status, body) = request(&app, "GET", "/", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "");
+    }
+
+    #[tokio::test]
+    async fn health_returns_ok() {
+        let app = build_router(test_state(false));
+        let (status, body) = request(&app, "GET", "/health", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""status":"ok"#));
+    }
+
+    // --- Open mode (no tokens) ---
+
+    #[tokio::test]
+    async fn open_mode_allows_all() {
+        let app = build_router(open_state());
+        let (status, _) = request(&app, "GET", "/queues", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = request(&app, "POST", "/queues", None, Some(r#"{"name":"test"}"#)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // --- Auth: unauthorized ---
+
+    #[tokio::test]
+    async fn no_token_returns_401() {
+        let app = build_router(test_state(false));
+        let (status, body) = request(&app, "GET", "/queues", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("unauthorized"));
+    }
+
+    #[tokio::test]
+    async fn bad_token_returns_401() {
+        let app = build_router(test_state(false));
+        let (status, _) = request(&app, "GET", "/queues", Some("wrong"), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // --- Auth: forbidden ---
+
+    #[tokio::test]
+    async fn reader_cannot_push() {
+        let app = build_router(test_state(false));
+        let (status, body) = request(&app, "POST", "/queues/test", Some("reader-tok"), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("forbidden"));
+    }
+
+    #[tokio::test]
+    async fn writer_cannot_create_queue() {
+        let app = build_router(test_state(false));
+        let (status, _) = request(
+            &app,
+            "POST",
+            "/queues",
+            Some("writer-tok"),
+            Some(r#"{"name":"q"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn reader_cannot_delete_queue() {
+        let app = build_router(test_state(false));
+        let (status, _) = request(&app, "DELETE", "/queues/test", Some("reader-tok"), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    // --- Auth: allowed ---
+
+    #[tokio::test]
+    async fn admin_can_create_queue() {
+        let app = build_router(test_state(false));
+        let (status, body) = request(
+            &app,
+            "POST",
+            "/queues",
+            Some("admin-tok"),
+            Some(r#"{"name":"tasks"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("tasks"));
+        assert!(body.contains("true"));
+    }
+
+    #[tokio::test]
+    async fn writer_can_push() {
+        let app = build_router(test_state(false));
+        let (status, body) = request(&app, "POST", "/queues/test", Some("writer-tok"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("pushed"));
+    }
+
+    #[tokio::test]
+    async fn reader_can_pop() {
+        let app = build_router(test_state(false));
+        let (status, body) = request(&app, "GET", "/queues/test", Some("reader-tok"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("message"));
+    }
+
+    #[tokio::test]
+    async fn reader_can_list_queues() {
+        let app = build_router(test_state(false));
+        let (status, body) = request(&app, "GET", "/queues", Some("reader-tok"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("queues"));
+    }
+
+    // --- Admin UI ---
+
+    #[tokio::test]
+    async fn admin_ui_disabled() {
+        let app = build_router(test_state(false));
+        let (status, _) = request(&app, "GET", "/admin", Some("admin-tok"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn admin_ui_enabled() {
+        let app = build_router(test_state(true));
+        let (status, body) = request(&app, "GET", "/admin", Some("admin-tok"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Rill Admin Dashboard"));
+    }
+
+    // --- Delete queue ---
+
+    #[tokio::test]
+    async fn admin_can_delete_queue() {
+        let app = build_router(test_state(false));
+        let (status, body) = request(&app, "DELETE", "/queues/myq", Some("admin-tok"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("myq"));
+        assert!(body.contains("deleted"));
+    }
 }
