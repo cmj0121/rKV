@@ -286,6 +286,8 @@ fn default_limit() -> usize {
     20
 }
 
+const MAX_PEEK_LIMIT: usize = 100;
+
 async fn queue_info(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -309,9 +311,10 @@ async fn peek_messages(
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Reader)?;
     validate_queue_name(&name)?;
+    let limit = query.limit.min(MAX_PEEK_LIMIT);
     let messages = state
         .backend
-        .peek_messages(&name, query.offset, query.limit)
+        .peek_messages(&name, query.offset, limit)
         .await
         .map_err(ApiError::Internal)?;
     let items: Vec<_> = messages
@@ -791,6 +794,26 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    // --- Pagination limit cap ---
+
+    #[tokio::test]
+    async fn peek_limit_capped_at_max() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"cap"}"#)).await;
+        // Push 3 messages
+        for i in 0..3 {
+            request(&app, "POST", "/queues/cap", None, Some(&format!("m{i}"))).await;
+        }
+        // Request limit=999 — should still work (capped server-side to MAX_PEEK_LIMIT)
+        let (status, body) =
+            request(&app, "GET", "/queues/cap/messages?limit=999", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        // All 3 messages returned (3 < MAX_PEEK_LIMIT)
+        assert!(body.contains("m0"));
+        assert!(body.contains("m1"));
+        assert!(body.contains("m2"));
     }
 
     // --- Delete queue ---
