@@ -317,6 +317,11 @@ pub struct Config {
     /// Namespaces owned by this node in cluster mode.
     /// Empty means all namespaces are accepted (standalone behavior).
     pub owned_namespaces: Vec<String>,
+    /// Object store sync interval in records (default: 128).
+    /// Number of pack records written before fsync. Set to 0 for per-record
+    /// sync (maximum durability). Higher values improve bulk write throughput
+    /// at the cost of durability — a crash may lose up to this many records.
+    pub object_sync_interval: usize,
     /// Run in pure in-memory mode with no disk I/O (default: false).
     /// When enabled: no directories, AOL, SSTables, or bin objects are created;
     /// all data lives in the memtable and grows unbounded. Background flush and
@@ -371,6 +376,7 @@ impl Config {
             event_listener: None,
             shard_group: 0,
             owned_namespaces: Vec::new(),
+            object_sync_interval: 128,
             in_memory: false,
         }
     }
@@ -2379,8 +2385,12 @@ impl DB {
             }
             let ns = ns_entry.file_name().to_string_lossy().to_string();
             let repair_io: Arc<dyn io::IoBackend> = Arc::new(io::BufferedIo);
-            let store =
-                objects::ObjectStore::open(obj_root.parent().unwrap_or(obj_root), &ns, repair_io)?;
+            let store = objects::ObjectStore::open(
+                obj_root.parent().unwrap_or(obj_root),
+                &ns,
+                repair_io,
+                0,
+            )?;
 
             let hashes = store.list_object_hashes()?;
             for hash_str in &hashes {
@@ -3140,7 +3150,7 @@ impl DB {
             hashes
         };
 
-        let store = objects::ObjectStore::open(&config.path, ns, Arc::clone(io))?;
+        let store = objects::ObjectStore::open(&config.path, ns, Arc::clone(io), 0)?;
 
         // Delete orphaned loose files
         let on_disk = store.list_object_hashes()?;
@@ -3377,8 +3387,12 @@ impl DB {
             .write()
             .unwrap_or_else(|e| e.into_inner());
         if !map.contains_key(ns) {
-            let store =
-                objects::ObjectStore::open(&self.config.path, ns, Arc::clone(&self.io_backend))?;
+            let store = objects::ObjectStore::open(
+                &self.config.path,
+                ns,
+                Arc::clone(&self.io_backend),
+                self.config.object_sync_interval,
+            )?;
             map.insert(ns.to_owned(), store);
         }
         let ptr = map.get(ns).unwrap() as *const objects::ObjectStore;
