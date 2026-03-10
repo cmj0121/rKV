@@ -410,6 +410,10 @@ fn bench_profiling(n: usize) -> (std::time::Duration, Vec<(&'static str, u64, u6
         ns.put(i as i64, VALUE.as_slice(), None).unwrap();
     }
 
+    // Flush to SSTables so reads hit disk path, not just memtable
+    db.flush().unwrap();
+    db.wait_for_compaction();
+
     let mut indices: Vec<i64> = (0..n as i64).collect();
     fastrand::shuffle(&mut indices);
 
