@@ -425,12 +425,48 @@ async fn main() {
                 ui_enabled: cfg.ui,
             });
 
-            let app = build_router(state);
+            let app = build_router(state.clone());
             let addr = format!("{}:{}", cfg.host, cfg.port);
             println!("rill listening on {addr}");
             let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-            axum::serve(listener, app).await.unwrap();
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+                .unwrap();
+
+            // Flush embedded DB on shutdown
+            if let Backend::Embed(db) = &state.backend {
+                println!("flushing database...");
+                let _ = db.flush();
+            }
+            println!("rill stopped");
         }
+    }
+}
+
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => { println!("received SIGINT, shutting down..."); }
+        () = terminate => { println!("received SIGTERM, shutting down..."); }
     }
 }
 
