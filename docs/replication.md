@@ -151,9 +151,6 @@ with `ReadOnlyReplica`. All nodes bind-mount data to `.data/` subdirectories.
 For cluster/sharding mode (namespace-level sharding with gateway routing), use
 `docker compose --profile cluster up`. See [Cluster / Sharding](cluster.md) for details.
 
-For cluster/sharding mode (namespace-level sharding with gateway routing), use
-`docker compose --profile cluster up`. See [Cluster / Sharding](cluster.md) for details.
-
 ## Peer Replication
 
 Peer (master-master) replication allows two or more nodes to accept writes independently, with

@@ -598,9 +598,6 @@ It is the default because it provides excellent read throughput with minimal sys
 overhead. The trade-off is that write-heavy workloads may trigger unpredictable page faults
 and the engine has less control over I/O scheduling.
 
-**Stub status**: All three backends are defined but return `NotImplemented`. The actual
-I/O logic will be implemented when the storage layer is built.
-
 ### In-Memory Mode
 
 When `in_memory` is `true` (or `Config::in_memory()` is used), the database runs entirely
@@ -780,7 +777,6 @@ This section catalogs known dead code, missing API exposure, and architectural l
 | `PackEntry::original_size`       | `objects.rs` | Pack format field reserved for future use  |
 | `DumpRecord::expires_at_ms`      | `dump.rs`    | Format spec field, consumed when TTL added |
 | `replay_peer_record()`           | `mod.rs`     | Peer AOL replay, not yet wired in          |
-| `LazyMeta::first_key`            | `sstable.rs` | Accessed via `#[cfg(test)]` method only    |
 | `SSTableReader::features`        | `sstable.rs` | Accessed via `#[cfg(test)]` method only    |
 
 #### Missing API Exposure
