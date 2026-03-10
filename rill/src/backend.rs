@@ -243,3 +243,112 @@ impl Backend {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rkv::Config;
+
+    fn embed_backend() -> Backend {
+        let db = DB::open(Config::in_memory()).unwrap();
+        Backend::Embed(Box::new(db))
+    }
+
+    #[tokio::test]
+    async fn list_queues_empty() {
+        let b = embed_backend();
+        let queues = b.list_queues().await.unwrap();
+        assert!(queues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_and_list_queues() {
+        let b = embed_backend();
+        b.create_queue("tasks").await.unwrap();
+        b.create_queue("events").await.unwrap();
+        let mut queues = b.list_queues().await.unwrap();
+        queues.sort();
+        assert_eq!(queues, vec!["events", "tasks"]);
+    }
+
+    #[tokio::test]
+    async fn list_queues_ignores_non_rill_namespaces() {
+        let b = embed_backend();
+        b.create_queue("myq").await.unwrap();
+        if let Backend::Embed(db) = &b {
+            db.namespace("other_ns", None).unwrap();
+        }
+        let queues = b.list_queues().await.unwrap();
+        assert_eq!(queues, vec!["myq"]);
+    }
+
+    #[tokio::test]
+    async fn push_and_pop_fifo_order() {
+        let b = embed_backend();
+        b.create_queue("q").await.unwrap();
+        b.push_message("q", "first").await.unwrap();
+        b.push_message("q", "second").await.unwrap();
+        b.push_message("q", "third").await.unwrap();
+
+        assert_eq!(b.pop_message("q").await.unwrap(), Some("first".into()));
+        assert_eq!(b.pop_message("q").await.unwrap(), Some("second".into()));
+        assert_eq!(b.pop_message("q").await.unwrap(), Some("third".into()));
+        assert_eq!(b.pop_message("q").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn pop_empty_queue_returns_none() {
+        let b = embed_backend();
+        b.create_queue("empty").await.unwrap();
+        assert_eq!(b.pop_message("empty").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn delete_queue_clears_messages() {
+        let b = embed_backend();
+        b.create_queue("del").await.unwrap();
+        b.push_message("del", "msg1").await.unwrap();
+        b.push_message("del", "msg2").await.unwrap();
+        b.delete_queue("del").await.unwrap();
+        assert_eq!(b.pop_message("del").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn push_after_pop_continues_sequence() {
+        let b = embed_backend();
+        b.create_queue("seq").await.unwrap();
+        b.push_message("seq", "a").await.unwrap();
+        b.pop_message("seq").await.unwrap();
+        b.push_message("seq", "b").await.unwrap();
+        assert_eq!(b.pop_message("seq").await.unwrap(), Some("b".into()));
+    }
+
+    #[tokio::test]
+    async fn multiple_queues_are_isolated() {
+        let b = embed_backend();
+        b.create_queue("q1").await.unwrap();
+        b.create_queue("q2").await.unwrap();
+        b.push_message("q1", "from-q1").await.unwrap();
+        b.push_message("q2", "from-q2").await.unwrap();
+        assert_eq!(b.pop_message("q1").await.unwrap(), Some("from-q1".into()));
+        assert_eq!(b.pop_message("q2").await.unwrap(), Some("from-q2".into()));
+    }
+
+    #[test]
+    fn filter_queue_names_strips_prefix() {
+        let names = vec![
+            "rill_tasks".into(),
+            "rill_events".into(),
+            "other".into(),
+            "rill_".into(),
+        ];
+        let mut result = filter_queue_names(names);
+        result.sort();
+        assert_eq!(result, vec!["", "events", "tasks"]);
+    }
+
+    #[test]
+    fn queue_ns_adds_prefix() {
+        assert_eq!(queue_ns("tasks"), "rill_tasks");
+    }
+}
