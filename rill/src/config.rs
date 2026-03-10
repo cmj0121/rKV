@@ -207,3 +207,191 @@ default_max_size = "2gb"
 write_stall_size = "8mb"
 in_memory = false
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_is_embed() {
+        let cfg = RillConfig::default();
+        assert_eq!(cfg.rkv.mode, BackendMode::Embed);
+        assert_eq!(cfg.rkv.data, "./rill-data");
+        assert_eq!(cfg.port, 3000);
+    }
+
+    #[test]
+    fn yaml_template_parses() {
+        let cfg: RillConfig = serde_yaml::from_str(YAML_TEMPLATE).unwrap();
+        assert_eq!(cfg.rkv.mode, BackendMode::Embed);
+        assert_eq!(cfg.rkv.data, "./rill-data");
+        assert_eq!(cfg.rkv.url, "http://localhost:8321");
+        assert_eq!(cfg.rkv.storage.max_levels, 3);
+        assert_eq!(cfg.port, 3000);
+    }
+
+    #[test]
+    fn toml_template_parses() {
+        let cfg: RillConfig = toml::from_str(TOML_TEMPLATE).unwrap();
+        assert_eq!(cfg.rkv.mode, BackendMode::Embed);
+        assert_eq!(cfg.rkv.data, "./rill-data");
+        assert_eq!(cfg.rkv.url, "http://localhost:8321");
+        assert_eq!(cfg.rkv.storage.max_levels, 3);
+        assert_eq!(cfg.port, 3000);
+    }
+
+    #[test]
+    fn yaml_remote_mode() {
+        let yaml = r#"
+host: 0.0.0.0
+port: 4000
+rkv:
+  mode: remote
+  url: http://rkv-server:8321
+"#;
+        let cfg: RillConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.rkv.mode, BackendMode::Remote);
+        assert_eq!(cfg.rkv.url, "http://rkv-server:8321");
+        assert_eq!(cfg.port, 4000);
+    }
+
+    #[test]
+    fn toml_remote_mode() {
+        let toml_str = r#"
+port = 4000
+
+[rkv]
+mode = "remote"
+url = "http://rkv-server:8321"
+"#;
+        let cfg: RillConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.rkv.mode, BackendMode::Remote);
+        assert_eq!(cfg.rkv.url, "http://rkv-server:8321");
+    }
+
+    #[test]
+    fn yaml_embed_with_storage_tuning() {
+        let yaml = r#"
+rkv:
+  mode: embed
+  data: /var/lib/rill
+  storage:
+    write_buffer_size: 16mb
+    cache_size: 128mb
+    compression: zstd
+    max_levels: 5
+"#;
+        let cfg: RillConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.rkv.mode, BackendMode::Embed);
+        assert_eq!(cfg.rkv.data, "/var/lib/rill");
+        assert_eq!(cfg.rkv.storage.write_buffer_size.0, 16 * 1024 * 1024);
+        assert_eq!(cfg.rkv.storage.cache_size.0, 128 * 1024 * 1024);
+        assert_eq!(cfg.rkv.storage.max_levels, 5);
+    }
+
+    #[test]
+    fn yaml_auth_tokens() {
+        let yaml = r#"
+auth:
+  admin_token: admin123
+  writer_token: writer456
+  reader_token: reader789
+"#;
+        let cfg: RillConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.auth.admin_token.as_deref(), Some("admin123"));
+        assert_eq!(cfg.auth.writer_token.as_deref(), Some("writer456"));
+        assert_eq!(cfg.auth.reader_token.as_deref(), Some("reader789"));
+    }
+
+    #[test]
+    fn empty_yaml_uses_defaults() {
+        let cfg: RillConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(cfg.rkv.mode, BackendMode::Embed);
+        assert_eq!(cfg.host, "0.0.0.0");
+        assert_eq!(cfg.port, 3000);
+        assert!(cfg.auth.admin_token.is_none());
+    }
+
+    #[test]
+    fn to_rkv_config_uses_data_path() {
+        let mut cfg = RillConfig::default();
+        cfg.rkv.data = "/tmp/test-rill".to_string();
+        cfg.rkv.storage.max_levels = 7;
+        let rkv_cfg = cfg.rkv.to_rkv_config();
+        assert_eq!(rkv_cfg.path, std::path::PathBuf::from("/tmp/test-rill"));
+        assert_eq!(rkv_cfg.max_levels, 7);
+    }
+
+    #[test]
+    fn dump_yaml_roundtrip() {
+        let cfg = RillConfig::default();
+        let yaml = cfg.dump("yaml").unwrap();
+        let parsed: RillConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.rkv.mode, cfg.rkv.mode);
+        assert_eq!(parsed.port, cfg.port);
+        assert_eq!(parsed.rkv.data, cfg.rkv.data);
+    }
+
+    #[test]
+    fn dump_toml_roundtrip() {
+        let cfg = RillConfig::default();
+        let toml_str = cfg.dump("toml").unwrap();
+        let parsed: RillConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.rkv.mode, cfg.rkv.mode);
+        assert_eq!(parsed.port, cfg.port);
+        assert_eq!(parsed.rkv.data, cfg.rkv.data);
+    }
+
+    #[test]
+    fn dump_unsupported_format() {
+        let cfg = RillConfig::default();
+        assert!(cfg.dump("json").is_err());
+    }
+
+    #[test]
+    fn template_unsupported_format() {
+        assert!(RillConfig::template("json").is_err());
+    }
+
+    #[test]
+    fn load_file_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rill.yaml");
+        std::fs::write(
+            &path,
+            "port: 5000\nrkv:\n  mode: remote\n  url: http://db:8321\n",
+        )
+        .unwrap();
+        let cfg = RillConfig::load(&path).unwrap();
+        assert_eq!(cfg.port, 5000);
+        assert_eq!(cfg.rkv.mode, BackendMode::Remote);
+        assert_eq!(cfg.rkv.url, "http://db:8321");
+    }
+
+    #[test]
+    fn load_file_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rill.toml");
+        std::fs::write(
+            &path,
+            "port = 5000\n\n[rkv]\nmode = \"remote\"\nurl = \"http://db:8321\"\n",
+        )
+        .unwrap();
+        let cfg = RillConfig::load(&path).unwrap();
+        assert_eq!(cfg.port, 5000);
+        assert_eq!(cfg.rkv.mode, BackendMode::Remote);
+    }
+
+    #[test]
+    fn load_file_missing() {
+        assert!(RillConfig::load(Path::new("/nonexistent/rill.yaml")).is_err());
+    }
+
+    #[test]
+    fn load_file_bad_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rill.json");
+        std::fs::write(&path, "{}").unwrap();
+        assert!(RillConfig::load(&path).is_err());
+    }
+}

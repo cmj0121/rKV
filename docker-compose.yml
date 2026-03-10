@@ -95,10 +95,9 @@ services:
     platform: linux/amd64
     ports:
       - "3000:3000"
-    volumes:
-      - .data/primary:/data
     environment:
-      RILL_DATA: "/data"
+      RILL_RKV_MODE: "remote"
+      RILL_RKV_URL: "http://primary:8321"
       RILL_ADMIN_TOKEN: "admin-secret"
       RILL_WRITER_TOKEN: "writer-secret"
       RILL_READER_TOKEN: "reader-secret"
