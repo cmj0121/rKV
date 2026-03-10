@@ -833,6 +833,11 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                     "LZ4-compress bin objects",
                     c.compress.to_string(),
                 ),
+                (
+                    "  object.sync_interval",
+                    "pack sync threshold (0 = per-record)",
+                    c.object_sync_interval.to_string(),
+                ),
                 ("", "", String::new()),
                 ("I/O", "", String::new()),
                 (
@@ -1186,6 +1191,13 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected true or false"),
+        },
+        "object.sync_interval" => match value.parse::<usize>() {
+            Ok(v) => {
+                c.object_sync_interval = v;
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected a number"),
         },
         "lsm.verify_checksums" => match value.parse::<bool>() {
             Ok(v) => {
