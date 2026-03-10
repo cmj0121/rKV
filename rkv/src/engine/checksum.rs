@@ -137,6 +137,29 @@ mod tests {
     }
 
     #[test]
+    fn compute_slices_matches_compute() {
+        let a = b"hello ";
+        let b = b"world";
+        let c = b"!";
+        let combined = [&a[..], &b[..], &c[..]].concat();
+        assert_eq!(
+            Checksum::compute_slices(&[a, b, c]),
+            Checksum::compute(&combined)
+        );
+    }
+
+    #[test]
+    fn compute_slices_single_slice() {
+        let data = b"single";
+        assert_eq!(Checksum::compute_slices(&[data]), Checksum::compute(data));
+    }
+
+    #[test]
+    fn compute_slices_empty() {
+        assert_eq!(Checksum::compute_slices(&[]), Checksum::compute(b""));
+    }
+
+    #[test]
     fn from_raw_stores_values() {
         let cs = Checksum::from_raw(ChecksumAlgo::Crc32c, 0xDEAD_BEEF);
         assert_eq!(cs.algo(), ChecksumAlgo::Crc32c);

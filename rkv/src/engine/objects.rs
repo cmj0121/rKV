@@ -83,6 +83,10 @@ impl PackWriter {
         flags: u8,
         data: &[u8],
     ) -> Result<PackEntry> {
+        debug_assert!(
+            data.len() <= u32::MAX as usize,
+            "data exceeds pack u32 limit"
+        );
         let record_offset = self.offset;
         let data_len = data.len() as u32;
         let original_size_be = original_size.to_be_bytes();
@@ -343,10 +347,9 @@ impl ObjectStore {
         // Rotate pack file if current one exceeds size threshold
         if let Some(ref mut w) = state.writer {
             if w.offset >= PACK_MAX_SIZE {
-                // Sync any buffered records before dropping the old writer
-                if w.records_since_sync > 0 {
-                    w.file.get_ref().sync_all()?;
-                }
+                // Flush and sync any buffered records before dropping the old writer
+                w.file.flush()?;
+                w.file.get_ref().sync_all()?;
                 state.writer = None;
             }
         }
@@ -545,9 +548,8 @@ impl ObjectStore {
 
         // Close the active writer so all data is on disk
         if let Some(ref mut w) = state.writer {
-            if w.records_since_sync > 0 {
-                w.file.get_ref().sync_all()?;
-            }
+            w.file.flush()?;
+            w.file.get_ref().sync_all()?;
         }
         state.writer = None;
 
@@ -617,6 +619,10 @@ impl ObjectStore {
                 writer.append(hash, old_entry.original_size, old_entry.flags, &raw_data)?;
             new_index.insert(*hash, new_entry);
         }
+
+        // Ensure all records are durably written before updating the index
+        writer.file.flush()?;
+        writer.file.get_ref().sync_all()?;
 
         // Update index BEFORE deleting old packs (crash safety: if we crash
         // after index update but before deletion, the old packs remain on disk
