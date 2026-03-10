@@ -244,7 +244,7 @@ pub struct Config {
     pub max_levels: usize,
     /// SSTable block size in bytes (default: 4 KB).
     pub block_size: usize,
-    /// Block cache size in bytes (default: 8 MB).
+    /// Block cache size in bytes (default: 64 MB).
     pub cache_size: usize,
     /// Object size threshold in bytes for value separation (default: 1 KB).
     /// Values larger than this are stored as bin objects in the value log;
@@ -351,7 +351,7 @@ impl Config {
             write_buffer_size: 4 * 1024 * 1024,
             max_levels: 3,
             block_size: 4 * 1024,
-            cache_size: 8 * 1024 * 1024,
+            cache_size: 64 * 1024 * 1024,
             object_size: 1024,
             compress: true,
             bloom_bits: 10,
@@ -2085,6 +2085,7 @@ impl DB {
             )?;
             #[cfg(feature = "profiling")]
             reader.set_metrics(Arc::clone(&self.metrics));
+            reader.warm_cache();
             let sst_bytes = reader.size_bytes() as u64;
             let mut sst = self.sstables.write().unwrap_or_else(|e| e.into_inner());
             let levels = sst
@@ -2895,6 +2896,7 @@ impl DB {
 
                     let reader =
                         sstable::SSTableReader::open(&dst_path, seq, block_cache.clone(), &**io)?;
+                    reader.warm_cache();
                     total_size += reader.size_bytes();
                     moved_readers.push(reader);
                 }
@@ -3060,6 +3062,7 @@ impl DB {
 
         // Open the new reader and update the in-memory level structure
         let reader = sstable::SSTableReader::open(&output_path, seq, block_cache.clone(), &**io)?;
+        reader.warm_cache();
         let output_size = reader.size_bytes();
         let mut sst = sstables.write().unwrap_or_else(|e| e.into_inner());
         let levels = sst.entry(ns.to_owned()).or_insert_with(|| vec![Vec::new()]);

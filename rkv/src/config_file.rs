@@ -240,7 +240,7 @@ impl Default for StorageSection {
             write_buffer_size: Size(4 * 1024 * 1024),
             max_levels: 3,
             block_size: Size(4 * 1024),
-            cache_size: Size(8 * 1024 * 1024),
+            cache_size: Size(64 * 1024 * 1024),
             object_size: Size(1024),
             compress: true,
             bloom_bits: 10,
@@ -615,7 +615,7 @@ storage:
   write_buffer_size: 4mb
   max_levels: 3
   block_size: 4kb
-  cache_size: 8mb
+  cache_size: 64mb
   object_size: 1kb
   compress: true
   bloom_bits: 10
@@ -663,7 +663,7 @@ create_if_missing = true
 write_buffer_size = "4mb"
 max_levels = 3
 block_size = "4kb"
-cache_size = "8mb"
+cache_size = "64mb"
 object_size = "1kb"
 compress = true
 bloom_bits = 10

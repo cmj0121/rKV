@@ -1535,6 +1535,25 @@ impl SSTableReader {
         Ok(self.ensure_meta()?.index.clone())
     }
 
+    /// Pre-populate the block cache with all data blocks from this SSTable.
+    ///
+    /// Each block is decompressed from disk and inserted into the cache.
+    /// Blocks that are already cached are skipped (cache hit path).
+    /// Errors on individual blocks are silently ignored — warming is
+    /// best-effort and must not break the flush path.
+    pub(crate) fn warm_cache(&self) {
+        if self.cache.is_none() {
+            return;
+        }
+        let meta = match self.ensure_meta() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        for (i, ie) in meta.index.iter().enumerate() {
+            let _ = self.get_raw_block(ie, i, false);
+        }
+    }
+
     /// Check prefix bloom filter for scan skip.
     pub(crate) fn may_contain_prefix_for_scan(&self, prefix_bytes: &[u8]) -> bool {
         let meta = match self.ensure_meta() {

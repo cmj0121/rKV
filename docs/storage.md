@@ -145,7 +145,7 @@ when the same block is read repeatedly (e.g., hot keys, repeated scans). The cac
 └──────────────────────────────────────────────────────┘
 ```
 
-The `cache_size` config field controls the total byte budget (default 8 MB). Set to `0` to
+The `cache_size` config field controls the total byte budget (default 64 MB). Set to `0` to
 disable the cache entirely — all operations remain functionally correct but may be slower
 for workloads with repeated block access.
 
