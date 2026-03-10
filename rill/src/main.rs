@@ -84,6 +84,7 @@ struct AppState {
     writer_token: Option<String>,
     reader_token: Option<String>,
     ui_enabled: bool,
+    max_peek_limit: usize,
     started_at: Instant,
 }
 
@@ -287,8 +288,6 @@ fn default_limit() -> usize {
     20
 }
 
-const MAX_PEEK_LIMIT: usize = 100;
-
 async fn queue_info(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -312,7 +311,7 @@ async fn peek_messages(
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Reader)?;
     validate_queue_name(&name)?;
-    let limit = query.limit.min(MAX_PEEK_LIMIT);
+    let limit = query.limit.min(state.max_peek_limit);
     let messages = state
         .backend
         .peek_messages(&name, query.offset, limit)
@@ -473,6 +472,7 @@ async fn main() {
                 writer_token: cfg.auth.writer_token,
                 reader_token: cfg.auth.reader_token,
                 ui_enabled: cfg.ui,
+                max_peek_limit: cfg.max_peek_limit,
                 started_at: Instant::now(),
             });
 
@@ -537,6 +537,7 @@ mod tests {
             writer_token: Some("writer-tok".to_string()),
             reader_token: Some("reader-tok".to_string()),
             ui_enabled: ui,
+            max_peek_limit: 100,
             started_at: Instant::now(),
         })
     }
@@ -549,6 +550,7 @@ mod tests {
             writer_token: None,
             reader_token: None,
             ui_enabled: false,
+            max_peek_limit: 100,
             started_at: Instant::now(),
         })
     }
