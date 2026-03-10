@@ -8,8 +8,11 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
+use rkv::{Config, DB};
 use serde::Deserialize;
 use serde_json::json;
+
+const NS_PREFIX: &str = "rill_";
 
 #[derive(Parser)]
 #[command(name = "rill", about = "Message queue powered by rKV")]
@@ -22,6 +25,9 @@ struct Cli {
 enum Command {
     /// Start the HTTP server
     Serve {
+        #[arg(long, default_value = "./rill-data", env = "RILL_DATA")]
+        data: String,
+
         #[arg(long, default_value = "0.0.0.0", env = "RILL_HOST")]
         host: String,
 
@@ -49,8 +55,8 @@ enum Role {
     Admin = 2,
 }
 
-#[derive(Clone)]
 struct AppState {
+    db: DB,
     admin_token: Option<String>,
     writer_token: Option<String>,
     reader_token: Option<String>,
@@ -61,17 +67,32 @@ enum ApiError {
     Unauthorized,
     Forbidden,
     NotFound(&'static str),
+    Internal(String),
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, body) = match self {
-            Self::Unauthorized => (StatusCode::UNAUTHORIZED, r#"{"error":"unauthorized"}"#),
-            Self::Forbidden => (StatusCode::FORBIDDEN, r#"{"error":"forbidden"}"#),
-            Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            Self::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                r#"{"error":"unauthorized"}"#.to_string(),
+            ),
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                r#"{"error":"forbidden"}"#.to_string(),
+            ),
+            Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg.to_string()),
+            Self::Internal(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(r#"{{"error":"{msg}"}}"#),
+            ),
         };
         (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
     }
+}
+
+fn queue_ns(name: &str) -> String {
+    format!("{NS_PREFIX}{name}")
 }
 
 impl AppState {
@@ -132,6 +153,12 @@ async fn create_queue(
     Json(body): Json<CreateQueueRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Admin)?;
+    let ns_name = queue_ns(&body.name);
+    // Touch the namespace to ensure it exists
+    state
+        .db
+        .namespace(&ns_name, None)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(json!({"queue": body.name, "created": true})))
 }
 
@@ -141,6 +168,20 @@ async fn delete_queue(
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Admin)?;
+    let ns_name = queue_ns(&name);
+    let ns = state
+        .db
+        .namespace(&ns_name, None)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let prefix = rkv::Key::Str(String::new());
+    let keys: Vec<_> = ns
+        .keys(&prefix)
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .filter_map(|k| k.ok())
+        .collect();
+    for key in keys {
+        let _ = ns.delete(key);
+    }
     Ok(Json(json!({"queue": name, "deleted": true})))
 }
 
@@ -149,25 +190,70 @@ async fn list_queues(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Reader)?;
-    Ok(Json(json!({"queues": []})))
+    let all = state
+        .db
+        .list_namespaces()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let queues: Vec<&str> = all
+        .iter()
+        .filter_map(|ns| ns.strip_prefix(NS_PREFIX))
+        .collect();
+    Ok(Json(json!({"queues": queues})))
 }
 
 async fn push_message(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(_name): Path<String>,
+    Path(name): Path<String>,
+    body: String,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Writer)?;
+    let ns_name = queue_ns(&name);
+    let ns = state
+        .db
+        .namespace(&ns_name, None)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    // Use reverse scan to find the highest key, then increment
+    let prefix = rkv::Key::Str(String::new());
+    let next_id = match ns
+        .rkeys(&prefix)
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .next()
+    {
+        Some(Ok(rkv::Key::Int(n))) => n + 1,
+        _ => 0,
+    };
+    ns.put(rkv::Key::Int(next_id), body.as_bytes(), None)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(json!({"pushed": true})))
 }
 
 async fn pop_message(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(_name): Path<String>,
+    Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Reader)?;
-    Ok(Json(json!({"message": null})))
+    let ns_name = queue_ns(&name);
+    let ns = state
+        .db
+        .namespace(&ns_name, None)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    // Scan first key (head of FIFO)
+    let prefix = rkv::Key::Str(String::new());
+    let mut entries = ns
+        .entries(&prefix)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    match entries.next() {
+        Some(Ok((key, value))) => {
+            let data = value
+                .as_bytes()
+                .map(|b| String::from_utf8_lossy(b).to_string());
+            let _ = ns.delete(key);
+            Ok(Json(json!({"message": data})))
+        }
+        _ => Ok(Json(json!({"message": null}))),
+    }
 }
 
 async fn admin_ui(
@@ -211,6 +297,7 @@ async fn main() {
 
     match cli.command {
         Command::Serve {
+            data,
             host,
             port,
             admin_token,
@@ -218,7 +305,12 @@ async fn main() {
             reader_token,
             ui,
         } => {
+            let config = Config::new(&data);
+            let db = DB::open(config).expect("failed to open rKV database");
+            println!("rKV database opened at {data}");
+
             let state = Arc::new(AppState {
+                db,
                 admin_token,
                 writer_token,
                 reader_token,
@@ -242,7 +334,9 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_state(ui: bool) -> Arc<AppState> {
+        let db = DB::open(Config::in_memory()).unwrap();
         Arc::new(AppState {
+            db,
             admin_token: Some("admin-tok".to_string()),
             writer_token: Some("writer-tok".to_string()),
             reader_token: Some("reader-tok".to_string()),
@@ -251,7 +345,9 @@ mod tests {
     }
 
     fn open_state() -> Arc<AppState> {
+        let db = DB::open(Config::in_memory()).unwrap();
         Arc::new(AppState {
+            db,
             admin_token: None,
             writer_token: None,
             reader_token: None,
