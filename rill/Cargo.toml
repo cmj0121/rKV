@@ -1,0 +1,15 @@
+[package]
+name = "rill"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rill"
+path = "src/main.rs"
+
+[lib]
+name = "rill"
+path = "src/lib.rs"
+
+[dependencies]
+rkv = { path = "../rkv" }
