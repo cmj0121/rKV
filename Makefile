@@ -1,4 +1,4 @@
-.PHONY: all clean test fuzz run build bench bench-compare bench-compare-rocksdb bench-gen-data bench-server fuzz-server docker-up docker-down cluster-up cluster-down upgrade help $(SUBDIR)
+.PHONY: all clean test fuzz run build bench bench-profile bench-compare bench-compare-rocksdb bench-gen-data bench-server fuzz-server docker-up docker-down cluster-up cluster-down upgrade help $(SUBDIR)
 
 all: $(SUBDIR) 		# default action
 	@[ -f .git/hooks/pre-commit ] || pre-commit install --install-hooks
@@ -23,6 +23,9 @@ build:				# build the binary/library (all features)
 
 bench:				# run benchmarks
 	cargo run --bin bench --release
+
+bench-profile:			# run profiling benchmarks (get hot path breakdown)
+	cargo run --bin bench --features profiling --release
 
 bench-compare:			# run comparison benchmarks (pure Rust stores)
 	cargo run --bin bench_compare --features bench-compare --release

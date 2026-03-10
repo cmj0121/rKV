@@ -4,13 +4,10 @@ use std::sync::{Arc, Mutex};
 /// Cache key: (SSTable ID, block index within the SSTable).
 type CacheKey = (u64, u32);
 
-/// Raw entry parsed from a data block: (key_bytes, revision, expires_at_ms, value_tag, value_data).
-pub(crate) type RawEntry = (Vec<u8>, u128, u64, u8, Vec<u8>);
-
 /// Node in the slab-backed doubly-linked LRU list.
 struct LruNode {
     key: CacheKey,
-    entries: Arc<Vec<RawEntry>>,
+    data: Arc<Vec<u8>>,
     size: usize,
     prev: usize,
     next: usize,
@@ -21,9 +18,10 @@ const SENTINEL: usize = usize::MAX;
 
 /// LRU block cache for decompressed SSTable blocks.
 ///
-/// Stores parsed block entries keyed by `(sst_id, block_index)`. Uses a
-/// slab-allocated doubly-linked list for O(1) promotion and eviction, plus
-/// a `HashMap` for O(1) lookups.
+/// Stores raw decompressed block bytes keyed by `(sst_id, block_index)`.
+/// Uses a slab-allocated doubly-linked list for O(1) promotion and eviction,
+/// plus a `HashMap` for O(1) lookups. Callers search the cached bytes
+/// directly via restart-point binary search — no per-entry allocation.
 ///
 /// When `capacity` is 0, all operations are no-ops (cache disabled).
 pub(crate) struct BlockCache {
@@ -58,8 +56,8 @@ impl BlockCache {
 
     /// Look up a cached block and promote it to MRU position.
     ///
-    /// Returns a shared reference to the cached entries, or `None` on miss.
-    pub(crate) fn get(&mut self, sst_id: u64, block_index: u32) -> Option<Arc<Vec<RawEntry>>> {
+    /// Returns a shared reference to the cached decompressed bytes, or `None` on miss.
+    pub(crate) fn get(&mut self, sst_id: u64, block_index: u32) -> Option<Arc<Vec<u8>>> {
         if self.capacity == 0 {
             return None;
         }
@@ -68,7 +66,7 @@ impl BlockCache {
             self.hits += 1;
             self.detach(idx);
             self.push_front(idx);
-            Some(Arc::clone(&self.nodes[idx].entries))
+            Some(Arc::clone(&self.nodes[idx].data))
         } else {
             self.misses += 1;
             None
@@ -85,16 +83,10 @@ impl BlockCache {
 
     /// Insert a block into the cache, evicting LRU entries if needed.
     ///
-    /// Convenience wrapper that wraps entries in `Arc`.
+    /// Convenience wrapper that wraps data in `Arc`.
     #[cfg(test)]
-    pub(crate) fn insert(
-        &mut self,
-        sst_id: u64,
-        block_index: u32,
-        entries: Vec<RawEntry>,
-        size: usize,
-    ) {
-        self.insert_arc(sst_id, block_index, Arc::new(entries), size);
+    pub(crate) fn insert(&mut self, sst_id: u64, block_index: u32, data: Vec<u8>, size: usize) {
+        self.insert_arc(sst_id, block_index, Arc::new(data), size);
     }
 
     /// Insert a pre-wrapped `Arc` block into the cache, evicting LRU
@@ -106,7 +98,7 @@ impl BlockCache {
         &mut self,
         sst_id: u64,
         block_index: u32,
-        entries: Arc<Vec<RawEntry>>,
+        data: Arc<Vec<u8>>,
         size: usize,
     ) {
         if self.capacity == 0 || size > self.capacity {
@@ -118,7 +110,7 @@ impl BlockCache {
         // If already present, update in place and promote
         if let Some(&idx) = self.map.get(&key) {
             self.current_size -= self.nodes[idx].size;
-            self.nodes[idx].entries = Arc::clone(&entries);
+            self.nodes[idx].data = Arc::clone(&data);
             self.nodes[idx].size = size;
             self.current_size += size;
             self.detach(idx);
@@ -135,7 +127,7 @@ impl BlockCache {
         // Allocate a node (reuse free slot or push new)
         let node = LruNode {
             key,
-            entries,
+            data,
             size,
             prev: SENTINEL,
             next: SENTINEL,
@@ -282,7 +274,7 @@ impl ShardedBlockCache {
 
     /// Look up a cached block and promote it to MRU position within
     /// its shard.
-    pub(crate) fn get(&self, sst_id: u64, block_index: u32) -> Option<Arc<Vec<RawEntry>>> {
+    pub(crate) fn get(&self, sst_id: u64, block_index: u32) -> Option<Arc<Vec<u8>>> {
         let idx = Self::shard_index(sst_id, block_index);
         let mut shard = self.shards[idx].lock().unwrap_or_else(|e| e.into_inner());
         shard.get(sst_id, block_index)
@@ -293,12 +285,12 @@ impl ShardedBlockCache {
         &self,
         sst_id: u64,
         block_index: u32,
-        entries: Arc<Vec<RawEntry>>,
+        data: Arc<Vec<u8>>,
         size: usize,
     ) {
         let idx = Self::shard_index(sst_id, block_index);
         let mut shard = self.shards[idx].lock().unwrap_or_else(|e| e.into_inner());
-        shard.insert_arc(sst_id, block_index, entries, size);
+        shard.insert_arc(sst_id, block_index, data, size);
     }
 
     /// Remove all cached blocks for a given SSTable across all shards.
@@ -326,26 +318,20 @@ impl ShardedBlockCache {
     }
 }
 
-/// Estimate the in-memory size of a block's raw entries.
+/// Estimate the in-memory size of decompressed block bytes.
 ///
-/// Per entry: key_bytes.len() + 16 (revision) + 8 (expires_at_ms) + 1 (tag) + value_data.len() + 48 (Vec overhead).
-/// Plus 64 bytes for the Vec<RawEntry> itself and node overhead.
-pub(crate) fn estimate_block_size(entries: &[RawEntry]) -> usize {
-    let mut size = 64; // Vec + node overhead
-    for (key_bytes, _, _, _, value_data) in entries {
-        size += key_bytes.len() + 16 + 8 + 1 + value_data.len() + 48;
-    }
-    size
+/// The cached data is a `Vec<u8>` of the raw decompressed block.
+/// Add 64 bytes for Arc/Vec/node overhead.
+pub(crate) fn estimate_block_size(data: &[u8]) -> usize {
+    data.len() + 64
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_entries(n: usize) -> Vec<RawEntry> {
-        (0..n)
-            .map(|i| (vec![i as u8], 0u128, 0u64, 0x00, vec![i as u8; 10]))
-            .collect()
+    fn make_block_data(n: usize) -> Vec<u8> {
+        vec![0u8; 64 * n]
     }
 
     #[test]
@@ -358,8 +344,8 @@ mod tests {
     #[test]
     fn disabled_cache_skips_all() {
         let mut cache = BlockCache::new(0);
-        let entries = make_entries(1);
-        cache.insert(1, 0, entries.clone(), 100);
+        let data = make_block_data(1);
+        cache.insert(1, 0, data, 100);
         assert!(cache.is_empty());
         assert!(cache.get(1, 0).is_none());
     }
@@ -367,13 +353,13 @@ mod tests {
     #[test]
     fn insert_and_get() {
         let mut cache = BlockCache::new(4096);
-        let entries = make_entries(3);
-        let size = estimate_block_size(&entries);
-        cache.insert(1, 0, entries.clone(), size);
+        let data = make_block_data(3);
+        let size = estimate_block_size(&data);
+        cache.insert(1, 0, data.clone(), size);
 
         assert_eq!(cache.len(), 1);
         let got = cache.get(1, 0).unwrap();
-        assert_eq!(*got, entries);
+        assert_eq!(*got, data);
     }
 
     #[test]
@@ -385,18 +371,13 @@ mod tests {
     #[test]
     fn evicts_lru_when_full() {
         let mut cache = BlockCache::new(200);
-        let e1 = make_entries(1);
-        let e2 = make_entries(1);
-        let e3 = make_entries(1);
 
-        // Each entry ~60 bytes (64 overhead + 1 + 1 + 10 + 48 = 124),
-        // use explicit sizes for predictability.
-        cache.insert(1, 0, e1, 80);
-        cache.insert(2, 0, e2, 80);
+        cache.insert(1, 0, make_block_data(1), 80);
+        cache.insert(2, 0, make_block_data(1), 80);
         // Both fit (160 <= 200)
         assert_eq!(cache.len(), 2);
 
-        cache.insert(3, 0, e3, 80);
+        cache.insert(3, 0, make_block_data(1), 80);
         // Evicts LRU (sst 1, block 0) to fit (240 > 200)
         assert_eq!(cache.len(), 2);
         assert!(cache.get(1, 0).is_none());
@@ -407,18 +388,15 @@ mod tests {
     #[test]
     fn get_promotes_to_mru() {
         let mut cache = BlockCache::new(200);
-        let e1 = make_entries(1);
-        let e2 = make_entries(1);
-        let e3 = make_entries(1);
 
-        cache.insert(1, 0, e1, 80);
-        cache.insert(2, 0, e2, 80);
+        cache.insert(1, 0, make_block_data(1), 80);
+        cache.insert(2, 0, make_block_data(1), 80);
 
         // Access sst 1 to promote it
         cache.get(1, 0);
 
         // Insert sst 3, should evict sst 2 (now LRU)
-        cache.insert(3, 0, e3, 80);
+        cache.insert(3, 0, make_block_data(1), 80);
         assert!(cache.get(2, 0).is_none());
         assert!(cache.get(1, 0).is_some());
         assert!(cache.get(3, 0).is_some());
@@ -427,10 +405,10 @@ mod tests {
     #[test]
     fn evict_sst_removes_all_blocks() {
         let mut cache = BlockCache::new(4096);
-        cache.insert(1, 0, make_entries(1), 100);
-        cache.insert(1, 1, make_entries(1), 100);
-        cache.insert(1, 2, make_entries(1), 100);
-        cache.insert(2, 0, make_entries(1), 100);
+        cache.insert(1, 0, make_block_data(1), 100);
+        cache.insert(1, 1, make_block_data(1), 100);
+        cache.insert(1, 2, make_block_data(1), 100);
+        cache.insert(2, 0, make_block_data(1), 100);
 
         assert_eq!(cache.len(), 4);
         cache.evict_sst(1);
@@ -444,31 +422,30 @@ mod tests {
     #[test]
     fn skip_oversized_block() {
         let mut cache = BlockCache::new(100);
-        let entries = make_entries(1);
-        cache.insert(1, 0, entries, 200); // larger than capacity
+        cache.insert(1, 0, make_block_data(1), 200); // larger than capacity
         assert!(cache.is_empty());
     }
 
     #[test]
     fn update_existing_entry() {
         let mut cache = BlockCache::new(4096);
-        let e1 = make_entries(2);
-        let e2 = make_entries(3);
+        let d1 = make_block_data(2);
+        let d2 = make_block_data(3);
 
-        cache.insert(1, 0, e1, 100);
-        cache.insert(1, 0, e2.clone(), 150);
+        cache.insert(1, 0, d1, 100);
+        cache.insert(1, 0, d2.clone(), 150);
 
         assert_eq!(cache.len(), 1);
         let got = cache.get(1, 0).unwrap();
-        assert_eq!(*got, e2);
+        assert_eq!(*got, d2);
     }
 
     #[test]
     fn estimate_block_size_works() {
-        let entries = make_entries(2);
-        let size = estimate_block_size(&entries);
-        // 64 + 2 * (1 + 16 + 8 + 1 + 10 + 48) = 64 + 168 = 232
-        assert_eq!(size, 232);
+        let data = make_block_data(2);
+        let size = estimate_block_size(&data);
+        // 128 bytes of data + 64 overhead = 192
+        assert_eq!(size, 192);
     }
 
     #[test]
@@ -483,7 +460,7 @@ mod tests {
         assert_eq!(cache.misses(), 1);
 
         // Insert and hit
-        cache.insert(1, 0, make_entries(1), 100);
+        cache.insert(1, 0, make_block_data(1), 100);
         cache.get(1, 0);
         assert_eq!(cache.hits(), 1);
         assert_eq!(cache.misses(), 1);
@@ -512,12 +489,12 @@ mod tests {
     #[test]
     fn sharded_insert_and_get() {
         let cache = ShardedBlockCache::new(65536);
-        let entries = Arc::new(make_entries(3));
-        let size = estimate_block_size(&entries);
-        cache.insert_arc(1, 0, Arc::clone(&entries), size);
+        let data = Arc::new(make_block_data(3));
+        let size = estimate_block_size(&data);
+        cache.insert_arc(1, 0, Arc::clone(&data), size);
 
         let got = cache.get(1, 0).unwrap();
-        assert_eq!(*got, *entries);
+        assert_eq!(*got, *data);
     }
 
     #[test]
@@ -529,11 +506,10 @@ mod tests {
     #[test]
     fn sharded_evict_sst_removes_across_shards() {
         let cache = ShardedBlockCache::new(1_000_000);
-        // Insert blocks for sst 1 with different block indices (likely different shards)
         for bi in 0..32 {
-            cache.insert_arc(1, bi, Arc::new(make_entries(1)), 100);
+            cache.insert_arc(1, bi, Arc::new(make_block_data(1)), 100);
         }
-        cache.insert_arc(2, 0, Arc::new(make_entries(1)), 100);
+        cache.insert_arc(2, 0, Arc::new(make_block_data(1)), 100);
 
         cache.evict_sst(1);
 
@@ -557,7 +533,7 @@ mod tests {
         assert_eq!(cache.misses(), 1);
 
         // Insert and hit
-        cache.insert_arc(1, 0, Arc::new(make_entries(1)), 100);
+        cache.insert_arc(1, 0, Arc::new(make_block_data(1)), 100);
         cache.get(1, 0);
         assert_eq!(cache.hits(), 1);
         assert_eq!(cache.misses(), 1);
@@ -566,20 +542,18 @@ mod tests {
     #[test]
     fn sharded_zero_capacity_disabled() {
         let cache = ShardedBlockCache::new(0);
-        cache.insert_arc(1, 0, Arc::new(make_entries(1)), 100);
+        cache.insert_arc(1, 0, Arc::new(make_block_data(1)), 100);
         assert!(cache.get(1, 0).is_none());
     }
 
     #[test]
     fn sharded_distributes_across_shards() {
-        // Different (sst_id, block_index) pairs should map to different shards
         let mut seen = std::collections::HashSet::new();
         for sst_id in 0..8u64 {
             for bi in 0..4u32 {
                 seen.insert(ShardedBlockCache::shard_index(sst_id, bi));
             }
         }
-        // With 32 distinct keys, we should hit at least 8 of 16 shards
         assert!(
             seen.len() >= 8,
             "expected >=8 shards used, got {}",

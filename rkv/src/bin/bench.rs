@@ -398,7 +398,96 @@ fn format_size(n: usize) -> String {
     }
 }
 
+/// Run profiling benchmark: put N keys, then random get N keys, then print
+/// sub-operation breakdown from profiling histograms.
+#[cfg(feature = "profiling")]
+fn bench_profiling(n: usize) -> (std::time::Duration, Vec<(&'static str, u64, u64)>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = DB::open(Config::new(tmp.path())).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    for i in 0..n {
+        ns.put(i as i64, VALUE.as_slice(), None).unwrap();
+    }
+
+    // Flush to SSTables so reads hit disk path, not just memtable
+    db.flush().unwrap();
+    db.wait_for_compaction();
+
+    let mut indices: Vec<i64> = (0..n as i64).collect();
+    fastrand::shuffle(&mut indices);
+
+    let start = Instant::now();
+    for &i in &indices {
+        ns.get(i).unwrap();
+    }
+    let elapsed = start.elapsed();
+
+    let report = db.profiling_report();
+    (elapsed, report)
+}
+
+#[cfg(feature = "profiling")]
+fn format_nanos(ns: u64) -> String {
+    if ns < 1_000 {
+        format!("{ns} ns")
+    } else if ns < 1_000_000 {
+        format!("{:.2} µs", ns as f64 / 1_000.0)
+    } else if ns < 1_000_000_000 {
+        format!("{:.2} ms", ns as f64 / 1_000_000.0)
+    } else {
+        format!("{:.2} s", ns as f64 / 1_000_000_000.0)
+    }
+}
+
+#[allow(unreachable_code)]
 fn main() {
+    // Profiling mode: run profiling benchmark and exit
+    #[cfg(feature = "profiling")]
+    {
+        let prof_sizes: &[usize] = &[1_000, 16_000, 1_000_000];
+        for &n in prof_sizes {
+            eprintln!("Profiling get n={n}...");
+            let (elapsed, report) = bench_profiling(n);
+            let total_ns = elapsed.as_nanos() as u64;
+
+            eprintln!(
+                "\n## Profiling (get, {} keys, total: {})\n",
+                format_size(n),
+                format_nanos(total_ns)
+            );
+            eprintln!(
+                "| {:<20} | {:>10} | {:>12} | {:>10} | {:>8} |",
+                "Probe", "Count", "Total", "Avg", "% of get"
+            );
+            eprintln!(
+                "|{:-<22}|{:-<12}|{:-<14}|{:-<12}|{:-<10}|",
+                "", "", "", "", ""
+            );
+            for (name, count, sum_ns) in &report {
+                if *count == 0 {
+                    continue;
+                }
+                let avg_ns = sum_ns / count;
+                let pct = if total_ns > 0 {
+                    *sum_ns as f64 / total_ns as f64 * 100.0
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "| {:<20} | {:>10} | {:>12} | {:>10} | {:>7.1}% |",
+                    name,
+                    count,
+                    format_nanos(*sum_ns),
+                    format_nanos(avg_ns),
+                    pct
+                );
+            }
+            eprintln!();
+        }
+        return;
+    }
+
     eprintln!("Collecting machine info...");
     let info = collect_machine_info();
 

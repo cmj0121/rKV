@@ -106,6 +106,43 @@ impl Drop for Timer<'_> {
     }
 }
 
+// --- Profiling timer macro ---
+
+/// Record a sub-operation duration into a profiling histogram.
+/// Compiles to nothing when the `profiling` feature is disabled.
+///
+/// Usage: `prof_timer!(metrics_ref, field_name)` where `metrics_ref`
+/// is `&Metrics`. Creates a RAII timer `_prof_t` that records on drop.
+#[cfg(feature = "profiling")]
+macro_rules! prof_timer {
+    ($metrics:expr, $field:ident) => {
+        let _prof_t = $crate::engine::metrics::Timer::start(&$metrics.$field);
+    };
+}
+
+#[cfg(not(feature = "profiling"))]
+macro_rules! prof_timer {
+    ($metrics:expr, $field:ident) => {};
+}
+
+/// Create an `Option<Timer>` that records into a profiling histogram on drop.
+/// Works with `Option<&Metrics>` — returns `None` when metrics is `None`.
+/// Compiles to nothing when the `profiling` feature is disabled.
+#[cfg(feature = "profiling")]
+macro_rules! prof_opt_timer {
+    ($opt_metrics:expr, $field:ident) => {
+        let _prof_t = $opt_metrics.map(|m| $crate::engine::metrics::Timer::start(&m.$field));
+    };
+}
+
+#[cfg(not(feature = "profiling"))]
+macro_rules! prof_opt_timer {
+    ($opt_metrics:expr, $field:ident) => {};
+}
+
+pub(crate) use prof_opt_timer;
+pub(crate) use prof_timer;
+
 // --- Metrics ---
 
 /// Central metrics registry for the database engine.
@@ -127,6 +164,26 @@ pub(crate) struct Metrics {
     pub(crate) compaction_total: AtomicU64,
     pub(crate) bytes_flushed: AtomicU64,
     pub(crate) bytes_compacted: AtomicU64,
+
+    // Profiling histograms (get hot path sub-operations)
+    #[cfg(feature = "profiling")]
+    pub(crate) prof_memtable_lookup: Histogram,
+    #[cfg(feature = "profiling")]
+    pub(crate) prof_sst_total: Histogram,
+    #[cfg(feature = "profiling")]
+    pub(crate) prof_sst_bloom_check: Histogram,
+    #[cfg(feature = "profiling")]
+    pub(crate) prof_sst_index_search: Histogram,
+    #[cfg(feature = "profiling")]
+    pub(crate) prof_sst_block_read: Histogram,
+    #[cfg(feature = "profiling")]
+    pub(crate) prof_sst_cache_hit: Histogram,
+    #[cfg(feature = "profiling")]
+    pub(crate) prof_sst_cache_miss: Histogram,
+    #[cfg(feature = "profiling")]
+    pub(crate) prof_key_serialize: Histogram,
+    #[cfg(feature = "profiling")]
+    pub(crate) prof_value_resolve: Histogram,
 }
 
 impl Metrics {
@@ -142,7 +199,44 @@ impl Metrics {
             compaction_total: AtomicU64::new(0),
             bytes_flushed: AtomicU64::new(0),
             bytes_compacted: AtomicU64::new(0),
+            #[cfg(feature = "profiling")]
+            prof_memtable_lookup: Histogram::new(),
+            #[cfg(feature = "profiling")]
+            prof_sst_total: Histogram::new(),
+            #[cfg(feature = "profiling")]
+            prof_sst_bloom_check: Histogram::new(),
+            #[cfg(feature = "profiling")]
+            prof_sst_index_search: Histogram::new(),
+            #[cfg(feature = "profiling")]
+            prof_sst_block_read: Histogram::new(),
+            #[cfg(feature = "profiling")]
+            prof_sst_cache_hit: Histogram::new(),
+            #[cfg(feature = "profiling")]
+            prof_sst_cache_miss: Histogram::new(),
+            #[cfg(feature = "profiling")]
+            prof_key_serialize: Histogram::new(),
+            #[cfg(feature = "profiling")]
+            prof_value_resolve: Histogram::new(),
         }
+    }
+}
+
+/// Names and accessors for profiling histograms.
+#[cfg(feature = "profiling")]
+impl Metrics {
+    /// Return all profiling histograms as `(name, &Histogram)` pairs for reporting.
+    pub(crate) fn profiling_histograms(&self) -> Vec<(&'static str, &Histogram)> {
+        vec![
+            ("memtable_lookup", &self.prof_memtable_lookup),
+            ("sst_total", &self.prof_sst_total),
+            ("sst_bloom_check", &self.prof_sst_bloom_check),
+            ("sst_index_search", &self.prof_sst_index_search),
+            ("sst_block_read", &self.prof_sst_block_read),
+            ("sst_cache_hit", &self.prof_sst_cache_hit),
+            ("sst_cache_miss", &self.prof_sst_cache_miss),
+            ("key_serialize", &self.prof_key_serialize),
+            ("value_resolve", &self.prof_value_resolve),
+        ]
     }
 }
 

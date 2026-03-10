@@ -13,7 +13,10 @@ use super::revision::RevisionID;
 use super::value::Value;
 use super::Compression;
 
-pub(crate) use cache::RawEntry;
+use cache::estimate_block_size;
+
+/// Raw entry parsed from a data block: (key_bytes, revision, expires_at_ms, value_tag, value_data).
+pub(crate) type RawEntry = (Vec<u8>, u128, u64, u8, Vec<u8>);
 
 // --- Constants ---
 
@@ -412,7 +415,6 @@ struct LazyMeta {
     filter: KeyFilter,
     prefix_filter: Option<KeyFilter>,
     filter_prefix_len: usize,
-    #[allow(dead_code)] // accessed via #[cfg(test)] first_key() method
     first_key: Option<Vec<u8>>,
 }
 
@@ -423,6 +425,34 @@ struct FooterOffsets {
     filter_offset: usize,
     filter_size: usize,
     filter_format: u8,
+}
+
+/// Zero-copy view over the restart point trailer in a decompressed block.
+///
+/// The trailer is a contiguous array of little-endian `u32` offsets.
+/// This avoids allocating a `Vec<u32>` on every block access.
+pub(crate) struct RestartIndex<'a>(&'a [u8]);
+
+impl<'a> RestartIndex<'a> {
+    /// Number of restart points.
+    fn len(&self) -> usize {
+        self.0.len() / 4
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Get the restart offset at index `i`.
+    fn get(&self, i: usize) -> u32 {
+        let off = i * 4;
+        u32::from_le_bytes([
+            self.0[off],
+            self.0[off + 1],
+            self.0[off + 2],
+            self.0[off + 3],
+        ])
+    }
 }
 
 /// Reads key-value entries from an SSTable file.
@@ -449,6 +479,9 @@ pub(crate) struct SSTableReader {
     footer_offsets: FooterOffsets,
     /// Lazily-parsed metadata (index, bloom, first key).
     lazy_meta: OnceLock<std::result::Result<LazyMeta, String>>,
+    /// Shared metrics for profiling instrumentation.
+    #[cfg(feature = "profiling")]
+    metrics: Option<Arc<super::metrics::Metrics>>,
 }
 
 impl SSTableReader {
@@ -569,6 +602,8 @@ impl SSTableReader {
             has_restarts,
             footer_offsets,
             lazy_meta: OnceLock::new(),
+            #[cfg(feature = "profiling")]
+            metrics: None,
         })
     }
 
@@ -740,6 +775,7 @@ impl SSTableReader {
     /// Uses the bloom filter for fast negative answers, binary search
     /// for block selection, and binary search within blocks via restart
     /// points (or `partition_point` on cached entries).
+    #[cfg(test)]
     pub(crate) fn get(
         &self,
         key: &Key,
@@ -751,25 +787,68 @@ impl SSTableReader {
             return Ok(None);
         }
 
-        let mut key_buf = Vec::with_capacity(key.encoded_len());
-        key.write_bytes_to(&mut key_buf);
+        let key_buf = {
+            super::metrics::prof_opt_timer!(self.metrics.as_deref(), prof_key_serialize);
+            let mut buf = Vec::with_capacity(key.encoded_len());
+            key.write_bytes_to(&mut buf);
+            buf
+        };
 
-        // Bloom filter check: skip this SSTable if the key is definitely absent
-        if !meta.filter.may_contain(&key_buf) {
+        self.get_with_key_bytes(&key_buf, verify_checksums)
+    }
+
+    /// Look up a key using pre-serialized key bytes.
+    ///
+    /// This avoids repeated key serialization when the same key is searched
+    /// across multiple SSTables.
+    pub(crate) fn get_with_key_bytes(
+        &self,
+        key_buf: &[u8],
+        verify_checksums: bool,
+    ) -> Result<Option<(Value, RevisionID, u64)>> {
+        let meta = self.ensure_meta()?;
+
+        if meta.index.is_empty() {
             return Ok(None);
         }
 
-        // Binary search: find the first block whose last_key >= target
-        let block_idx = match meta
-            .index
-            .binary_search_by(|e| e.last_key.as_slice().cmp(&key_buf))
+        #[cfg(feature = "profiling")]
+        let prof_m = self.metrics.as_deref();
+
+        // Key-range pre-filter: skip if key is outside [first_key, last_key]
+        if let Some(ref first_key) = meta.first_key {
+            if key_buf < first_key.as_slice() {
+                return Ok(None);
+            }
+        }
+        if let Some(last_ie) = meta.index.last() {
+            if key_buf > last_ie.last_key.as_slice() {
+                return Ok(None);
+            }
+        }
+
+        // Bloom filter check: skip this SSTable if the key is definitely absent
         {
-            Ok(i) => i,
-            Err(i) => {
-                if i >= meta.index.len() {
-                    return Ok(None); // key beyond all blocks
+            super::metrics::prof_opt_timer!(prof_m, prof_sst_bloom_check);
+            if !meta.filter.may_contain(key_buf) {
+                return Ok(None);
+            }
+        }
+
+        // Binary search: find the first block whose last_key >= target
+        let block_idx = {
+            super::metrics::prof_opt_timer!(prof_m, prof_sst_index_search);
+            match meta
+                .index
+                .binary_search_by(|e| e.last_key.as_slice().cmp(key_buf))
+            {
+                Ok(i) => i,
+                Err(i) => {
+                    if i >= meta.index.len() {
+                        return Ok(None); // key beyond all blocks
+                    }
+                    i
                 }
-                i
             }
         };
 
@@ -779,11 +858,13 @@ impl SSTableReader {
         // contain more entries for the same key.
         for bi in block_idx..meta.index.len() {
             let ie = &meta.index[bi];
-            let found_in_block =
-                self.get_from_block(ie, bi, &key_buf, verify_checksums, &mut last_match)?;
+            let found_in_block = {
+                super::metrics::prof_opt_timer!(prof_m, prof_sst_block_read);
+                self.get_from_block(ie, bi, key_buf, verify_checksums, &mut last_match)?
+            };
 
             if found_in_block {
-                if ie.last_key.as_slice() != key_buf.as_slice() {
+                if ie.last_key.as_slice() != key_buf {
                     return Ok(last_match);
                 }
                 // last_key == target → entries may continue in next block
@@ -798,10 +879,9 @@ impl SSTableReader {
     /// Search a single block for a key, updating `last_match` with the latest
     /// revision found. Returns `true` if any match was found in this block.
     ///
-    /// On cache hit: binary search via `partition_point`.
-    /// On cache miss (no cache) with restart points: targeted parse via
-    ///   `find_key_in_block` — skips full entry parsing for non-matching entries.
-    /// On cache miss (cache enabled): full parse + cache insert + binary search.
+    /// Always uses restart-point binary search on raw decompressed bytes.
+    /// On cache hit: uses cached decompressed bytes directly.
+    /// On cache miss: decompresses, caches if cache is present, then searches.
     fn get_from_block(
         &self,
         ie: &IndexEntry,
@@ -810,16 +890,9 @@ impl SSTableReader {
         verify_checksums: bool,
         last_match: &mut Option<(Value, RevisionID, u64)>,
     ) -> Result<bool> {
-        // 1. Cache hit → binary search on parsed entries
-        if let Some(ref c) = self.cache {
-            if let Some(entries) = c.get(self.sst_id, block_index as u32) {
-                return Self::binary_search_entries(&entries, key_bytes, last_match);
-            }
-        }
+        let block_data = self.get_raw_block(ie, block_index, verify_checksums)?;
 
-        // 2. Cache miss, no cache, restart points → targeted parse (fastest cold path)
-        if self.has_restarts && self.cache.is_none() {
-            let block_data = self.decompress_raw_block(ie, verify_checksums)?;
+        if self.has_restarts {
             let (entry_data, restarts) = Self::strip_restart_trailer(&block_data)?;
             if let Some(found) =
                 Self::find_key_in_block(entry_data, &restarts, key_bytes, self.version)?
@@ -827,12 +900,12 @@ impl SSTableReader {
                 *last_match = Some(found);
                 return Ok(true);
             }
-            return Ok(false);
+            Ok(false)
+        } else {
+            // Legacy blocks without restart points: fall back to full parse + binary search
+            let entries = Self::parse_block_entries(&block_data, self.version)?;
+            Self::binary_search_entries(&entries, key_bytes, last_match)
         }
-
-        // 3. Cache miss with cache enabled → full parse + cache insert + binary search
-        let entries = self.read_block(ie, block_index, verify_checksums)?;
-        Self::binary_search_entries(&entries, key_bytes, last_match)
     }
 
     /// Binary search on parsed entries for a target key.
@@ -878,6 +951,18 @@ impl SSTableReader {
 
         let mut key_buf = Vec::with_capacity(key.encoded_len());
         key.write_bytes_to(&mut key_buf);
+
+        // Key-range pre-filter
+        if let Some(ref first_key) = meta.first_key {
+            if key_buf.as_slice() < first_key.as_slice() {
+                return Ok(Vec::new());
+            }
+        }
+        if let Some(last_ie) = meta.index.last() {
+            if key_buf.as_slice() > last_ie.last_key.as_slice() {
+                return Ok(Vec::new());
+            }
+        }
 
         if !meta.filter.may_contain(&key_buf) {
             return Ok(Vec::new());
@@ -925,26 +1010,18 @@ impl SSTableReader {
         verify_checksums: bool,
         result: &mut Vec<(Value, RevisionID, u64)>,
     ) -> Result<bool> {
-        // 1. Cache hit → binary search on parsed entries
-        if let Some(ref c) = self.cache {
-            if let Some(entries) = c.get(self.sst_id, block_index as u32) {
-                return Self::binary_search_all_entries(&entries, key_bytes, result);
-            }
-        }
+        let block_data = self.get_raw_block(ie, block_index, verify_checksums)?;
 
-        // 2. Cache miss, no cache, restart points → targeted parse
-        if self.has_restarts && self.cache.is_none() {
-            let block_data = self.decompress_raw_block(ie, verify_checksums)?;
+        if self.has_restarts {
             let (entry_data, restarts) = Self::strip_restart_trailer(&block_data)?;
             let found = Self::find_all_in_block(entry_data, &restarts, key_bytes, self.version)?;
             let any = !found.is_empty();
             result.extend(found);
-            return Ok(any);
+            Ok(any)
+        } else {
+            let entries = Self::parse_block_entries(&block_data, self.version)?;
+            Self::binary_search_all_entries(&entries, key_bytes, result)
         }
-
-        // 3. Cache miss with cache enabled → full parse + cache insert + binary search
-        let entries = self.read_block(ie, block_index, verify_checksums)?;
-        Self::binary_search_all_entries(&entries, key_bytes, result)
     }
 
     /// Binary search on parsed entries for all revisions of a target key.
@@ -1063,9 +1140,10 @@ impl SSTableReader {
 
     /// Strip the restart point trailer from a decompressed block.
     ///
-    /// Returns the entry data slice (without trailer) and the restart offsets.
+    /// Returns the entry data slice (without trailer) and a zero-copy
+    /// `RestartIndex` over the raw restart bytes.
     /// Trailer format: `[restart_0: u32 LE]...[num_restarts: u32 LE]`
-    pub(crate) fn strip_restart_trailer(block: &[u8]) -> Result<(&[u8], Vec<u32>)> {
+    pub(crate) fn strip_restart_trailer(block: &[u8]) -> Result<(&[u8], RestartIndex<'_>)> {
         if block.len() < 4 {
             return Err(Error::Corruption(
                 "block too small for restart trailer".into(),
@@ -1083,15 +1161,8 @@ impl SSTableReader {
             )));
         }
         let entry_end = block.len() - trailer_size;
-        let mut restarts = Vec::with_capacity(num_restarts);
-        for i in 0..num_restarts {
-            let off = entry_end + i * 4;
-            restarts.push(u32::from_le_bytes(bytes_to_array(
-                &block[off..off + 4],
-                "SSTable restart offset",
-            )?));
-        }
-        Ok((&block[..entry_end], restarts))
+        let restart_bytes = &block[entry_end..block.len() - 4];
+        Ok((&block[..entry_end], RestartIndex(restart_bytes)))
     }
 
     /// Read the key at a given byte offset within entry data (no allocation).
@@ -1205,7 +1276,11 @@ impl SSTableReader {
     /// Search restart point keys via binary search.
     ///
     /// Returns the index of the last restart point whose key <= `target`.
-    fn search_restart_keys(entry_data: &[u8], restarts: &[u32], target: &[u8]) -> Result<usize> {
+    fn search_restart_keys(
+        entry_data: &[u8],
+        restarts: &RestartIndex<'_>,
+        target: &[u8],
+    ) -> Result<usize> {
         let n = restarts.len();
         if n == 0 {
             return Err(Error::Corruption("no restart points in block".into()));
@@ -1216,7 +1291,7 @@ impl SSTableReader {
 
         while lo < hi {
             let mid = lo + (hi - lo).div_ceil(2);
-            let (key, _) = Self::key_at_offset(entry_data, restarts[mid] as usize)?;
+            let (key, _) = Self::key_at_offset(entry_data, restarts.get(mid) as usize)?;
             if key <= target {
                 lo = mid;
             } else {
@@ -1234,7 +1309,7 @@ impl SSTableReader {
     /// (last entry with matching key, since entries are oldest-first).
     fn find_key_in_block(
         entry_data: &[u8],
-        restarts: &[u32],
+        restarts: &RestartIndex<'_>,
         key_bytes: &[u8],
         version: u16,
     ) -> Result<Option<(Value, RevisionID, u64)>> {
@@ -1243,7 +1318,7 @@ impl SSTableReader {
         }
 
         let ri = Self::search_restart_keys(entry_data, restarts, key_bytes)?;
-        let mut pos = restarts[ri] as usize;
+        let mut pos = restarts.get(ri) as usize;
         let mut last_match: Option<(Value, RevisionID, u64)> = None;
 
         while pos < entry_data.len() {
@@ -1269,7 +1344,7 @@ impl SSTableReader {
     /// Find all revisions of a key within a decompressed block using restart points.
     fn find_all_in_block(
         entry_data: &[u8],
-        restarts: &[u32],
+        restarts: &RestartIndex<'_>,
         key_bytes: &[u8],
         version: u16,
     ) -> Result<Vec<(Value, RevisionID, u64)>> {
@@ -1278,7 +1353,7 @@ impl SSTableReader {
         }
 
         let ri = Self::search_restart_keys(entry_data, restarts, key_bytes)?;
-        let mut pos = restarts[ri] as usize;
+        let mut pos = restarts.get(ri) as usize;
         let mut result = Vec::new();
 
         while pos < entry_data.len() {
@@ -1324,45 +1399,56 @@ impl SSTableReader {
         decompress_block(compression_tag, compressed_payload)
     }
 
-    /// Read and decompress a single block, returning raw entries.
+    /// Get decompressed block bytes, using cache if available.
     ///
-    /// When a block cache is present, checks for a cached copy first and
-    /// inserts newly parsed blocks into the cache for future lookups.
+    /// On cache hit: returns cached bytes (promoted to MRU).
+    /// On cache miss: decompresses from disk, inserts into cache if present.
+    fn get_raw_block(
+        &self,
+        ie: &IndexEntry,
+        block_index: usize,
+        verify_checksums: bool,
+    ) -> Result<Arc<Vec<u8>>> {
+        // 1. Cache lookup
+        if let Some(ref c) = self.cache {
+            if let Some(data) = c.get(self.sst_id, block_index as u32) {
+                #[cfg(feature = "profiling")]
+                super::metrics::prof_opt_timer!(self.metrics.as_deref(), prof_sst_cache_hit);
+                return Ok(data);
+            }
+        }
+
+        #[cfg(feature = "profiling")]
+        super::metrics::prof_opt_timer!(self.metrics.as_deref(), prof_sst_cache_miss);
+
+        // 2. Decompress from disk
+        let block_data = Arc::new(self.decompress_raw_block(ie, verify_checksums)?);
+
+        // 3. Cache insert
+        if let Some(ref c) = self.cache {
+            let size = estimate_block_size(&block_data);
+            c.insert_arc(
+                self.sst_id,
+                block_index as u32,
+                Arc::clone(&block_data),
+                size,
+            );
+        }
+
+        Ok(block_data)
+    }
+
+    /// Read and decompress a single block, returning parsed entries.
+    ///
+    /// Uses `get_raw_block` for decompression and caching, then parses
+    /// entries from the raw bytes.
     fn read_block(
         &self,
         ie: &IndexEntry,
         block_index: usize,
         verify_checksums: bool,
-    ) -> Result<Arc<Vec<RawEntry>>> {
-        // 1. Cache lookup
-        if let Some(ref c) = self.cache {
-            if let Some(entries) = c.get(self.sst_id, block_index as u32) {
-                return Ok(entries);
-            }
-        }
-
-        // 2. Decompress + parse (no lock held)
-        let block_start = ie.offset as usize;
-        let block_end = block_start + ie.size as usize;
-
-        if block_end > self.data.len() {
-            return Err(Error::Corruption(format!(
-                "SSTable block out of bounds: {block_start}..{block_end} (file size {})",
-                self.data.len()
-            )));
-        }
-
-        let block_on_disk = &self.data[block_start..block_end];
-        let cksum_start = block_on_disk.len() - Checksum::encoded_size();
-
-        if verify_checksums {
-            let checksum = Checksum::from_bytes(&block_on_disk[cksum_start..])?;
-            checksum.verify(&block_on_disk[..cksum_start])?;
-        }
-
-        let compression_tag = block_on_disk[0];
-        let compressed_payload = &block_on_disk[1..cksum_start];
-        let block_data = decompress_block(compression_tag, compressed_payload)?;
+    ) -> Result<Vec<RawEntry>> {
+        let block_data = self.get_raw_block(ie, block_index, verify_checksums)?;
 
         let entry_data = if self.has_restarts {
             let (entries_slice, _restarts) = Self::strip_restart_trailer(&block_data)?;
@@ -1370,17 +1456,7 @@ impl SSTableReader {
         } else {
             &block_data
         };
-        let entries = Self::parse_block_entries(entry_data, self.version)?;
-
-        let entries = Arc::new(entries);
-
-        // 3. Cache insert — shares the Arc with the cache
-        if let Some(ref c) = self.cache {
-            let size = cache::estimate_block_size(&entries);
-            c.insert_arc(self.sst_id, block_index as u32, Arc::clone(&entries), size);
-        }
-
-        Ok(entries)
+        Self::parse_block_entries(entry_data, self.version)
     }
 
     /// Iterate all entries in sorted key order.
@@ -1419,6 +1495,12 @@ impl SSTableReader {
     /// Return the total size of the SSTable data in bytes.
     pub(crate) fn size_bytes(&self) -> usize {
         self.data.len()
+    }
+
+    /// Attach shared metrics for profiling instrumentation.
+    #[cfg(feature = "profiling")]
+    pub(crate) fn set_metrics(&mut self, metrics: Arc<super::metrics::Metrics>) {
+        self.metrics = Some(metrics);
     }
 
     /// Return the total number of entries in this SSTable.
@@ -2763,7 +2845,10 @@ mod tests {
 
         let (entries, restarts) = SSTableReader::strip_restart_trailer(&block).unwrap();
         assert_eq!(entries, &block[..entry_end]);
-        assert_eq!(restarts, vec![0, 5, 10]);
+        assert_eq!(restarts.len(), 3);
+        assert_eq!(restarts.get(0), 0);
+        assert_eq!(restarts.get(1), 5);
+        assert_eq!(restarts.get(2), 10);
     }
 
     #[test]
