@@ -1,1 +1,1 @@
-// Rill — message queue powered by rKV.
+pub mod config;

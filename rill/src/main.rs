@@ -1,14 +1,16 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path as AxumPath, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
 use clap::Parser;
-use rkv::{Config, DB};
+use rill::config::{BackendMode, RillConfig};
+use rkv::DB;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -17,22 +19,29 @@ const NS_PREFIX: &str = "rill_";
 #[derive(Parser)]
 #[command(name = "rill", about = "Message queue powered by rKV")]
 struct Cli {
+    /// Path to config file (YAML or TOML)
+    #[arg(long, short, global = true, env = "RILL_CONFIG")]
+    config: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(clap::Subcommand)]
 enum Command {
+    /// Dump config to stdout (default or from --config file)
+    Init {
+        /// Output format: yaml or toml
+        #[arg(long, default_value = "yaml")]
+        format: String,
+    },
     /// Start the HTTP server
     Serve {
-        #[arg(long, default_value = "./rill-data", env = "RILL_DATA")]
-        data: String,
+        #[arg(long, env = "RILL_HOST")]
+        host: Option<String>,
 
-        #[arg(long, default_value = "0.0.0.0", env = "RILL_HOST")]
-        host: String,
-
-        #[arg(long, default_value_t = 3000, env = "RILL_PORT")]
-        port: u16,
+        #[arg(long, env = "RILL_PORT")]
+        port: Option<u16>,
 
         #[arg(long, env = "RILL_ADMIN_TOKEN")]
         admin_token: Option<String>,
@@ -45,6 +54,18 @@ enum Command {
 
         #[arg(long, env = "RILL_UI")]
         ui: bool,
+
+        /// rKV backend mode: embed or remote
+        #[arg(long, env = "RILL_RKV_MODE")]
+        rkv_mode: Option<String>,
+
+        /// Data directory (embed mode)
+        #[arg(long, env = "RILL_DATA")]
+        data: Option<String>,
+
+        /// rKV server URL (remote mode)
+        #[arg(long, env = "RILL_RKV_URL")]
+        rkv_url: Option<String>,
     },
 }
 
@@ -165,7 +186,7 @@ async fn create_queue(
 async fn delete_queue(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(name): Path<String>,
+    AxumPath(name): AxumPath<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Admin)?;
     let ns_name = queue_ns(&name);
@@ -204,7 +225,7 @@ async fn list_queues(
 async fn push_message(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(name): Path<String>,
+    AxumPath(name): AxumPath<String>,
     body: String,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Writer)?;
@@ -231,7 +252,7 @@ async fn push_message(
 async fn pop_message(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(name): Path<String>,
+    AxumPath(name): AxumPath<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Reader)?;
     let ns_name = queue_ns(&name);
@@ -295,30 +316,101 @@ fn build_router(state: Arc<AppState>) -> Router {
 async fn main() {
     let cli = Cli::parse();
 
+    // Load config file if provided, otherwise use defaults
+    let mut cfg = match &cli.config {
+        Some(path) => RillConfig::load(Path::new(path)).expect("failed to load config"),
+        None => RillConfig::default(),
+    };
+
     match cli.command {
+        Command::Init { format } => {
+            let output = if cli.config.is_some() {
+                // Config file provided — dump the loaded (merged) config
+                cfg.dump(&format).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                })
+            } else {
+                // No config file — show annotated template
+                RillConfig::template(&format)
+                    .unwrap_or_else(|e| {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    })
+                    .to_string()
+            };
+            print!("{output}");
+        }
         Command::Serve {
-            data,
             host,
             port,
             admin_token,
             writer_token,
             reader_token,
             ui,
+            rkv_mode,
+            data,
+            rkv_url,
         } => {
-            let config = Config::new(&data);
-            let db = DB::open(config).expect("failed to open rKV database");
-            println!("rKV database opened at {data}");
+            // CLI flags override config file
+            if let Some(h) = host {
+                cfg.host = h;
+            }
+            if let Some(p) = port {
+                cfg.port = p;
+            }
+            if let Some(t) = admin_token {
+                cfg.auth.admin_token = Some(t);
+            }
+            if let Some(t) = writer_token {
+                cfg.auth.writer_token = Some(t);
+            }
+            if let Some(t) = reader_token {
+                cfg.auth.reader_token = Some(t);
+            }
+            if ui {
+                cfg.ui = true;
+            }
+            if let Some(m) = rkv_mode {
+                cfg.rkv.mode = match m.as_str() {
+                    "embed" => BackendMode::Embed,
+                    "remote" => BackendMode::Remote,
+                    _ => {
+                        eprintln!("invalid rkv mode: {m} (use 'embed' or 'remote')");
+                        std::process::exit(1);
+                    }
+                };
+            }
+            if let Some(d) = data {
+                cfg.rkv.data = d;
+            }
+            if let Some(u) = rkv_url {
+                cfg.rkv.url = u;
+            }
+
+            let db = match cfg.rkv.mode {
+                BackendMode::Embed => {
+                    let rkv_config = cfg.rkv.to_rkv_config();
+                    let db = DB::open(rkv_config).expect("failed to open rKV database");
+                    println!("rKV database opened at {}", cfg.rkv.data);
+                    db
+                }
+                BackendMode::Remote => {
+                    eprintln!("remote mode not yet implemented (url: {})", cfg.rkv.url);
+                    std::process::exit(1);
+                }
+            };
 
             let state = Arc::new(AppState {
                 db,
-                admin_token,
-                writer_token,
-                reader_token,
-                ui_enabled: ui,
+                admin_token: cfg.auth.admin_token,
+                writer_token: cfg.auth.writer_token,
+                reader_token: cfg.auth.reader_token,
+                ui_enabled: cfg.ui,
             });
 
             let app = build_router(state);
-            let addr = format!("{host}:{port}");
+            let addr = format!("{}:{}", cfg.host, cfg.port);
             println!("rill listening on {addr}");
             let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
             axum::serve(listener, app).await.unwrap();
@@ -331,6 +423,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use rkv::Config;
     use tower::ServiceExt;
 
     fn test_state(ui: bool) -> Arc<AppState> {

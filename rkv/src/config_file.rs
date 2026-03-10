@@ -12,7 +12,7 @@ pub struct Size(pub usize);
 
 impl Serialize for Size {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_u64(self.0 as u64)
+        serializer.serialize_str(&format_size(self.0))
     }
 }
 

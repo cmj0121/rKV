@@ -87,7 +87,7 @@ services:
       primary:
         condition: service_healthy
 
-  # --- Rill message queue (docker compose --profile rill up) ---
+  # --- Rill message queue (launches by default alongside primary) ---
   rill:
     build:
       context: .
@@ -95,7 +95,10 @@ services:
     platform: linux/amd64
     ports:
       - "3000:3000"
+    volumes:
+      - .data/primary:/data
     environment:
+      RILL_DATA: "/data"
       RILL_ADMIN_TOKEN: "admin-secret"
       RILL_WRITER_TOKEN: "writer-secret"
       RILL_READER_TOKEN: "reader-secret"
@@ -106,6 +109,9 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+    depends_on:
+      primary:
+        condition: service_healthy
 
   # --- Cluster mode (docker compose --profile cluster up) ---
   # Adds 2 shard groups alongside the primary/replicas.
