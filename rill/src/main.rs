@@ -604,4 +604,50 @@ mod tests {
         assert!(body.contains("myq"));
         assert!(body.contains("deleted"));
     }
+
+    // --- E2E: push, pop, FIFO through HTTP ---
+
+    #[tokio::test]
+    async fn e2e_push_pop_fifo() {
+        let app = build_router(open_state());
+        // Create queue
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"e2e"}"#)).await;
+        // Push two messages
+        request(&app, "POST", "/queues/e2e", None, Some("msg-a")).await;
+        request(&app, "POST", "/queues/e2e", None, Some("msg-b")).await;
+        // Pop in FIFO order
+        let (_, body) = request(&app, "GET", "/queues/e2e", None, None).await;
+        assert!(body.contains("msg-a"));
+        let (_, body) = request(&app, "GET", "/queues/e2e", None, None).await;
+        assert!(body.contains("msg-b"));
+        // Pop empty returns null
+        let (_, body) = request(&app, "GET", "/queues/e2e", None, None).await;
+        assert!(body.contains("null"));
+    }
+
+    #[tokio::test]
+    async fn e2e_create_list_delete() {
+        let app = build_router(open_state());
+        // Create two queues
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"q1"}"#)).await;
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"q2"}"#)).await;
+        // List should contain both
+        let (_, body) = request(&app, "GET", "/queues", None, None).await;
+        assert!(body.contains("q1"));
+        assert!(body.contains("q2"));
+        // Push to q1 then delete it
+        request(&app, "POST", "/queues/q1", None, Some("data")).await;
+        request(&app, "DELETE", "/queues/q1", None, None).await;
+        // Pop from deleted queue returns null
+        let (_, body) = request(&app, "GET", "/queues/q1", None, None).await;
+        assert!(body.contains("null"));
+    }
+
+    #[tokio::test]
+    async fn e2e_pop_nonexistent_queue() {
+        let app = build_router(open_state());
+        let (status, body) = request(&app, "GET", "/queues/nope", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("null"));
+    }
 }
