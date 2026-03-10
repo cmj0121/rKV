@@ -86,19 +86,19 @@ impl PackWriter {
     ) -> Result<PackEntry> {
         let record_offset = self.offset;
         let data_len = data.len() as u32;
+        let original_size_be = original_size.to_be_bytes();
+        let data_len_be = data_len.to_be_bytes();
 
-        // Build checksummed payload: [hash][original_size][flags][data_len][data]
-        let payload_len = PACK_RECORD_HEADER_SIZE + data.len();
-        let mut payload = Vec::with_capacity(payload_len);
-        payload.extend_from_slice(hash);
-        payload.extend_from_slice(&original_size.to_be_bytes());
-        payload.push(flags);
-        payload.extend_from_slice(&data_len.to_be_bytes());
-        payload.extend_from_slice(data);
+        // Compute checksum over header+data without allocating a concatenation Vec.
+        let checksum =
+            Checksum::compute_slices(&[hash, &original_size_be, &[flags], &data_len_be, data]);
 
-        let checksum = Checksum::compute(&payload);
-
-        self.file.write_all(&payload)?;
+        // Write header fields + data + checksum directly to BufWriter.
+        self.file.write_all(hash)?;
+        self.file.write_all(&original_size_be)?;
+        self.file.write_all(&[flags])?;
+        self.file.write_all(&data_len_be)?;
+        self.file.write_all(data)?;
         self.file.write_all(&checksum.to_bytes())?;
         // Always flush the BufWriter so data is visible to concurrent readers
         // that open the file directly. The expensive sync_all() is batched.
@@ -110,7 +110,7 @@ impl PackWriter {
             self.records_since_sync = 0;
         }
 
-        let record_len = payload_len + Checksum::encoded_size();
+        let record_len = PACK_RECORD_HEADER_SIZE + data.len() + Checksum::encoded_size();
         self.offset += record_len as u64;
 
         Ok(PackEntry {
@@ -329,20 +329,19 @@ impl ObjectStore {
             return Ok(vp);
         }
 
-        // Compress if requested
-        let (flags, payload) = if compress {
-            let compressed = lz4_flex::compress_prepend_size(data);
-            (FLAG_LZ4, compressed)
+        // Compress if requested — avoid cloning when uncompressed
+        let compressed;
+        let (flags, payload): (u8, &[u8]) = if compress {
+            compressed = lz4_flex::compress_prepend_size(data);
+            if compressed.len() > u32::MAX as usize {
+                return Err(Error::Corruption(
+                    "compressed payload too large for pack format (>4 GB)".into(),
+                ));
+            }
+            (FLAG_LZ4, &compressed)
         } else {
-            (0u8, data.to_vec())
+            (0u8, data)
         };
-
-        // Guard: compressed payload must also fit in u32
-        if payload.len() > u32::MAX as usize {
-            return Err(Error::Corruption(
-                "compressed payload too large for pack format (>4 GB)".into(),
-            ));
-        }
 
         // Rotate pack file if current one exceeds size threshold
         if let Some(ref mut w) = state.writer {
@@ -366,7 +365,7 @@ impl ObjectStore {
         let writer = state.writer.as_mut().ok_or_else(|| {
             Error::Corruption("pack writer unexpectedly None after initialization".into())
         })?;
-        let entry = writer.append(&hash, size, flags, &payload)?;
+        let entry = writer.append(&hash, size, flags, payload)?;
         state.index.insert(hash, entry);
 
         Ok(vp)

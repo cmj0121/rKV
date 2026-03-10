@@ -31,6 +31,18 @@ impl Checksum {
         }
     }
 
+    /// Compute a CRC32C checksum over multiple slices without concatenation.
+    pub(crate) fn compute_slices(slices: &[&[u8]]) -> Self {
+        let mut crc = 0u32;
+        for slice in slices {
+            crc = crc32c::crc32c_append(crc, slice);
+        }
+        Self {
+            algo: ChecksumAlgo::Crc32c,
+            value: crc,
+        }
+    }
+
     /// Verify this checksum against `data`.
     ///
     /// Returns `Ok(())` if the recomputed checksum matches, or
