@@ -66,7 +66,6 @@ impl PackWriter {
         let mut bw = std::io::BufWriter::new(file);
         bw.write_all(&PACK_MAGIC)?;
         bw.write_all(&PACK_VERSION.to_be_bytes())?;
-        bw.flush()?;
         Ok(Self {
             file: bw,
             seq,
@@ -100,12 +99,10 @@ impl PackWriter {
         self.file.write_all(&data_len_be)?;
         self.file.write_all(data)?;
         self.file.write_all(&checksum.to_bytes())?;
-        // Always flush the BufWriter so data is visible to concurrent readers
-        // that open the file directly. The expensive sync_all() is batched.
-        self.file.flush()?;
 
         self.records_since_sync += 1;
         if self.sync_interval == 0 || self.records_since_sync >= self.sync_interval {
+            self.file.flush()?;
             self.file.get_ref().sync_all()?;
             self.records_since_sync = 0;
         }
@@ -366,6 +363,9 @@ impl ObjectStore {
             Error::Corruption("pack writer unexpectedly None after initialization".into())
         })?;
         let entry = writer.append(&hash, size, flags, payload)?;
+        // Flush BufWriter before exposing the entry in the index, so
+        // concurrent readers that open the file directly can see the data.
+        writer.file.flush()?;
         state.index.insert(hash, entry);
 
         Ok(vp)
@@ -639,6 +639,7 @@ impl ObjectStore {
         if let Some(ref mut writer) = state.writer {
             writer.file.flush()?;
             writer.file.get_ref().sync_all()?;
+            writer.records_since_sync = 0;
         }
         Ok(())
     }
