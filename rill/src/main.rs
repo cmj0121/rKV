@@ -277,25 +277,36 @@ async fn pop_message(
     }
 }
 
-async fn admin_ui(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, ApiError> {
-    state.require_role(&headers, Role::Admin)?;
+async fn ui_index(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     if !state.ui_enabled {
         return Err(ApiError::NotFound(
             r#"{"error":"UI not enabled. Start with --ui flag."}"#,
         ));
     }
-    Ok(Html(
-        r#"<!DOCTYPE html>
-<html>
-<head><title>Rill Admin</title></head>
-<body>
-  <h1>Rill Admin Dashboard</h1>
-  <p>Coming soon.</p>
-</body>
-</html>"#,
+    Ok(Html(include_str!("ui/index.html")))
+}
+
+async fn ui_app_js(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    if !state.ui_enabled {
+        return Err(ApiError::NotFound(
+            r#"{"error":"UI not enabled. Start with --ui flag."}"#,
+        ));
+    }
+    Ok((
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("ui/app.js"),
+    ))
+}
+
+async fn ui_style_css(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    if !state.ui_enabled {
+        return Err(ApiError::NotFound(
+            r#"{"error":"UI not enabled. Start with --ui flag."}"#,
+        ));
+    }
+    Ok((
+        [(header::CONTENT_TYPE, "text/css")],
+        include_str!("ui/style.css"),
     ))
 }
 
@@ -303,7 +314,9 @@ fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/health", get(health))
-        .route("/admin", get(admin_ui))
+        .route("/ui", get(ui_index))
+        .route("/ui/app.js", get(ui_app_js))
+        .route("/ui/style.css", get(ui_style_css))
         .route("/queues", post(create_queue))
         .route("/queues", get(list_queues))
         .route("/queues/{name}", post(push_message))
@@ -592,21 +605,37 @@ mod tests {
         assert!(body.contains("queues"));
     }
 
-    // --- Admin UI ---
+    // --- UI ---
 
     #[tokio::test]
-    async fn admin_ui_disabled() {
+    async fn ui_disabled() {
         let app = build_router(test_state(false));
-        let (status, _) = request(&app, "GET", "/admin", Some("admin-tok"), None).await;
+        let (status, _) = request(&app, "GET", "/ui", None, None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
-    async fn admin_ui_enabled() {
+    async fn ui_enabled() {
         let app = build_router(test_state(true));
-        let (status, body) = request(&app, "GET", "/admin", Some("admin-tok"), None).await;
+        let (status, body) = request(&app, "GET", "/ui", None, None).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("Rill Admin Dashboard"));
+        assert!(body.contains("Rill"));
+    }
+
+    #[tokio::test]
+    async fn ui_serves_js() {
+        let app = build_router(test_state(true));
+        let (status, body) = request(&app, "GET", "/ui/app.js", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Rill Web UI"));
+    }
+
+    #[tokio::test]
+    async fn ui_serves_css() {
+        let app = build_router(test_state(true));
+        let (status, body) = request(&app, "GET", "/ui/style.css", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("--accent"));
     }
 
     // --- Delete queue ---
