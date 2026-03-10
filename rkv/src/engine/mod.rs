@@ -2085,6 +2085,7 @@ impl DB {
             )?;
             #[cfg(feature = "profiling")]
             reader.set_metrics(Arc::clone(&self.metrics));
+            reader.warm_cache();
             let sst_bytes = reader.size_bytes() as u64;
             let mut sst = self.sstables.write().unwrap_or_else(|e| e.into_inner());
             let levels = sst
