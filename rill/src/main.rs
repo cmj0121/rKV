@@ -87,6 +87,7 @@ struct AppState {
 }
 
 enum ApiError {
+    BadRequest(&'static str),
     Unauthorized,
     Forbidden,
     NotFound(&'static str),
@@ -96,6 +97,7 @@ enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, body) = match self {
+            Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, format!(r#"{{"error":"{msg}"}}"#)),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 r#"{"error":"unauthorized"}"#.to_string(),
@@ -153,6 +155,24 @@ struct CreateQueueRequest {
     name: String,
 }
 
+fn validate_queue_name(name: &str) -> Result<(), ApiError> {
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("queue name cannot be empty"));
+    }
+    if name.len() > 128 {
+        return Err(ApiError::BadRequest("queue name too long (max 128 chars)"));
+    }
+    if name
+        .chars()
+        .any(|c| !c.is_alphanumeric() && c != '-' && c != '_')
+    {
+        return Err(ApiError::BadRequest(
+            "queue name may only contain alphanumeric, dash, or underscore",
+        ));
+    }
+    Ok(())
+}
+
 // --- Handlers ---
 
 async fn root() -> &'static str {
@@ -186,6 +206,7 @@ async fn create_queue(
     Json(body): Json<CreateQueueRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Admin)?;
+    validate_queue_name(&body.name)?;
     state
         .backend
         .create_queue(&body.name)
@@ -200,6 +221,7 @@ async fn delete_queue(
     AxumPath(name): AxumPath<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Admin)?;
+    validate_queue_name(&name)?;
     state
         .backend
         .delete_queue(&name)
@@ -228,6 +250,7 @@ async fn push_message(
     body: String,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Writer)?;
+    validate_queue_name(&name)?;
     state
         .backend
         .push_message(&name, &body)
@@ -242,6 +265,7 @@ async fn pop_message(
     AxumPath(name): AxumPath<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Reader)?;
+    validate_queue_name(&name)?;
     let msg = state
         .backend
         .pop_message(&name)
@@ -268,6 +292,7 @@ async fn queue_info(
     AxumPath(name): AxumPath<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Reader)?;
+    validate_queue_name(&name)?;
     let length = state
         .backend
         .queue_length(&name)
@@ -283,6 +308,7 @@ async fn peek_messages(
     axum::extract::Query(query): axum::extract::Query<PeekQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Reader)?;
+    validate_queue_name(&name)?;
     let messages = state
         .backend
         .peek_messages(&name, query.offset, query.limit)
@@ -701,6 +727,70 @@ mod tests {
         let (status, body) = request(&app, "GET", "/ui/style.css", None, None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("--accent"));
+    }
+
+    // --- Queue name validation ---
+
+    #[tokio::test]
+    async fn invalid_queue_name_empty() {
+        let app = build_router(open_state());
+        let (status, body) = request(&app, "POST", "/queues", None, Some(r#"{"name":""}"#)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn invalid_queue_name_special_chars() {
+        let app = build_router(open_state());
+        let (status, body) =
+            request(&app, "POST", "/queues", None, Some(r#"{"name":"a/b"}"#)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("alphanumeric"));
+    }
+
+    #[tokio::test]
+    async fn invalid_queue_name_too_long() {
+        let app = build_router(open_state());
+        let long_name = "a".repeat(129);
+        let payload = format!(r#"{{"name":"{long_name}"}}"#);
+        let (status, body) = request(&app, "POST", "/queues", None, Some(&payload)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("too long"));
+    }
+
+    #[tokio::test]
+    async fn invalid_name_rejected_on_push() {
+        let app = build_router(open_state());
+        let (status, _) = request(&app, "POST", "/queues/a.b", None, Some("msg")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn invalid_name_rejected_on_pop() {
+        let app = build_router(open_state());
+        let (status, _) = request(&app, "GET", "/queues/a.b", None, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn invalid_name_rejected_on_delete() {
+        let app = build_router(open_state());
+        let (status, _) = request(&app, "DELETE", "/queues/a.b", None, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn valid_queue_name_with_dash_and_underscore() {
+        let app = build_router(open_state());
+        let (status, _) = request(
+            &app,
+            "POST",
+            "/queues",
+            None,
+            Some(r#"{"name":"my-queue_1"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     // --- Delete queue ---
