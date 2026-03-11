@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     extract::{Path as AxumPath, State},
@@ -14,6 +15,8 @@ use rill::config::{BackendMode, RillConfig};
 use rkv::DB;
 use serde::Deserialize;
 use serde_json::json;
+use tower_http::trace::TraceLayer;
+use tracing::{info, warn};
 
 #[derive(Parser)]
 #[command(name = "rill", about = "Message queue powered by rKV")]
@@ -81,9 +84,12 @@ struct AppState {
     writer_token: Option<String>,
     reader_token: Option<String>,
     ui_enabled: bool,
+    max_peek_limit: usize,
+    started_at: Instant,
 }
 
 enum ApiError {
+    BadRequest(&'static str),
     Unauthorized,
     Forbidden,
     NotFound(&'static str),
@@ -92,21 +98,14 @@ enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, body) = match self {
-            Self::Unauthorized => (
-                StatusCode::UNAUTHORIZED,
-                r#"{"error":"unauthorized"}"#.to_string(),
-            ),
-            Self::Forbidden => (
-                StatusCode::FORBIDDEN,
-                r#"{"error":"forbidden"}"#.to_string(),
-            ),
+        let (status, msg) = match self {
+            Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.to_string()),
+            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
+            Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden".to_string()),
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg.to_string()),
-            Self::Internal(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(r#"{{"error":"{msg}"}}"#),
-            ),
+            Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
+        let body = serde_json::json!({"error": msg}).to_string();
         (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
     }
 }
@@ -150,17 +149,49 @@ struct CreateQueueRequest {
     name: String,
 }
 
+fn validate_queue_name(name: &str) -> Result<(), ApiError> {
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("queue name cannot be empty"));
+    }
+    if name.len() > 128 {
+        return Err(ApiError::BadRequest("queue name too long (max 128 chars)"));
+    }
+    if name
+        .chars()
+        .any(|c| !c.is_alphanumeric() && c != '-' && c != '_')
+    {
+        return Err(ApiError::BadRequest(
+            "queue name may only contain alphanumeric, dash, or underscore",
+        ));
+    }
+    Ok(())
+}
+
 // --- Handlers ---
 
 async fn root() -> &'static str {
     ""
 }
 
-async fn health() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/json")],
-        r#"{"status":"ok"}"#,
-    )
+async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let uptime = state.started_at.elapsed().as_secs();
+    let mode = match &state.backend {
+        Backend::Embed(_) => "embed",
+        Backend::Remote(_) => "remote",
+    };
+    let queue_count = state
+        .backend
+        .list_queues()
+        .await
+        .map(|q| q.len())
+        .unwrap_or(0);
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "mode": mode,
+        "queues": queue_count,
+        "uptime_seconds": uptime,
+    }))
 }
 
 async fn create_queue(
@@ -169,6 +200,7 @@ async fn create_queue(
     Json(body): Json<CreateQueueRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Admin)?;
+    validate_queue_name(&body.name)?;
     state
         .backend
         .create_queue(&body.name)
@@ -183,6 +215,7 @@ async fn delete_queue(
     AxumPath(name): AxumPath<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Admin)?;
+    validate_queue_name(&name)?;
     state
         .backend
         .delete_queue(&name)
@@ -211,6 +244,7 @@ async fn push_message(
     body: String,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Writer)?;
+    validate_queue_name(&name)?;
     state
         .backend
         .push_message(&name, &body)
@@ -225,6 +259,7 @@ async fn pop_message(
     AxumPath(name): AxumPath<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Reader)?;
+    validate_queue_name(&name)?;
     let msg = state
         .backend
         .pop_message(&name)
@@ -251,6 +286,7 @@ async fn queue_info(
     AxumPath(name): AxumPath<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Reader)?;
+    validate_queue_name(&name)?;
     let length = state
         .backend
         .queue_length(&name)
@@ -266,9 +302,11 @@ async fn peek_messages(
     axum::extract::Query(query): axum::extract::Query<PeekQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Reader)?;
+    validate_queue_name(&name)?;
+    let limit = query.limit.min(state.max_peek_limit);
     let messages = state
         .backend
-        .peek_messages(&name, query.offset, query.limit)
+        .peek_messages(&name, query.offset, limit)
         .await
         .map_err(ApiError::Internal)?;
     let items: Vec<_> = messages
@@ -325,11 +363,14 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/queues/{name}", delete(delete_queue))
         .route("/queues/{name}/info", get(queue_info))
         .route("/queues/{name}/messages", get(peek_messages))
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
+
     let cli = Cli::parse();
 
     // Load config file if provided, otherwise use defaults
@@ -392,7 +433,7 @@ async fn main() {
                     "embed" => BackendMode::Embed,
                     "remote" => BackendMode::Remote,
                     _ => {
-                        eprintln!("invalid rkv mode: {m} (use 'embed' or 'remote')");
+                        warn!("invalid rkv mode: {m} (use 'embed' or 'remote')");
                         std::process::exit(1);
                     }
                 };
@@ -408,11 +449,11 @@ async fn main() {
                 BackendMode::Embed => {
                     let rkv_config = cfg.rkv.to_rkv_config();
                     let db = DB::open(rkv_config).expect("failed to open rKV database");
-                    println!("rKV database opened at {}", cfg.rkv.data);
+                    info!("rKV database opened at {}", cfg.rkv.data);
                     Backend::Embed(Box::new(db))
                 }
                 BackendMode::Remote => {
-                    println!("connecting to rKV server at {}", cfg.rkv.url);
+                    info!("connecting to rKV server at {}", cfg.rkv.url);
                     Backend::Remote(RkvClient::new(&cfg.rkv.url))
                 }
             };
@@ -423,14 +464,52 @@ async fn main() {
                 writer_token: cfg.auth.writer_token,
                 reader_token: cfg.auth.reader_token,
                 ui_enabled: cfg.ui,
+                max_peek_limit: cfg.max_peek_limit,
+                started_at: Instant::now(),
             });
 
-            let app = build_router(state);
+            let app = build_router(state.clone());
             let addr = format!("{}:{}", cfg.host, cfg.port);
-            println!("rill listening on {addr}");
+            info!("rill listening on {addr}");
             let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-            axum::serve(listener, app).await.unwrap();
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+                .unwrap();
+
+            // Flush embedded DB on shutdown
+            if let Backend::Embed(db) = &state.backend {
+                info!("flushing database...");
+                let _ = db.flush();
+            }
+            info!("rill stopped");
         }
+    }
+}
+
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => { info!("received SIGINT, shutting down..."); }
+        () = terminate => { info!("received SIGTERM, shutting down..."); }
     }
 }
 
@@ -450,6 +529,23 @@ mod tests {
             writer_token: Some("writer-tok".to_string()),
             reader_token: Some("reader-tok".to_string()),
             ui_enabled: ui,
+            max_peek_limit: 100,
+            started_at: Instant::now(),
+        })
+    }
+
+    fn remote_state() -> Arc<AppState> {
+        // Use a fake URL — we won't actually make HTTP calls in these tests,
+        // just test code paths that depend on Backend::Remote variant.
+        let client = rill::backend::RkvClient::new("http://localhost:9999");
+        Arc::new(AppState {
+            backend: Backend::Remote(client),
+            admin_token: None,
+            writer_token: None,
+            reader_token: None,
+            ui_enabled: false,
+            max_peek_limit: 100,
+            started_at: Instant::now(),
         })
     }
 
@@ -461,6 +557,8 @@ mod tests {
             writer_token: None,
             reader_token: None,
             ui_enabled: false,
+            max_peek_limit: 100,
+            started_at: Instant::now(),
         })
     }
 
@@ -500,11 +598,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_returns_ok() {
+    async fn health_returns_diagnostics() {
         let app = build_router(test_state(false));
         let (status, body) = request(&app, "GET", "/health", None, None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains(r#""status":"ok"#));
+        assert!(body.contains(r#""mode":"embed"#));
+        assert!(body.contains(r#""version""#));
+        assert!(body.contains(r#""uptime_seconds""#));
+        assert!(body.contains(r#""queues""#));
     }
 
     // --- Open mode (no tokens) ---
@@ -641,6 +743,90 @@ mod tests {
         assert!(body.contains("--accent"));
     }
 
+    // --- Queue name validation ---
+
+    #[tokio::test]
+    async fn invalid_queue_name_empty() {
+        let app = build_router(open_state());
+        let (status, body) = request(&app, "POST", "/queues", None, Some(r#"{"name":""}"#)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn invalid_queue_name_special_chars() {
+        let app = build_router(open_state());
+        let (status, body) =
+            request(&app, "POST", "/queues", None, Some(r#"{"name":"a/b"}"#)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("alphanumeric"));
+    }
+
+    #[tokio::test]
+    async fn invalid_queue_name_too_long() {
+        let app = build_router(open_state());
+        let long_name = "a".repeat(129);
+        let payload = format!(r#"{{"name":"{long_name}"}}"#);
+        let (status, body) = request(&app, "POST", "/queues", None, Some(&payload)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("too long"));
+    }
+
+    #[tokio::test]
+    async fn invalid_name_rejected_on_push() {
+        let app = build_router(open_state());
+        let (status, _) = request(&app, "POST", "/queues/a.b", None, Some("msg")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn invalid_name_rejected_on_pop() {
+        let app = build_router(open_state());
+        let (status, _) = request(&app, "GET", "/queues/a.b", None, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn invalid_name_rejected_on_delete() {
+        let app = build_router(open_state());
+        let (status, _) = request(&app, "DELETE", "/queues/a.b", None, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn valid_queue_name_with_dash_and_underscore() {
+        let app = build_router(open_state());
+        let (status, _) = request(
+            &app,
+            "POST",
+            "/queues",
+            None,
+            Some(r#"{"name":"my-queue_1"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // --- Pagination limit cap ---
+
+    #[tokio::test]
+    async fn peek_limit_capped_at_max() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"cap"}"#)).await;
+        // Push 3 messages
+        for i in 0..3 {
+            request(&app, "POST", "/queues/cap", None, Some(&format!("m{i}"))).await;
+        }
+        // Request limit=999 — should still work (capped server-side to MAX_PEEK_LIMIT)
+        let (status, body) =
+            request(&app, "GET", "/queues/cap/messages?limit=999", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        // All 3 messages returned (3 < MAX_PEEK_LIMIT)
+        assert!(body.contains("m0"));
+        assert!(body.contains("m1"));
+        assert!(body.contains("m2"));
+    }
+
     // --- Delete queue ---
 
     #[tokio::test]
@@ -725,5 +911,166 @@ mod tests {
         // Messages still there
         let (_, body) = request(&app, "GET", "/queues/peek/info", None, None).await;
         assert!(body.contains(r#""length":2"#));
+    }
+
+    // --- ApiError response formatting ---
+
+    #[tokio::test]
+    async fn api_error_bad_request_escapes_json() {
+        // Verify serde_json properly escapes special chars in error messages
+        let err = ApiError::BadRequest("queue name cannot be empty");
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains(r#""error":"queue name cannot be empty""#));
+    }
+
+    #[tokio::test]
+    async fn api_error_not_found_response() {
+        let err = ApiError::NotFound("queue not found");
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("queue not found"));
+    }
+
+    #[tokio::test]
+    async fn api_error_internal_response() {
+        let err = ApiError::Internal("db error".to_string());
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("db error"));
+    }
+
+    #[tokio::test]
+    async fn api_error_forbidden_response() {
+        let err = ApiError::Forbidden;
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // --- validate_queue_name unit tests ---
+
+    #[test]
+    fn validate_queue_name_accepts_valid() {
+        assert!(validate_queue_name("my-queue_123").is_ok());
+        assert!(validate_queue_name("a").is_ok());
+        assert!(validate_queue_name(&"x".repeat(128)).is_ok());
+    }
+
+    #[test]
+    fn validate_queue_name_rejects_dots() {
+        assert!(validate_queue_name("a.b").is_err());
+    }
+
+    #[test]
+    fn validate_queue_name_rejects_spaces() {
+        assert!(validate_queue_name("a b").is_err());
+    }
+
+    #[test]
+    fn validate_queue_name_rejects_slashes() {
+        assert!(validate_queue_name("a/b").is_err());
+    }
+
+    #[test]
+    fn validate_queue_name_boundary_length() {
+        // 128 chars is ok
+        assert!(validate_queue_name(&"a".repeat(128)).is_ok());
+        // 129 chars is rejected
+        assert!(validate_queue_name(&"a".repeat(129)).is_err());
+    }
+
+    // --- Additional handler edge cases ---
+
+    #[tokio::test]
+    async fn peek_with_default_params() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"dflt"}"#)).await;
+        request(&app, "POST", "/queues/dflt", None, Some("msg")).await;
+        // No query params — uses defaults (offset=0, limit=20)
+        let (status, body) = request(&app, "GET", "/queues/dflt/messages", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("msg"));
+    }
+
+    #[tokio::test]
+    async fn queue_info_empty_queue() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"empt"}"#)).await;
+        let (status, body) = request(&app, "GET", "/queues/empt/info", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""length":0"#));
+    }
+
+    #[tokio::test]
+    async fn invalid_json_body_returns_error() {
+        let app = build_router(open_state());
+        let (status, _) = request(&app, "POST", "/queues", None, Some("not json")).await;
+        // axum returns 422 for deserialization errors
+        assert_ne!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn push_empty_body() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"emp"}"#)).await;
+        let (status, _) = request(&app, "POST", "/queues/emp", None, Some("")).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, body) = request(&app, "GET", "/queues/emp", None, None).await;
+        assert!(body.contains(r#""message":"""#));
+    }
+
+    #[tokio::test]
+    async fn writer_can_peek_messages() {
+        // Writer role >= Reader, so can access read endpoints
+        let app = build_router(test_state(false));
+        let (status, _) =
+            request(&app, "GET", "/queues/q/messages", Some("writer-tok"), None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_can_peek_messages() {
+        let app = build_router(test_state(false));
+        let (status, _) = request(&app, "GET", "/queues/q/messages", Some("admin-tok"), None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_can_view_queue_info() {
+        let app = build_router(test_state(false));
+        let (status, _) = request(&app, "GET", "/queues/q/info", Some("admin-tok"), None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // --- UI disabled for JS/CSS ---
+
+    #[tokio::test]
+    async fn ui_js_disabled() {
+        let app = build_router(test_state(false));
+        let (status, _) = request(&app, "GET", "/ui/app.js", None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ui_css_disabled() {
+        let app = build_router(test_state(false));
+        let (status, _) = request(&app, "GET", "/ui/style.css", None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // --- Remote backend health ---
+
+    #[tokio::test]
+    async fn health_reports_remote_mode() {
+        let app = build_router(remote_state());
+        let (status, body) = request(&app, "GET", "/health", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""mode":"remote"#));
     }
 }
