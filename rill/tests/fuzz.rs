@@ -13,7 +13,7 @@
 //! # Scope
 //!
 //! Tests: create_queue, delete_queue, push_message, pop_message, queue_length,
-//! peek_messages, list_queues — all verified against an oracle.
+//! list_queues — all verified against an oracle.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
@@ -67,18 +67,6 @@ impl Oracle {
     fn length(&mut self, name: &str) -> usize {
         // Accessing a non-existent queue recreates it
         self.queues.entry(name.to_owned()).or_default().len()
-    }
-
-    fn peek(&mut self, name: &str, offset: usize, limit: usize) -> Vec<String> {
-        // Accessing a non-existent queue recreates it
-        self.queues
-            .entry(name.to_owned())
-            .or_default()
-            .iter()
-            .skip(offset)
-            .take(limit)
-            .cloned()
-            .collect()
     }
 
     fn list_queues(&self) -> Vec<String> {
@@ -143,20 +131,6 @@ fn verify_all(backend: &Backend, oracle: &mut Oracle, rt: &tokio::runtime::Runti
         assert_eq!(
             backend_len, oracle_len,
             "queue_length mismatch for '{name}': backend={backend_len} oracle={oracle_len}"
-        );
-    }
-
-    // Verify peek contents of each queue
-    for name in &oracle_queues {
-        let oracle_len = oracle.length(name);
-        let backend_msgs = rt
-            .block_on(backend.peek_messages(name, 0, oracle_len + 10))
-            .unwrap();
-        let oracle_msgs = oracle.peek(name, 0, oracle_len + 10);
-        let backend_bodies: Vec<&str> = backend_msgs.iter().map(|(_, b)| b.as_str()).collect();
-        assert_eq!(
-            backend_bodies, oracle_msgs,
-            "peek mismatch for '{name}': backend={backend_bodies:?} oracle={oracle_msgs:?}"
         );
     }
 }
@@ -225,22 +199,7 @@ fn fuzz_random_queue_ops() {
                     "length mismatch for '{name}': backend={backend_len} oracle={oracle_len} (op={ops}, seed={seed})"
                 );
             }
-            // peek_messages (10%)
-            85..95 => {
-                let offset = rng.usize(0..5);
-                let limit = rng.usize(1..20);
-                let backend_msgs = rt
-                    .block_on(backend.peek_messages(name, offset, limit))
-                    .unwrap();
-                let oracle_msgs = oracle.peek(name, offset, limit);
-                let backend_bodies: Vec<&str> =
-                    backend_msgs.iter().map(|(_, b)| b.as_str()).collect();
-                assert_eq!(
-                    backend_bodies, oracle_msgs,
-                    "peek mismatch for '{name}' offset={offset} limit={limit} (op={ops}, seed={seed})"
-                );
-            }
-            // list_queues (5%)
+            // list_queues (15%)
             _ => {
                 let mut backend_queues = rt.block_on(backend.list_queues()).unwrap();
                 backend_queues.sort();

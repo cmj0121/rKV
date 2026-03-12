@@ -85,7 +85,6 @@ struct AppState {
     writer_token: Option<String>,
     reader_token: Option<String>,
     ui_enabled: bool,
-    max_peek_limit: usize,
     started_at: Instant,
 }
 
@@ -300,18 +299,6 @@ async fn pop_message(
     Ok(Json(json!({"message": msg})))
 }
 
-#[derive(Deserialize)]
-struct PeekQuery {
-    #[serde(default)]
-    offset: usize,
-    #[serde(default = "default_limit")]
-    limit: usize,
-}
-
-fn default_limit() -> usize {
-    20
-}
-
 async fn queue_info(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -325,27 +312,6 @@ async fn queue_info(
         .await
         .map_err(ApiError::Internal)?;
     Ok(Json(json!({"queue": name, "length": length})))
-}
-
-async fn peek_messages(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    AxumPath(name): AxumPath<String>,
-    axum::extract::Query(query): axum::extract::Query<PeekQuery>,
-) -> Result<impl IntoResponse, ApiError> {
-    state.require_role(&headers, Role::Reader)?;
-    validate_queue_name(&name)?;
-    let limit = query.limit.min(state.max_peek_limit);
-    let messages = state
-        .backend
-        .peek_messages(&name, query.offset, limit)
-        .await
-        .map_err(ApiError::Internal)?;
-    let items: Vec<_> = messages
-        .into_iter()
-        .map(|(id, body)| json!({"id": id, "body": body}))
-        .collect();
-    Ok(Json(json!({"messages": items, "queue": name})))
 }
 
 async fn ui_index(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
@@ -381,10 +347,23 @@ async fn ui_style_css(State(state): State<Arc<AppState>>) -> Result<impl IntoRes
     ))
 }
 
+async fn docs_index() -> impl IntoResponse {
+    Html(include_str!("ui/docs.html"))
+}
+
+async fn docs_openapi() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/yaml")],
+        include_str!("ui/openapi.yaml"),
+    )
+}
+
 fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/health", get(health))
+        .route("/docs", get(docs_index))
+        .route("/docs/openapi.yaml", get(docs_openapi))
         .route("/ui", get(ui_index))
         .route("/ui/app.js", get(ui_app_js))
         .route("/ui/style.css", get(ui_style_css))
@@ -394,7 +373,6 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/queues/{name}", get(pop_message))
         .route("/queues/{name}", delete(delete_queue))
         .route("/queues/{name}/info", get(queue_info))
-        .route("/queues/{name}/messages", get(peek_messages))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -496,7 +474,6 @@ async fn main() {
                 writer_token: cfg.auth.writer_token,
                 reader_token: cfg.auth.reader_token,
                 ui_enabled: cfg.ui,
-                max_peek_limit: cfg.max_peek_limit,
                 started_at: Instant::now(),
             });
 
@@ -562,7 +539,7 @@ mod tests {
             writer_token: Some("writer-tok".to_string()),
             reader_token: Some("reader-tok".to_string()),
             ui_enabled: ui,
-            max_peek_limit: 100,
+
             started_at: Instant::now(),
         })
     }
@@ -577,7 +554,7 @@ mod tests {
             writer_token: None,
             reader_token: None,
             ui_enabled: false,
-            max_peek_limit: 100,
+
             started_at: Instant::now(),
         })
     }
@@ -590,7 +567,7 @@ mod tests {
             writer_token: None,
             reader_token: None,
             ui_enabled: false,
-            max_peek_limit: 100,
+
             started_at: Instant::now(),
         })
     }
@@ -840,26 +817,6 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
-    // --- Pagination limit cap ---
-
-    #[tokio::test]
-    async fn peek_limit_capped_at_max() {
-        let app = build_router(open_state());
-        request(&app, "POST", "/queues", None, Some(r#"{"name":"cap"}"#)).await;
-        // Push 3 messages
-        for i in 0..3 {
-            request(&app, "POST", "/queues/cap", None, Some(&format!("m{i}"))).await;
-        }
-        // Request limit=999 — should still work (capped server-side to MAX_PEEK_LIMIT)
-        let (status, body) =
-            request(&app, "GET", "/queues/cap/messages?limit=999", None, None).await;
-        assert_eq!(status, StatusCode::OK);
-        // All 3 messages returned (3 < MAX_PEEK_LIMIT)
-        assert!(body.contains("m0"));
-        assert!(body.contains("m1"));
-        assert!(body.contains("m2"));
-    }
-
     // --- Delete queue ---
 
     #[tokio::test]
@@ -917,7 +874,7 @@ mod tests {
         assert!(body.contains("null"));
     }
 
-    // --- Queue info and peek ---
+    // --- Queue info ---
 
     #[tokio::test]
     async fn e2e_queue_info() {
@@ -927,22 +884,6 @@ mod tests {
         request(&app, "POST", "/queues/info", None, Some("b")).await;
         let (status, body) = request(&app, "GET", "/queues/info/info", None, None).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains(r#""length":2"#));
-    }
-
-    #[tokio::test]
-    async fn e2e_peek_messages() {
-        let app = build_router(open_state());
-        request(&app, "POST", "/queues", None, Some(r#"{"name":"peek"}"#)).await;
-        request(&app, "POST", "/queues/peek", None, Some("x")).await;
-        request(&app, "POST", "/queues/peek", None, Some("y")).await;
-        // Peek without consuming
-        let (status, body) = request(&app, "GET", "/queues/peek/messages", None, None).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("\"x\""));
-        assert!(body.contains("\"y\""));
-        // Messages still there
-        let (_, body) = request(&app, "GET", "/queues/peek/info", None, None).await;
         assert!(body.contains(r#""length":2"#));
     }
 
@@ -1021,17 +962,6 @@ mod tests {
     // --- Additional handler edge cases ---
 
     #[tokio::test]
-    async fn peek_with_default_params() {
-        let app = build_router(open_state());
-        request(&app, "POST", "/queues", None, Some(r#"{"name":"dflt"}"#)).await;
-        request(&app, "POST", "/queues/dflt", None, Some("msg")).await;
-        // No query params — uses defaults (offset=0, limit=20)
-        let (status, body) = request(&app, "GET", "/queues/dflt/messages", None, None).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("msg"));
-    }
-
-    #[tokio::test]
     async fn queue_info_empty_queue() {
         let app = build_router(open_state());
         request(&app, "POST", "/queues", None, Some(r#"{"name":"empt"}"#)).await;
@@ -1059,22 +989,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_can_peek_messages() {
-        // Writer role >= Reader, so can access read endpoints
-        let app = build_router(test_state(false));
-        let (status, _) =
-            request(&app, "GET", "/queues/q/messages", Some("writer-tok"), None).await;
-        assert_eq!(status, StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn admin_can_peek_messages() {
-        let app = build_router(test_state(false));
-        let (status, _) = request(&app, "GET", "/queues/q/messages", Some("admin-tok"), None).await;
-        assert_eq!(status, StatusCode::OK);
-    }
-
-    #[tokio::test]
     async fn admin_can_view_queue_info() {
         let app = build_router(test_state(false));
         let (status, _) = request(&app, "GET", "/queues/q/info", Some("admin-tok"), None).await;
@@ -1095,6 +1009,25 @@ mod tests {
         let app = build_router(test_state(false));
         let (status, _) = request(&app, "GET", "/ui/style.css", None, None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // --- Docs ---
+
+    #[tokio::test]
+    async fn docs_serves_swagger_ui() {
+        let app = build_router(open_state());
+        let (status, body) = request(&app, "GET", "/docs", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("swagger-ui"));
+    }
+
+    #[tokio::test]
+    async fn docs_serves_openapi_yaml() {
+        let app = build_router(open_state());
+        let (status, body) = request(&app, "GET", "/docs/openapi.yaml", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("openapi:"));
+        assert!(body.contains("/queues"));
     }
 
     // --- TTL ---

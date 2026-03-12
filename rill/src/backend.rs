@@ -255,76 +255,6 @@ impl Backend {
             }
         }
     }
-
-    pub async fn peek_messages(
-        &self,
-        name: &str,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Vec<(String, String)>, String> {
-        let ns_name = queue_ns(name);
-        match self {
-            Backend::Embed(db, _) => {
-                let ns = db.namespace(&ns_name, None).map_err(|e| e.to_string())?;
-                let prefix = Key::Str(String::new());
-                let entries: Vec<_> = ns
-                    .entries(&prefix)
-                    .map_err(|e| e.to_string())?
-                    .filter_map(|e| e.ok())
-                    .skip(offset)
-                    .take(limit)
-                    .map(|(key, value)| {
-                        let k = match &key {
-                            Key::Int(n) => n.to_string(),
-                            Key::Str(s) => s.clone(),
-                        };
-                        let v = value
-                            .as_bytes()
-                            .map(|b| String::from_utf8_lossy(b).to_string())
-                            .unwrap_or_default();
-                        (k, v)
-                    })
-                    .collect();
-                Ok(entries)
-            }
-            Backend::Remote(client) => {
-                let list_url = format!(
-                    "{}?offset={}&limit={}",
-                    client.keys_url(&ns_name),
-                    offset,
-                    limit
-                );
-                let resp = client
-                    .client
-                    .get(&list_url)
-                    .send()
-                    .await
-                    .map_err(|e| e.to_string())?;
-                if !resp.status().is_success() {
-                    return Ok(Vec::new());
-                }
-                let keys: Vec<String> = resp.json().await.map_err(|e| e.to_string())?;
-                let mut results = Vec::new();
-                for key in keys {
-                    let get_url = client.key_url(&ns_name, &key);
-                    let resp = client
-                        .client
-                        .get(&get_url)
-                        .send()
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let value = if resp.status().is_success() {
-                        let text = resp.text().await.unwrap_or_default();
-                        serde_json::from_str::<String>(&text).unwrap_or(text)
-                    } else {
-                        String::new()
-                    };
-                    results.push((key, value));
-                }
-                Ok(results)
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -487,47 +417,6 @@ mod tests {
         assert_eq!(b.queue_length("len").await.unwrap(), 1);
     }
 
-    #[tokio::test]
-    async fn peek_messages_returns_without_consuming() {
-        let b = embed_backend();
-        b.create_queue("peek").await.unwrap();
-        b.push_message("peek", "x", None).await.unwrap();
-        b.push_message("peek", "y", None).await.unwrap();
-
-        let msgs = b.peek_messages("peek", 0, 10).await.unwrap();
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].1, "x");
-        assert_eq!(msgs[1].1, "y");
-
-        // Messages still there
-        assert_eq!(b.queue_length("peek").await.unwrap(), 2);
-    }
-
-    #[tokio::test]
-    async fn peek_messages_offset_and_limit() {
-        let b = embed_backend();
-        b.create_queue("page").await.unwrap();
-        for i in 0..5 {
-            b.push_message("page", &format!("m{i}"), None)
-                .await
-                .unwrap();
-        }
-
-        let page1 = b.peek_messages("page", 0, 2).await.unwrap();
-        assert_eq!(page1.len(), 2);
-        assert_eq!(page1[0].1, "m0");
-        assert_eq!(page1[1].1, "m1");
-
-        let page2 = b.peek_messages("page", 2, 2).await.unwrap();
-        assert_eq!(page2.len(), 2);
-        assert_eq!(page2[0].1, "m2");
-        assert_eq!(page2[1].1, "m3");
-
-        let page3 = b.peek_messages("page", 4, 2).await.unwrap();
-        assert_eq!(page3.len(), 1);
-        assert_eq!(page3[0].1, "m4");
-    }
-
     fn remote_backend() -> Backend {
         // Points at a port nothing listens on — all requests will fail with connection error
         Backend::Remote(RkvClient::new("http://127.0.0.1:1"))
@@ -570,12 +459,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_peek_messages_returns_error() {
-        let b = remote_backend();
-        assert!(b.peek_messages("test", 0, 10).await.is_err());
-    }
-
-    #[tokio::test]
     async fn delete_nonexistent_queue_is_noop() {
         let b = embed_backend();
         b.delete_queue("nonexistent").await.unwrap();
@@ -585,23 +468,6 @@ mod tests {
     async fn queue_length_nonexistent_queue() {
         let b = embed_backend();
         assert_eq!(b.queue_length("nope").await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn peek_empty_queue() {
-        let b = embed_backend();
-        b.create_queue("empty").await.unwrap();
-        let msgs = b.peek_messages("empty", 0, 10).await.unwrap();
-        assert!(msgs.is_empty());
-    }
-
-    #[tokio::test]
-    async fn peek_beyond_offset() {
-        let b = embed_backend();
-        b.create_queue("off").await.unwrap();
-        b.push_message("off", "a", None).await.unwrap();
-        let msgs = b.peek_messages("off", 100, 10).await.unwrap();
-        assert!(msgs.is_empty());
     }
 
     #[tokio::test]
@@ -618,10 +484,6 @@ mod tests {
         for w in ids.windows(2) {
             assert!(w[0] < w[1], "IDs not monotonic: {} >= {}", w[0], w[1]);
         }
-        // Peek returns same IDs in order
-        let msgs = b.peek_messages("ids", 0, 10).await.unwrap();
-        let peek_ids: Vec<&str> = msgs.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(peek_ids, ids);
     }
 
     #[tokio::test]
@@ -642,8 +504,7 @@ mod tests {
         b.create_queue("rc").await.unwrap();
         assert_eq!(b.pop_message("rc").await.unwrap(), None);
         b.push_message("rc", "new", None).await.unwrap();
-        let msgs = b.peek_messages("rc", 0, 10).await.unwrap();
-        assert_eq!(msgs[0].1, "new");
+        assert_eq!(b.pop_message("rc").await.unwrap(), Some("new".into()));
     }
 
     #[tokio::test]
