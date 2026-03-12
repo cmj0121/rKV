@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
-    extract::{Path as AxumPath, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
@@ -55,7 +55,7 @@ enum Command {
         #[arg(long, env = "RILL_READER_TOKEN")]
         reader_token: Option<String>,
 
-        #[arg(long, env = "RILL_UI")]
+        #[arg(long, env = "RILL_UI", default_value = "false")]
         ui: bool,
 
         /// rKV backend mode: embed or remote
@@ -142,6 +142,8 @@ impl AppState {
     }
 }
 
+const MAX_QUEUE_NAME_LEN: usize = 128;
+
 // --- Request types ---
 
 #[derive(Deserialize)]
@@ -153,7 +155,7 @@ fn validate_queue_name(name: &str) -> Result<(), ApiError> {
     if name.is_empty() {
         return Err(ApiError::BadRequest("queue name cannot be empty"));
     }
-    if name.len() > 128 {
+    if name.len() > MAX_QUEUE_NAME_LEN {
         return Err(ApiError::BadRequest("queue name too long (max 128 chars)"));
     }
     if name
@@ -263,7 +265,10 @@ fn parse_ttl(s: &str) -> Result<Duration, ApiError> {
     let n: u64 = num
         .parse()
         .map_err(|_| ApiError::BadRequest("invalid ttl number"))?;
-    Ok(Duration::from_millis(n * multiplier))
+    let ms = n
+        .checked_mul(multiplier)
+        .ok_or(ApiError::BadRequest("ttl value too large"))?;
+    Ok(Duration::from_millis(ms))
 }
 
 async fn push_message(
@@ -316,18 +321,14 @@ async fn queue_info(
 
 async fn ui_index(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     if !state.ui_enabled {
-        return Err(ApiError::NotFound(
-            r#"{"error":"UI not enabled. Start with --ui flag."}"#,
-        ));
+        return Err(ApiError::NotFound("UI not enabled. Start with --ui flag."));
     }
     Ok(Html(include_str!("ui/index.html")))
 }
 
 async fn ui_app_js(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     if !state.ui_enabled {
-        return Err(ApiError::NotFound(
-            r#"{"error":"UI not enabled. Start with --ui flag."}"#,
-        ));
+        return Err(ApiError::NotFound("UI not enabled. Start with --ui flag."));
     }
     Ok((
         [(header::CONTENT_TYPE, "application/javascript")],
@@ -337,9 +338,7 @@ async fn ui_app_js(State(state): State<Arc<AppState>>) -> Result<impl IntoRespon
 
 async fn ui_style_css(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     if !state.ui_enabled {
-        return Err(ApiError::NotFound(
-            r#"{"error":"UI not enabled. Start with --ui flag."}"#,
-        ));
+        return Err(ApiError::NotFound("UI not enabled. Start with --ui flag."));
     }
     Ok((
         [(header::CONTENT_TYPE, "text/css")],
@@ -373,6 +372,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/queues/{name}", get(pop_message))
         .route("/queues/{name}", delete(delete_queue))
         .route("/queues/{name}/info", get(queue_info))
+        .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -933,7 +933,7 @@ mod tests {
     fn validate_queue_name_accepts_valid() {
         assert!(validate_queue_name("my-queue_123").is_ok());
         assert!(validate_queue_name("a").is_ok());
-        assert!(validate_queue_name(&"x".repeat(128)).is_ok());
+        assert!(validate_queue_name(&"x".repeat(MAX_QUEUE_NAME_LEN)).is_ok());
     }
 
     #[test]
@@ -954,9 +954,9 @@ mod tests {
     #[test]
     fn validate_queue_name_boundary_length() {
         // 128 chars is ok
-        assert!(validate_queue_name(&"a".repeat(128)).is_ok());
+        assert!(validate_queue_name(&"a".repeat(MAX_QUEUE_NAME_LEN)).is_ok());
         // 129 chars is rejected
-        assert!(validate_queue_name(&"a".repeat(129)).is_err());
+        assert!(validate_queue_name(&"a".repeat(MAX_QUEUE_NAME_LEN + 1)).is_err());
     }
 
     // --- Additional handler edge cases ---
@@ -1090,5 +1090,21 @@ mod tests {
         let (status, body) = request(&app, "GET", "/health", None, None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains(r#""mode":"remote"#));
+    }
+
+    // --- Body size limit ---
+
+    #[tokio::test]
+    async fn push_rejects_oversized_body() {
+        let app = build_router(test_state(false));
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"big"}"#)).await;
+        let big_body = "x".repeat(2 * 1024 * 1024); // 2 MB > 1 MB limit
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/queues/big")
+            .body(axum::body::Body::from(big_body))
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

@@ -60,8 +60,13 @@ function api(method, path, body) {
     opts.headers["Authorization"] = "Bearer " + authToken;
   }
   if (body !== undefined) {
-    opts.headers["Content-Type"] = "application/json";
-    opts.body = typeof body === "string" ? body : JSON.stringify(body);
+    if (typeof body === "string") {
+      opts.headers["Content-Type"] = "text/plain";
+      opts.body = body;
+    } else {
+      opts.headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(body);
+    }
   }
   return fetch(path, opts).then(function (r) {
     if (!r.ok) {
@@ -107,8 +112,7 @@ function route() {
   }
   var app = $("#app");
   app.innerHTML = "";
-  if (hash === "queues") renderQueues(app);
-  else renderQueues(app);
+  renderQueues(app);
 }
 
 window.addEventListener("hashchange", route);
@@ -150,15 +154,22 @@ function loadQueues() {
       state.queues = (r.data && r.data.queues) || [];
       renderQueueList();
       renderQueueStats();
-      // Load lengths for each queue
+      // Load lengths for each queue, batch render after all complete
+      var pending = state.queues.length;
+      if (pending === 0) return;
       state.queues.forEach(function (name) {
         api("GET", "/queues/" + encodeURIComponent(name) + "/info")
           .then(function (r) {
             state.queueLengths[name] = r.data.length;
-            renderQueueList();
-            renderQueueStats();
           })
-          .catch(function () {});
+          .catch(function () {})
+          .then(function () {
+            pending--;
+            if (pending === 0) {
+              renderQueueList();
+              renderQueueStats();
+            }
+          });
       });
     })
     .catch(function (e) {

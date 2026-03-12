@@ -99,14 +99,14 @@ impl Backend {
     pub async fn delete_queue(&self, name: &str) -> Result<(), String> {
         let ns_name = queue_ns(name);
         match self {
-            Backend::Embed(db, _) => {
-                // Ignore "does not exist" errors — deleting a non-existent queue is a no-op
-                let _ = db.drop_namespace(&ns_name);
-                Ok(())
-            }
+            Backend::Embed(db, _) => match db.drop_namespace(&ns_name) {
+                Ok(()) => Ok(()),
+                Err(e) if e.to_string().contains("does not exist") => Ok(()),
+                Err(e) => Err(e.to_string()),
+            },
             Backend::Remote(client) => {
-                // Delete all keys in the namespace using prefix delete
-                let url = format!("{}?prefix=", client.keys_url(&ns_name));
+                // Drop the namespace entirely (DELETE /api/{ns})
+                let url = client.api_url(&ns_name);
                 let resp = client
                     .client
                     .delete(&url)
@@ -141,7 +141,7 @@ impl Backend {
                 let id = MsgIdGen::one();
                 let mut put_url = client.key_url(&ns_name, &id);
                 if let Some(d) = ttl {
-                    put_url = format!("{put_url}?ttl={}s", d.as_secs());
+                    put_url = format!("{put_url}?ttl={}ms", d.as_millis());
                 }
                 let resp = client
                     .client
@@ -248,7 +248,8 @@ impl Backend {
                     .await
                     .map_err(|e| e.to_string())?;
                 if !resp.status().is_success() {
-                    return Ok(0);
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(format!("queue_length failed: {body}"));
                 }
                 let keys: Vec<String> = resp.json().await.map_err(|e| e.to_string())?;
                 Ok(keys.len())

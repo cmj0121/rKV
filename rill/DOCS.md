@@ -6,18 +6,45 @@ Rill is a FIFO message queue powered by rKV. Push data in, pop data out.
 
 ## CLI
 
+### Global Options
+
+| Option     | Env Var       | Description                     |
+| ---------- | ------------- | ------------------------------- |
+| `--config` | `RILL_CONFIG` | Path to config file (YAML/TOML) |
+
+### `rill init`
+
+Generate a default config file to stdout.
+
 ```sh
-rill serve [OPTIONS]
+rill init > rill.yaml
+rill init --format toml > rill.toml
 ```
 
-| Option           | Env Var             | Default   | Description          |
-| ---------------- | ------------------- | --------- | -------------------- |
-| `--host`         | `RILL_HOST`         | `0.0.0.0` | Bind address         |
-| `--port`         | `RILL_PORT`         | `3000`    | Listen port          |
-| `--admin-token`  | `RILL_ADMIN_TOKEN`  |           | Admin bearer token   |
-| `--writer-token` | `RILL_WRITER_TOKEN` |           | Writer bearer token  |
-| `--reader-token` | `RILL_READER_TOKEN` |           | Reader bearer token  |
-| `--ui`           | `RILL_UI`           | `false`   | Enable web UI at /ui |
+| Option     | Default | Description               |
+| ---------- | ------- | ------------------------- |
+| `--format` | `yaml`  | Output format (yaml/toml) |
+
+### `rill serve`
+
+Start the HTTP server.
+
+```sh
+rill serve [OPTIONS]
+rill --config rill.yaml serve
+```
+
+| Option           | Env Var             | Default                 | Description                  |
+| ---------------- | ------------------- | ----------------------- | ---------------------------- |
+| `--host`         | `RILL_HOST`         | `0.0.0.0`               | Bind address                 |
+| `--port`         | `RILL_PORT`         | `3000`                  | Listen port                  |
+| `--admin-token`  | `RILL_ADMIN_TOKEN`  |                         | Admin bearer token           |
+| `--writer-token` | `RILL_WRITER_TOKEN` |                         | Writer bearer token          |
+| `--reader-token` | `RILL_READER_TOKEN` |                         | Reader bearer token          |
+| `--ui`           | `RILL_UI`           | `false`                 | Enable web UI at /ui         |
+| `--rkv-mode`     | `RILL_RKV_MODE`     | `embed`                 | Backend mode (embed/remote)  |
+| `--data`         | `RILL_DATA`         | `./rill-data`           | Data directory (embed mode)  |
+| `--rkv-url`      | `RILL_RKV_URL`      | `http://localhost:8321` | rKV server URL (remote mode) |
 
 ## Authentication
 
@@ -31,7 +58,7 @@ If no tokens are configured, all endpoints are open (no auth enforced).
 | ------ | ---------------------------------------- |
 | admin  | Full access — queue management + all ops |
 | writer | Push messages + read ops                 |
-| reader | Pop/peek messages only                   |
+| reader | Pop messages + view queue info           |
 
 ### Endpoint Permissions
 
@@ -56,7 +83,17 @@ If no tokens are configured, all endpoints are open (no auth enforced).
 GET /health
 ```
 
-Response: `{"status": "ok"}`
+Response:
+
+```json
+{
+  "status": "ok",
+  "version": "0.1.0",
+  "mode": "embed",
+  "queues": 3,
+  "uptime_seconds": 120
+}
+```
 
 ### Root
 
@@ -120,7 +157,7 @@ The `id` field contains a 26-character ULID (monotonic, lexicographically sortab
 GET /queues/:name
 ```
 
-Response: `{"message": null}` (or message data when available)
+Response: `{"message": "hello world"}` (or `{"message": null}` when queue is empty)
 
 ### Queue Info
 
@@ -154,7 +191,7 @@ Returns an HTML dashboard. Requires `--ui` flag; returns 404 if disabled.
 
 ```sh
 # Using docker-compose (from project root)
-docker compose --profile rill up -d
+docker compose up rill -d
 
 # Standalone
 docker build -f rill/Dockerfile -t rill .
@@ -166,14 +203,18 @@ docker run -p 3000:3000 \
 
 ### Environment Variables
 
-| Variable            | Description         |
-| ------------------- | ------------------- |
-| `RILL_HOST`         | Bind address        |
-| `RILL_PORT`         | Listen port         |
-| `RILL_ADMIN_TOKEN`  | Admin bearer token  |
-| `RILL_WRITER_TOKEN` | Writer bearer token |
-| `RILL_READER_TOKEN` | Reader bearer token |
-| `RILL_UI`           | Enable admin web UI |
+| Variable            | Description                  |
+| ------------------- | ---------------------------- |
+| `RILL_HOST`         | Bind address                 |
+| `RILL_PORT`         | Listen port                  |
+| `RILL_ADMIN_TOKEN`  | Admin bearer token           |
+| `RILL_WRITER_TOKEN` | Writer bearer token          |
+| `RILL_READER_TOKEN` | Reader bearer token          |
+| `RILL_UI`           | Enable web UI                |
+| `RILL_RKV_MODE`     | Backend mode (embed/remote)  |
+| `RILL_DATA`         | Data directory (embed mode)  |
+| `RILL_RKV_URL`      | rKV server URL (remote mode) |
+| `RILL_CONFIG`       | Path to config file          |
 
 ## Examples
 
