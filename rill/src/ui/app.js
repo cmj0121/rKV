@@ -623,6 +623,15 @@ function openPushDialog() {
   var msgInput = el("textarea", { placeholder: "Enter message content..." });
   dlg.appendChild(msgInput);
 
+  dlg.appendChild(
+    el("label", { textContent: "TTL (optional, e.g. 30s, 5m, 1h, 2d)" }),
+  );
+  var ttlInput = el("input", {
+    type: "text",
+    placeholder: "e.g. 30s, 5m, 1h",
+  });
+  dlg.appendChild(ttlInput);
+
   var actions = el("div", { className: "dialog-actions" }, [
     el("button", {
       className: "btn",
@@ -643,7 +652,12 @@ function openPushDialog() {
         }
         dlg.close();
         dlg.remove();
-        api("POST", "/queues/" + encodeURIComponent(state.selectedQueue), msg)
+        var url = "/queues/" + encodeURIComponent(state.selectedQueue);
+        var ttl = ttlInput.value.trim();
+        if (ttl) {
+          url += "?ttl=" + encodeURIComponent(ttl);
+        }
+        api("POST", url, msg)
           .then(function () {
             toast("Pushed message", true);
             addActivity("push", state.selectedQueue, msg);

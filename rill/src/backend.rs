@@ -1,9 +1,12 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use reqwest::Client;
 use rkv::{Key, DB};
 
+use crate::msgid::MsgIdGen;
+
 const NS_PREFIX: &str = "rill_";
-/// Reserved key for the monotonic sequence counter (sorts before all message keys >= 0).
-const SEQ_KEY: i64 = i64::MIN;
 
 /// Remote rKV HTTP client.
 pub struct RkvClient {
@@ -13,7 +16,7 @@ pub struct RkvClient {
 
 /// Backend enum — either an embedded DB or a remote HTTP client.
 pub enum Backend {
-    Embed(Box<DB>),
+    Embed(Box<DB>, Arc<MsgIdGen>),
     Remote(RkvClient),
 }
 
@@ -38,10 +41,6 @@ impl RkvClient {
     }
 }
 
-fn is_message_key(key: &Key) -> bool {
-    !matches!(key, Key::Int(SEQ_KEY))
-}
-
 fn queue_ns(name: &str) -> String {
     format!("{NS_PREFIX}{name}")
 }
@@ -56,7 +55,7 @@ fn filter_queue_names(namespaces: Vec<String>) -> Vec<String> {
 impl Backend {
     pub async fn list_queues(&self) -> Result<Vec<String>, String> {
         match self {
-            Backend::Embed(db) => {
+            Backend::Embed(db, _) => {
                 let all = db.list_namespaces().map_err(|e| e.to_string())?;
                 Ok(filter_queue_names(all))
             }
@@ -76,7 +75,7 @@ impl Backend {
     pub async fn create_queue(&self, name: &str) -> Result<(), String> {
         let ns_name = queue_ns(name);
         match self {
-            Backend::Embed(db) => {
+            Backend::Embed(db, _) => {
                 db.namespace(&ns_name, None).map_err(|e| e.to_string())?;
                 Ok(())
             }
@@ -100,7 +99,7 @@ impl Backend {
     pub async fn delete_queue(&self, name: &str) -> Result<(), String> {
         let ns_name = queue_ns(name);
         match self {
-            Backend::Embed(db) => {
+            Backend::Embed(db, _) => {
                 // Ignore "does not exist" errors — deleting a non-existent queue is a no-op
                 let _ = db.drop_namespace(&ns_name);
                 Ok(())
@@ -123,50 +122,27 @@ impl Backend {
         }
     }
 
-    pub async fn push_message(&self, name: &str, body: &str) -> Result<(), String> {
+    pub async fn push_message(
+        &self,
+        name: &str,
+        body: &str,
+        ttl: Option<Duration>,
+    ) -> Result<String, String> {
         let ns_name = queue_ns(name);
         match self {
-            Backend::Embed(db) => {
+            Backend::Embed(db, idgen) => {
                 let ns = db.namespace(&ns_name, None).map_err(|e| e.to_string())?;
-                // Use a reserved negative key to store the next sequence number.
-                // Message keys are always >= 0, so SEQ_KEY sorts before all messages.
-                let seq_key = Key::Int(SEQ_KEY);
-                let next_id: i64 = match ns.get(seq_key.clone()) {
-                    Ok(v) => match v.as_bytes() {
-                        Some(bytes) => {
-                            let s = std::str::from_utf8(bytes).unwrap_or("0");
-                            s.parse::<i64>().unwrap_or(0)
-                        }
-                        None => 0,
-                    },
-                    Err(_) => 0, // key not found — start at 0
-                };
-                ns.put(Key::Int(next_id), body.as_bytes(), None)
+                let id = idgen.generate();
+                ns.put(Key::Str(id.clone()), body.as_bytes(), ttl)
                     .map_err(|e| e.to_string())?;
-                ns.put(seq_key, (next_id + 1).to_string().as_bytes(), None)
-                    .map_err(|e| e.to_string())?;
-                Ok(())
+                Ok(id)
             }
             Backend::Remote(client) => {
-                // Find highest key via reverse scan
-                let list_url = format!("{}?reverse=true&limit=1", client.keys_url(&ns_name));
-                let resp = client
-                    .client
-                    .get(&list_url)
-                    .send()
-                    .await
-                    .map_err(|e| e.to_string())?;
-                if !resp.status().is_success() {
-                    let err = resp.text().await.unwrap_or_default();
-                    return Err(format!("list keys failed: {err}"));
+                let id = MsgIdGen::one();
+                let mut put_url = client.key_url(&ns_name, &id);
+                if let Some(d) = ttl {
+                    put_url = format!("{put_url}?ttl={}s", d.as_secs());
                 }
-                let keys: Vec<String> = resp.json().await.map_err(|e| e.to_string())?;
-                let next_id: i64 = match keys.first() {
-                    Some(k) => k.parse::<i64>().unwrap_or(0) + 1,
-                    None => 0,
-                };
-                // Put the new message
-                let put_url = client.key_url(&ns_name, &next_id.to_string());
                 let resp = client
                     .client
                     .put(&put_url)
@@ -178,7 +154,7 @@ impl Backend {
                     let err_body = resp.text().await.unwrap_or_default();
                     return Err(format!("push failed: {err_body}"));
                 }
-                Ok(())
+                Ok(id)
             }
         }
     }
@@ -186,14 +162,14 @@ impl Backend {
     pub async fn pop_message(&self, name: &str) -> Result<Option<String>, String> {
         let ns_name = queue_ns(name);
         match self {
-            Backend::Embed(db) => {
+            Backend::Embed(db, _) => {
                 let ns = db.namespace(&ns_name, None).map_err(|e| e.to_string())?;
                 let prefix = Key::Str(String::new());
                 let entry = ns
                     .entries(&prefix)
                     .map_err(|e| e.to_string())?
                     .filter_map(|e| e.ok())
-                    .find(|(k, _)| is_message_key(k));
+                    .next();
                 match entry {
                     Some((key, value)) => {
                         let data = value
@@ -258,15 +234,9 @@ impl Backend {
     pub async fn queue_length(&self, name: &str) -> Result<usize, String> {
         let ns_name = queue_ns(name);
         match self {
-            Backend::Embed(db) => {
+            Backend::Embed(db, _) => {
                 let ns = db.namespace(&ns_name, None).map_err(|e| e.to_string())?;
-                let prefix = Key::Str(String::new());
-                let count = ns
-                    .keys(&prefix)
-                    .map_err(|e| e.to_string())?
-                    .filter_map(|k| k.ok())
-                    .filter(is_message_key)
-                    .count();
+                let count = ns.count().map_err(|e| e.to_string())? as usize;
                 Ok(count)
             }
             Backend::Remote(client) => {
@@ -294,14 +264,13 @@ impl Backend {
     ) -> Result<Vec<(String, String)>, String> {
         let ns_name = queue_ns(name);
         match self {
-            Backend::Embed(db) => {
+            Backend::Embed(db, _) => {
                 let ns = db.namespace(&ns_name, None).map_err(|e| e.to_string())?;
                 let prefix = Key::Str(String::new());
                 let entries: Vec<_> = ns
                     .entries(&prefix)
                     .map_err(|e| e.to_string())?
                     .filter_map(|e| e.ok())
-                    .filter(|(k, _)| is_message_key(k))
                     .skip(offset)
                     .take(limit)
                     .map(|(key, value)| {
@@ -365,7 +334,7 @@ mod tests {
 
     fn embed_backend() -> Backend {
         let db = DB::open(Config::in_memory()).unwrap();
-        Backend::Embed(Box::new(db))
+        Backend::Embed(Box::new(db), Arc::new(MsgIdGen::new()))
     }
 
     #[tokio::test]
@@ -389,7 +358,7 @@ mod tests {
     async fn list_queues_ignores_non_rill_namespaces() {
         let b = embed_backend();
         b.create_queue("myq").await.unwrap();
-        if let Backend::Embed(db) = &b {
+        if let Backend::Embed(db, _) = &b {
             db.namespace("other_ns", None).unwrap();
         }
         let queues = b.list_queues().await.unwrap();
@@ -400,9 +369,9 @@ mod tests {
     async fn push_and_pop_fifo_order() {
         let b = embed_backend();
         b.create_queue("q").await.unwrap();
-        b.push_message("q", "first").await.unwrap();
-        b.push_message("q", "second").await.unwrap();
-        b.push_message("q", "third").await.unwrap();
+        b.push_message("q", "first", None).await.unwrap();
+        b.push_message("q", "second", None).await.unwrap();
+        b.push_message("q", "third", None).await.unwrap();
 
         assert_eq!(b.pop_message("q").await.unwrap(), Some("first".into()));
         assert_eq!(b.pop_message("q").await.unwrap(), Some("second".into()));
@@ -421,19 +390,19 @@ mod tests {
     async fn delete_queue_clears_messages() {
         let b = embed_backend();
         b.create_queue("del").await.unwrap();
-        b.push_message("del", "msg1").await.unwrap();
-        b.push_message("del", "msg2").await.unwrap();
+        b.push_message("del", "msg1", None).await.unwrap();
+        b.push_message("del", "msg2", None).await.unwrap();
         b.delete_queue("del").await.unwrap();
         assert_eq!(b.pop_message("del").await.unwrap(), None);
     }
 
     #[tokio::test]
-    async fn push_after_pop_continues_sequence() {
+    async fn push_after_pop_maintains_fifo() {
         let b = embed_backend();
         b.create_queue("seq").await.unwrap();
-        b.push_message("seq", "a").await.unwrap();
+        b.push_message("seq", "a", None).await.unwrap();
         b.pop_message("seq").await.unwrap();
-        b.push_message("seq", "b").await.unwrap();
+        b.push_message("seq", "b", None).await.unwrap();
         assert_eq!(b.pop_message("seq").await.unwrap(), Some("b".into()));
     }
 
@@ -442,8 +411,8 @@ mod tests {
         let b = embed_backend();
         b.create_queue("q1").await.unwrap();
         b.create_queue("q2").await.unwrap();
-        b.push_message("q1", "from-q1").await.unwrap();
-        b.push_message("q2", "from-q2").await.unwrap();
+        b.push_message("q1", "from-q1", None).await.unwrap();
+        b.push_message("q2", "from-q2", None).await.unwrap();
         assert_eq!(b.pop_message("q1").await.unwrap(), Some("from-q1".into()));
         assert_eq!(b.pop_message("q2").await.unwrap(), Some("from-q2".into()));
     }
@@ -464,15 +433,6 @@ mod tests {
     #[test]
     fn queue_ns_adds_prefix() {
         assert_eq!(queue_ns("tasks"), "rill_tasks");
-    }
-
-    #[test]
-    fn is_message_key_filters_seq_key() {
-        assert!(!is_message_key(&Key::Int(SEQ_KEY)));
-        assert!(is_message_key(&Key::Int(0)));
-        assert!(is_message_key(&Key::Int(1)));
-        assert!(is_message_key(&Key::Int(-1)));
-        assert!(is_message_key(&Key::Int(i64::MAX)));
     }
 
     #[test]
@@ -520,8 +480,8 @@ mod tests {
     async fn queue_length_tracks_push_pop() {
         let b = embed_backend();
         b.create_queue("len").await.unwrap();
-        b.push_message("len", "a").await.unwrap();
-        b.push_message("len", "b").await.unwrap();
+        b.push_message("len", "a", None).await.unwrap();
+        b.push_message("len", "b", None).await.unwrap();
         assert_eq!(b.queue_length("len").await.unwrap(), 2);
         b.pop_message("len").await.unwrap();
         assert_eq!(b.queue_length("len").await.unwrap(), 1);
@@ -531,8 +491,8 @@ mod tests {
     async fn peek_messages_returns_without_consuming() {
         let b = embed_backend();
         b.create_queue("peek").await.unwrap();
-        b.push_message("peek", "x").await.unwrap();
-        b.push_message("peek", "y").await.unwrap();
+        b.push_message("peek", "x", None).await.unwrap();
+        b.push_message("peek", "y", None).await.unwrap();
 
         let msgs = b.peek_messages("peek", 0, 10).await.unwrap();
         assert_eq!(msgs.len(), 2);
@@ -548,7 +508,9 @@ mod tests {
         let b = embed_backend();
         b.create_queue("page").await.unwrap();
         for i in 0..5 {
-            b.push_message("page", &format!("m{i}")).await.unwrap();
+            b.push_message("page", &format!("m{i}"), None)
+                .await
+                .unwrap();
         }
 
         let page1 = b.peek_messages("page", 0, 2).await.unwrap();
@@ -592,7 +554,7 @@ mod tests {
     #[tokio::test]
     async fn remote_push_message_returns_error() {
         let b = remote_backend();
-        assert!(b.push_message("test", "msg").await.is_err());
+        assert!(b.push_message("test", "msg", None).await.is_err());
     }
 
     #[tokio::test]
@@ -616,14 +578,12 @@ mod tests {
     #[tokio::test]
     async fn delete_nonexistent_queue_is_noop() {
         let b = embed_backend();
-        // Should not error
         b.delete_queue("nonexistent").await.unwrap();
     }
 
     #[tokio::test]
     async fn queue_length_nonexistent_queue() {
         let b = embed_backend();
-        // Namespace created lazily, length is 0
         assert_eq!(b.queue_length("nope").await.unwrap(), 0);
     }
 
@@ -639,28 +599,36 @@ mod tests {
     async fn peek_beyond_offset() {
         let b = embed_backend();
         b.create_queue("off").await.unwrap();
-        b.push_message("off", "a").await.unwrap();
+        b.push_message("off", "a", None).await.unwrap();
         let msgs = b.peek_messages("off", 100, 10).await.unwrap();
         assert!(msgs.is_empty());
     }
 
     #[tokio::test]
-    async fn push_many_then_peek_ids_are_sequential() {
+    async fn push_returns_ulid_ids() {
         let b = embed_backend();
         b.create_queue("ids").await.unwrap();
+        let mut ids = Vec::new();
         for _ in 0..5 {
-            b.push_message("ids", "x").await.unwrap();
+            let id = b.push_message("ids", "x", None).await.unwrap();
+            assert_eq!(id.len(), 26, "ULID should be 26 chars: {id}");
+            ids.push(id);
         }
+        // IDs are monotonically increasing
+        for w in ids.windows(2) {
+            assert!(w[0] < w[1], "IDs not monotonic: {} >= {}", w[0], w[1]);
+        }
+        // Peek returns same IDs in order
         let msgs = b.peek_messages("ids", 0, 10).await.unwrap();
-        let ids: Vec<&str> = msgs.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(ids, vec!["0", "1", "2", "3", "4"]);
+        let peek_ids: Vec<&str> = msgs.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(peek_ids, ids);
     }
 
     #[tokio::test]
     async fn create_queue_idempotent() {
         let b = embed_backend();
         b.create_queue("idem").await.unwrap();
-        b.create_queue("idem").await.unwrap(); // no error
+        b.create_queue("idem").await.unwrap();
         let queues = b.list_queues().await.unwrap();
         assert_eq!(queues.iter().filter(|q| *q == "idem").count(), 1);
     }
@@ -669,15 +637,25 @@ mod tests {
     async fn delete_then_recreate_queue() {
         let b = embed_backend();
         b.create_queue("rc").await.unwrap();
-        b.push_message("rc", "old").await.unwrap();
+        b.push_message("rc", "old", None).await.unwrap();
         b.delete_queue("rc").await.unwrap();
         b.create_queue("rc").await.unwrap();
-        // Queue is fresh, pop returns None
         assert_eq!(b.pop_message("rc").await.unwrap(), None);
-        // Push starts from 0 again
-        b.push_message("rc", "new").await.unwrap();
+        b.push_message("rc", "new", None).await.unwrap();
         let msgs = b.peek_messages("rc", 0, 10).await.unwrap();
-        assert_eq!(msgs[0].0, "0");
         assert_eq!(msgs[0].1, "new");
+    }
+
+    #[tokio::test]
+    async fn push_with_ttl() {
+        let b = embed_backend();
+        b.create_queue("ttl").await.unwrap();
+        let id = b
+            .push_message("ttl", "expires", Some(Duration::from_secs(3600)))
+            .await
+            .unwrap();
+        assert_eq!(id.len(), 26);
+        // Message is readable before expiry
+        assert_eq!(b.pop_message("ttl").await.unwrap(), Some("expires".into()));
     }
 }

@@ -94,12 +94,23 @@ Response: `{"queues": []}`
 ### Push Message
 
 ```http
-POST /queues/:name
+POST /queues/:name[?ttl=<duration>]
 
 <raw body>
 ```
 
-Response: `{"pushed": true}`
+Query parameters:
+
+| Parameter | Required | Example                 | Description                         |
+| --------- | -------- | ----------------------- | ----------------------------------- |
+| `ttl`     | no       | `30s`, `5m`, `1h`, `2d` | Message time-to-live (auto-expires) |
+
+Supported TTL units: `ms` (milliseconds), `s` (seconds), `m` (minutes), `h` (hours), `d` (days).
+If no unit is specified, seconds are assumed.
+
+Response: `{"id": "01jqx...", "pushed": true}`
+
+The `id` field contains a 26-character ULID (monotonic, lexicographically sortable).
 
 ### Pop Message
 
@@ -160,6 +171,11 @@ curl -X POST http://localhost:3000/queues \
 curl -X POST http://localhost:3000/queues/tasks \
   -H "Authorization: Bearer secret" \
   -d "hello world"
+
+# Push a message with 5-minute TTL
+curl -X POST "http://localhost:3000/queues/tasks?ttl=5m" \
+  -H "Authorization: Bearer secret" \
+  -d "expires soon"
 
 # Pop a message
 curl http://localhost:3000/queues/tasks \

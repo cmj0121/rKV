@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{Path as AxumPath, State},
@@ -12,6 +12,7 @@ use axum::{
 use clap::Parser;
 use rill::backend::{Backend, RkvClient};
 use rill::config::{BackendMode, RillConfig};
+use rill::msgid::MsgIdGen;
 use rkv::DB;
 use serde::Deserialize;
 use serde_json::json;
@@ -176,7 +177,7 @@ async fn root() -> &'static str {
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let uptime = state.started_at.elapsed().as_secs();
     let mode = match &state.backend {
-        Backend::Embed(_) => "embed",
+        Backend::Embed(..) => "embed",
         Backend::Remote(_) => "remote",
     };
     let queue_count = state
@@ -237,20 +238,51 @@ async fn list_queues(
     Ok(Json(json!({"queues": queues})))
 }
 
+#[derive(Deserialize)]
+struct PushQuery {
+    ttl: Option<String>,
+}
+
+fn parse_ttl(s: &str) -> Result<Duration, ApiError> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(ApiError::BadRequest("ttl cannot be empty"));
+    }
+    let (num, multiplier) = if let Some(n) = s.strip_suffix("ms") {
+        (n, 1u64) // milliseconds
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1000)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60_000)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3_600_000)
+    } else if let Some(n) = s.strip_suffix('d') {
+        (n, 86_400_000)
+    } else {
+        (s, 1000) // default to seconds
+    };
+    let n: u64 = num
+        .parse()
+        .map_err(|_| ApiError::BadRequest("invalid ttl number"))?;
+    Ok(Duration::from_millis(n * multiplier))
+}
+
 async fn push_message(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     AxumPath(name): AxumPath<String>,
+    axum::extract::Query(query): axum::extract::Query<PushQuery>,
     body: String,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_role(&headers, Role::Writer)?;
     validate_queue_name(&name)?;
-    state
+    let ttl = query.ttl.as_deref().map(parse_ttl).transpose()?;
+    let id = state
         .backend
-        .push_message(&name, &body)
+        .push_message(&name, &body, ttl)
         .await
         .map_err(ApiError::Internal)?;
-    Ok(Json(json!({"pushed": true})))
+    Ok(Json(json!({"id": id, "pushed": true})))
 }
 
 async fn pop_message(
@@ -450,7 +482,7 @@ async fn main() {
                     let rkv_config = cfg.rkv.to_rkv_config();
                     let db = DB::open(rkv_config).expect("failed to open rKV database");
                     info!("rKV database opened at {}", cfg.rkv.data);
-                    Backend::Embed(Box::new(db))
+                    Backend::Embed(Box::new(db), Arc::new(MsgIdGen::new()))
                 }
                 BackendMode::Remote => {
                     info!("connecting to rKV server at {}", cfg.rkv.url);
@@ -478,7 +510,7 @@ async fn main() {
                 .unwrap();
 
             // Flush embedded DB on shutdown
-            if let Backend::Embed(db) = &state.backend {
+            if let Backend::Embed(db, _) = &state.backend {
                 info!("flushing database...");
                 let _ = db.flush();
             }
@@ -518,13 +550,14 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use rill::msgid::MsgIdGen;
     use rkv::Config;
     use tower::ServiceExt;
 
     fn test_state(ui: bool) -> Arc<AppState> {
         let db = DB::open(Config::in_memory()).unwrap();
         Arc::new(AppState {
-            backend: Backend::Embed(Box::new(db)),
+            backend: Backend::Embed(Box::new(db), Arc::new(MsgIdGen::new())),
             admin_token: Some("admin-tok".to_string()),
             writer_token: Some("writer-tok".to_string()),
             reader_token: Some("reader-tok".to_string()),
@@ -552,7 +585,7 @@ mod tests {
     fn open_state() -> Arc<AppState> {
         let db = DB::open(Config::in_memory()).unwrap();
         Arc::new(AppState {
-            backend: Backend::Embed(Box::new(db)),
+            backend: Backend::Embed(Box::new(db), Arc::new(MsgIdGen::new())),
             admin_token: None,
             writer_token: None,
             reader_token: None,

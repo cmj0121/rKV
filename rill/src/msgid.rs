@@ -49,6 +49,11 @@ impl MsgIdGen {
         format!("{:0>26}", CROCKFORD_LOWER.encode_u128(raw))
     }
 
+    /// Generate a single ULID without keeping a generator around.
+    pub fn one() -> String {
+        Self::new().generate()
+    }
+
     fn refresh_ts(&self, seq: u64) -> u64 {
         // Refresh timestamp periodically (every 4096 ops)
         if seq.is_multiple_of(4096) {

@@ -94,7 +94,10 @@ impl Oracle {
 
 fn embed_backend() -> Backend {
     let db = DB::open(Config::in_memory()).unwrap();
-    Backend::Embed(Box::new(db))
+    Backend::Embed(
+        Box::new(db),
+        std::sync::Arc::new(rill::msgid::MsgIdGen::new()),
+    )
 }
 
 fn gen_queue_name(rng: &mut fastrand::Rng) -> &'static str {
@@ -201,7 +204,7 @@ fn fuzz_random_queue_ops() {
 
                 let msg = gen_message(&mut rng, msg_seq);
                 msg_seq += 1;
-                rt.block_on(backend.push_message(name, &msg)).unwrap();
+                rt.block_on(backend.push_message(name, &msg, None)).unwrap();
                 oracle.push(name, &msg);
             }
             // pop_message (25%)
@@ -318,7 +321,8 @@ fn fuzz_queue_name_validation() {
             valid_count += 1;
 
             // Push and pop should also work
-            rt.block_on(backend.push_message(&name, "test")).unwrap();
+            rt.block_on(backend.push_message(&name, "test", None))
+                .unwrap();
             let popped = rt.block_on(backend.pop_message(&name)).unwrap();
             assert_eq!(
                 popped,
@@ -372,7 +376,8 @@ fn fuzz_fifo_ordering_stress() {
             0..60 => {
                 let msg = format!("s{push_seq}");
                 push_seq += 1;
-                rt.block_on(backend.push_message("stress", &msg)).unwrap();
+                rt.block_on(backend.push_message("stress", &msg, None))
+                    .unwrap();
                 expected.push_back(msg);
             }
             // Pop (30%)
