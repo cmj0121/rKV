@@ -2,9 +2,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
 
 use crate::server::error::ServerError;
 use crate::server::types::parse_key;
@@ -49,10 +50,16 @@ pub async fn get_key(
     Ok(resp)
 }
 
-/// PUT /api/{ns}/keys/{key} -> 201
+#[derive(Deserialize)]
+pub struct PutQuery {
+    pub ttl: Option<String>,
+}
+
+/// PUT /api/{ns}/keys/{key}?ttl=30s -> 201
 pub async fn put_key(
     State(state): State<Arc<AppState>>,
     Path((ns_name, raw_key)): Path<(String, String)>,
+    Query(query): Query<PutQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ServerError> {
@@ -61,7 +68,12 @@ pub async fn put_key(
     }
     let key = parse_key(&raw_key);
     let ns = state.namespace(&ns_name)?;
-    let ttl = parse_expires_header(&headers).or_else(|| parse_ttl_header(&headers));
+    let ttl = query
+        .ttl
+        .as_deref()
+        .and_then(parse_ttl_string)
+        .or_else(|| parse_expires_header(&headers))
+        .or_else(|| parse_ttl_header(&headers));
     let value = json_body_to_value(&body)?;
     let rev = ns.put(key, value, ttl)?;
 
@@ -123,13 +135,12 @@ fn parse_expires_header(headers: &HeaderMap) -> Option<Duration> {
     expires.duration_since(SystemTime::now()).ok()
 }
 
-/// Parse the `X-RKV-TTL` header into a Duration.
+/// Parse a human-readable TTL string into a Duration.
 ///
-/// Accepts human-readable suffixes: `s` (seconds), `m` (minutes), `h` (hours),
-/// `d` (days). A plain number is treated as seconds (e.g. `120` = 2 minutes).
-fn parse_ttl_header(headers: &HeaderMap) -> Option<Duration> {
-    let val = headers.get("X-RKV-TTL")?.to_str().ok()?;
-    let s = val.trim();
+/// Accepts suffixes: `s` (seconds), `m` (minutes), `h` (hours), `d` (days).
+/// A plain number is treated as seconds (e.g. `120` = 2 minutes).
+fn parse_ttl_string(s: &str) -> Option<Duration> {
+    let s = s.trim();
     let (num, unit) = if let Some(n) = s.strip_suffix('d') {
         (n.parse::<u64>().ok()?, 86400)
     } else if let Some(n) = s.strip_suffix('h') {
@@ -142,6 +153,12 @@ fn parse_ttl_header(headers: &HeaderMap) -> Option<Duration> {
         (s.parse::<u64>().ok()?, 1)
     };
     Some(Duration::from_secs(num * unit))
+}
+
+/// Parse the `X-RKV-TTL` header into a Duration.
+fn parse_ttl_header(headers: &HeaderMap) -> Option<Duration> {
+    let val = headers.get("X-RKV-TTL")?.to_str().ok()?;
+    parse_ttl_string(val)
 }
 
 /// Convert a JSON body to a Value.
