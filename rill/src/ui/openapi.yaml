@@ -1,0 +1,297 @@
+openapi: 3.1.0
+info:
+  title: Rill
+  description: FIFO message queue powered by rKV. Push data in, pop data out.
+  version: 0.1.0
+  license:
+    name: MIT
+
+servers:
+  - url: /
+
+security:
+  - BearerAuth: []
+
+paths:
+  /:
+    get:
+      summary: Root
+      operationId: root
+      security: []
+      responses:
+        "200":
+          description: Empty response
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: ""
+
+  /health:
+    get:
+      summary: Health check
+      operationId: health
+      security: []
+      responses:
+        "200":
+          description: Server health and diagnostics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  version:
+                    type: string
+                    example: 0.1.0
+                  mode:
+                    type: string
+                    enum: [embed, remote]
+                  queues:
+                    type: integer
+                    example: 3
+                  uptime_seconds:
+                    type: integer
+                    example: 120
+
+  /queues:
+    get:
+      summary: List queues
+      operationId: listQueues
+      description: Returns all queue names. Requires Reader role or above.
+      responses:
+        "200":
+          description: Queue list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queues:
+                    type: array
+                    items:
+                      type: string
+                    example: [tasks, events]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      summary: Create queue
+      operationId: createQueue
+      description: Creates a new queue. Requires Admin role.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  pattern: ^[a-zA-Z0-9_-]{1,128}$
+                  example: my-queue
+      responses:
+        "200":
+          description: Queue created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queue:
+                    type: string
+                  created:
+                    type: boolean
+                example:
+                  queue: my-queue
+                  created: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /queues/{name}:
+    parameters:
+      - $ref: "#/components/parameters/QueueName"
+    post:
+      summary: Push message
+      operationId: pushMessage
+      description: |
+        Push a message onto the queue. The raw request body becomes the message content.
+        Optionally set a TTL to auto-expire the message.
+        Requires Writer role or above.
+      parameters:
+        - name: ttl
+          in: query
+          required: false
+          description: |
+            Message time-to-live. Supported units: `ms`, `s`, `m`, `h`, `d`.
+            Bare number defaults to seconds.
+          schema:
+            type: string
+          examples:
+            seconds:
+              value: "30s"
+            minutes:
+              value: "5m"
+            hours:
+              value: "1h"
+            days:
+              value: "2d"
+            bare:
+              value: "60"
+              summary: 60 seconds (no unit)
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+              example: hello world
+      responses:
+        "200":
+          description: Message pushed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    description: 26-character ULID (monotonic, lexicographically sortable)
+                    example: 01jqxk7m3n0000000000000001
+                  pushed:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    get:
+      summary: Pop message
+      operationId: popMessage
+      description: |
+        Pop the oldest message from the queue (FIFO).
+        The message is removed from the queue.
+        Requires Reader role or above.
+      responses:
+        "200":
+          description: Popped message (or null if queue is empty)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    nullable: true
+                    example: hello world
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    delete:
+      summary: Delete queue
+      operationId: deleteQueue
+      description: Deletes a queue and all its messages. Requires Admin role.
+      responses:
+        "200":
+          description: Queue deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queue:
+                    type: string
+                  deleted:
+                    type: boolean
+                example:
+                  queue: my-queue
+                  deleted: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /queues/{name}/info:
+    parameters:
+      - $ref: "#/components/parameters/QueueName"
+    get:
+      summary: Queue info
+      operationId: queueInfo
+      description: Returns the queue name and current message count. Requires Reader role or above.
+      responses:
+        "200":
+          description: Queue info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queue:
+                    type: string
+                  length:
+                    type: integer
+                example:
+                  queue: tasks
+                  length: 42
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Roles: admin (full access), writer (push + read), reader (pop/peek).
+        If no tokens are configured, all endpoints are open.
+
+  parameters:
+    QueueName:
+      name: name
+      in: path
+      required: true
+      description: "Queue name (alphanumeric, dash, underscore; max 128 chars)"
+      schema:
+        type: string
+        pattern: ^[a-zA-Z0-9_-]{1,128}$
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or invalid token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Insufficient role
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+      example:
+        error: unauthorized
