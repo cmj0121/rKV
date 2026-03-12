@@ -10,14 +10,14 @@ Rill is a FIFO message queue powered by rKV. Push data in, pop data out.
 rill serve [OPTIONS]
 ```
 
-| Option           | Env Var             | Default   | Description             |
-| ---------------- | ------------------- | --------- | ----------------------- |
-| `--host`         | `RILL_HOST`         | `0.0.0.0` | Bind address            |
-| `--port`         | `RILL_PORT`         | `3000`    | Listen port             |
-| `--admin-token`  | `RILL_ADMIN_TOKEN`  |           | Admin bearer token      |
-| `--writer-token` | `RILL_WRITER_TOKEN` |           | Writer bearer token     |
-| `--reader-token` | `RILL_READER_TOKEN` |           | Reader bearer token     |
-| `--ui`           | `RILL_UI`           | `false`   | Enable web UI at /admin |
+| Option           | Env Var             | Default   | Description          |
+| ---------------- | ------------------- | --------- | -------------------- |
+| `--host`         | `RILL_HOST`         | `0.0.0.0` | Bind address         |
+| `--port`         | `RILL_PORT`         | `3000`    | Listen port          |
+| `--admin-token`  | `RILL_ADMIN_TOKEN`  |           | Admin bearer token   |
+| `--writer-token` | `RILL_WRITER_TOKEN` |           | Writer bearer token  |
+| `--reader-token` | `RILL_READER_TOKEN` |           | Reader bearer token  |
+| `--ui`           | `RILL_UI`           | `false`   | Enable web UI at /ui |
 
 ## Authentication
 
@@ -35,16 +35,18 @@ If no tokens are configured, all endpoints are open (no auth enforced).
 
 ### Endpoint Permissions
 
-| Endpoint               | Admin  | Writer | Reader |
-| ---------------------- | ------ | ------ | ------ |
-| `POST   /queues`       | yes    | -      | -      |
-| `DELETE /queues/:name` | yes    | -      | -      |
-| `GET    /queues`       | yes    | yes    | yes    |
-| `POST   /queues/:name` | yes    | yes    | -      |
-| `GET    /queues/:name` | yes    | yes    | yes    |
-| `GET    /admin`        | yes    | -      | -      |
-| `GET    /health`       | public | public | public |
-| `GET    /`             | public | public | public |
+| Endpoint                    | Admin  | Writer | Reader |
+| --------------------------- | ------ | ------ | ------ |
+| `POST   /queues`            | yes    | -      | -      |
+| `DELETE /queues/:name`      | yes    | -      | -      |
+| `GET    /queues`            | yes    | yes    | yes    |
+| `POST   /queues/:name`      | yes    | yes    | -      |
+| `GET    /queues/:name`      | yes    | yes    | yes    |
+| `GET    /queues/:name/info` | yes    | yes    | yes    |
+| `GET    /ui`                | public | public | public |
+| `GET    /docs`              | public | public | public |
+| `GET    /health`            | public | public | public |
+| `GET    /`                  | public | public | public |
 
 ## HTTP API
 
@@ -120,10 +122,28 @@ GET /queues/:name
 
 Response: `{"message": null}` (or message data when available)
 
-### Admin UI
+### Queue Info
 
 ```http
-GET /admin
+GET /queues/:name/info
+```
+
+Response: `{"queue": "my-queue", "length": 42}`
+
+### API Docs
+
+```http
+GET /docs
+```
+
+Interactive OpenAPI documentation (Swagger UI). Always available.
+
+The raw OpenAPI spec is at `GET /docs/openapi.yaml`.
+
+### Web UI
+
+```http
+GET /ui
 ```
 
 Returns an HTML dashboard. Requires `--ui` flag; returns 404 if disabled.

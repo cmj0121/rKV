@@ -10,7 +10,6 @@ pub struct RillConfig {
     pub host: String,
     pub port: u16,
     pub ui: bool,
-    pub max_peek_limit: usize,
     pub auth: AuthSection,
     pub rkv: RkvBackend,
 }
@@ -57,7 +56,6 @@ impl Default for RillConfig {
             host: "0.0.0.0".to_string(),
             port: 3000,
             ui: false,
-            max_peek_limit: 100,
             auth: AuthSection::default(),
             rkv: RkvBackend::default(),
         }
@@ -135,7 +133,6 @@ const YAML_TEMPLATE: &str = r#"# Rill configuration file
 host: 0.0.0.0
 port: 3000
 ui: false
-max_peek_limit: 100              # max messages per peek request
 
 auth:
   # admin_token: null          # queue create/delete + all
@@ -176,7 +173,6 @@ const TOML_TEMPLATE: &str = r#"# Rill configuration file
 host = "0.0.0.0"
 port = 3000
 ui = false
-max_peek_limit = 100               # max messages per peek request
 
 [auth]
 # admin_token = "secret"      # queue create/delete + all

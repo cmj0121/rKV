@@ -91,9 +91,6 @@ var state = {
   queues: [],
   queueLengths: {},
   selectedQueue: null,
-  messages: [],
-  msgOffset: 0,
-  msgLimit: 20,
 };
 
 // ---------------------------------------------------------------------------
@@ -111,7 +108,6 @@ function route() {
   var app = $("#app");
   app.innerHTML = "";
   if (hash === "queues") renderQueues(app);
-  else if (hash === "messages") renderMessages(app);
   else renderQueues(app);
 }
 
@@ -227,12 +223,20 @@ function renderQueueList() {
       el("div", { className: "actions" }, [
         el("button", {
           className: "btn btn-green btn-sm",
-          textContent: "Browse",
+          textContent: "Push",
           onClick: function (e) {
             e.stopPropagation();
             state.selectedQueue = name;
-            state.msgOffset = 0;
-            location.hash = "#messages";
+            openPushDialog();
+          },
+        }),
+        el("button", {
+          className: "btn btn-yellow btn-sm",
+          textContent: "Pop",
+          onClick: function (e) {
+            e.stopPropagation();
+            state.selectedQueue = name;
+            popMessage();
           },
         }),
         el("button", {
@@ -313,296 +317,6 @@ function deleteQueue(name) {
 }
 
 // ---------------------------------------------------------------------------
-// Messages view
-// ---------------------------------------------------------------------------
-function renderMessages(app) {
-  if (!state.selectedQueue && state.queues.length > 0) {
-    state.selectedQueue = state.queues[0];
-  }
-
-  app.appendChild(el("h2", { textContent: "Messages" }));
-
-  // Queue selector toolbar
-  var queueSelect = el("select", {
-    id: "msg-queue-select",
-    onChange: function () {
-      state.selectedQueue = this.value;
-      state.msgOffset = 0;
-      loadMessages();
-    },
-  });
-
-  var toolbar = el("div", { className: "toolbar" }, [
-    queueSelect,
-    el("button", {
-      className: "btn btn-green",
-      textContent: "Push",
-      onClick: openPushDialog,
-    }),
-    el("button", {
-      className: "btn btn-yellow",
-      textContent: "Pop",
-      onClick: popMessage,
-    }),
-    el("button", {
-      className: "btn",
-      textContent: "Refresh",
-      onClick: function () {
-        loadMessages();
-      },
-    }),
-  ]);
-  app.appendChild(toolbar);
-
-  // Queue info bar
-  app.appendChild(el("div", { className: "queue-info", id: "queue-info" }));
-
-  // Messages table
-  var table = el("table", { id: "msg-table" });
-  table.appendChild(
-    el("thead", null, [
-      el("tr", null, [
-        el("th", { textContent: "#" }),
-        el("th", { textContent: "Message" }),
-      ]),
-    ]),
-  );
-  table.appendChild(el("tbody", { id: "msg-body" }));
-  app.appendChild(table);
-
-  // Pagination
-  app.appendChild(el("div", { className: "pagination", id: "pagination" }));
-
-  // Activity log
-  app.appendChild(el("h2", { textContent: "Activity Log" }));
-  var activityTable = el("table", { id: "activity-table" });
-  activityTable.appendChild(
-    el("thead", null, [
-      el("tr", null, [
-        el("th", { textContent: "Action" }),
-        el("th", { textContent: "Queue" }),
-        el("th", { textContent: "Message" }),
-        el("th", { textContent: "Time" }),
-      ]),
-    ]),
-  );
-  activityTable.appendChild(el("tbody", { id: "activity-body" }));
-  app.appendChild(activityTable);
-
-  loadMessagesView();
-}
-
-function loadMessagesView() {
-  api("GET", "/queues")
-    .then(function (r) {
-      state.queues = (r.data && r.data.queues) || [];
-      var sel = $("#msg-queue-select");
-      if (!sel) return;
-      sel.innerHTML = "";
-      if (state.queues.length === 0) {
-        sel.appendChild(
-          el("option", { textContent: "(no queues)", disabled: true }),
-        );
-        return;
-      }
-      state.queues.forEach(function (name) {
-        var opt = el("option", { value: name, textContent: name });
-        if (name === state.selectedQueue) opt.selected = true;
-        sel.appendChild(opt);
-      });
-      if (!state.selectedQueue && state.queues.length > 0) {
-        state.selectedQueue = state.queues[0];
-      }
-      loadMessages();
-    })
-    .catch(function (e) {
-      toast("Load queues: " + e.message);
-    });
-
-  renderActivity();
-}
-
-function loadMessages() {
-  if (!state.selectedQueue) return;
-
-  var q = encodeURIComponent(state.selectedQueue);
-
-  // Load queue info
-  api("GET", "/queues/" + q + "/info")
-    .then(function (r) {
-      var info = $("#queue-info");
-      if (!info) return;
-      var len = r.data.length;
-      state.queueLengths[state.selectedQueue] = len;
-      info.innerHTML = "";
-      info.appendChild(
-        el("span", {
-          className: "info-label",
-          textContent:
-            state.selectedQueue +
-            " \u2014 " +
-            len +
-            " message" +
-            (len !== 1 ? "s" : ""),
-        }),
-      );
-    })
-    .catch(function () {});
-
-  // Load messages (peek)
-  api(
-    "GET",
-    "/queues/" +
-      q +
-      "/messages?offset=" +
-      state.msgOffset +
-      "&limit=" +
-      state.msgLimit,
-  )
-    .then(function (r) {
-      state.messages = (r.data && r.data.messages) || [];
-      renderMessageTable();
-      renderPagination();
-    })
-    .catch(function (e) {
-      toast("Load messages: " + e.message);
-    });
-}
-
-function renderMessageTable() {
-  var tbody = $("#msg-body");
-  if (!tbody) return;
-  tbody.innerHTML = "";
-
-  if (state.messages.length === 0) {
-    tbody.appendChild(
-      el("tr", null, [
-        el("td", {
-          colSpan: "2",
-          className: "empty",
-          textContent: "No messages in queue",
-        }),
-      ]),
-    );
-    return;
-  }
-
-  state.messages.forEach(function (msg, i) {
-    var preview =
-      msg.body.length > 120 ? msg.body.slice(0, 117) + "..." : msg.body;
-    tbody.appendChild(
-      el("tr", null, [
-        el("td", {
-          className: "row-num",
-          textContent: String(state.msgOffset + i + 1),
-        }),
-        el("td", { className: "msg-preview", textContent: preview }),
-      ]),
-    );
-  });
-}
-
-function renderPagination() {
-  var pag = $("#pagination");
-  if (!pag) return;
-  pag.innerHTML = "";
-
-  if (state.msgOffset > 0) {
-    pag.appendChild(
-      el("button", {
-        className: "btn btn-sm",
-        textContent: "\u2190 Prev",
-        onClick: function () {
-          state.msgOffset = Math.max(0, state.msgOffset - state.msgLimit);
-          loadMessages();
-        },
-      }),
-    );
-  }
-
-  pag.appendChild(
-    el("span", {
-      className: "page-info",
-      textContent:
-        "Showing " +
-        (state.msgOffset + 1) +
-        "-" +
-        (state.msgOffset + state.messages.length),
-    }),
-  );
-
-  if (state.messages.length === state.msgLimit) {
-    pag.appendChild(
-      el("button", {
-        className: "btn btn-sm",
-        textContent: "Next \u2192",
-        onClick: function () {
-          state.msgOffset += state.msgLimit;
-          loadMessages();
-        },
-      }),
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Activity log
-// ---------------------------------------------------------------------------
-var activityLog = [];
-
-function addActivity(action, queue, message) {
-  activityLog.unshift({
-    action: action,
-    queue: queue,
-    message: message,
-    time: new Date().toLocaleTimeString(),
-  });
-  if (activityLog.length > 20) activityLog.pop();
-  renderActivity();
-}
-
-function renderActivity() {
-  var tbody = $("#activity-body");
-  if (!tbody) return;
-  tbody.innerHTML = "";
-
-  if (activityLog.length === 0) {
-    tbody.appendChild(
-      el("tr", null, [
-        el("td", {
-          colSpan: "4",
-          className: "empty",
-          textContent: "No recent activity",
-        }),
-      ]),
-    );
-    return;
-  }
-
-  activityLog.forEach(function (entry) {
-    var preview =
-      entry.message && entry.message.length > 60
-        ? entry.message.slice(0, 57) + "..."
-        : entry.message || "-";
-    tbody.appendChild(
-      el("tr", null, [
-        el("td", null, [
-          el("span", {
-            className:
-              "action-badge " +
-              (entry.action === "push" ? "badge-green" : "badge-yellow"),
-            textContent: entry.action,
-          }),
-        ]),
-        el("td", { textContent: entry.queue }),
-        el("td", { className: "msg-preview", textContent: preview }),
-        el("td", { className: "dim", textContent: entry.time }),
-      ]),
-    );
-  });
-}
-
-// ---------------------------------------------------------------------------
 // Push / Pop
 // ---------------------------------------------------------------------------
 function openPushDialog() {
@@ -658,8 +372,7 @@ function openPushDialog() {
         api("POST", url, msg)
           .then(function () {
             toast("Pushed message", true);
-            addActivity("push", state.selectedQueue, msg);
-            loadMessages();
+            loadQueues();
           })
           .catch(function (e) {
             toast("Push: " + e.message);
@@ -685,12 +398,10 @@ function popMessage() {
       var msg = r.data && r.data.message;
       if (msg === null || msg === undefined) {
         toast("Queue is empty");
-        addActivity("pop", state.selectedQueue, "(empty)");
       } else {
-        toast("Popped message", true);
-        addActivity("pop", state.selectedQueue, String(msg));
+        toast("Popped: " + String(msg).slice(0, 60), true);
       }
-      loadMessages();
+      loadQueues();
     })
     .catch(function (e) {
       toast("Pop: " + e.message);
