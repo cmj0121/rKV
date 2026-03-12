@@ -55,7 +55,7 @@ enum Command {
         #[arg(long, env = "RILL_READER_TOKEN")]
         reader_token: Option<String>,
 
-        #[arg(long, env = "RILL_UI")]
+        #[arg(long, env = "RILL_UI", default_value = "false")]
         ui: bool,
 
         /// rKV backend mode: embed or remote
@@ -1090,5 +1090,21 @@ mod tests {
         let (status, body) = request(&app, "GET", "/health", None, None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains(r#""mode":"remote"#));
+    }
+
+    // --- Body size limit ---
+
+    #[tokio::test]
+    async fn push_rejects_oversized_body() {
+        let app = build_router(test_state(false));
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"big"}"#)).await;
+        let big_body = "x".repeat(2 * 1024 * 1024); // 2 MB > 1 MB limit
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/queues/big")
+            .body(axum::body::Body::from(big_body))
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

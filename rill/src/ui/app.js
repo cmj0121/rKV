@@ -60,8 +60,13 @@ function api(method, path, body) {
     opts.headers["Authorization"] = "Bearer " + authToken;
   }
   if (body !== undefined) {
-    opts.headers["Content-Type"] = "application/json";
-    opts.body = typeof body === "string" ? body : JSON.stringify(body);
+    if (typeof body === "string") {
+      opts.headers["Content-Type"] = "text/plain";
+      opts.body = body;
+    } else {
+      opts.headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(body);
+    }
   }
   return fetch(path, opts).then(function (r) {
     if (!r.ok) {

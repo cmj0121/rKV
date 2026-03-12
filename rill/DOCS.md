@@ -6,8 +6,32 @@ Rill is a FIFO message queue powered by rKV. Push data in, pop data out.
 
 ## CLI
 
+### Global Options
+
+| Option     | Env Var       | Description                     |
+| ---------- | ------------- | ------------------------------- |
+| `--config` | `RILL_CONFIG` | Path to config file (YAML/TOML) |
+
+### `rill init`
+
+Generate a default config file to stdout.
+
+```sh
+rill init > rill.yaml
+rill init --format toml > rill.toml
+```
+
+| Option     | Default | Description               |
+| ---------- | ------- | ------------------------- |
+| `--format` | `yaml`  | Output format (yaml/toml) |
+
+### `rill serve`
+
+Start the HTTP server.
+
 ```sh
 rill serve [OPTIONS]
+rill --config rill.yaml serve
 ```
 
 | Option           | Env Var             | Default                 | Description                  |
@@ -21,7 +45,6 @@ rill serve [OPTIONS]
 | `--rkv-mode`     | `RILL_RKV_MODE`     | `embed`                 | Backend mode (embed/remote)  |
 | `--data`         | `RILL_DATA`         | `./rill-data`           | Data directory (embed mode)  |
 | `--rkv-url`      | `RILL_RKV_URL`      | `http://localhost:8321` | rKV server URL (remote mode) |
-| `--config`       | `RILL_CONFIG`       |                         | Path to config file          |
 
 ## Authentication
 
@@ -168,7 +191,7 @@ Returns an HTML dashboard. Requires `--ui` flag; returns 404 if disabled.
 
 ```sh
 # Using docker-compose (from project root)
-docker compose --profile rill up -d
+docker compose up rill -d
 
 # Standalone
 docker build -f rill/Dockerfile -t rill .
