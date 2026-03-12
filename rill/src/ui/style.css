@@ -226,12 +226,6 @@ td .actions {
   width: 40px;
 }
 
-.msg-id {
-  color: var(--accent);
-  font-size: 12px;
-  width: 80px;
-}
-
 /* ---- Cards / stat grid ---- */
 .stat-grid {
   display: grid;

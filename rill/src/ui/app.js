@@ -363,7 +363,6 @@ function renderMessages(app) {
     el("thead", null, [
       el("tr", null, [
         el("th", { textContent: "#" }),
-        el("th", { textContent: "ID" }),
         el("th", { textContent: "Message" }),
       ]),
     ]),
@@ -479,7 +478,7 @@ function renderMessageTable() {
     tbody.appendChild(
       el("tr", null, [
         el("td", {
-          colSpan: "3",
+          colSpan: "2",
           className: "empty",
           textContent: "No messages in queue",
         }),
@@ -497,7 +496,6 @@ function renderMessageTable() {
           className: "row-num",
           textContent: String(state.msgOffset + i + 1),
         }),
-        el("td", { className: "msg-id", textContent: msg.id }),
         el("td", { className: "msg-preview", textContent: preview }),
       ]),
     );
