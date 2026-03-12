@@ -10,14 +10,18 @@ Rill is a FIFO message queue powered by rKV. Push data in, pop data out.
 rill serve [OPTIONS]
 ```
 
-| Option           | Env Var             | Default   | Description          |
-| ---------------- | ------------------- | --------- | -------------------- |
-| `--host`         | `RILL_HOST`         | `0.0.0.0` | Bind address         |
-| `--port`         | `RILL_PORT`         | `3000`    | Listen port          |
-| `--admin-token`  | `RILL_ADMIN_TOKEN`  |           | Admin bearer token   |
-| `--writer-token` | `RILL_WRITER_TOKEN` |           | Writer bearer token  |
-| `--reader-token` | `RILL_READER_TOKEN` |           | Reader bearer token  |
-| `--ui`           | `RILL_UI`           | `false`   | Enable web UI at /ui |
+| Option           | Env Var             | Default                 | Description                  |
+| ---------------- | ------------------- | ----------------------- | ---------------------------- |
+| `--host`         | `RILL_HOST`         | `0.0.0.0`               | Bind address                 |
+| `--port`         | `RILL_PORT`         | `3000`                  | Listen port                  |
+| `--admin-token`  | `RILL_ADMIN_TOKEN`  |                         | Admin bearer token           |
+| `--writer-token` | `RILL_WRITER_TOKEN` |                         | Writer bearer token          |
+| `--reader-token` | `RILL_READER_TOKEN` |                         | Reader bearer token          |
+| `--ui`           | `RILL_UI`           | `false`                 | Enable web UI at /ui         |
+| `--rkv-mode`     | `RILL_RKV_MODE`     | `embed`                 | Backend mode (embed/remote)  |
+| `--data`         | `RILL_DATA`         | `./rill-data`           | Data directory (embed mode)  |
+| `--rkv-url`      | `RILL_RKV_URL`      | `http://localhost:8321` | rKV server URL (remote mode) |
+| `--config`       | `RILL_CONFIG`       |                         | Path to config file          |
 
 ## Authentication
 
@@ -31,7 +35,7 @@ If no tokens are configured, all endpoints are open (no auth enforced).
 | ------ | ---------------------------------------- |
 | admin  | Full access — queue management + all ops |
 | writer | Push messages + read ops                 |
-| reader | Pop/peek messages only                   |
+| reader | Pop messages + view queue info           |
 
 ### Endpoint Permissions
 
@@ -56,7 +60,17 @@ If no tokens are configured, all endpoints are open (no auth enforced).
 GET /health
 ```
 
-Response: `{"status": "ok"}`
+Response:
+
+```json
+{
+  "status": "ok",
+  "version": "0.1.0",
+  "mode": "embed",
+  "queues": 3,
+  "uptime_seconds": 120
+}
+```
 
 ### Root
 
@@ -120,7 +134,7 @@ The `id` field contains a 26-character ULID (monotonic, lexicographically sortab
 GET /queues/:name
 ```
 
-Response: `{"message": null}` (or message data when available)
+Response: `{"message": "hello world"}` (or `{"message": null}` when queue is empty)
 
 ### Queue Info
 
@@ -166,14 +180,18 @@ docker run -p 3000:3000 \
 
 ### Environment Variables
 
-| Variable            | Description         |
-| ------------------- | ------------------- |
-| `RILL_HOST`         | Bind address        |
-| `RILL_PORT`         | Listen port         |
-| `RILL_ADMIN_TOKEN`  | Admin bearer token  |
-| `RILL_WRITER_TOKEN` | Writer bearer token |
-| `RILL_READER_TOKEN` | Reader bearer token |
-| `RILL_UI`           | Enable admin web UI |
+| Variable            | Description                  |
+| ------------------- | ---------------------------- |
+| `RILL_HOST`         | Bind address                 |
+| `RILL_PORT`         | Listen port                  |
+| `RILL_ADMIN_TOKEN`  | Admin bearer token           |
+| `RILL_WRITER_TOKEN` | Writer bearer token          |
+| `RILL_READER_TOKEN` | Reader bearer token          |
+| `RILL_UI`           | Enable web UI                |
+| `RILL_RKV_MODE`     | Backend mode (embed/remote)  |
+| `RILL_DATA`         | Data directory (embed mode)  |
+| `RILL_RKV_URL`      | rKV server URL (remote mode) |
+| `RILL_CONFIG`       | Path to config file          |
 
 ## Examples
 

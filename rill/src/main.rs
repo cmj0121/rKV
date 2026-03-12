@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
-    extract::{Path as AxumPath, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
@@ -265,7 +265,10 @@ fn parse_ttl(s: &str) -> Result<Duration, ApiError> {
     let n: u64 = num
         .parse()
         .map_err(|_| ApiError::BadRequest("invalid ttl number"))?;
-    Ok(Duration::from_millis(n * multiplier))
+    let ms = n
+        .checked_mul(multiplier)
+        .ok_or(ApiError::BadRequest("ttl value too large"))?;
+    Ok(Duration::from_millis(ms))
 }
 
 async fn push_message(
@@ -318,18 +321,14 @@ async fn queue_info(
 
 async fn ui_index(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     if !state.ui_enabled {
-        return Err(ApiError::NotFound(
-            r#"{"error":"UI not enabled. Start with --ui flag."}"#,
-        ));
+        return Err(ApiError::NotFound("UI not enabled. Start with --ui flag."));
     }
     Ok(Html(include_str!("ui/index.html")))
 }
 
 async fn ui_app_js(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     if !state.ui_enabled {
-        return Err(ApiError::NotFound(
-            r#"{"error":"UI not enabled. Start with --ui flag."}"#,
-        ));
+        return Err(ApiError::NotFound("UI not enabled. Start with --ui flag."));
     }
     Ok((
         [(header::CONTENT_TYPE, "application/javascript")],
@@ -339,9 +338,7 @@ async fn ui_app_js(State(state): State<Arc<AppState>>) -> Result<impl IntoRespon
 
 async fn ui_style_css(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     if !state.ui_enabled {
-        return Err(ApiError::NotFound(
-            r#"{"error":"UI not enabled. Start with --ui flag."}"#,
-        ));
+        return Err(ApiError::NotFound("UI not enabled. Start with --ui flag."));
     }
     Ok((
         [(header::CONTENT_TYPE, "text/css")],
@@ -375,6 +372,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/queues/{name}", get(pop_message))
         .route("/queues/{name}", delete(delete_queue))
         .route("/queues/{name}/info", get(queue_info))
+        .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
