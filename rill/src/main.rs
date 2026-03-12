@@ -1097,6 +1097,58 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    // --- TTL ---
+
+    #[test]
+    fn parse_ttl_units() {
+        assert!(matches!(parse_ttl("100ms"), Ok(d) if d == Duration::from_millis(100)));
+        assert!(matches!(parse_ttl("30s"), Ok(d) if d == Duration::from_secs(30)));
+        assert!(matches!(parse_ttl("5m"), Ok(d) if d == Duration::from_secs(300)));
+        assert!(matches!(parse_ttl("2h"), Ok(d) if d == Duration::from_secs(7200)));
+        assert!(matches!(parse_ttl("1d"), Ok(d) if d == Duration::from_secs(86400)));
+        // bare number defaults to seconds
+        assert!(matches!(parse_ttl("10"), Ok(d) if d == Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn parse_ttl_rejects_invalid() {
+        assert!(parse_ttl("").is_err());
+        assert!(parse_ttl("abc").is_err());
+        assert!(parse_ttl("-5s").is_err());
+    }
+
+    #[tokio::test]
+    async fn e2e_push_with_ttl_query_param() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"ttl"}"#)).await;
+        // Push with TTL query param
+        let (status, body) =
+            request(&app, "POST", "/queues/ttl?ttl=30s", None, Some("expire-me")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("pushed"));
+        assert!(body.contains("id"));
+        // Message should be there (hasn't expired yet)
+        let (_, body) = request(&app, "GET", "/queues/ttl", None, None).await;
+        assert!(body.contains("expire-me"));
+    }
+
+    #[tokio::test]
+    async fn e2e_push_with_invalid_ttl_returns_400() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"ttlerr"}"#)).await;
+        let (status, body) = request(&app, "POST", "/queues/ttlerr?ttl=abc", None, Some("x")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("error"));
+    }
+
+    #[tokio::test]
+    async fn e2e_push_with_empty_ttl_returns_400() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"ttlemp"}"#)).await;
+        let (status, _) = request(&app, "POST", "/queues/ttlemp?ttl=", None, Some("x")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
     // --- Remote backend health ---
 
     #[tokio::test]
