@@ -142,6 +142,8 @@ impl AppState {
     }
 }
 
+const MAX_QUEUE_NAME_LEN: usize = 128;
+
 // --- Request types ---
 
 #[derive(Deserialize)]
@@ -153,7 +155,7 @@ fn validate_queue_name(name: &str) -> Result<(), ApiError> {
     if name.is_empty() {
         return Err(ApiError::BadRequest("queue name cannot be empty"));
     }
-    if name.len() > 128 {
+    if name.len() > MAX_QUEUE_NAME_LEN {
         return Err(ApiError::BadRequest("queue name too long (max 128 chars)"));
     }
     if name
@@ -933,7 +935,7 @@ mod tests {
     fn validate_queue_name_accepts_valid() {
         assert!(validate_queue_name("my-queue_123").is_ok());
         assert!(validate_queue_name("a").is_ok());
-        assert!(validate_queue_name(&"x".repeat(128)).is_ok());
+        assert!(validate_queue_name(&"x".repeat(MAX_QUEUE_NAME_LEN)).is_ok());
     }
 
     #[test]
@@ -954,9 +956,9 @@ mod tests {
     #[test]
     fn validate_queue_name_boundary_length() {
         // 128 chars is ok
-        assert!(validate_queue_name(&"a".repeat(128)).is_ok());
+        assert!(validate_queue_name(&"a".repeat(MAX_QUEUE_NAME_LEN)).is_ok());
         // 129 chars is rejected
-        assert!(validate_queue_name(&"a".repeat(129)).is_err());
+        assert!(validate_queue_name(&"a".repeat(MAX_QUEUE_NAME_LEN + 1)).is_err());
     }
 
     // --- Additional handler edge cases ---
