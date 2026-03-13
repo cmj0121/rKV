@@ -111,7 +111,7 @@ impl<'db> Namespace<'db> {
             .append_to_aol(&self.name, rev.as_u128(), &key, &value, ttl)?;
         let (actual_rev, should_flush, should_stall) = {
             let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mut mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mt = mt.write().unwrap_or_else(|e| e.into_inner());
             let actual_rev = mt.put(key, value, rev, ttl);
             self.db.inc_op_puts();
             let size = mt.approximate_size();
@@ -184,7 +184,7 @@ impl<'db> Namespace<'db> {
         // 3. Apply all ops to memtable under a single lock
         let (actual_revs, should_flush, should_stall) = {
             let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mut mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mt = mt.write().unwrap_or_else(|e| e.into_inner());
             let mut actual_revs = Vec::with_capacity(prepared.len());
             let mut puts = 0u64;
             let mut deletes = 0u64;
@@ -233,7 +233,7 @@ impl<'db> Namespace<'db> {
         let value = {
             metrics::prof_timer!(self.db.metrics(), prof_memtable_lookup);
             let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             match mt.lookup(&key) {
                 MemLookup::Found(v) => v.clone(),
                 MemLookup::Tombstone => return Err(Error::KeyNotFound),
@@ -264,7 +264,7 @@ impl<'db> Namespace<'db> {
 
         let (value, rev) = {
             let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             match mt.lookup_with_revision(&key) {
                 MemLookupRev::Found(v, rev) => (v.clone(), rev),
                 MemLookupRev::Tombstone => return Err(Error::KeyNotFound),
@@ -293,7 +293,7 @@ impl<'db> Namespace<'db> {
         self.db.inc_op_gets();
 
         let mt = self.db.get_or_create_memtable(&self.name)?;
-        let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+        let mt = mt.read().unwrap_or_else(|e| e.into_inner());
         match mt.lookup(&key) {
             MemLookup::Found(v) => {
                 let v = v.clone();
@@ -326,7 +326,7 @@ impl<'db> Namespace<'db> {
         self.db
             .append_to_aol(&self.name, rev.as_u128(), &key, &Value::tombstone(), None)?;
         let mt = self.db.get_or_create_memtable(&self.name)?;
-        let mut mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mt = mt.write().unwrap_or_else(|e| e.into_inner());
         mt.delete(key, rev);
         self.db.inc_op_deletes();
         Ok(())
@@ -352,7 +352,7 @@ impl<'db> Namespace<'db> {
 
         let ordered_mode = {
             let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             mt.is_ordered()
         };
 
@@ -383,7 +383,7 @@ impl<'db> Namespace<'db> {
             self.db
                 .append_to_aol(&self.name, rev.as_u128(), &key, &Value::tombstone(), None)?;
             let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mut mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mt = mt.write().unwrap_or_else(|e| e.into_inner());
             mt.delete(key, rev);
         }
 
@@ -402,7 +402,7 @@ impl<'db> Namespace<'db> {
         }
         let ordered_mode = {
             let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             mt.is_ordered()
         };
 
@@ -427,7 +427,7 @@ impl<'db> Namespace<'db> {
             self.db
                 .append_to_aol(&self.name, rev.as_u128(), &key, &Value::tombstone(), None)?;
             let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mut mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mt = mt.write().unwrap_or_else(|e| e.into_inner());
             mt.delete(key, rev);
         }
 
@@ -440,7 +440,7 @@ impl<'db> Namespace<'db> {
     pub fn exists(&self, key: impl Into<Key>) -> Result<bool> {
         let key = key.into();
         let mt = self.db.get_or_create_memtable(&self.name)?;
-        let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+        let mt = mt.read().unwrap_or_else(|e| e.into_inner());
         match mt.lookup(&key) {
             MemLookup::Found(_) => return Ok(true),
             MemLookup::Tombstone => return Ok(false),
@@ -465,7 +465,7 @@ impl<'db> Namespace<'db> {
         let _timer = metrics::Timer::start(&self.db.metrics().op_scan);
         let ordered_mode = {
             let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             mt.is_ordered()
         };
 
@@ -501,7 +501,7 @@ impl<'db> Namespace<'db> {
         let _timer = metrics::Timer::start(&self.db.metrics().op_scan);
         let ordered_mode = {
             let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             mt.is_ordered()
         };
 
@@ -531,7 +531,7 @@ impl<'db> Namespace<'db> {
     pub fn count(&self) -> Result<u64> {
         let ordered_mode = {
             let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             mt.is_ordered()
         };
 
@@ -555,7 +555,7 @@ impl<'db> Namespace<'db> {
         let key = key.into();
         let mt_count = {
             let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             mt.rev_count(&key).unwrap_or(0)
         };
         let sst_count = self.db.count_revisions_from_sstables(&self.name, &key)?;
@@ -587,7 +587,7 @@ impl<'db> Namespace<'db> {
             // Fetch from memtable (shift index past SSTable revisions)
             let mt_index = index - sst_count;
             let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             match mt.rev_get(&key, mt_index) {
                 Some(v) => v.clone(),
                 None => return Err(Error::KeyNotFound),
@@ -633,7 +633,7 @@ impl<'db> Namespace<'db> {
         } else {
             let mt_index = index - sst_count;
             let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             match mt.rev_get_with_ttl(&key, mt_index) {
                 Some((v, exp, rem)) => (v.clone(), exp, rem),
                 None => return Err(Error::KeyNotFound),
@@ -649,7 +649,7 @@ impl<'db> Namespace<'db> {
     pub fn ttl(&self, key: impl Into<Key>) -> Result<Option<Duration>> {
         let key = key.into();
         let mt = self.db.get_or_create_memtable(&self.name)?;
-        let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+        let mt = mt.read().unwrap_or_else(|e| e.into_inner());
         mt.ttl(&key).ok_or(Error::KeyNotFound)
     }
 
@@ -663,7 +663,7 @@ impl<'db> Namespace<'db> {
     pub fn keys(&self, prefix: &Key) -> Result<KeyIterator> {
         let ordered_mode = {
             let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             mt.is_ordered()
         };
         let iter = self
@@ -679,7 +679,7 @@ impl<'db> Namespace<'db> {
     pub fn entries(&self, prefix: &Key) -> Result<EntryIterator<'db>> {
         let ordered_mode = {
             let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             mt.is_ordered()
         };
         let iter = self
@@ -697,7 +697,7 @@ impl<'db> Namespace<'db> {
     pub fn rkeys(&self, prefix: &Key) -> Result<KeyIterator> {
         let ordered_mode = {
             let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             mt.is_ordered()
         };
         let merge = self
@@ -711,7 +711,7 @@ impl<'db> Namespace<'db> {
     pub fn rentries(&self, prefix: &Key) -> Result<EntryIterator<'db>> {
         let ordered_mode = {
             let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             mt.is_ordered()
         };
         let merge = self

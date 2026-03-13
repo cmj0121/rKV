@@ -76,7 +76,7 @@ pub const DEFAULT_NAMESPACE: &str = "_";
 
 /// Per-namespace state: memtable + append-only log.
 pub(crate) struct NamespaceState {
-    pub memtable: Mutex<memtable::MemTable>,
+    pub memtable: RwLock<memtable::MemTable>,
     /// `None` in in-memory mode (no disk I/O).
     pub aol: Option<Mutex<aol::Aol>>,
 }
@@ -89,7 +89,7 @@ impl NamespaceState {
         fs::create_dir_all(&ns_dir)?;
         let ns_aol = aol::Aol::open_at(ns_dir.join(aol::AOL_FILENAME), aol_buffer_size)?;
         Ok(Self {
-            memtable: Mutex::new(memtable::MemTable::new()),
+            memtable: RwLock::new(memtable::MemTable::new()),
             aol: Some(Mutex::new(ns_aol)),
         })
     }
@@ -97,7 +97,7 @@ impl NamespaceState {
     /// Create a new `NamespaceState` for in-memory mode (no AOL).
     pub(crate) fn create_in_memory() -> Self {
         Self {
-            memtable: Mutex::new(memtable::MemTable::new()),
+            memtable: RwLock::new(memtable::MemTable::new()),
             aol: None,
         }
     }
@@ -576,7 +576,7 @@ impl DB {
             ns_map.insert(
                 ns_name,
                 NamespaceState {
-                    memtable: Mutex::new(mt),
+                    memtable: RwLock::new(mt),
                     aol: Some(Mutex::new(ns_aol)),
                 },
             );
@@ -924,7 +924,7 @@ impl DB {
                     let Some(ns_state) = map.get(ns_name) else {
                         continue;
                     };
-                    let mut mt = ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut mt = ns_state.memtable.write().unwrap_or_else(|e| e.into_inner());
                     if mt.is_empty() {
                         continue;
                     }
@@ -1116,7 +1116,7 @@ impl DB {
                         let map = ns_data.read().unwrap_or_else(|e| e.into_inner());
                         if let Some(ns_state) = map.get(&record.namespace) {
                             let mut mt =
-                                ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+                                ns_state.memtable.write().unwrap_or_else(|e| e.into_inner());
                             let rev = RevisionID::from(record.revision);
                             let ttl = if record.expires_at_ms > 0 {
                                 let remaining_ms = record.expires_at_ms.saturating_sub(now_ms);
@@ -1153,7 +1153,7 @@ impl DB {
                         let mut ns_map = sync_ns_data.write().unwrap_or_else(|e| e.into_inner());
                         for ns_state in ns_map.values() {
                             let mut mt =
-                                ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+                                ns_state.memtable.write().unwrap_or_else(|e| e.into_inner());
                             *mt = memtable::MemTable::new();
                             let mut aol = ns_state
                                 .aol
@@ -1250,7 +1250,7 @@ impl DB {
                         let map = cleanup_ns_data.read().unwrap_or_else(|e| e.into_inner());
                         for ns_state in map.values() {
                             let mut mt =
-                                ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+                                ns_state.memtable.write().unwrap_or_else(|e| e.into_inner());
                             *mt = memtable::MemTable::new();
                             let mut aol = ns_state
                                 .aol
@@ -1385,7 +1385,7 @@ impl DB {
                         let map = db_ns_data.read().unwrap_or_else(|e| e.into_inner());
                         if let Some(ns_state) = map.get(&record.namespace) {
                             let mut mt =
-                                ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+                                ns_state.memtable.write().unwrap_or_else(|e| e.into_inner());
                             mt.put_if_newer(
                                 record.key.clone(),
                                 record.value.clone(),
@@ -1398,7 +1398,7 @@ impl DB {
                             ensure_ns(&mut map, &record.namespace)?;
                             let ns_state = map.get(&record.namespace).unwrap();
                             let mut mt =
-                                ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+                                ns_state.memtable.write().unwrap_or_else(|e| e.into_inner());
                             mt.put_if_newer(
                                 record.key.clone(),
                                 record.value.clone(),
@@ -1472,7 +1472,7 @@ impl DB {
                         let mut ns_map = sync_ns_data.write().unwrap_or_else(|e| e.into_inner());
                         for ns_state in ns_map.values() {
                             let mut mt =
-                                ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+                                ns_state.memtable.write().unwrap_or_else(|e| e.into_inner());
                             *mt = memtable::MemTable::new();
                             let mut aol = ns_state
                                 .aol
@@ -1671,7 +1671,7 @@ impl DB {
         let mut total_keys: u64 = 0;
         let mut write_buffer_bytes: u64 = 0;
         for ns_state in map.values() {
-            let mt = ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = ns_state.memtable.read().unwrap_or_else(|e| e.into_inner());
             total_keys += mt.count();
             write_buffer_bytes += mt.approximate_size() as u64;
         }
@@ -2042,7 +2042,7 @@ impl DB {
         for ns_name in &namespaces {
             let entries = {
                 let mt = self.get_or_create_memtable(ns_name)?;
-                let mut mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+                let mut mt = mt.write().unwrap_or_else(|e| e.into_inner());
                 if mt.is_empty() {
                     continue;
                 }
@@ -3127,7 +3127,7 @@ impl DB {
         {
             let ns_map = namespace_data.read().unwrap_or_else(|e| e.into_inner());
             if let Some(ns_state) = ns_map.get(ns) {
-                let mt = ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+                let mt = ns_state.memtable.read().unwrap_or_else(|e| e.into_inner());
                 if !mt.is_empty() {
                     return Ok(());
                 }
@@ -3351,7 +3351,7 @@ impl DB {
             };
 
             let ns_state = self.get_or_create_ns(&record.namespace)?;
-            let mut mt = ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mt = ns_state.memtable.write().unwrap_or_else(|e| e.into_inner());
             mt.put_if_newer(record.key.clone(), record.value.clone(), incoming_rev, ttl)
         };
 
@@ -3477,7 +3477,7 @@ impl DB {
         // 2. Memtable snapshot (highest priority)
         let mt_entries = {
             let mt = self.get_or_create_memtable(ns)?;
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             mt.scan_all_raw(prefix)
         };
         let memtable_priority = sources.len() as u32 + 1;
@@ -3550,7 +3550,7 @@ impl DB {
         // 2. Memtable snapshot
         let mt_entries = {
             let mt = self.get_or_create_memtable(ns)?;
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             mt.rscan_all_raw(prefix)
         };
         let memtable_priority = sources.len() as u32 + 1;
@@ -3898,7 +3898,7 @@ impl DB {
     }
 
     /// Convenience: get only the memtable mutex for read-path callers.
-    pub(crate) fn get_or_create_memtable(&self, name: &str) -> Result<&Mutex<memtable::MemTable>> {
+    pub(crate) fn get_or_create_memtable(&self, name: &str) -> Result<&RwLock<memtable::MemTable>> {
         Ok(&self.get_or_create_ns(name)?.memtable)
     }
 }
