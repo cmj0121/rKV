@@ -12,8 +12,8 @@
 //!
 //! # Scope
 //!
-//! Tests: create_queue, delete_queue, push_message, pop_message, queue_length,
-//! list_queues — all verified against an oracle.
+//! Tests: create_queue, delete_queue, push_message, pop_message, push_messages,
+//! pop_messages, queue_length, list_queues — all verified against an oracle.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
@@ -62,6 +62,25 @@ impl Oracle {
     fn pop(&mut self, name: &str) -> Option<String> {
         // Accessing a non-existent queue recreates it (db.namespace auto-creates)
         self.queues.entry(name.to_owned()).or_default().pop_front()
+    }
+
+    fn push_batch(&mut self, name: &str, msgs: &[String]) {
+        let q = self.queues.entry(name.to_owned()).or_default();
+        for msg in msgs {
+            q.push_back(msg.clone());
+        }
+    }
+
+    fn pop_batch(&mut self, name: &str, count: usize) -> Vec<String> {
+        let q = self.queues.entry(name.to_owned()).or_default();
+        let mut result = Vec::new();
+        for _ in 0..count {
+            match q.pop_front() {
+                Some(msg) => result.push(msg),
+                None => break,
+            }
+        }
+        result
     }
 
     fn length(&mut self, name: &str) -> usize {
@@ -170,8 +189,8 @@ fn fuzz_random_queue_ops() {
                 rt.block_on(backend.delete_queue(name)).unwrap();
                 oracle.delete_queue(name);
             }
-            // push_message (35%)
-            15..50 => {
+            // push_message (25%)
+            15..40 => {
                 // Ensure queue exists before push
                 rt.block_on(backend.create_queue(name)).unwrap();
                 oracle.create_queue(name);
@@ -181,8 +200,8 @@ fn fuzz_random_queue_ops() {
                 rt.block_on(backend.push_message(name, &msg, None)).unwrap();
                 oracle.push(name, &msg);
             }
-            // pop_message (25%)
-            50..75 => {
+            // pop_message (20%)
+            40..60 => {
                 let backend_result = rt.block_on(backend.pop_message(name)).unwrap();
                 let oracle_result = oracle.pop(name);
                 assert_eq!(
@@ -190,8 +209,42 @@ fn fuzz_random_queue_ops() {
                     "pop mismatch for '{name}': backend={backend_result:?} oracle={oracle_result:?} (op={ops}, seed={seed})"
                 );
             }
+            // batch_push (10%)
+            60..70 => {
+                rt.block_on(backend.create_queue(name)).unwrap();
+                oracle.create_queue(name);
+
+                let count = rng.usize(1..=8);
+                let mut msgs = Vec::new();
+                let mut msg_strs = Vec::new();
+                for _ in 0..count {
+                    let msg = gen_message(&mut rng, msg_seq);
+                    msg_seq += 1;
+                    msgs.push((msg.clone(), None));
+                    msg_strs.push(msg);
+                }
+                let batch: Vec<(&str, Option<std::time::Duration>)> =
+                    msgs.iter().map(|(s, t)| (s.as_str(), *t)).collect();
+                let ids = rt.block_on(backend.push_messages(name, &batch)).unwrap();
+                assert_eq!(
+                    ids.len(),
+                    count,
+                    "batch_push id count mismatch (op={ops}, seed={seed})"
+                );
+                oracle.push_batch(name, &msg_strs);
+            }
+            // batch_pop (10%)
+            70..80 => {
+                let count = rng.usize(1..=8);
+                let backend_result = rt.block_on(backend.pop_messages(name, count)).unwrap();
+                let oracle_result = oracle.pop_batch(name, count);
+                assert_eq!(
+                    backend_result, oracle_result,
+                    "batch_pop mismatch for '{name}': backend={backend_result:?} oracle={oracle_result:?} (op={ops}, seed={seed})"
+                );
+            }
             // queue_length (10%)
-            75..85 => {
+            80..90 => {
                 let backend_len = rt.block_on(backend.queue_length(name)).unwrap();
                 let oracle_len = oracle.length(name);
                 assert_eq!(
@@ -199,7 +252,7 @@ fn fuzz_random_queue_ops() {
                     "length mismatch for '{name}': backend={backend_len} oracle={oracle_len} (op={ops}, seed={seed})"
                 );
             }
-            // list_queues (15%)
+            // list_queues (10%)
             _ => {
                 let mut backend_queues = rt.block_on(backend.list_queues()).unwrap();
                 backend_queues.sort();
