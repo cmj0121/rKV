@@ -25,6 +25,7 @@ pub struct Stats {
     pub op_deletes: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    pub cache_hit_rate: f64,
     // Uptime
     pub uptime: Duration,
     // Replication

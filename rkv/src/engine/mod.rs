@@ -1720,10 +1720,10 @@ impl DB {
         drop(sst);
 
         // Cache hit/miss counters
-        let (cache_hits, cache_misses) = if let Some(ref bc) = self.block_cache {
-            (bc.hits(), bc.misses())
+        let (cache_hits, cache_misses, cache_hit_rate) = if let Some(ref bc) = self.block_cache {
+            (bc.hits(), bc.misses(), bc.hit_rate())
         } else {
-            (0, 0)
+            (0, 0, 0.0)
         };
 
         Stats {
@@ -1740,6 +1740,7 @@ impl DB {
             op_deletes: self.op_deletes.load(Ordering::Relaxed),
             cache_hits,
             cache_misses,
+            cache_hit_rate,
             uptime: self.opened_at.elapsed(),
             role: self.config.role.to_string(),
             peer_count: self

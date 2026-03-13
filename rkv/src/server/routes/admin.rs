@@ -24,6 +24,7 @@ pub async fn get_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         "op_deletes": s.op_deletes,
         "cache_hits": s.cache_hits,
         "cache_misses": s.cache_misses,
+        "cache_hit_rate": s.cache_hit_rate,
         "uptime_secs": s.uptime.as_secs(),
         "role": s.role,
         "peer_count": s.peer_count,

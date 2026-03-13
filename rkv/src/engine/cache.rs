@@ -316,6 +316,20 @@ impl ShardedBlockCache {
             .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).misses())
             .sum()
     }
+
+    /// Cache hit rate as a fraction in [0.0, 1.0].
+    ///
+    /// Returns 0.0 when no accesses have been recorded.
+    pub(crate) fn hit_rate(&self) -> f64 {
+        let hits = self.hits();
+        let misses = self.misses();
+        let total = hits + misses;
+        if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        }
+    }
 }
 
 /// Estimate the in-memory size of decompressed block bytes.
@@ -544,6 +558,23 @@ mod tests {
         let cache = ShardedBlockCache::new(0);
         cache.insert_arc(1, 0, Arc::new(make_block_data(1)), 100);
         assert!(cache.get(1, 0).is_none());
+    }
+
+    #[test]
+    fn sharded_hit_rate() {
+        let cache = ShardedBlockCache::new(65536);
+        // No accesses: 0.0
+        assert!((cache.hit_rate() - 0.0).abs() < f64::EPSILON);
+
+        // All misses: 0.0
+        cache.get(1, 0);
+        cache.get(2, 0);
+        assert!((cache.hit_rate() - 0.0).abs() < f64::EPSILON);
+
+        // Insert and get: 1 hit / 3 total = 0.333...
+        cache.insert_arc(1, 0, Arc::new(make_block_data(1)), 100);
+        cache.get(1, 0); // hit
+        assert!((cache.hit_rate() - 1.0 / 3.0).abs() < 0.01);
     }
 
     #[test]

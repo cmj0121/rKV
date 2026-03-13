@@ -320,6 +320,9 @@ pub(crate) fn render_prometheus(stats: &super::Stats, metrics: &Metrics) -> Stri
         "miss",
         stats.cache_misses,
     );
+    out.push_str("# HELP rkv_cache_hit_rate Block cache hit rate (0.0-1.0).\n");
+    out.push_str("# TYPE rkv_cache_hit_rate gauge\n");
+    out.push_str(&format!("rkv_cache_hit_rate {:.4}\n", stats.cache_hit_rate));
 
     // Flush / compaction counters
     out.push_str("# HELP rkv_flush_total Total flush operations.\n");

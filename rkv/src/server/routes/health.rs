@@ -17,6 +17,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
         "role": s.role,
         "peer_count": s.peer_count,
         "uptime_secs": s.uptime.as_secs(),
+        "cache_hit_rate": s.cache_hit_rate,
     });
     // Include shard info when in cluster mode
     if !c.owned_namespaces.is_empty() {
