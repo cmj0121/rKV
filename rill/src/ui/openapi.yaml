@@ -56,6 +56,34 @@ paths:
                     type: integer
                     example: 120
 
+  /auth/me:
+    get:
+      summary: Current role
+      operationId: authMe
+      description: Returns the caller's role based on the provided bearer token.
+      security:
+        - BearerAuth: []
+        - {}
+      responses:
+        "200":
+          description: Current authentication status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  role:
+                    type: string
+                    enum: [admin, writer, reader, anonymous]
+                  authenticated:
+                    type: boolean
+                  auth_required:
+                    type: boolean
+                example:
+                  role: admin
+                  authenticated: true
+                  auth_required: true
+
   /queues:
     get:
       summary: List queues

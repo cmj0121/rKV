@@ -70,12 +70,27 @@ If no tokens are configured, all endpoints are open (no auth enforced).
 | `POST   /queues/:name`      | yes    | yes    | -      |
 | `GET    /queues/:name`      | yes    | yes    | yes    |
 | `GET    /queues/:name/info` | yes    | yes    | yes    |
+| `GET    /auth/me`           | public | public | public |
 | `GET    /ui`                | public | public | public |
 | `GET    /docs`              | public | public | public |
 | `GET    /health`            | public | public | public |
 | `GET    /`                  | public | public | public |
 
 ## HTTP API
+
+### Auth Info
+
+```http
+GET /auth/me
+```
+
+Returns the caller's role based on the provided bearer token.
+
+Response: `{"role": "admin", "authenticated": true, "auth_required": true}`
+
+When no token is provided: `{"role": "anonymous", "authenticated": false, "auth_required": true}`
+
+When no tokens are configured (open mode): `{"role": "admin", "authenticated": true, "auth_required": false}`
 
 ### Health Check
 

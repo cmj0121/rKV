@@ -448,6 +448,7 @@ function showAuthDialog() {
         dlg.close();
         dlg.remove();
         toast("Token cleared", true);
+        loadRole();
         route();
       },
     }),
@@ -464,6 +465,7 @@ function showAuthDialog() {
         dlg.close();
         dlg.remove();
         toast("Token saved", true);
+        loadRole();
         route();
       },
     }),
@@ -476,6 +478,21 @@ function showAuthDialog() {
 }
 
 // ---------------------------------------------------------------------------
+// Role display
+// ---------------------------------------------------------------------------
+function loadRole() {
+  api("GET", "/auth/me")
+    .then(function (r) {
+      var badge = $("#role-badge");
+      if (!badge) return;
+      var role = r.data.role;
+      badge.textContent = role;
+      badge.className = "role-badge role-" + role;
+    })
+    .catch(function () {});
+}
+
+// ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 document.addEventListener("DOMContentLoaded", function () {
@@ -483,5 +500,6 @@ document.addEventListener("DOMContentLoaded", function () {
   var authBtn = $("#auth-btn");
   if (authBtn) authBtn.addEventListener("click", showAuthDialog);
 
+  loadRole();
   route();
 });

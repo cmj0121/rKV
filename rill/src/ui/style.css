@@ -72,6 +72,37 @@ body {
   flex: 1;
 }
 
+.role-badge {
+  margin: 0 16px 4px;
+  padding: 4px 10px;
+  font-size: 11px;
+  text-align: center;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-radius: var(--radius);
+  color: var(--text-dim);
+}
+
+.role-badge.role-admin {
+  color: var(--red);
+  background: rgba(239, 83, 80, 0.12);
+}
+
+.role-badge.role-writer {
+  color: var(--yellow);
+  background: rgba(255, 202, 40, 0.12);
+}
+
+.role-badge.role-reader {
+  color: var(--green);
+  background: rgba(102, 187, 106, 0.12);
+}
+
+.role-badge.role-anonymous {
+  color: var(--text-dim);
+  background: transparent;
+}
+
 .nav-btn {
   display: block;
   margin: 10px 16px;
