@@ -196,6 +196,27 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }))
 }
 
+async fn auth_me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    let auth_required =
+        state.admin_token.is_some() || state.writer_token.is_some() || state.reader_token.is_some();
+    let (role, authenticated) = match state.authenticate(&headers) {
+        Some(role) => {
+            let name = match role {
+                Role::Admin => "admin",
+                Role::Writer => "writer",
+                Role::Reader => "reader",
+            };
+            (name, true)
+        }
+        None => ("anonymous", false),
+    };
+    Json(json!({
+        "role": role,
+        "authenticated": authenticated,
+        "auth_required": auth_required,
+    }))
+}
+
 async fn create_queue(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -366,6 +387,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/ui", get(ui_index))
         .route("/ui/app.js", get(ui_app_js))
         .route("/ui/style.css", get(ui_style_css))
+        .route("/auth/me", get(auth_me))
         .route("/queues", post(create_queue))
         .route("/queues", get(list_queues))
         .route("/queues/{name}", post(push_message))
@@ -1106,5 +1128,53 @@ mod tests {
             .unwrap();
         let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // --- Auth me ---
+
+    #[tokio::test]
+    async fn auth_me_returns_admin_with_admin_token() {
+        let app = build_router(test_state(false));
+        let (status, body) = request(&app, "GET", "/auth/me", Some("admin-tok"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""role":"admin"#));
+        assert!(body.contains(r#""authenticated":true"#));
+        assert!(body.contains(r#""auth_required":true"#));
+    }
+
+    #[tokio::test]
+    async fn auth_me_returns_writer_with_writer_token() {
+        let app = build_router(test_state(false));
+        let (status, body) = request(&app, "GET", "/auth/me", Some("writer-tok"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""role":"writer"#));
+    }
+
+    #[tokio::test]
+    async fn auth_me_returns_reader_with_reader_token() {
+        let app = build_router(test_state(false));
+        let (status, body) = request(&app, "GET", "/auth/me", Some("reader-tok"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""role":"reader"#));
+    }
+
+    #[tokio::test]
+    async fn auth_me_returns_anonymous_without_token() {
+        let app = build_router(test_state(false));
+        let (status, body) = request(&app, "GET", "/auth/me", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""role":"anonymous"#));
+        assert!(body.contains(r#""authenticated":false"#));
+        assert!(body.contains(r#""auth_required":true"#));
+    }
+
+    #[tokio::test]
+    async fn auth_me_open_mode_returns_admin() {
+        let app = build_router(open_state());
+        let (status, body) = request(&app, "GET", "/auth/me", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#""role":"admin"#));
+        assert!(body.contains(r#""authenticated":true"#));
+        assert!(body.contains(r#""auth_required":false"#));
     }
 }
