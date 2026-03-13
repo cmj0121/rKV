@@ -62,19 +62,21 @@ If no tokens are configured, all endpoints are open (no auth enforced).
 
 ### Endpoint Permissions
 
-| Endpoint                    | Admin  | Writer | Reader |
-| --------------------------- | ------ | ------ | ------ |
-| `POST   /queues`            | yes    | -      | -      |
-| `DELETE /queues/:name`      | yes    | -      | -      |
-| `GET    /queues`            | yes    | yes    | yes    |
-| `POST   /queues/:name`      | yes    | yes    | -      |
-| `GET    /queues/:name`      | yes    | yes    | yes    |
-| `GET    /queues/:name/info` | yes    | yes    | yes    |
-| `GET    /auth/me`           | public | public | public |
-| `GET    /ui`                | public | public | public |
-| `GET    /docs`              | public | public | public |
-| `GET    /health`            | public | public | public |
-| `GET    /`                  | public | public | public |
+| Endpoint                     | Admin  | Writer | Reader |
+| ---------------------------- | ------ | ------ | ------ |
+| `POST   /queues`             | yes    | -      | -      |
+| `DELETE /queues/:name`       | yes    | -      | -      |
+| `GET    /queues`             | yes    | yes    | yes    |
+| `POST   /queues/:name`       | yes    | yes    | -      |
+| `GET    /queues/:name`       | yes    | yes    | yes    |
+| `GET    /queues/:name/info`  | yes    | yes    | yes    |
+| `POST   /queues/:name/batch` | yes    | yes    | -      |
+| `GET    /queues/:name/batch` | yes    | yes    | yes    |
+| `GET    /auth/me`            | public | public | public |
+| `GET    /ui`                 | public | public | public |
+| `GET    /docs`               | public | public | public |
+| `GET    /health`             | public | public | public |
+| `GET    /`                   | public | public | public |
 
 ## HTTP API
 
@@ -173,6 +175,37 @@ GET /queues/:name
 ```
 
 Response: `{"message": "hello world"}` (or `{"message": null}` when queue is empty)
+
+### Batch Push
+
+```http
+POST /queues/:name/batch
+Content-Type: application/json
+
+{"messages": [{"body": "msg1"}, {"body": "msg2", "ttl": "5m"}]}
+```
+
+Response: `{"ids": ["01jqx...", "01jqx..."], "count": 2}`
+
+Each item may include an optional `ttl` field (same format as the single push `ttl` query param).
+Requires Writer role or above.
+
+### Batch Pop
+
+```http
+GET /queues/:name/batch[?count=N]
+```
+
+Query parameters:
+
+| Parameter | Required | Default | Max  | Description               |
+| --------- | -------- | ------- | ---- | ------------------------- |
+| `count`   | no       | 1       | 1000 | Number of messages to pop |
+
+Response: `{"messages": ["msg1", "msg2"], "count": 2}`
+
+Returns up to `count` messages in FIFO order. Messages are removed from the queue.
+Requires Reader role or above.
 
 ### Queue Info
 

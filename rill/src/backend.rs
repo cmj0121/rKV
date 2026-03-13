@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::Client;
-use rkv::{Key, DB};
+use rkv::{Key, WriteBatch, DB};
 
 use crate::msgid::MsgIdGen;
 
@@ -165,68 +165,96 @@ impl Backend {
             Backend::Embed(db, _) => {
                 let ns = db.namespace(&ns_name, None).map_err(|e| e.to_string())?;
                 let prefix = Key::Str(String::new());
-                let entry = ns
-                    .entries(&prefix)
-                    .map_err(|e| e.to_string())?
-                    .filter_map(|e| e.ok())
-                    .next();
-                match entry {
-                    Some((key, value)) => {
-                        let data = value
-                            .as_bytes()
-                            .map(|b| String::from_utf8_lossy(b).to_string());
-                        let _ = ns.delete(key);
-                        Ok(data)
-                    }
-                    _ => Ok(None),
+                match ns.pop_first(&prefix).map_err(|e| e.to_string())? {
+                    Some((_key, value)) => Ok(value
+                        .as_bytes()
+                        .map(|b| String::from_utf8_lossy(b).to_string())),
+                    None => Ok(None),
                 }
             }
             Backend::Remote(client) => {
-                // Get first key (limit=1 to avoid downloading all keys)
-                let list_url = format!("{}?offset=0&limit=1", client.keys_url(&ns_name));
+                let url = format!("{}/api/{}/pop", client.base_url, ns_name);
                 let resp = client
                     .client
-                    .get(&list_url)
+                    .post(&url)
                     .send()
                     .await
                     .map_err(|e| e.to_string())?;
+                if resp.status() == reqwest::StatusCode::NO_CONTENT {
+                    return Ok(None);
+                }
                 if !resp.status().is_success() {
                     let err = resp.text().await.unwrap_or_default();
-                    return Err(format!("list keys failed: {err}"));
+                    return Err(format!("pop failed: {err}"));
                 }
-                let keys: Vec<String> = resp.json().await.map_err(|e| e.to_string())?;
-                let first_key = match keys.first() {
-                    Some(k) => k.clone(),
-                    None => return Ok(None),
-                };
-                // Get the value
-                let get_url = client.key_url(&ns_name, &first_key);
-                let resp = client
-                    .client
-                    .get(&get_url)
-                    .send()
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let value = if resp.status().is_success() {
-                    let text = resp.text().await.unwrap_or_default();
-                    // rKV returns JSON-encoded string, strip quotes
-                    serde_json::from_str::<String>(&text).unwrap_or(text)
-                } else {
-                    return Ok(None);
-                };
-                // Delete the key
-                let del_url = client.key_url(&ns_name, &first_key);
-                let del_resp = client
-                    .client
-                    .delete(&del_url)
-                    .send()
-                    .await
-                    .map_err(|e| e.to_string())?;
-                if !del_resp.status().is_success() {
-                    let err = del_resp.text().await.unwrap_or_default();
-                    return Err(format!("pop delete failed: {err}"));
+                let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+                let value = body
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                Ok(value)
+            }
+        }
+    }
+
+    pub async fn push_messages(
+        &self,
+        name: &str,
+        messages: &[(&str, Option<Duration>)],
+    ) -> Result<Vec<String>, String> {
+        match self {
+            Backend::Embed(db, idgen) => {
+                let ns_name = queue_ns(name);
+                let ns = db.namespace(&ns_name, None).map_err(|e| e.to_string())?;
+                let mut batch = WriteBatch::new();
+                let mut ids = Vec::with_capacity(messages.len());
+                for (body, ttl) in messages {
+                    let id = idgen.generate();
+                    batch = batch.put(Key::Str(id.clone()), body.as_bytes(), *ttl);
+                    ids.push(id);
                 }
-                Ok(Some(value))
+                ns.write_batch(batch).map_err(|e| e.to_string())?;
+                Ok(ids)
+            }
+            Backend::Remote(_) => {
+                let mut ids = Vec::with_capacity(messages.len());
+                for (body, ttl) in messages {
+                    ids.push(self.push_message(name, body, *ttl).await?);
+                }
+                Ok(ids)
+            }
+        }
+    }
+
+    pub async fn pop_messages(&self, name: &str, count: usize) -> Result<Vec<String>, String> {
+        match self {
+            Backend::Embed(db, _) => {
+                let ns_name = queue_ns(name);
+                let ns = db.namespace(&ns_name, None).map_err(|e| e.to_string())?;
+                let prefix = Key::Str(String::new());
+                let mut results = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match ns.pop_first(&prefix).map_err(|e| e.to_string())? {
+                        Some((_key, value)) => {
+                            if let Some(b) = value.as_bytes() {
+                                results.push(String::from_utf8_lossy(b).to_string());
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                Ok(results)
+            }
+            Backend::Remote(_) => {
+                // Batch pop via individual calls for remote mode
+                let mut results = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.pop_message(name).await? {
+                        Some(msg) => results.push(msg),
+                        None => break,
+                    }
+                }
+                Ok(results)
             }
         }
     }
@@ -506,6 +534,48 @@ mod tests {
         assert_eq!(b.pop_message("rc").await.unwrap(), None);
         b.push_message("rc", "new", None).await.unwrap();
         assert_eq!(b.pop_message("rc").await.unwrap(), Some("new".into()));
+    }
+
+    #[tokio::test]
+    async fn batch_push_and_pop() {
+        let b = embed_backend();
+        b.create_queue("bq").await.unwrap();
+        let msgs: Vec<(&str, Option<Duration>)> = vec![
+            ("a", None),
+            ("b", Some(Duration::from_secs(3600))),
+            ("c", None),
+        ];
+        let ids = b.push_messages("bq", &msgs).await.unwrap();
+        assert_eq!(ids.len(), 3);
+        for w in ids.windows(2) {
+            assert!(w[0] < w[1], "IDs not monotonic");
+        }
+
+        let popped = b.pop_messages("bq", 2).await.unwrap();
+        assert_eq!(popped, vec!["a", "b"]);
+
+        let popped = b.pop_messages("bq", 10).await.unwrap();
+        assert_eq!(popped, vec!["c"]);
+
+        let popped = b.pop_messages("bq", 5).await.unwrap();
+        assert!(popped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_pop_empty() {
+        let b = embed_backend();
+        b.create_queue("be").await.unwrap();
+        let popped = b.pop_messages("be", 3).await.unwrap();
+        assert!(popped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_push_empty_messages() {
+        let b = embed_backend();
+        b.create_queue("empty_batch").await.unwrap();
+        let ids = b.push_messages("empty_batch", &[]).await.unwrap();
+        assert!(ids.is_empty(), "empty batch should return 0 ids");
+        assert_eq!(b.queue_length("empty_batch").await.unwrap(), 0);
     }
 
     #[tokio::test]

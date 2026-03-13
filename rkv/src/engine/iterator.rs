@@ -1,6 +1,6 @@
 use super::error::Result;
 use super::key::Key;
-use super::merge_iter::{MergeIterator, RScanAdapter};
+use super::merge_iter::{MergeIterator, ReverseMergeIterator};
 use super::value::Value;
 use super::DB;
 
@@ -10,7 +10,7 @@ use super::DB;
 
 enum IterInner {
     Forward(MergeIterator),
-    Reverse(RScanAdapter),
+    Reverse(ReverseMergeIterator),
 }
 
 // ---------------------------------------------------------------------------
@@ -35,9 +35,9 @@ impl KeyIterator {
         }
     }
 
-    pub(crate) fn reverse(adapter: RScanAdapter) -> Self {
+    pub(crate) fn reverse(iter: ReverseMergeIterator) -> Self {
         Self {
-            inner: IterInner::Reverse(adapter),
+            inner: IterInner::Reverse(iter),
             error: false,
         }
     }
@@ -51,29 +51,22 @@ impl Iterator for KeyIterator {
             return None;
         }
         loop {
-            match &mut self.inner {
-                IterInner::Forward(iter) => match iter.next() {
-                    Ok(Some((key, value))) => {
-                        if value.is_tombstone() {
-                            continue;
-                        }
-                        return Some(Ok(key));
+            let result = match &mut self.inner {
+                IterInner::Forward(iter) => iter.next(),
+                IterInner::Reverse(iter) => iter.next(),
+            };
+            match result {
+                Ok(Some((key, value))) => {
+                    if value.is_tombstone() {
+                        continue;
                     }
-                    Ok(None) => return None,
-                    Err(e) => {
-                        self.error = true;
-                        return Some(Err(e));
-                    }
-                },
-                IterInner::Reverse(adapter) => match adapter.next() {
-                    Some((key, value)) => {
-                        if value.is_tombstone() {
-                            continue;
-                        }
-                        return Some(Ok(key));
-                    }
-                    None => return None,
-                },
+                    return Some(Ok(key));
+                }
+                Ok(None) => return None,
+                Err(e) => {
+                    self.error = true;
+                    return Some(Err(e));
+                }
             }
         }
     }
@@ -114,13 +107,13 @@ impl<'db> EntryIterator<'db> {
     }
 
     pub(crate) fn reverse(
-        adapter: RScanAdapter,
+        iter: ReverseMergeIterator,
         db: &'db DB,
         ns: String,
         encryption_key: Option<[u8; 32]>,
     ) -> Self {
         Self {
-            inner: IterInner::Reverse(adapter),
+            inner: IterInner::Reverse(iter),
             db,
             ns,
             encryption_key,
@@ -149,41 +142,28 @@ impl Iterator for EntryIterator<'_> {
             return None;
         }
         loop {
-            match &mut self.inner {
-                IterInner::Forward(iter) => match iter.next() {
-                    Ok(Some((key, value))) => {
-                        if value.is_tombstone() {
-                            continue;
-                        }
-                        match self.resolve(value) {
-                            Ok(v) => return Some(Ok((key, v))),
-                            Err(e) => {
-                                self.error = true;
-                                return Some(Err(e));
-                            }
+            let result = match &mut self.inner {
+                IterInner::Forward(iter) => iter.next(),
+                IterInner::Reverse(iter) => iter.next(),
+            };
+            match result {
+                Ok(Some((key, value))) => {
+                    if value.is_tombstone() {
+                        continue;
+                    }
+                    match self.resolve(value) {
+                        Ok(v) => return Some(Ok((key, v))),
+                        Err(e) => {
+                            self.error = true;
+                            return Some(Err(e));
                         }
                     }
-                    Ok(None) => return None,
-                    Err(e) => {
-                        self.error = true;
-                        return Some(Err(e));
-                    }
-                },
-                IterInner::Reverse(adapter) => match adapter.next() {
-                    Some((key, value)) => {
-                        if value.is_tombstone() {
-                            continue;
-                        }
-                        match self.resolve(value) {
-                            Ok(v) => return Some(Ok((key, v))),
-                            Err(e) => {
-                                self.error = true;
-                                return Some(Err(e));
-                            }
-                        }
-                    }
-                    None => return None,
-                },
+                }
+                Ok(None) => return None,
+                Err(e) => {
+                    self.error = true;
+                    return Some(Err(e));
+                }
             }
         }
     }

@@ -23,20 +23,23 @@ jobs:
             target
           key: bench-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Run benchmarks
+      - name: Run rKV benchmarks
         run: cargo run --bin bench --release
 
-      - name: Run comparison benchmarks
+      - name: Run rKV comparison benchmarks
         run: cargo run --bin bench_compare --features bench-compare --release
 
-      - name: Format BENCH.md
-        run: npx prettier@3 --write BENCH.md
+      - name: Run rill benchmarks
+        run: cargo run --bin rill-bench --release
+
+      - name: Format benchmark results
+        run: npx prettier@3 --write BENCH.md rill/BENCH.md
 
       - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add BENCH.md
+          git add BENCH.md rill/BENCH.md
           git diff --staged --quiet || \
             (git commit -m "docs(bench): [skip ci] update benchmark results" && \
              git push)

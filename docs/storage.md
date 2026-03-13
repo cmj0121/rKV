@@ -358,9 +358,10 @@ filters skip entire SSTables when the prefix is definitely absent.
   (omitting the trailing null terminator), then checks each SSTable entry with
   `starts_with`. All matching blocks must be read.
 
-**Reverse scan**: `rscan` uses an `RScanAdapter` that drains the forward merge
-iterator, reverses the collected entries, then yields them with offset/limit. True
-lazy reverse iteration over an LSM merge is deferred to a future optimization.
+**Reverse scan**: `rscan` uses a `ReverseMergeIterator` (max-heap) that lazily
+merges sources producing entries in descending key order. Each `SSTableScanIter`
+iterates blocks from last to first with entries reversed within each block.
+This avoids the O(n) memory cost of draining all entries before reversing.
 
 **Tombstone handling**: The merge iterator emits tombstones — callers decide whether
 to filter them. This ensures tombstones correctly shadow values from deeper levels.

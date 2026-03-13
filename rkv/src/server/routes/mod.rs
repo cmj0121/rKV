@@ -33,6 +33,8 @@ pub fn router(state: Arc<AppState>, enable_ui: bool) -> Router {
                 .delete(keys::delete_key)
                 .head(keys::head_key),
         )
+        // Pop (atomic scan+delete)
+        .route("/api/{ns}/pop", post(keys::pop_first))
         // Scan & bulk ops
         .route(
             "/api/{ns}/keys",

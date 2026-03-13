@@ -178,6 +178,37 @@ fn json_body_to_value(body: &[u8]) -> Result<crate::Value, ServerError> {
     }
 }
 
+/// POST /api/{ns}/pop?prefix=... -> 200 (key+value) / 204 (empty)
+pub async fn pop_first(
+    State(state): State<Arc<AppState>>,
+    Path(ns_name): Path<String>,
+    Query(query): Query<PopQuery>,
+) -> Result<Response, ServerError> {
+    if state.db.is_replica() {
+        return Err(crate::Error::ReadOnlyReplica.into());
+    }
+    let prefix = parse_key(&query.prefix.unwrap_or_default());
+    let ns = state.namespace(&ns_name)?;
+
+    match ns.pop_first(&prefix)? {
+        Some((key, value)) => {
+            let body = serde_json::json!({
+                "key": key.to_string(),
+                "value": serde_json::from_slice::<serde_json::Value>(
+                    &value_to_json_bytes(&value)
+                ).unwrap_or(serde_json::Value::Null),
+            });
+            Ok((StatusCode::OK, axum::Json(body)).into_response())
+        }
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PopQuery {
+    pub prefix: Option<String>,
+}
+
 /// Convert a Value to JSON bytes for the response body.
 pub(super) fn value_to_json_bytes(value: &crate::Value) -> Vec<u8> {
     match value.as_bytes() {

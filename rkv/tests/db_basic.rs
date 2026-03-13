@@ -6434,3 +6434,217 @@ fn iterator_with_disk_sstables() {
 
     db.close().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// pop_first
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pop_first_returns_first_live_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("a", "1", None).unwrap();
+    ns.put("b", "2", None).unwrap();
+    ns.put("c", "3", None).unwrap();
+
+    let result = ns.pop_first(&Key::from("")).unwrap();
+    assert_eq!(result, Some((Key::from("a"), Value::from("1"))));
+
+    // Key "a" should be deleted now
+    assert!(ns.get("a").is_err());
+
+    // Next pop_first should return "b"
+    let result = ns.pop_first(&Key::from("")).unwrap();
+    assert_eq!(result, Some((Key::from("b"), Value::from("2"))));
+}
+
+#[test]
+fn pop_first_with_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("queue:1", "msg1", None).unwrap();
+    ns.put("queue:2", "msg2", None).unwrap();
+    ns.put("other:1", "x", None).unwrap();
+
+    let result = ns.pop_first(&Key::from("queue:")).unwrap();
+    assert_eq!(result, Some((Key::from("queue:1"), Value::from("msg1"))));
+
+    // "other:1" is unaffected
+    assert_eq!(ns.get("other:1").unwrap(), Value::from("x"));
+}
+
+#[test]
+fn pop_first_empty_returns_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    assert_eq!(ns.pop_first(&Key::from("")).unwrap(), None);
+}
+
+#[test]
+fn pop_first_after_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("a", "1", None).unwrap();
+    ns.put("b", "2", None).unwrap();
+    db.flush().unwrap();
+    ns.put("c", "3", None).unwrap();
+
+    // Should pop "a" from SSTable
+    let result = ns.pop_first(&Key::from("")).unwrap();
+    assert_eq!(result, Some((Key::from("a"), Value::from("1"))));
+
+    // Pop "b" from SSTable
+    let result = ns.pop_first(&Key::from("")).unwrap();
+    assert_eq!(result, Some((Key::from("b"), Value::from("2"))));
+
+    // Pop "c" from memtable
+    let result = ns.pop_first(&Key::from("")).unwrap();
+    assert_eq!(result, Some((Key::from("c"), Value::from("3"))));
+
+    // Empty
+    assert_eq!(ns.pop_first(&Key::from("")).unwrap(), None);
+}
+
+// ---------------------------------------------------------------------------
+// Edge-case coverage for performance improvements
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rscan_with_empty_sstable_levels() {
+    // Reverse iteration when some SSTable levels have no matching entries.
+    // Write data to L0 via flush, then add more data only in memtable.
+    // The rscan must skip empty SSTable levels gracefully.
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // Flush with keys in one range
+    ns.put(1_i64, "a", None).unwrap();
+    ns.put(2_i64, "b", None).unwrap();
+    db.flush().unwrap();
+
+    // Delete all flushed keys so the SSTable has only tombstones for this range
+    ns.delete(1_i64).unwrap();
+    ns.delete(2_i64).unwrap();
+    db.flush().unwrap();
+
+    // Add fresh keys only in memtable
+    ns.put(10_i64, "x", None).unwrap();
+    ns.put(20_i64, "y", None).unwrap();
+
+    // rscan should return only the live keys, skipping SSTable tombstones
+    let keys = ns.rscan(&Key::Int(20), 10, 0, false).unwrap();
+    assert_eq!(keys, vec![Key::Int(20), Key::Int(10)]);
+}
+
+#[test]
+fn rscan_single_sstable_via_flush() {
+    // ConcatIterator with a single SSTable source — ensures it works
+    // when there is exactly one SSTable in the level.
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put(5_i64, "five", None).unwrap();
+    ns.put(3_i64, "three", None).unwrap();
+    ns.put(7_i64, "seven", None).unwrap();
+    db.flush().unwrap();
+
+    // Compact to ensure a single SSTable per level
+    db.compact().unwrap();
+
+    let keys = ns.rscan(&Key::Int(7), 10, 0, false).unwrap();
+    assert_eq!(keys, vec![Key::Int(7), Key::Int(5), Key::Int(3)]);
+}
+
+#[test]
+fn pop_first_only_tombstones_returns_none() {
+    // When all entries in the namespace are tombstones, pop_first should
+    // return None rather than surfacing a deleted entry.
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    // Write keys and then delete them all
+    ns.put("a", "1", None).unwrap();
+    ns.put("b", "2", None).unwrap();
+    ns.put("c", "3", None).unwrap();
+    ns.delete("a").unwrap();
+    ns.delete("b").unwrap();
+    ns.delete("c").unwrap();
+
+    assert_eq!(ns.pop_first(&Key::from("")).unwrap(), None);
+}
+
+#[test]
+fn pop_first_only_tombstones_after_flush_returns_none() {
+    // Same as above but tombstones span both memtable and SSTable.
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("x", "1", None).unwrap();
+    ns.put("y", "2", None).unwrap();
+    db.flush().unwrap();
+
+    // Delete both — tombstones live in memtable, data in SSTable
+    ns.delete("x").unwrap();
+    ns.delete("y").unwrap();
+
+    assert_eq!(ns.pop_first(&Key::from("")).unwrap(), None);
+}
+
+#[test]
+fn cache_hit_rate_zero_when_empty() {
+    // When no cache accesses have occurred, cache_hit_rate should be 0.0.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.cache_size = 8 * 1024 * 1024;
+    let db = DB::open(config).unwrap();
+
+    let stats = db.stats();
+    assert!(
+        (stats.cache_hit_rate - 0.0).abs() < f64::EPSILON,
+        "expected 0.0 hit rate on fresh DB, got {}",
+        stats.cache_hit_rate
+    );
+    assert_eq!(stats.cache_hits, 0);
+    assert_eq!(stats.cache_misses, 0);
+}
+
+#[test]
+fn cache_hit_rate_zero_with_disabled_cache() {
+    // When cache_size is 0 (disabled), stats should report 0.0 hit rate.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path());
+    config.cache_size = 0;
+    let db = DB::open(config).unwrap();
+
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+    ns.put("k", "v", None).unwrap();
+    db.flush().unwrap();
+    let _ = ns.get("k").unwrap();
+
+    let stats = db.stats();
+    assert!(
+        (stats.cache_hit_rate - 0.0).abs() < f64::EPSILON,
+        "expected 0.0 hit rate with disabled cache, got {}",
+        stats.cache_hit_rate
+    );
+}

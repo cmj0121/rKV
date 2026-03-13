@@ -325,6 +325,63 @@ async fn pop_message(
     Ok(Json(json!({"message": msg})))
 }
 
+#[derive(Deserialize)]
+struct BatchPushRequest {
+    messages: Vec<BatchPushItem>,
+}
+
+#[derive(Deserialize)]
+struct BatchPushItem {
+    body: String,
+    ttl: Option<String>,
+}
+
+async fn batch_push(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    Json(req): Json<BatchPushRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    state.require_role(&headers, Role::Writer)?;
+    validate_queue_name(&name)?;
+    let msgs: Vec<(&str, Option<Duration>)> = req
+        .messages
+        .iter()
+        .map(|m| {
+            let ttl = m.ttl.as_deref().map(parse_ttl).transpose();
+            ttl.map(|t| (m.body.as_str(), t))
+        })
+        .collect::<Result<_, _>>()?;
+    let ids = state
+        .backend
+        .push_messages(&name, &msgs)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(json!({"ids": ids, "count": ids.len()})))
+}
+
+#[derive(Deserialize)]
+struct BatchPopQuery {
+    count: Option<usize>,
+}
+
+async fn batch_pop(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    axum::extract::Query(query): axum::extract::Query<BatchPopQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    state.require_role(&headers, Role::Reader)?;
+    validate_queue_name(&name)?;
+    let count = query.count.unwrap_or(1).min(1000);
+    let msgs = state
+        .backend
+        .pop_messages(&name, count)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(json!({"messages": msgs, "count": msgs.len()})))
+}
+
 async fn queue_info(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -394,6 +451,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/queues/{name}", get(pop_message))
         .route("/queues/{name}", delete(delete_queue))
         .route("/queues/{name}/info", get(queue_info))
+        .route("/queues/{name}/batch", post(batch_push).get(batch_pop))
         .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -1031,6 +1089,103 @@ mod tests {
         let app = build_router(test_state(false));
         let (status, _) = request(&app, "GET", "/ui/style.css", None, None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // --- Batch push/pop ---
+
+    #[tokio::test]
+    async fn e2e_batch_push_and_pop() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"batch"}"#)).await;
+
+        // Batch push 3 messages
+        let payload = r#"{"messages":[{"body":"a"},{"body":"b"},{"body":"c"}]}"#;
+        let (status, body) =
+            request(&app, "POST", "/queues/batch/batch", None, Some(payload)).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["count"], 3);
+        assert_eq!(json["ids"].as_array().unwrap().len(), 3);
+
+        // Batch pop 2
+        let (status, body) = request(&app, "GET", "/queues/batch/batch?count=2", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["count"], 2);
+        let msgs = json["messages"].as_array().unwrap();
+        assert_eq!(msgs[0], "a");
+        assert_eq!(msgs[1], "b");
+
+        // Batch pop remaining
+        let (_, body) = request(&app, "GET", "/queues/batch/batch?count=10", None, None).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["count"], 1);
+        assert_eq!(json["messages"][0], "c");
+    }
+
+    #[tokio::test]
+    async fn batch_push_with_ttl() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"bttl"}"#)).await;
+        let payload = r#"{"messages":[{"body":"x","ttl":"1h"},{"body":"y"}]}"#;
+        let (status, body) = request(&app, "POST", "/queues/bttl/batch", None, Some(payload)).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn batch_push_invalid_ttl_returns_400() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"bttlerr"}"#)).await;
+        let payload = r#"{"messages":[{"body":"x","ttl":"abc"}]}"#;
+        let (status, _) = request(&app, "POST", "/queues/bttlerr/batch", None, Some(payload)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn batch_pop_empty_queue() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"bempty"}"#)).await;
+        let (status, body) = request(&app, "GET", "/queues/bempty/batch?count=5", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["count"], 0);
+        assert!(json["messages"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_pop_defaults_to_one() {
+        let app = build_router(open_state());
+        request(&app, "POST", "/queues", None, Some(r#"{"name":"bdef"}"#)).await;
+        request(&app, "POST", "/queues/bdef", None, Some("m1")).await;
+        request(&app, "POST", "/queues/bdef", None, Some("m2")).await;
+        let (_, body) = request(&app, "GET", "/queues/bdef/batch", None, None).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["count"], 1);
+        assert_eq!(json["messages"][0], "m1");
+    }
+
+    #[tokio::test]
+    async fn batch_push_requires_writer_role() {
+        let app = build_router(test_state(false));
+        let payload = r#"{"messages":[{"body":"x"}]}"#;
+        let (status, _) = request(
+            &app,
+            "POST",
+            "/queues/q/batch",
+            Some("reader-tok"),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn batch_pop_requires_reader_role() {
+        let app = build_router(test_state(false));
+        let (status, _) = request(&app, "GET", "/queues/q/batch", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     // --- Docs ---

@@ -76,7 +76,7 @@ pub const DEFAULT_NAMESPACE: &str = "_";
 
 /// Per-namespace state: memtable + append-only log.
 pub(crate) struct NamespaceState {
-    pub memtable: Mutex<memtable::MemTable>,
+    pub memtable: RwLock<memtable::MemTable>,
     /// `None` in in-memory mode (no disk I/O).
     pub aol: Option<Mutex<aol::Aol>>,
 }
@@ -89,7 +89,7 @@ impl NamespaceState {
         fs::create_dir_all(&ns_dir)?;
         let ns_aol = aol::Aol::open_at(ns_dir.join(aol::AOL_FILENAME), aol_buffer_size)?;
         Ok(Self {
-            memtable: Mutex::new(memtable::MemTable::new()),
+            memtable: RwLock::new(memtable::MemTable::new()),
             aol: Some(Mutex::new(ns_aol)),
         })
     }
@@ -97,7 +97,7 @@ impl NamespaceState {
     /// Create a new `NamespaceState` for in-memory mode (no AOL).
     pub(crate) fn create_in_memory() -> Self {
         Self {
-            memtable: Mutex::new(memtable::MemTable::new()),
+            memtable: RwLock::new(memtable::MemTable::new()),
             aol: None,
         }
     }
@@ -576,7 +576,7 @@ impl DB {
             ns_map.insert(
                 ns_name,
                 NamespaceState {
-                    memtable: Mutex::new(mt),
+                    memtable: RwLock::new(mt),
                     aol: Some(Mutex::new(ns_aol)),
                 },
             );
@@ -924,7 +924,7 @@ impl DB {
                     let Some(ns_state) = map.get(ns_name) else {
                         continue;
                     };
-                    let mut mt = ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut mt = ns_state.memtable.write().unwrap_or_else(|e| e.into_inner());
                     if mt.is_empty() {
                         continue;
                     }
@@ -1116,7 +1116,7 @@ impl DB {
                         let map = ns_data.read().unwrap_or_else(|e| e.into_inner());
                         if let Some(ns_state) = map.get(&record.namespace) {
                             let mut mt =
-                                ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+                                ns_state.memtable.write().unwrap_or_else(|e| e.into_inner());
                             let rev = RevisionID::from(record.revision);
                             let ttl = if record.expires_at_ms > 0 {
                                 let remaining_ms = record.expires_at_ms.saturating_sub(now_ms);
@@ -1153,7 +1153,7 @@ impl DB {
                         let mut ns_map = sync_ns_data.write().unwrap_or_else(|e| e.into_inner());
                         for ns_state in ns_map.values() {
                             let mut mt =
-                                ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+                                ns_state.memtable.write().unwrap_or_else(|e| e.into_inner());
                             *mt = memtable::MemTable::new();
                             let mut aol = ns_state
                                 .aol
@@ -1250,7 +1250,7 @@ impl DB {
                         let map = cleanup_ns_data.read().unwrap_or_else(|e| e.into_inner());
                         for ns_state in map.values() {
                             let mut mt =
-                                ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+                                ns_state.memtable.write().unwrap_or_else(|e| e.into_inner());
                             *mt = memtable::MemTable::new();
                             let mut aol = ns_state
                                 .aol
@@ -1385,7 +1385,7 @@ impl DB {
                         let map = db_ns_data.read().unwrap_or_else(|e| e.into_inner());
                         if let Some(ns_state) = map.get(&record.namespace) {
                             let mut mt =
-                                ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+                                ns_state.memtable.write().unwrap_or_else(|e| e.into_inner());
                             mt.put_if_newer(
                                 record.key.clone(),
                                 record.value.clone(),
@@ -1398,7 +1398,7 @@ impl DB {
                             ensure_ns(&mut map, &record.namespace)?;
                             let ns_state = map.get(&record.namespace).unwrap();
                             let mut mt =
-                                ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+                                ns_state.memtable.write().unwrap_or_else(|e| e.into_inner());
                             mt.put_if_newer(
                                 record.key.clone(),
                                 record.value.clone(),
@@ -1472,7 +1472,7 @@ impl DB {
                         let mut ns_map = sync_ns_data.write().unwrap_or_else(|e| e.into_inner());
                         for ns_state in ns_map.values() {
                             let mut mt =
-                                ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+                                ns_state.memtable.write().unwrap_or_else(|e| e.into_inner());
                             *mt = memtable::MemTable::new();
                             let mut aol = ns_state
                                 .aol
@@ -1671,7 +1671,7 @@ impl DB {
         let mut total_keys: u64 = 0;
         let mut write_buffer_bytes: u64 = 0;
         for ns_state in map.values() {
-            let mt = ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = ns_state.memtable.read().unwrap_or_else(|e| e.into_inner());
             total_keys += mt.count();
             write_buffer_bytes += mt.approximate_size() as u64;
         }
@@ -1720,10 +1720,10 @@ impl DB {
         drop(sst);
 
         // Cache hit/miss counters
-        let (cache_hits, cache_misses) = if let Some(ref bc) = self.block_cache {
-            (bc.hits(), bc.misses())
+        let (cache_hits, cache_misses, cache_hit_rate) = if let Some(ref bc) = self.block_cache {
+            (bc.hits(), bc.misses(), bc.hit_rate())
         } else {
-            (0, 0)
+            (0, 0, 0.0)
         };
 
         Stats {
@@ -1740,6 +1740,7 @@ impl DB {
             op_deletes: self.op_deletes.load(Ordering::Relaxed),
             cache_hits,
             cache_misses,
+            cache_hit_rate,
             uptime: self.opened_at.elapsed(),
             role: self.config.role.to_string(),
             peer_count: self
@@ -2042,7 +2043,7 @@ impl DB {
         for ns_name in &namespaces {
             let entries = {
                 let mt = self.get_or_create_memtable(ns_name)?;
-                let mut mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+                let mut mt = mt.write().unwrap_or_else(|e| e.into_inner());
                 if mt.is_empty() {
                     continue;
                 }
@@ -3127,7 +3128,7 @@ impl DB {
         {
             let ns_map = namespace_data.read().unwrap_or_else(|e| e.into_inner());
             if let Some(ns_state) = ns_map.get(ns) {
-                let mt = ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+                let mt = ns_state.memtable.read().unwrap_or_else(|e| e.into_inner());
                 if !mt.is_empty() {
                     return Ok(());
                 }
@@ -3351,7 +3352,7 @@ impl DB {
             };
 
             let ns_state = self.get_or_create_ns(&record.namespace)?;
-            let mut mt = ns_state.memtable.lock().unwrap_or_else(|e| e.into_inner());
+            let mut mt = ns_state.memtable.write().unwrap_or_else(|e| e.into_inner());
             mt.put_if_newer(record.key.clone(), record.value.clone(), incoming_rev, ttl)
         };
 
@@ -3434,12 +3435,13 @@ impl DB {
         {
             let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
             if let Some(levels) = sst.get(ns) {
-                let mut sst_sources: Vec<Box<dyn merge_iter::MergeSource>> = Vec::new();
+                let mut priority = 1u32;
 
                 // Process levels from bottom (oldest) to top (newest)
                 for (level_idx, level_readers) in levels.iter().enumerate().rev() {
                     if level_idx == 0 {
-                        // L0: oldest-to-newest (reverse of storage order)
+                        // L0: overlapping ranges — each SSTable is a separate
+                        // source in the heap (oldest-to-newest priority)
                         for reader in level_readers.iter().rev() {
                             if let Some(iter) = merge_iter::SSTableScanIter::new(
                                 reader,
@@ -3447,37 +3449,45 @@ impl DB {
                                 effective_ordered,
                                 self.config.verify_checksums,
                             )? {
-                                sst_sources.push(Box::new(iter));
+                                sources.push((Box::new(iter), priority));
+                                priority += 1;
                             }
                         }
                     } else {
-                        for reader in level_readers {
+                        // L1+: non-overlapping ranges — concatenate into a
+                        // single source to reduce heap size.
+                        // Sort readers by first index key to ensure key order.
+                        let mut sorted_readers: Vec<&sstable::SSTableReader> =
+                            level_readers.iter().collect();
+                        sorted_readers
+                            .sort_by(|a, b| a.first_index_key().cmp(&b.first_index_key()));
+                        let mut level_iters: Vec<Box<dyn merge_iter::MergeSource>> = Vec::new();
+                        for reader in &sorted_readers {
                             if let Some(iter) = merge_iter::SSTableScanIter::new(
                                 reader,
                                 prefix_bytes.clone(),
                                 effective_ordered,
                                 self.config.verify_checksums,
                             )? {
-                                sst_sources.push(Box::new(iter));
+                                level_iters.push(Box::new(iter));
                             }
+                        }
+                        if !level_iters.is_empty() {
+                            sources.push((
+                                Box::new(merge_iter::ConcatIterator::new(level_iters)),
+                                priority,
+                            ));
+                            priority += 1;
                         }
                     }
                 }
-
-                // Assign priorities: first source gets priority 1, last gets N
-                let n = sst_sources.len() as u32;
-                for (i, src) in sst_sources.into_iter().enumerate() {
-                    sources.push((src, i as u32 + 1));
-                }
-                // Memtable gets priority n + 1
-                let _ = n; // used implicitly via sources.len()
             }
         }
 
         // 2. Memtable snapshot (highest priority)
         let mt_entries = {
             let mt = self.get_or_create_memtable(ns)?;
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             mt.scan_all_raw(prefix)
         };
         let memtable_priority = sources.len() as u32 + 1;
@@ -3498,7 +3508,7 @@ impl DB {
         ns: &str,
         prefix: &Key,
         ordered_mode: bool,
-    ) -> Result<merge_iter::MergeIterator> {
+    ) -> Result<merge_iter::ReverseMergeIterator> {
         let prefix_bytes = if ordered_mode {
             prefix.to_bytes()
         } else {
@@ -3507,11 +3517,11 @@ impl DB {
 
         let mut sources: Vec<(Box<dyn merge_iter::MergeSource>, u32)> = Vec::new();
 
-        // 1. SSTable sources
+        // 1. SSTable sources (reverse direction — each source yields keys descending)
         {
             let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
             if let Some(levels) = sst.get(ns) {
-                let mut sst_sources: Vec<Box<dyn merge_iter::MergeSource>> = Vec::new();
+                let mut priority = 1u32;
 
                 for (level_idx, level_readers) in levels.iter().enumerate().rev() {
                     if level_idx == 0 {
@@ -3523,11 +3533,19 @@ impl DB {
                                 self.config.verify_checksums,
                                 merge_iter::ScanDirection::Reverse,
                             )? {
-                                sst_sources.push(Box::new(iter));
+                                sources.push((Box::new(iter), priority));
+                                priority += 1;
                             }
                         }
                     } else {
-                        for reader in level_readers {
+                        // L1+: non-overlapping — concatenate into single source.
+                        // Sort readers by first index key in reverse for reverse scan.
+                        let mut sorted_readers: Vec<&sstable::SSTableReader> =
+                            level_readers.iter().collect();
+                        sorted_readers
+                            .sort_by(|a, b| b.first_index_key().cmp(&a.first_index_key()));
+                        let mut level_iters: Vec<Box<dyn merge_iter::MergeSource>> = Vec::new();
+                        for reader in &sorted_readers {
                             if let Some(iter) = merge_iter::SSTableScanIter::with_direction(
                                 reader,
                                 prefix_bytes.clone(),
@@ -3535,22 +3553,25 @@ impl DB {
                                 self.config.verify_checksums,
                                 merge_iter::ScanDirection::Reverse,
                             )? {
-                                sst_sources.push(Box::new(iter));
+                                level_iters.push(Box::new(iter));
                             }
                         }
+                        if !level_iters.is_empty() {
+                            sources.push((
+                                Box::new(merge_iter::ConcatIterator::new(level_iters)),
+                                priority,
+                            ));
+                            priority += 1;
+                        }
                     }
-                }
-
-                for (i, src) in sst_sources.into_iter().enumerate() {
-                    sources.push((src, i as u32 + 1));
                 }
             }
         }
 
-        // 2. Memtable snapshot
+        // 2. Memtable snapshot (already in reverse order)
         let mt_entries = {
             let mt = self.get_or_create_memtable(ns)?;
-            let mt = mt.lock().unwrap_or_else(|e| e.into_inner());
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             mt.rscan_all_raw(prefix)
         };
         let memtable_priority = sources.len() as u32 + 1;
@@ -3559,7 +3580,7 @@ impl DB {
             memtable_priority,
         ));
 
-        Ok(merge_iter::MergeIterator::new(sources))
+        Ok(merge_iter::ReverseMergeIterator::new(sources))
     }
 
     /// Look up a key across all SSTable levels for a namespace.
@@ -3898,7 +3919,7 @@ impl DB {
     }
 
     /// Convenience: get only the memtable mutex for read-path callers.
-    pub(crate) fn get_or_create_memtable(&self, name: &str) -> Result<&Mutex<memtable::MemTable>> {
+    pub(crate) fn get_or_create_memtable(&self, name: &str) -> Result<&RwLock<memtable::MemTable>> {
         Ok(&self.get_or_create_ns(name)?.memtable)
     }
 }
