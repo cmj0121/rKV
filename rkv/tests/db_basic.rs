@@ -6434,3 +6434,85 @@ fn iterator_with_disk_sstables() {
 
     db.close().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// pop_first
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pop_first_returns_first_live_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("a", "1", None).unwrap();
+    ns.put("b", "2", None).unwrap();
+    ns.put("c", "3", None).unwrap();
+
+    let result = ns.pop_first(&Key::from("")).unwrap();
+    assert_eq!(result, Some((Key::from("a"), Value::from("1"))));
+
+    // Key "a" should be deleted now
+    assert!(ns.get("a").is_err());
+
+    // Next pop_first should return "b"
+    let result = ns.pop_first(&Key::from("")).unwrap();
+    assert_eq!(result, Some((Key::from("b"), Value::from("2"))));
+}
+
+#[test]
+fn pop_first_with_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("queue:1", "msg1", None).unwrap();
+    ns.put("queue:2", "msg2", None).unwrap();
+    ns.put("other:1", "x", None).unwrap();
+
+    let result = ns.pop_first(&Key::from("queue:")).unwrap();
+    assert_eq!(result, Some((Key::from("queue:1"), Value::from("msg1"))));
+
+    // "other:1" is unaffected
+    assert_eq!(ns.get("other:1").unwrap(), Value::from("x"));
+}
+
+#[test]
+fn pop_first_empty_returns_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    assert_eq!(ns.pop_first(&Key::from("")).unwrap(), None);
+}
+
+#[test]
+fn pop_first_after_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config::new(tmp.path());
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace(DEFAULT_NAMESPACE, None).unwrap();
+
+    ns.put("a", "1", None).unwrap();
+    ns.put("b", "2", None).unwrap();
+    db.flush().unwrap();
+    ns.put("c", "3", None).unwrap();
+
+    // Should pop "a" from SSTable
+    let result = ns.pop_first(&Key::from("")).unwrap();
+    assert_eq!(result, Some((Key::from("a"), Value::from("1"))));
+
+    // Pop "b" from SSTable
+    let result = ns.pop_first(&Key::from("")).unwrap();
+    assert_eq!(result, Some((Key::from("b"), Value::from("2"))));
+
+    // Pop "c" from memtable
+    let result = ns.pop_first(&Key::from("")).unwrap();
+    assert_eq!(result, Some((Key::from("c"), Value::from("3"))));
+
+    // Empty
+    assert_eq!(ns.pop_first(&Key::from("")).unwrap(), None);
+}

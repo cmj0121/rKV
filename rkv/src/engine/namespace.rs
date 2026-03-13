@@ -721,4 +721,52 @@ impl<'db> Namespace<'db> {
             self.encryption_key,
         ))
     }
+
+    /// Atomically pop the first live key matching `prefix`.
+    ///
+    /// Returns the key and its resolved value, or `None` if no matching
+    /// live entry exists. The key is tombstoned in a single operation,
+    /// avoiding the separate scan+delete round-trip.
+    pub fn pop_first(&self, prefix: &Key) -> Result<Option<(Key, Value)>> {
+        if self.db.is_replica() {
+            return Err(Error::ReadOnlyReplica);
+        }
+
+        let ordered_mode = {
+            let mt = self.db.get_or_create_memtable(&self.name)?;
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
+            mt.is_ordered()
+        };
+
+        // Build merge iterator to find the first live entry
+        let mut iter = self
+            .db
+            .build_merge_iterator(&self.name, prefix, ordered_mode)?;
+
+        let (key, value) = loop {
+            match iter.next()? {
+                Some((_k, v)) if v.is_tombstone() => continue,
+                Some((k, v)) => break (k, v),
+                None => return Ok(None),
+            }
+        };
+
+        // Drop the iterator before writing (releases SSTable read locks)
+        drop(iter);
+
+        // Delete the key
+        let rev = self.db.generate_revision();
+        self.db
+            .append_to_aol(&self.name, rev.as_u128(), &key, &Value::tombstone(), None)?;
+        let mt = self.db.get_or_create_memtable(&self.name)?;
+        let mut mt = mt.write().unwrap_or_else(|e| e.into_inner());
+        mt.delete(key.clone(), rev);
+        drop(mt);
+        self.db.inc_op_deletes();
+
+        // Resolve value pointers and decrypt
+        let value = self.db.resolve_value(&self.name, &value)?;
+        let value = self.decrypt_value(value)?;
+        Ok(Some((key, value)))
+    }
 }
