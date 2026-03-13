@@ -570,6 +570,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_push_empty_messages() {
+        let b = embed_backend();
+        b.create_queue("empty_batch").await.unwrap();
+        let ids = b.push_messages("empty_batch", &[]).await.unwrap();
+        assert!(ids.is_empty(), "empty batch should return 0 ids");
+        assert_eq!(b.queue_length("empty_batch").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn push_with_ttl() {
         let b = embed_backend();
         b.create_queue("ttl").await.unwrap();
