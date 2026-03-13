@@ -165,68 +165,34 @@ impl Backend {
             Backend::Embed(db, _) => {
                 let ns = db.namespace(&ns_name, None).map_err(|e| e.to_string())?;
                 let prefix = Key::Str(String::new());
-                let entry = ns
-                    .entries(&prefix)
-                    .map_err(|e| e.to_string())?
-                    .filter_map(|e| e.ok())
-                    .next();
-                match entry {
-                    Some((key, value)) => {
-                        let data = value
-                            .as_bytes()
-                            .map(|b| String::from_utf8_lossy(b).to_string());
-                        let _ = ns.delete(key);
-                        Ok(data)
-                    }
-                    _ => Ok(None),
+                match ns.pop_first(&prefix).map_err(|e| e.to_string())? {
+                    Some((_key, value)) => Ok(value
+                        .as_bytes()
+                        .map(|b| String::from_utf8_lossy(b).to_string())),
+                    None => Ok(None),
                 }
             }
             Backend::Remote(client) => {
-                // Get first key (limit=1 to avoid downloading all keys)
-                let list_url = format!("{}?offset=0&limit=1", client.keys_url(&ns_name));
+                let url = format!("{}/api/{}/pop", client.base_url, ns_name);
                 let resp = client
                     .client
-                    .get(&list_url)
+                    .post(&url)
                     .send()
                     .await
                     .map_err(|e| e.to_string())?;
+                if resp.status() == reqwest::StatusCode::NO_CONTENT {
+                    return Ok(None);
+                }
                 if !resp.status().is_success() {
                     let err = resp.text().await.unwrap_or_default();
-                    return Err(format!("list keys failed: {err}"));
+                    return Err(format!("pop failed: {err}"));
                 }
-                let keys: Vec<String> = resp.json().await.map_err(|e| e.to_string())?;
-                let first_key = match keys.first() {
-                    Some(k) => k.clone(),
-                    None => return Ok(None),
-                };
-                // Get the value
-                let get_url = client.key_url(&ns_name, &first_key);
-                let resp = client
-                    .client
-                    .get(&get_url)
-                    .send()
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let value = if resp.status().is_success() {
-                    let text = resp.text().await.unwrap_or_default();
-                    // rKV returns JSON-encoded string, strip quotes
-                    serde_json::from_str::<String>(&text).unwrap_or(text)
-                } else {
-                    return Ok(None);
-                };
-                // Delete the key
-                let del_url = client.key_url(&ns_name, &first_key);
-                let del_resp = client
-                    .client
-                    .delete(&del_url)
-                    .send()
-                    .await
-                    .map_err(|e| e.to_string())?;
-                if !del_resp.status().is_success() {
-                    let err = del_resp.text().await.unwrap_or_default();
-                    return Err(format!("pop delete failed: {err}"));
-                }
-                Ok(Some(value))
+                let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+                let value = body
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                Ok(value)
             }
         }
     }
