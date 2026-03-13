@@ -3435,12 +3435,13 @@ impl DB {
         {
             let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
             if let Some(levels) = sst.get(ns) {
-                let mut sst_sources: Vec<Box<dyn merge_iter::MergeSource>> = Vec::new();
+                let mut priority = 1u32;
 
                 // Process levels from bottom (oldest) to top (newest)
                 for (level_idx, level_readers) in levels.iter().enumerate().rev() {
                     if level_idx == 0 {
-                        // L0: oldest-to-newest (reverse of storage order)
+                        // L0: overlapping ranges — each SSTable is a separate
+                        // source in the heap (oldest-to-newest priority)
                         for reader in level_readers.iter().rev() {
                             if let Some(iter) = merge_iter::SSTableScanIter::new(
                                 reader,
@@ -3448,30 +3449,38 @@ impl DB {
                                 effective_ordered,
                                 self.config.verify_checksums,
                             )? {
-                                sst_sources.push(Box::new(iter));
+                                sources.push((Box::new(iter), priority));
+                                priority += 1;
                             }
                         }
                     } else {
-                        for reader in level_readers {
+                        // L1+: non-overlapping ranges — concatenate into a
+                        // single source to reduce heap size.
+                        // Sort readers by first index key to ensure key order.
+                        let mut sorted_readers: Vec<&sstable::SSTableReader> =
+                            level_readers.iter().collect();
+                        sorted_readers
+                            .sort_by(|a, b| a.first_index_key().cmp(&b.first_index_key()));
+                        let mut level_iters: Vec<Box<dyn merge_iter::MergeSource>> = Vec::new();
+                        for reader in &sorted_readers {
                             if let Some(iter) = merge_iter::SSTableScanIter::new(
                                 reader,
                                 prefix_bytes.clone(),
                                 effective_ordered,
                                 self.config.verify_checksums,
                             )? {
-                                sst_sources.push(Box::new(iter));
+                                level_iters.push(Box::new(iter));
                             }
+                        }
+                        if !level_iters.is_empty() {
+                            sources.push((
+                                Box::new(merge_iter::ConcatIterator::new(level_iters)),
+                                priority,
+                            ));
+                            priority += 1;
                         }
                     }
                 }
-
-                // Assign priorities: first source gets priority 1, last gets N
-                let n = sst_sources.len() as u32;
-                for (i, src) in sst_sources.into_iter().enumerate() {
-                    sources.push((src, i as u32 + 1));
-                }
-                // Memtable gets priority n + 1
-                let _ = n; // used implicitly via sources.len()
             }
         }
 
@@ -3512,7 +3521,7 @@ impl DB {
         {
             let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
             if let Some(levels) = sst.get(ns) {
-                let mut sst_sources: Vec<Box<dyn merge_iter::MergeSource>> = Vec::new();
+                let mut priority = 1u32;
 
                 for (level_idx, level_readers) in levels.iter().enumerate().rev() {
                     if level_idx == 0 {
@@ -3524,11 +3533,19 @@ impl DB {
                                 self.config.verify_checksums,
                                 merge_iter::ScanDirection::Reverse,
                             )? {
-                                sst_sources.push(Box::new(iter));
+                                sources.push((Box::new(iter), priority));
+                                priority += 1;
                             }
                         }
                     } else {
-                        for reader in level_readers {
+                        // L1+: non-overlapping — concatenate into single source.
+                        // Sort readers by first index key in reverse for reverse scan.
+                        let mut sorted_readers: Vec<&sstable::SSTableReader> =
+                            level_readers.iter().collect();
+                        sorted_readers
+                            .sort_by(|a, b| b.first_index_key().cmp(&a.first_index_key()));
+                        let mut level_iters: Vec<Box<dyn merge_iter::MergeSource>> = Vec::new();
+                        for reader in &sorted_readers {
                             if let Some(iter) = merge_iter::SSTableScanIter::with_direction(
                                 reader,
                                 prefix_bytes.clone(),
@@ -3536,14 +3553,17 @@ impl DB {
                                 self.config.verify_checksums,
                                 merge_iter::ScanDirection::Reverse,
                             )? {
-                                sst_sources.push(Box::new(iter));
+                                level_iters.push(Box::new(iter));
                             }
                         }
+                        if !level_iters.is_empty() {
+                            sources.push((
+                                Box::new(merge_iter::ConcatIterator::new(level_iters)),
+                                priority,
+                            ));
+                            priority += 1;
+                        }
                     }
-                }
-
-                for (i, src) in sst_sources.into_iter().enumerate() {
-                    sources.push((src, i as u32 + 1));
                 }
             }
         }

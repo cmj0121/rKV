@@ -1535,6 +1535,15 @@ impl SSTableReader {
         Ok(self.ensure_meta()?.index.clone())
     }
 
+    /// Return the first key bytes of the first index entry (no clone).
+    ///
+    /// Returns `None` if index is empty or metadata is corrupted.
+    pub(crate) fn first_index_key(&self) -> Option<&[u8]> {
+        self.ensure_meta()
+            .ok()
+            .and_then(|m| m.index.first().map(|e| e.last_key.as_slice()))
+    }
+
     /// Pre-populate the block cache with all data blocks from this SSTable.
     ///
     /// Each block is decompressed from disk and inserted into the cache.

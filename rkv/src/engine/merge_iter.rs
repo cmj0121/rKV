@@ -388,6 +388,42 @@ impl MergeIterator {
 }
 
 // ---------------------------------------------------------------------------
+// ConcatIterator — sequential iteration over non-overlapping sources
+// ---------------------------------------------------------------------------
+
+/// A lazy concatenating iterator for non-overlapping sorted sources.
+///
+/// L1+ SSTable levels have non-overlapping key ranges after compaction, so
+/// they can be iterated sequentially instead of using a heap. This reduces
+/// heap size (fewer sources in the merge) and avoids per-entry heap ops
+/// for entries within a single SSTable.
+pub(crate) struct ConcatIterator {
+    sources: Vec<Box<dyn MergeSource>>,
+    current: usize,
+}
+
+impl ConcatIterator {
+    pub(crate) fn new(sources: Vec<Box<dyn MergeSource>>) -> Self {
+        Self {
+            sources,
+            current: 0,
+        }
+    }
+}
+
+impl MergeSource for ConcatIterator {
+    fn next_entry(&mut self) -> Result<Option<(Key, Value)>> {
+        while self.current < self.sources.len() {
+            if let Some(entry) = self.sources[self.current].next_entry()? {
+                return Ok(Some(entry));
+            }
+            self.current += 1;
+        }
+        Ok(None)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RScanAdapter — collects forward merge then reverses
 // ---------------------------------------------------------------------------
 
