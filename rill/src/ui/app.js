@@ -96,6 +96,7 @@ var state = {
   queues: [],
   queueLengths: {},
   selectedQueue: null,
+  role: null, // "admin", "writer", "reader", "anonymous", or null (unknown)
 };
 
 // ---------------------------------------------------------------------------
@@ -120,15 +121,23 @@ window.addEventListener("hashchange", route);
 // ---------------------------------------------------------------------------
 // Queues view
 // ---------------------------------------------------------------------------
-function renderQueues(app) {
-  app.appendChild(el("h2", { textContent: "Queues" }));
+function renderToolbar() {
+  var toolbar = $("#toolbar");
+  if (!toolbar) return;
+  toolbar.innerHTML = "";
 
-  var toolbar = el("div", { className: "toolbar" }, [
-    el("button", {
-      className: "btn btn-blue",
-      textContent: "+ New Queue",
-      onClick: openCreateQueueDialog,
-    }),
+  var newBtn = el("button", {
+    className: "btn btn-blue",
+    textContent: "+ New Queue",
+    onClick: openCreateQueueDialog,
+  });
+  if (!canAdmin()) {
+    newBtn.disabled = true;
+    newBtn.className = "btn btn-disabled";
+  }
+  toolbar.appendChild(newBtn);
+
+  toolbar.appendChild(
     el("button", {
       className: "btn",
       textContent: "Refresh",
@@ -136,8 +145,15 @@ function renderQueues(app) {
         loadQueues();
       },
     }),
-  ]);
+  );
+}
+
+function renderQueues(app) {
+  app.appendChild(el("h2", { textContent: "Queues" }));
+
+  var toolbar = el("div", { className: "toolbar", id: "toolbar" });
   app.appendChild(toolbar);
+  renderToolbar();
 
   var statsGrid = el("div", { className: "stat-grid", id: "stats-grid" });
   app.appendChild(statsGrid);
@@ -232,15 +248,21 @@ function renderQueueList() {
         badge,
       ]),
       el("div", { className: "actions" }, [
-        el("button", {
-          className: "btn btn-green btn-sm",
-          textContent: "Push",
-          onClick: function (e) {
-            e.stopPropagation();
-            state.selectedQueue = name;
-            openPushDialog();
-          },
-        }),
+        (function () {
+          var btn = el("button", {
+            className: canWrite()
+              ? "btn btn-green btn-sm"
+              : "btn btn-disabled btn-sm",
+            textContent: "Push",
+            onClick: function (e) {
+              e.stopPropagation();
+              state.selectedQueue = name;
+              openPushDialog();
+            },
+          });
+          if (!canWrite()) btn.disabled = true;
+          return btn;
+        })(),
         el("button", {
           className: "btn btn-yellow btn-sm",
           textContent: "Pop",
@@ -250,14 +272,20 @@ function renderQueueList() {
             popMessage();
           },
         }),
-        el("button", {
-          className: "btn btn-red btn-sm",
-          textContent: "Delete",
-          onClick: function (e) {
-            e.stopPropagation();
-            deleteQueue(name);
-          },
-        }),
+        (function () {
+          var btn = el("button", {
+            className: canAdmin()
+              ? "btn btn-red btn-sm"
+              : "btn btn-disabled btn-sm",
+            textContent: "Delete",
+            onClick: function (e) {
+              e.stopPropagation();
+              deleteQueue(name);
+            },
+          });
+          if (!canAdmin()) btn.disabled = true;
+          return btn;
+        })(),
       ]),
     ]);
     list.appendChild(item);
@@ -480,6 +508,14 @@ function showAuthDialog() {
 // ---------------------------------------------------------------------------
 // Role display
 // ---------------------------------------------------------------------------
+function canWrite() {
+  return state.role === "admin" || state.role === "writer";
+}
+
+function canAdmin() {
+  return state.role === "admin";
+}
+
 function loadRole() {
   api("GET", "/auth/me")
     .then(function (r) {
@@ -488,6 +524,12 @@ function loadRole() {
       var role = r.data.role;
       badge.textContent = role;
       badge.className = "role-badge role-" + role;
+      var prev = state.role;
+      state.role = role;
+      if (prev !== role) {
+        renderQueueList();
+        renderToolbar();
+      }
     })
     .catch(function () {});
 }

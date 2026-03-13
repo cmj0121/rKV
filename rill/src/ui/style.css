@@ -221,6 +221,15 @@ button:hover {
   background: rgba(255, 202, 40, 0.15);
 }
 
+.btn-disabled,
+.btn-disabled:hover {
+  color: var(--text-dim);
+  border-color: var(--border);
+  background: var(--bg-card);
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
 /* ---- Tables ---- */
 table {
   width: 100%;
@@ -247,9 +256,10 @@ tr:hover td {
   background: var(--bg-card);
 }
 
-td .actions {
+td .actions,
+.queue-item .actions {
   display: flex;
-  gap: 4px;
+  gap: 6px;
 }
 
 /* ---- Cards / stat grid ---- */
