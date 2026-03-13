@@ -7,7 +7,6 @@ use super::error::{Error, Result};
 use super::iterator::{EntryIterator, KeyIterator};
 use super::key::Key;
 use super::memtable::{MemLookup, MemLookupRev};
-use super::merge_iter;
 use super::metrics;
 use super::revision::RevisionID;
 use super::value::Value;
@@ -505,14 +504,13 @@ impl<'db> Namespace<'db> {
             mt.is_ordered()
         };
 
-        let merge = self
+        let mut rscan = self
             .db
             .build_rscan_merge_iterator(&self.name, prefix, ordered_mode)?;
-        let mut rscan = super::merge_iter::RScanAdapter::from_merge_iter(merge)?;
 
         let mut result = Vec::new();
         let mut skipped = 0usize;
-        while let Some((key, value)) = rscan.next() {
+        while let Some((key, value)) = rscan.next()? {
             if !include_deleted && value.is_tombstone() {
                 continue;
             }
@@ -700,11 +698,10 @@ impl<'db> Namespace<'db> {
             let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             mt.is_ordered()
         };
-        let merge = self
+        let reverse_iter = self
             .db
             .build_rscan_merge_iterator(&self.name, prefix, ordered_mode)?;
-        let adapter = merge_iter::RScanAdapter::from_merge_iter(merge)?;
-        Ok(KeyIterator::reverse(adapter))
+        Ok(KeyIterator::reverse(reverse_iter))
     }
 
     /// Returns a lazy reverse iterator over (key, value) pairs matching `prefix`.
@@ -714,12 +711,11 @@ impl<'db> Namespace<'db> {
             let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             mt.is_ordered()
         };
-        let merge = self
+        let reverse_iter = self
             .db
             .build_rscan_merge_iterator(&self.name, prefix, ordered_mode)?;
-        let adapter = merge_iter::RScanAdapter::from_merge_iter(merge)?;
         Ok(EntryIterator::reverse(
-            adapter,
+            reverse_iter,
             self.db,
             self.name.clone(),
             self.encryption_key,

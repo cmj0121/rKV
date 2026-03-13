@@ -3508,7 +3508,7 @@ impl DB {
         ns: &str,
         prefix: &Key,
         ordered_mode: bool,
-    ) -> Result<merge_iter::MergeIterator> {
+    ) -> Result<merge_iter::ReverseMergeIterator> {
         let prefix_bytes = if ordered_mode {
             prefix.to_bytes()
         } else {
@@ -3517,7 +3517,7 @@ impl DB {
 
         let mut sources: Vec<(Box<dyn merge_iter::MergeSource>, u32)> = Vec::new();
 
-        // 1. SSTable sources
+        // 1. SSTable sources (reverse direction — each source yields keys descending)
         {
             let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
             if let Some(levels) = sst.get(ns) {
@@ -3568,7 +3568,7 @@ impl DB {
             }
         }
 
-        // 2. Memtable snapshot
+        // 2. Memtable snapshot (already in reverse order)
         let mt_entries = {
             let mt = self.get_or_create_memtable(ns)?;
             let mt = mt.read().unwrap_or_else(|e| e.into_inner());
@@ -3580,7 +3580,7 @@ impl DB {
             memtable_priority,
         ));
 
-        Ok(merge_iter::MergeIterator::new(sources))
+        Ok(merge_iter::ReverseMergeIterator::new(sources))
     }
 
     /// Look up a key across all SSTable levels for a namespace.

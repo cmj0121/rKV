@@ -338,11 +338,13 @@ impl MemTable {
         if self.ordered_mode {
             self.entries
                 .range(..=prefix.clone())
+                .rev()
                 .map(|(k, entries)| (k.clone(), Self::latest_or_tombstone(entries)))
                 .collect()
         } else {
             self.entries
                 .iter()
+                .rev()
                 .filter(|(k, _)| k.has_prefix(prefix))
                 .map(|(k, entries)| (k.clone(), Self::latest_or_tombstone(entries)))
                 .collect()

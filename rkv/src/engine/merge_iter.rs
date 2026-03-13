@@ -121,21 +121,44 @@ impl SSTableScanIter {
             return Ok(None);
         }
 
-        let start_block =
-            if ordered_mode && !prefix_bytes.is_empty() && direction == ScanDirection::Forward {
-                // Binary search: find the first block whose last_key >= prefix_bytes
-                match index.binary_search_by(|e| e.last_key.as_slice().cmp(&prefix_bytes)) {
-                    Ok(i) => i,
-                    Err(i) => {
-                        if i >= index.len() {
-                            return Ok(None);
+        let start_block = match direction {
+            ScanDirection::Forward => {
+                if ordered_mode && !prefix_bytes.is_empty() {
+                    // Binary search: find the first block whose last_key >= prefix_bytes
+                    match index.binary_search_by(|e| e.last_key.as_slice().cmp(&prefix_bytes)) {
+                        Ok(i) => i,
+                        Err(i) => {
+                            if i >= index.len() {
+                                return Ok(None);
+                            }
+                            i
                         }
-                        i
                     }
+                } else {
+                    0
                 }
-            } else {
-                0
-            };
+            }
+            ScanDirection::Reverse => {
+                if ordered_mode && !prefix_bytes.is_empty() {
+                    // Binary search: find the last block whose first key could contain
+                    // keys <= prefix_bytes. We use the last_key of each block as upper
+                    // bound: start from the block whose last_key >= prefix_bytes, or the
+                    // last block if all last_keys are < prefix.
+                    match index.binary_search_by(|e| e.last_key.as_slice().cmp(&prefix_bytes)) {
+                        Ok(i) => i,
+                        Err(i) => {
+                            if i >= index.len() {
+                                index.len() - 1
+                            } else {
+                                i
+                            }
+                        }
+                    }
+                } else {
+                    index.len() - 1
+                }
+            }
+        };
 
         Ok(Some(Self {
             data: Arc::clone(reader.data()),
@@ -157,6 +180,9 @@ impl SSTableScanIter {
     /// Returns false if no more blocks to process.
     fn load_next_block(&mut self) -> Result<bool> {
         loop {
+            if self.exhausted {
+                return Ok(false);
+            }
             if self.block_idx >= self.index.len() {
                 return Ok(false);
             }
@@ -202,31 +228,38 @@ impl SSTableScanIter {
                 }
             }
 
-            self.block_idx += 1;
+            // Advance to next block (forward) or previous block (reverse)
+            match self.direction {
+                ScanDirection::Forward => {
+                    self.block_idx += 1;
+                }
+                ScanDirection::Reverse => {
+                    // Reverse entries within the block so iteration yields
+                    // largest key first.
+                    self.current_entries.reverse();
+                    if self.block_idx == 0 {
+                        self.exhausted = true;
+                    } else {
+                        self.block_idx -= 1;
+                    }
+                }
+            }
 
             if !self.current_entries.is_empty() {
                 return Ok(true);
             }
 
-            // In ordered mode, if this block had no matches and its last_key
-            // is already past our prefix range, we can stop early.
-            if self.ordered_mode && !self.prefix_bytes.is_empty() && self.block_idx > 0 {
-                // We already incremented block_idx, so check the previous block
-                // No easy early-termination here for range scans (they scan forward),
-                // but for prefix matching we can't do it in ordered mode anyway.
-                // Just continue to the next block.
-            }
+            // If no entries matched in this block, continue to the next/prev.
+            // For reverse, if we just set exhausted=true, the loop will exit.
         }
     }
 }
 
 impl MergeSource for SSTableScanIter {
     fn next_entry(&mut self) -> Result<Option<(Key, Value)>> {
-        if self.exhausted {
-            return Ok(None);
-        }
-
-        // If we have entries left in the current block, return the next one
+        // Check remaining entries in current block BEFORE exhausted flag,
+        // because reverse iteration sets exhausted when loading the last
+        // block but its entries still need to be yielded.
         if self.entry_idx < self.current_entries.len() {
             let idx = self.entry_idx;
             self.entry_idx += 1;
@@ -236,7 +269,10 @@ impl MergeSource for SSTableScanIter {
             return Ok(Some(entry));
         }
 
-        // Try to load the next block
+        // No more entries in current block — try to load the next one
+        if self.exhausted {
+            return Ok(None);
+        }
         if self.load_next_block()? {
             let idx = self.entry_idx;
             self.entry_idx += 1;
@@ -388,6 +424,132 @@ impl MergeIterator {
 }
 
 // ---------------------------------------------------------------------------
+// ReverseHeapItem — wrapper for BinaryHeap (max-heap by key for reverse scan)
+// ---------------------------------------------------------------------------
+
+struct ReverseHeapItem {
+    key: Key,
+    value: Value,
+    priority: u32,
+    source_idx: usize,
+}
+
+impl PartialEq for ReverseHeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.priority == other.priority
+    }
+}
+
+impl Eq for ReverseHeapItem {}
+
+impl PartialOrd for ReverseHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ReverseHeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap is a max-heap. For reverse scan we want max-key first,
+        // so use natural key ordering. For same keys, higher priority first.
+        self.key
+            .cmp(&other.key)
+            .then(self.priority.cmp(&other.priority))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReverseMergeIterator — max-heap merge with dedup for reverse scans
+// ---------------------------------------------------------------------------
+
+/// A lazy merge iterator that streams deduplicated `(Key, Value)` pairs in
+/// reverse (descending) key order. Each source must produce entries in
+/// descending order (e.g., SSTableScanIter with ScanDirection::Reverse or
+/// a reversed memtable snapshot).
+pub(crate) struct ReverseMergeIterator {
+    sources: Vec<Box<dyn MergeSource>>,
+    priorities: Vec<u32>,
+    heap: BinaryHeap<ReverseHeapItem>,
+    initialized: bool,
+}
+
+impl ReverseMergeIterator {
+    pub(crate) fn new(sources: Vec<(Box<dyn MergeSource>, u32)>) -> Self {
+        let (sources, priorities): (Vec<_>, Vec<_>) = sources.into_iter().unzip();
+        Self {
+            sources,
+            priorities,
+            heap: BinaryHeap::new(),
+            initialized: false,
+        }
+    }
+
+    fn initialize(&mut self) -> Result<()> {
+        for (idx, source) in self.sources.iter_mut().enumerate() {
+            if let Some((key, value)) = source.next_entry()? {
+                self.heap.push(ReverseHeapItem {
+                    key,
+                    value,
+                    priority: self.priorities[idx],
+                    source_idx: idx,
+                });
+            }
+        }
+        self.initialized = true;
+        Ok(())
+    }
+
+    fn refill(&mut self, source_idx: usize) -> Result<()> {
+        if let Some((key, value)) = self.sources[source_idx].next_entry()? {
+            self.heap.push(ReverseHeapItem {
+                key,
+                value,
+                priority: self.priorities[source_idx],
+                source_idx,
+            });
+        }
+        Ok(())
+    }
+
+    /// Return the next deduplicated `(Key, Value)` pair in descending key order.
+    pub(crate) fn next(&mut self) -> Result<Option<(Key, Value)>> {
+        if !self.initialized {
+            self.initialize()?;
+        }
+
+        let winner = match self.heap.pop() {
+            Some(item) => item,
+            None => return Ok(None),
+        };
+
+        self.refill(winner.source_idx)?;
+
+        let mut best_key = winner.key;
+        let mut best_value = winner.value;
+        let mut best_priority = winner.priority;
+
+        // Drain all items with the same key. Use strict `>` (not `>=`)
+        // because in reverse mode, same-source entries arrive newest-first
+        // (block entries are reversed). With `>=`, the older revision would
+        // incorrectly replace the newer one for same-priority entries.
+        while let Some(top) = self.heap.peek() {
+            if top.key != best_key {
+                break;
+            }
+            let dup = self.heap.pop().unwrap();
+            self.refill(dup.source_idx)?;
+            if dup.priority > best_priority {
+                best_key = dup.key;
+                best_value = dup.value;
+                best_priority = dup.priority;
+            }
+        }
+
+        Ok(Some((best_key, best_value)))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ConcatIterator — sequential iteration over non-overlapping sources
 // ---------------------------------------------------------------------------
 
@@ -420,46 +582,6 @@ impl MergeSource for ConcatIterator {
             self.current += 1;
         }
         Ok(None)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// RScanAdapter — collects forward merge then reverses
-// ---------------------------------------------------------------------------
-
-/// Collects all entries from a MergeIterator, then yields them in reverse order.
-///
-/// True lazy reverse iteration over an LSM merge is significantly more complex
-/// (reverse block reading, reverse heap). This drain-then-reverse approach is
-/// simpler and sufficient for rscan with limit/offset (early termination still
-/// applies on the reversed output).
-pub(crate) struct RScanAdapter {
-    entries: Vec<(Key, Value)>,
-    pos: usize,
-}
-
-impl RScanAdapter {
-    /// Create by draining the merge iterator.
-    pub(crate) fn from_merge_iter(mut iter: MergeIterator) -> Result<Self> {
-        let mut entries = Vec::new();
-        while let Some(entry) = iter.next()? {
-            entries.push(entry);
-        }
-        entries.reverse();
-        Ok(Self { entries, pos: 0 })
-    }
-
-    pub(crate) fn next(&mut self) -> Option<(Key, Value)> {
-        if self.pos < self.entries.len() {
-            let idx = self.pos;
-            self.pos += 1;
-            Some(std::mem::replace(
-                &mut self.entries[idx],
-                (Key::Int(0), Value::Null),
-            ))
-        } else {
-            None
-        }
     }
 }
 
@@ -648,21 +770,39 @@ mod tests {
     }
 
     #[test]
-    fn rscan_adapter_reverses() {
-        let s = VecSource::new(vec![
-            (Key::Int(1), Value::from("a")),
-            (Key::Int(2), Value::from("b")),
+    fn reverse_merge_iterator_descending() {
+        // Source entries must be in descending order (as reverse SSTable iters produce)
+        let s1 = VecSource::new(vec![
+            (Key::Int(5), Value::from("e")),
             (Key::Int(3), Value::from("c")),
+            (Key::Int(1), Value::from("a")),
         ]);
-        let iter = MergeIterator::new(vec![(Box::new(s), 0)]);
-        let mut rscan = RScanAdapter::from_merge_iter(iter).unwrap();
+        let s2 = VecSource::new(vec![
+            (Key::Int(4), Value::from("d")),
+            (Key::Int(2), Value::from("b")),
+        ]);
+        let mut iter = ReverseMergeIterator::new(vec![(Box::new(s1), 1), (Box::new(s2), 2)]);
 
-        let (k1, _) = rscan.next().unwrap();
-        assert_eq!(k1, Key::Int(3));
-        let (k2, _) = rscan.next().unwrap();
-        assert_eq!(k2, Key::Int(2));
-        let (k3, _) = rscan.next().unwrap();
-        assert_eq!(k3, Key::Int(1));
-        assert!(rscan.next().is_none());
+        let keys: Vec<i64> = std::iter::from_fn(|| {
+            iter.next().ok().flatten().map(|(k, _)| match k {
+                Key::Int(n) => n,
+                _ => panic!(),
+            })
+        })
+        .collect();
+        assert_eq!(keys, vec![5, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn reverse_merge_iterator_dedup() {
+        // Same key in both sources — higher priority wins
+        let s1 = VecSource::new(vec![(Key::Int(3), Value::from("old"))]);
+        let s2 = VecSource::new(vec![(Key::Int(3), Value::from("new"))]);
+        let mut iter = ReverseMergeIterator::new(vec![(Box::new(s1), 1), (Box::new(s2), 2)]);
+
+        let (k, v) = iter.next().unwrap().unwrap();
+        assert_eq!(k, Key::Int(3));
+        assert_eq!(v, Value::from("new")); // priority 2 wins
+        assert!(iter.next().unwrap().is_none());
     }
 }
