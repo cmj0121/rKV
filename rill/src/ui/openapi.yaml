@@ -249,6 +249,102 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
 
+  /queues/{name}/batch:
+    parameters:
+      - $ref: "#/components/parameters/QueueName"
+    post:
+      summary: Batch push
+      operationId: batchPush
+      description: |
+        Push multiple messages onto the queue in a single request.
+        Each message may include an optional TTL.
+        Requires Writer role or above.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [messages]
+              properties:
+                messages:
+                  type: array
+                  items:
+                    type: object
+                    required: [body]
+                    properties:
+                      body:
+                        type: string
+                      ttl:
+                        type: string
+                        description: "Optional TTL (e.g. 30s, 5m, 1h)"
+              example:
+                messages:
+                  - body: hello
+                  - body: world
+                    ttl: 5m
+      responses:
+        "200":
+          description: Messages pushed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ids:
+                    type: array
+                    items:
+                      type: string
+                  count:
+                    type: integer
+                example:
+                  ids: [01jqxk7m3n0000000000000001, 01jqxk7m3n0000000000000002]
+                  count: 2
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    get:
+      summary: Batch pop
+      operationId: batchPop
+      description: |
+        Pop multiple messages from the queue in FIFO order.
+        Messages are removed from the queue.
+        Requires Reader role or above.
+      parameters:
+        - name: count
+          in: query
+          required: false
+          description: Number of messages to pop (default 1, max 1000)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 1
+      responses:
+        "200":
+          description: Popped messages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  messages:
+                    type: array
+                    items:
+                      type: string
+                  count:
+                    type: integer
+                example:
+                  messages: [hello, world]
+                  count: 2
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /queues/{name}/info:
     parameters:
       - $ref: "#/components/parameters/QueueName"
