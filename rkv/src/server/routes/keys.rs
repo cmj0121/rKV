@@ -53,9 +53,10 @@ pub async fn get_key(
 #[derive(Deserialize)]
 pub struct PutQuery {
     pub ttl: Option<String>,
+    pub dedup: Option<bool>,
 }
 
-/// PUT /api/{ns}/keys/{key}?ttl=30s -> 201
+/// PUT /api/{ns}/keys/{key}?ttl=30s&dedup=true -> 201
 pub async fn put_key(
     State(state): State<Arc<AppState>>,
     Path((ns_name, raw_key)): Path<(String, String)>,
@@ -75,7 +76,7 @@ pub async fn put_key(
         .or_else(|| parse_expires_header(&headers))
         .or_else(|| parse_ttl_header(&headers));
     let value = json_body_to_value(&body)?;
-    let rev = ns.put(key, value, ttl)?;
+    let rev = ns.put_opt(key, value, ttl, query.dedup)?;
 
     let mut resp = StatusCode::CREATED.into_response();
     resp.headers_mut()

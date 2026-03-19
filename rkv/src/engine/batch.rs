@@ -11,6 +11,9 @@ pub enum BatchOp {
         key: Key,
         value: Value,
         ttl: Option<Duration>,
+        /// Per-op dedup override: `Some(true)` forces dedup, `Some(false)` forces
+        /// write, `None` uses the namespace/global setting.
+        dedup: Option<bool>,
     },
     /// Delete a key (writes a tombstone).
     Delete { key: Key },
@@ -61,6 +64,24 @@ impl WriteBatch {
             key: key.into(),
             value: value.into(),
             ttl,
+            dedup: None,
+        });
+        self
+    }
+
+    /// Add a put operation with an explicit per-op dedup override.
+    pub fn put_dedup(
+        mut self,
+        key: impl Into<Key>,
+        value: impl Into<Value>,
+        ttl: Option<Duration>,
+        dedup: Option<bool>,
+    ) -> Self {
+        self.ops.push(BatchOp::Put {
+            key: key.into(),
+            value: value.into(),
+            ttl,
+            dedup,
         });
         self
     }

@@ -6826,3 +6826,70 @@ fn dedup_stats_counter_accumulates() {
     }
     assert_eq!(db.stats().dedup_skips, 5);
 }
+
+#[test]
+fn dedup_per_request_override_on() {
+    // Global dedup OFF, but per-request dedup=true
+    let config = Config::in_memory();
+    assert!(!config.dedup);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let rev1 = ns.put("k", "v", None).unwrap();
+    let rev2 = ns.put_opt("k", "v", None, Some(true)).unwrap();
+    assert_eq!(
+        rev1, rev2,
+        "per-request dedup=true should skip identical write"
+    );
+    assert_eq!(db.stats().dedup_skips, 1);
+}
+
+#[test]
+fn dedup_per_request_override_off() {
+    // Global dedup ON, but per-request dedup=false forces write
+    let mut config = Config::in_memory();
+    config.dedup = true;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let rev1 = ns.put("k", "v", None).unwrap();
+    let rev2 = ns.put_opt("k", "v", None, Some(false)).unwrap();
+    assert_ne!(rev1, rev2, "per-request dedup=false should force write");
+    assert_eq!(db.stats().dedup_skips, 0);
+}
+
+#[test]
+fn dedup_per_request_none_uses_namespace() {
+    let mut config = Config::in_memory();
+    config.dedup = true;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let rev1 = ns.put("k", "v", None).unwrap();
+    let rev2 = ns.put_opt("k", "v", None, None).unwrap();
+    assert_eq!(
+        rev1, rev2,
+        "per-request dedup=None falls back to namespace setting"
+    );
+}
+
+#[test]
+fn dedup_batch_per_op_override() {
+    // Global dedup OFF
+    let config = Config::in_memory();
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let rev1 = ns.put("k1", "v1", None).unwrap();
+    ns.put("k2", "v2", None).unwrap();
+
+    let batch = WriteBatch::new()
+        .put_dedup("k1", "v1", None, Some(true)) // same + dedup on → skip
+        .put_dedup("k2", "v2", None, Some(false)) // same + dedup off → write
+        .put_dedup("k3", "new", None, Some(true)); // new key → write
+    let revs = ns.write_batch(batch).unwrap();
+
+    assert_eq!(revs[0], rev1, "batch per-op dedup=true skips identical");
+    assert_eq!(db.stats().dedup_skips, 1);
+    assert_eq!(ns.get("k3").unwrap(), Value::from("new"));
+}

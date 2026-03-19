@@ -98,6 +98,20 @@ impl<'db> Namespace<'db> {
         value: impl Into<Value>,
         ttl: Option<Duration>,
     ) -> Result<RevisionID> {
+        self.put_opt(key, value, ttl, None)
+    }
+
+    /// Like `put`, but with an explicit per-request dedup override.
+    ///
+    /// `dedup`: `Some(true)` forces dedup on, `Some(false)` forces it off,
+    /// `None` uses the namespace/global setting.
+    pub fn put_opt(
+        &self,
+        key: impl Into<Key>,
+        value: impl Into<Value>,
+        ttl: Option<Duration>,
+        dedup: Option<bool>,
+    ) -> Result<RevisionID> {
         let _timer = metrics::Timer::start(&self.db.metrics().op_put);
         if self.db.is_replica() {
             return Err(Error::ReadOnlyReplica);
@@ -106,7 +120,8 @@ impl<'db> Namespace<'db> {
         let value = value.into();
 
         // Dedup check: skip write if value is unchanged and no TTL on either side
-        if self.db.dedup_enabled(&self.name) && ttl.is_none() {
+        let dedup_active = dedup.unwrap_or_else(|| self.db.dedup_enabled(&self.name));
+        if dedup_active && ttl.is_none() {
             if let Ok((existing, rev)) = self.get_with_revision(key.clone()) {
                 if existing == value {
                     if let Ok(None) = self.ttl(key.clone()) {
@@ -159,14 +174,20 @@ impl<'db> Namespace<'db> {
         }
 
         // 1. Pre-process: dedup check, encrypt values, separate bin objects, generate revisions
-        let dedup = self.db.dedup_enabled(&self.name);
+        let ns_dedup = self.db.dedup_enabled(&self.name);
         // None = normal op, Some(rev) = deduped (skip AOL + memtable)
         let mut dedup_revs: Vec<Option<RevisionID>> = Vec::with_capacity(batch.len());
         let mut prepared: Vec<(Key, Value, Option<Duration>)> = Vec::with_capacity(batch.len());
         for op in batch.ops {
             match op {
-                BatchOp::Put { key, value, ttl } => {
-                    if dedup && ttl.is_none() {
+                BatchOp::Put {
+                    key,
+                    value,
+                    ttl,
+                    dedup,
+                } => {
+                    let dedup_active = dedup.unwrap_or(ns_dedup);
+                    if dedup_active && ttl.is_none() {
                         if let Ok((existing, rev)) = self.get_with_revision(key.clone()) {
                             if existing == value {
                                 if let Ok(None) = self.ttl(key.clone()) {

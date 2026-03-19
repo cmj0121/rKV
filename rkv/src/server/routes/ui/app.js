@@ -713,6 +713,13 @@ function setTtlHeader(headers, value) {
   }
 }
 
+function buildPutUrl(key, dedup) {
+  var url =
+    "/api/" + encodeURIComponent(state.ns) + "/keys/" + encodeURIComponent(key);
+  if (dedup) url += "?dedup=true";
+  return url;
+}
+
 function openCreateDialog() {
   showKeyDialog(
     "Create Key",
@@ -720,20 +727,14 @@ function openCreateDialog() {
     "",
     false,
     "",
-    function (key, value, expires) {
+    function (key, value, expires, dedup) {
       var opts = {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
       };
       if (expires) setTtlHeader(opts.headers, expires);
       opts.body = JSON.stringify(value);
-      fetch(
-        "/api/" +
-          encodeURIComponent(state.ns) +
-          "/keys/" +
-          encodeURIComponent(key),
-        opts,
-      )
+      fetch(buildPutUrl(key, dedup), opts)
         .then(function (r) {
           if (!r.ok)
             return r.text().then(function (t) {
@@ -757,20 +758,14 @@ function openEditDialog(key, currentValue, isNull, currentExpires) {
     valStr,
     isNull,
     currentExpires || "",
-    function (_k, value, expires) {
+    function (_k, value, expires, dedup) {
       var opts = {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
       };
       if (expires) setTtlHeader(opts.headers, expires);
       opts.body = JSON.stringify(value);
-      fetch(
-        "/api/" +
-          encodeURIComponent(state.ns) +
-          "/keys/" +
-          encodeURIComponent(key),
-        opts,
-      )
+      fetch(buildPutUrl(key, dedup), opts)
         .then(function (r) {
           if (!r.ok)
             return r.text().then(function (t) {
@@ -905,6 +900,13 @@ function showKeyDialog(title, keyVal, valueVal, isNull, expiresVal, onSubmit) {
   });
   dlg.appendChild(expInput);
 
+  var dedupBox = el("input", { type: "checkbox", id: "dedup-check" });
+  var dedupLabel = el("label", { className: "null-label" }, [
+    dedupBox,
+    document.createTextNode(" Dedup (skip if value unchanged)"),
+  ]);
+  dlg.appendChild(dedupLabel);
+
   var actions = el("div", { className: "dialog-actions" }, [
     el("button", {
       textContent: "Cancel",
@@ -929,7 +931,7 @@ function showKeyDialog(title, keyVal, valueVal, isNull, expiresVal, onSubmit) {
             : valInput.value;
         dlg.close();
         dlg.remove();
-        onSubmit(k, v, expInput.value.trim());
+        onSubmit(k, v, expInput.value.trim(), dedupBox.checked);
       },
     }),
   ]);
