@@ -1160,8 +1160,7 @@ function loadNsList() {
         list.appendChild(
           el("div", { className: "ns-item" }, [
             el("span", { className: "ns-name", textContent: name }),
-            dedupBtn,
-            dropBtn,
+            el("div", { className: "ns-actions" }, [dedupBtn, dropBtn]),
           ]),
         );
       });
