@@ -103,7 +103,21 @@ impl<'db> Namespace<'db> {
             return Err(Error::ReadOnlyReplica);
         }
         let key = key.into();
-        let value = self.encrypt_value(value.into());
+        let value = value.into();
+
+        // Dedup check: skip write if value is unchanged and no TTL on either side
+        if self.db.dedup_enabled(&self.name) && ttl.is_none() {
+            if let Ok((existing, rev)) = self.get_with_revision(key.clone()) {
+                if existing == value {
+                    if let Ok(None) = self.ttl(key.clone()) {
+                        self.db.inc_dedup_skips();
+                        return Ok(rev);
+                    }
+                }
+            }
+        }
+
+        let value = self.encrypt_value(value);
         let value = self.db.maybe_separate_value(&self.name, value)?;
         let rev = self.db.generate_revision();
         self.db
@@ -144,16 +158,33 @@ impl<'db> Namespace<'db> {
             return Ok(Vec::new());
         }
 
-        // 1. Pre-process: encrypt values, separate bin objects, generate revisions
+        // 1. Pre-process: dedup check, encrypt values, separate bin objects, generate revisions
+        let dedup = self.db.dedup_enabled(&self.name);
+        // None = normal op, Some(rev) = deduped (skip AOL + memtable)
+        let mut dedup_revs: Vec<Option<RevisionID>> = Vec::with_capacity(batch.len());
         let mut prepared: Vec<(Key, Value, Option<Duration>)> = Vec::with_capacity(batch.len());
         for op in batch.ops {
             match op {
                 BatchOp::Put { key, value, ttl } => {
+                    if dedup && ttl.is_none() {
+                        if let Ok((existing, rev)) = self.get_with_revision(key.clone()) {
+                            if existing == value {
+                                if let Ok(None) = self.ttl(key.clone()) {
+                                    self.db.inc_dedup_skips();
+                                    dedup_revs.push(Some(rev));
+                                    prepared.push((key, value, ttl));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    dedup_revs.push(None);
                     let value = self.encrypt_value(value);
                     let value = self.db.maybe_separate_value(&self.name, value)?;
                     prepared.push((key, value, ttl));
                 }
                 BatchOp::Delete { key } => {
+                    dedup_revs.push(None);
                     prepared.push((key, Value::tombstone(), None));
                 }
             }
@@ -164,10 +195,13 @@ impl<'db> Namespace<'db> {
             .map(|_| self.db.generate_revision())
             .collect();
 
-        // 2. Append all ops to AOL under a single lock
+        // 2. Append non-deduped ops to AOL under a single lock
         {
             if let Some(mut aol) = self.db.aol_lock(&self.name)? {
                 for (i, (key, value, ttl)) in prepared.iter().enumerate() {
+                    if dedup_revs[i].is_some() {
+                        continue;
+                    }
                     self.db.append_to_aol_locked(
                         &mut aol,
                         &self.name,
@@ -180,7 +214,7 @@ impl<'db> Namespace<'db> {
             }
         }
 
-        // 3. Apply all ops to memtable under a single lock
+        // 3. Apply non-deduped ops to memtable under a single lock
         let (actual_revs, should_flush, should_stall) = {
             let mt = self.db.get_or_create_memtable(&self.name)?;
             let mut mt = mt.write().unwrap_or_else(|e| e.into_inner());
@@ -188,6 +222,10 @@ impl<'db> Namespace<'db> {
             let mut puts = 0u64;
             let mut deletes = 0u64;
             for (i, (key, value, ttl)) in prepared.into_iter().enumerate() {
+                if let Some(existing_rev) = dedup_revs[i] {
+                    actual_revs.push(existing_rev);
+                    continue;
+                }
                 if value.is_tombstone() {
                     mt.delete(key, revisions[i]);
                     actual_revs.push(revisions[i]);

@@ -328,6 +328,9 @@ pub struct Config {
     /// compaction threads are not started. Replication and encryption are
     /// disallowed.
     pub in_memory: bool,
+    /// Skip writes when the value is identical to the existing one (default: false).
+    /// Only applies to non-TTL writes where the existing key also has no TTL.
+    pub dedup: bool,
 }
 
 impl fmt::Debug for Config {
@@ -378,6 +381,7 @@ impl Config {
             owned_namespaces: Vec::new(),
             object_sync_interval: 128,
             in_memory: false,
+            dedup: false,
         }
     }
 
@@ -497,6 +501,10 @@ pub struct DB {
     repl_force_sync: Option<Arc<AtomicBool>>,
     /// Counter for LWW conflict resolutions (peer replication).
     conflicts_resolved: Arc<AtomicU64>,
+    /// Per-namespace dedup overrides. `true` = dedup on, `false` = dedup off.
+    dedup_overrides: Mutex<HashMap<String, bool>>,
+    /// Counter for writes skipped by dedup-on-write.
+    dedup_skips: AtomicU64,
     // Peer replication
     peer_sessions: Arc<Mutex<Vec<repl_peer::PeerSession>>>,
     peer_listener: Option<repl_peer::PeerListener>,
@@ -773,6 +781,8 @@ impl DB {
             repl_receiver: None,
             repl_force_sync: None,
             conflicts_resolved: Arc::new(AtomicU64::new(0)),
+            dedup_overrides: Mutex::new(HashMap::new()),
+            dedup_skips: AtomicU64::new(0),
             peer_sessions: Arc::new(Mutex::new(Vec::new())),
             peer_listener: None,
             peer_connectors: Vec::new(),
@@ -832,6 +842,8 @@ impl DB {
             repl_receiver: None,
             repl_force_sync: None,
             conflicts_resolved: Arc::new(AtomicU64::new(0)),
+            dedup_overrides: Mutex::new(HashMap::new()),
+            dedup_skips: AtomicU64::new(0),
             peer_sessions: Arc::new(Mutex::new(Vec::new())),
             peer_listener: None,
             peer_connectors: Vec::new(),
@@ -1749,6 +1761,7 @@ impl DB {
                 .unwrap_or_else(|e| e.into_inner())
                 .len() as u64,
             conflicts_resolved: self.conflicts_resolved.load(Ordering::Relaxed),
+            dedup_skips: self.dedup_skips.load(Ordering::Relaxed),
         }
     }
 
@@ -3837,6 +3850,41 @@ impl DB {
 
     pub(crate) fn inc_op_deletes_by(&self, n: u64) {
         self.op_deletes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Check if dedup is enabled for a given namespace.
+    /// Per-namespace overrides take precedence over the global config.
+    pub fn dedup_enabled(&self, ns: &str) -> bool {
+        let overrides = self
+            .dedup_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(&v) = overrides.get(ns) {
+            return v;
+        }
+        self.config.dedup
+    }
+
+    /// Set a per-namespace dedup override.
+    pub fn set_namespace_dedup(&self, ns: &str, enabled: bool) {
+        let mut overrides = self
+            .dedup_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides.insert(ns.to_owned(), enabled);
+    }
+
+    /// Remove a per-namespace dedup override, falling back to global config.
+    pub fn clear_namespace_dedup(&self, ns: &str) {
+        let mut overrides = self
+            .dedup_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides.remove(ns);
+    }
+
+    pub(crate) fn inc_dedup_skips(&self) {
+        self.dedup_skips.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Load operation counters from `stats.meta`. Returns (0,0,0) if the file
