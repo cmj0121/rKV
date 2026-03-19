@@ -501,6 +501,8 @@ pub struct DB {
     repl_force_sync: Option<Arc<AtomicBool>>,
     /// Counter for LWW conflict resolutions (peer replication).
     conflicts_resolved: Arc<AtomicU64>,
+    /// Global dedup flag (runtime-mutable mirror of config.dedup).
+    dedup_global: AtomicBool,
     /// Per-namespace dedup overrides. `true` = dedup on, `false` = dedup off.
     dedup_overrides: Mutex<HashMap<String, bool>>,
     /// Counter for writes skipped by dedup-on-write.
@@ -753,6 +755,7 @@ impl DB {
         // Load persisted operation counters
         let (op_puts, op_gets, op_deletes) = Self::load_stats_meta(&config.path);
         let event_listener = config.event_listener.clone();
+        let dedup_default = config.dedup;
 
         let mut db = Self {
             config,
@@ -781,6 +784,7 @@ impl DB {
             repl_receiver: None,
             repl_force_sync: None,
             conflicts_resolved: Arc::new(AtomicU64::new(0)),
+            dedup_global: AtomicBool::new(dedup_default),
             dedup_overrides: Mutex::new(HashMap::new()),
             dedup_skips: AtomicU64::new(0),
             peer_sessions: Arc::new(Mutex::new(Vec::new())),
@@ -808,6 +812,7 @@ impl DB {
         let revision_gen = revision::RevisionGen::new(config.cluster_id);
         let metrics_arc = Arc::new(metrics::Metrics::new());
         let event_listener = config.event_listener.clone();
+        let dedup_default = config.dedup;
 
         let mut ns_map: HashMap<String, NamespaceState> = HashMap::new();
         ns_map.insert(
@@ -842,6 +847,7 @@ impl DB {
             repl_receiver: None,
             repl_force_sync: None,
             conflicts_resolved: Arc::new(AtomicU64::new(0)),
+            dedup_global: AtomicBool::new(dedup_default),
             dedup_overrides: Mutex::new(HashMap::new()),
             dedup_skips: AtomicU64::new(0),
             peer_sessions: Arc::new(Mutex::new(Vec::new())),
@@ -3862,7 +3868,17 @@ impl DB {
         if let Some(&v) = overrides.get(ns) {
             return v;
         }
-        self.config.dedup
+        self.dedup_global.load(Ordering::Relaxed)
+    }
+
+    /// Returns the global dedup setting.
+    pub fn dedup(&self) -> bool {
+        self.dedup_global.load(Ordering::Relaxed)
+    }
+
+    /// Set the global dedup flag at runtime.
+    pub fn set_dedup(&self, enabled: bool) {
+        self.dedup_global.store(enabled, Ordering::Relaxed);
     }
 
     /// Set a per-namespace dedup override.

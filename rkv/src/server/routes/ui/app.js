@@ -971,10 +971,30 @@ function renderAdmin(app) {
       adminAction("compact");
     },
   });
+  var dedupGlobalBtn = el("button", {
+    className: "btn-yellow",
+    id: "dedup-global-btn",
+    textContent: "Dedup: ...",
+    onClick: function () {
+      var cur = dedupGlobalBtn.textContent.indexOf("on") !== -1;
+      api("PUT", "/api/admin/dedup", { enabled: !cur })
+        .then(function () {
+          dedupGlobalBtn.textContent = "Dedup: " + (!cur ? "on" : "off");
+          toast("Global dedup " + (!cur ? "enabled" : "disabled"), true);
+        })
+        .catch(function (e) {
+          toast("Dedup: " + e.message);
+        });
+    },
+  });
+  api("GET", "/api/admin/config").then(function (r) {
+    dedupGlobalBtn.textContent = "Dedup: " + (r.data.dedup ? "on" : "off");
+  });
   var actions = el("div", { className: "toolbar" }, [
     flushBtn,
     syncBtn,
     compactBtn,
+    dedupGlobalBtn,
     el("button", { textContent: "Refresh", onClick: loadStats }),
   ]);
   app.appendChild(actions);
@@ -1122,9 +1142,25 @@ function loadNsList() {
           },
         });
         if (state.role === "replica") dropBtn.disabled = true;
+        var dedupBtn = el("button", {
+          className: "btn-yellow",
+          textContent: "Dedup: ...",
+          onClick: function () {
+            toggleNsDedup(name, dedupBtn);
+          },
+        });
+        // Load initial dedup state
+        (function (btn, nsName) {
+          api("GET", "/api/" + encodeURIComponent(nsName) + "/dedup").then(
+            function (r) {
+              btn.textContent = "Dedup: " + (r.data.dedup ? "on" : "off");
+            },
+          );
+        })(dedupBtn, name);
         list.appendChild(
           el("div", { className: "ns-item" }, [
             el("span", { className: "ns-name", textContent: name }),
+            dedupBtn,
             dropBtn,
           ]),
         );
@@ -1132,6 +1168,24 @@ function loadNsList() {
     })
     .catch(function (e) {
       toast("Namespaces: " + e.message);
+    });
+}
+
+function toggleNsDedup(nsName, btn) {
+  var current = btn.textContent.indexOf("on") !== -1;
+  var next = !current;
+  api("PUT", "/api/" + encodeURIComponent(nsName) + "/dedup", {
+    enabled: next,
+  })
+    .then(function () {
+      btn.textContent = "Dedup: " + (next ? "on" : "off");
+      toast(
+        "Dedup " + (next ? "enabled" : "disabled") + " for " + nsName,
+        true,
+      );
+    })
+    .catch(function (e) {
+      toast("Dedup: " + e.message);
     });
 }
 

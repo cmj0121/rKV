@@ -844,7 +844,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 (
                     "  behavior.dedup",
                     "skip duplicate writes",
-                    c.dedup.to_string(),
+                    db.dedup().to_string(),
                 ),
                 ("", "", String::new()),
                 ("I/O", "", String::new()),
@@ -1146,6 +1146,18 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
 }
 
 fn set_config(db: &mut DB, key: &str, value: &str) {
+    // behavior.dedup needs both config_mut and set_dedup — handle before borrow
+    if key == "behavior.dedup" {
+        match value.parse::<bool>() {
+            Ok(v) => {
+                db.config_mut().dedup = v;
+                db.set_dedup(v);
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected true or false"),
+        }
+        return;
+    }
     let c = db.config_mut();
     match key {
         "storage.create_if_missing" => match value.parse::<bool>() {
@@ -1323,13 +1335,6 @@ fn set_config(db: &mut DB, key: &str, value: &str) {
                 println!("OK");
             }
             Err(_) => eprintln!("error: expected a number"),
-        },
-        "behavior.dedup" => match value.parse::<bool>() {
-            Ok(v) => {
-                c.dedup = v;
-                println!("OK");
-            }
-            Err(_) => eprintln!("error: expected true or false"),
         },
         "storage.in_memory" => eprintln!("error: in_memory cannot be changed at runtime"),
         "storage.path" => eprintln!("error: path cannot be changed at runtime"),
