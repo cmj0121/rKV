@@ -574,14 +574,14 @@ The CLI uses dot-notation keys for `config <key> <value>`:
 | `shard_group`          | `cluster.shard_group`           |
 | `owned_namespaces`     | `cluster.owned_namespaces`      |
 | `in_memory`            | `storage.in_memory` (read-only) |
-| `dedup`                | `behavior.dedup`                |
+| `dedup`                | `storage.dedup`                 |
 
 `Config::new(path)` initializes all fields to their defaults. `Config::in_memory()` creates
 a pure in-memory configuration. Fields can be overridden before passing the config to `DB::open`.
 
 ### Dedup-on-Write
 
-When `dedup` is enabled (`Config.dedup = true` or `config behavior.dedup true`), `put()` compares
+When `dedup` is enabled (`Config.dedup = true` or `config storage.dedup true`), `put()` compares
 the incoming value against the current value before writing. If the values are identical and neither
 the new write nor the existing key has a TTL, the write is skipped and the existing revision is
 returned. This eliminates unnecessary AOL entries, revision churn, and compaction work for workloads

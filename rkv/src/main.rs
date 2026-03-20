@@ -843,7 +843,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 ("", "", String::new()),
                 ("Behavior", "", String::new()),
                 (
-                    "  behavior.dedup",
+                    "  storage.dedup",
                     "skip duplicate writes",
                     db.dedup().to_string(),
                 ),
@@ -1080,7 +1080,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                         println!(
                             "OK (namespace '{}' using global dedup: {})",
                             ns.name(),
-                            db.config().dedup
+                            db.dedup()
                         );
                     }
                     _ => eprintln!("usage: dedup [on|off|reset]"),
@@ -1148,7 +1148,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
 
 fn set_config(db: &mut DB, key: &str, value: &str) {
     // behavior.dedup needs both config_mut and set_dedup — handle before borrow
-    if key == "behavior.dedup" {
+    if key == "storage.dedup" {
         match value.parse::<bool>() {
             Ok(v) => {
                 db.config_mut().dedup = v;

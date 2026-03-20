@@ -6985,3 +6985,28 @@ fn dedup_hash_fast_path_for_large_values() {
     assert_eq!(db.stats().dedup_skips, 1);
     db.close().unwrap();
 }
+
+#[test]
+fn dedup_with_encrypted_namespace() {
+    // Dedup compares raw plaintext before encryption — identical plaintext
+    // produces different ciphertext (nonce-based), so dedup must compare
+    // at the plaintext layer.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path().join("db"));
+    config.dedup = true;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("secret", Some("password123")).unwrap();
+
+    let rev1 = ns.put("k", "sensitive-data", None).unwrap();
+    let rev2 = ns.put("k", "sensitive-data", None).unwrap();
+    assert_eq!(rev1, rev2, "dedup should work with encrypted namespace");
+    assert_eq!(db.stats().dedup_skips, 1);
+
+    // Different value should proceed
+    let rev3 = ns.put("k", "different-data", None).unwrap();
+    assert_ne!(rev2, rev3);
+
+    // Verify data is readable and correct
+    assert_eq!(ns.get("k").unwrap(), Value::from("different-data"));
+    db.close().unwrap();
+}
