@@ -87,6 +87,58 @@ impl<'db> Namespace<'db> {
         Ok(value)
     }
 
+    /// Check if a write can be skipped via dedup. Returns `Some(existing_rev)`
+    /// if the value is identical and neither side has a TTL.
+    ///
+    /// Uses raw memtable/SSTable lookups to avoid inflating `op_gets` stats.
+    fn try_dedup(
+        &self,
+        key: &Key,
+        value: &Value,
+        ttl: &Option<Duration>,
+        dedup: Option<bool>,
+    ) -> Result<Option<RevisionID>> {
+        let dedup_active = dedup.unwrap_or_else(|| self.db.dedup_enabled(&self.name));
+        if !dedup_active || ttl.is_some() {
+            return Ok(None);
+        }
+
+        // Look up existing value+revision without counting as a user get
+        let (existing, rev) = {
+            let mt = self.db.get_or_create_memtable(&self.name)?;
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
+            match mt.lookup_with_revision(key) {
+                MemLookupRev::Found(v, rev) => (v.clone(), rev),
+                MemLookupRev::Tombstone | MemLookupRev::NotFound => {
+                    drop(mt);
+                    match self.db.get_from_sstables(&self.name, key)? {
+                        Some((v, rev)) if !v.is_tombstone() => (v, rev),
+                        _ => return Ok(None),
+                    }
+                }
+            }
+        };
+
+        // Resolve pointer + decrypt to get raw value for comparison
+        let existing = self.db.resolve_value(&self.name, &existing)?;
+        let existing = self.decrypt_value(existing)?;
+        if existing != *value {
+            return Ok(None);
+        }
+
+        // Check that existing key has no TTL (memtable only — fast path)
+        {
+            let mt = self.db.get_or_create_memtable(&self.name)?;
+            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(Some(_)) = mt.ttl(key) {
+                return Ok(None); // existing has TTL, don't dedup
+            }
+        }
+
+        self.db.inc_dedup_skips();
+        Ok(Some(rev))
+    }
+
     /// Store a key-value pair, returning its revision ID.
     ///
     /// Write path: generate revision → AOL append → memtable insert.
@@ -119,17 +171,8 @@ impl<'db> Namespace<'db> {
         let key = key.into();
         let value = value.into();
 
-        // Dedup check: skip write if value is unchanged and no TTL on either side
-        let dedup_active = dedup.unwrap_or_else(|| self.db.dedup_enabled(&self.name));
-        if dedup_active && ttl.is_none() {
-            if let Ok((existing, rev)) = self.get_with_revision(key.clone()) {
-                if existing == value {
-                    if let Ok(None) = self.ttl(key.clone()) {
-                        self.db.inc_dedup_skips();
-                        return Ok(rev);
-                    }
-                }
-            }
+        if let Some(rev) = self.try_dedup(&key, &value, &ttl, dedup)? {
+            return Ok(rev);
         }
 
         let value = self.encrypt_value(value);
@@ -173,11 +216,12 @@ impl<'db> Namespace<'db> {
             return Ok(Vec::new());
         }
 
-        // 1. Pre-process: dedup check, encrypt values, separate bin objects, generate revisions
-        let ns_dedup = self.db.dedup_enabled(&self.name);
-        // None = normal op, Some(rev) = deduped (skip AOL + memtable)
-        let mut dedup_revs: Vec<Option<RevisionID>> = Vec::with_capacity(batch.len());
-        let mut prepared: Vec<(Key, Value, Option<Duration>)> = Vec::with_capacity(batch.len());
+        // 1. Pre-process: dedup check, encrypt values, separate bin objects
+        enum PreparedOp {
+            Write(Key, Value, Option<Duration>),
+            Deduped(RevisionID),
+        }
+        let mut ops: Vec<PreparedOp> = Vec::with_capacity(batch.len());
         for op in batch.ops {
             match op {
                 BatchOp::Put {
@@ -186,51 +230,43 @@ impl<'db> Namespace<'db> {
                     ttl,
                     dedup,
                 } => {
-                    let dedup_active = dedup.unwrap_or(ns_dedup);
-                    if dedup_active && ttl.is_none() {
-                        if let Ok((existing, rev)) = self.get_with_revision(key.clone()) {
-                            if existing == value {
-                                if let Ok(None) = self.ttl(key.clone()) {
-                                    self.db.inc_dedup_skips();
-                                    dedup_revs.push(Some(rev));
-                                    prepared.push((key, value, ttl));
-                                    continue;
-                                }
-                            }
-                        }
+                    if let Some(rev) = self.try_dedup(&key, &value, &ttl, dedup)? {
+                        ops.push(PreparedOp::Deduped(rev));
+                    } else {
+                        let value = self.encrypt_value(value);
+                        let value = self.db.maybe_separate_value(&self.name, value)?;
+                        ops.push(PreparedOp::Write(key, value, ttl));
                     }
-                    dedup_revs.push(None);
-                    let value = self.encrypt_value(value);
-                    let value = self.db.maybe_separate_value(&self.name, value)?;
-                    prepared.push((key, value, ttl));
                 }
                 BatchOp::Delete { key } => {
-                    dedup_revs.push(None);
-                    prepared.push((key, Value::tombstone(), None));
+                    ops.push(PreparedOp::Write(key, Value::tombstone(), None));
                 }
             }
         }
 
-        let revisions: Vec<_> = prepared
-            .iter()
-            .map(|_| self.db.generate_revision())
-            .collect();
+        // Generate revisions only for non-deduped ops
+        let mut revisions: Vec<Option<RevisionID>> = Vec::with_capacity(ops.len());
+        for op in &ops {
+            match op {
+                PreparedOp::Write(..) => revisions.push(Some(self.db.generate_revision())),
+                PreparedOp::Deduped(_) => revisions.push(None),
+            }
+        }
 
         // 2. Append non-deduped ops to AOL under a single lock
         {
             if let Some(mut aol) = self.db.aol_lock(&self.name)? {
-                for (i, (key, value, ttl)) in prepared.iter().enumerate() {
-                    if dedup_revs[i].is_some() {
-                        continue;
+                for (i, op) in ops.iter().enumerate() {
+                    if let PreparedOp::Write(key, value, ttl) = op {
+                        self.db.append_to_aol_locked(
+                            &mut aol,
+                            &self.name,
+                            revisions[i].unwrap().as_u128(),
+                            key,
+                            value,
+                            *ttl,
+                        )?;
                     }
-                    self.db.append_to_aol_locked(
-                        &mut aol,
-                        &self.name,
-                        revisions[i].as_u128(),
-                        key,
-                        value,
-                        *ttl,
-                    )?;
                 }
             }
         }
@@ -239,22 +275,24 @@ impl<'db> Namespace<'db> {
         let (actual_revs, should_flush, should_stall) = {
             let mt = self.db.get_or_create_memtable(&self.name)?;
             let mut mt = mt.write().unwrap_or_else(|e| e.into_inner());
-            let mut actual_revs = Vec::with_capacity(prepared.len());
+            let mut actual_revs = Vec::with_capacity(ops.len());
             let mut puts = 0u64;
             let mut deletes = 0u64;
-            for (i, (key, value, ttl)) in prepared.into_iter().enumerate() {
-                if let Some(existing_rev) = dedup_revs[i] {
-                    actual_revs.push(existing_rev);
-                    continue;
-                }
-                if value.is_tombstone() {
-                    mt.delete(key, revisions[i]);
-                    actual_revs.push(revisions[i]);
-                    deletes += 1;
-                } else {
-                    let actual_rev = mt.put(key, value, revisions[i], ttl);
-                    actual_revs.push(actual_rev);
-                    puts += 1;
+            for (i, op) in ops.into_iter().enumerate() {
+                match op {
+                    PreparedOp::Deduped(rev) => actual_revs.push(rev),
+                    PreparedOp::Write(key, value, ttl) => {
+                        let rev = revisions[i].unwrap();
+                        if value.is_tombstone() {
+                            mt.delete(key, rev);
+                            actual_revs.push(rev);
+                            deletes += 1;
+                        } else {
+                            let actual_rev = mt.put(key, value, rev, ttl);
+                            actual_revs.push(actual_rev);
+                            puts += 1;
+                        }
+                    }
                 }
             }
             self.db.inc_op_puts_by(puts);

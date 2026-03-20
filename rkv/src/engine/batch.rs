@@ -54,19 +54,8 @@ impl WriteBatch {
     }
 
     /// Add a put operation to the batch.
-    pub fn put(
-        mut self,
-        key: impl Into<Key>,
-        value: impl Into<Value>,
-        ttl: Option<Duration>,
-    ) -> Self {
-        self.ops.push(BatchOp::Put {
-            key: key.into(),
-            value: value.into(),
-            ttl,
-            dedup: None,
-        });
-        self
+    pub fn put(self, key: impl Into<Key>, value: impl Into<Value>, ttl: Option<Duration>) -> Self {
+        self.put_dedup(key, value, ttl, None)
     }
 
     /// Add a put operation with an explicit per-op dedup override.
