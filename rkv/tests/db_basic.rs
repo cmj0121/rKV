@@ -6893,3 +6893,30 @@ fn dedup_batch_per_op_override() {
     assert_eq!(db.stats().dedup_skips, 1);
     assert_eq!(ns.get("k3").unwrap(), Value::from("new"));
 }
+
+#[test]
+fn dedup_skipped_when_existing_ttl_flushed_to_sstable() {
+    // Key with TTL is flushed to SSTable. Dedup should NOT skip the write
+    // because the existing entry has a TTL (even though it's in SSTable, not memtable).
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path().join("db"));
+    config.dedup = true;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    // Write key with 1-hour TTL, then flush to SSTable
+    ns.put("k", "v", Some(Duration::from_secs(3600))).unwrap();
+    db.flush().unwrap();
+    db.wait_for_compaction();
+
+    // Now try dedup write without TTL — should NOT be deduped
+    // because the existing SSTable entry has a TTL
+    let rev1_rev = ns.put("k", "v", None).unwrap();
+    assert_eq!(
+        db.stats().dedup_skips,
+        0,
+        "should not dedup when SSTable entry has TTL"
+    );
+    let _ = rev1_rev;
+    db.close().unwrap();
+}

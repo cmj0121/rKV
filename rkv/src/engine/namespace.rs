@@ -103,36 +103,38 @@ impl<'db> Namespace<'db> {
             return Ok(None);
         }
 
-        // Look up existing value+revision without counting as a user get
-        let (existing, rev) = {
+        // Look up existing value+revision and TTL status without inflating op_gets.
+        // `has_ttl` tracks whether the existing entry has a non-zero expiration,
+        // regardless of whether it lives in the memtable or SSTables.
+        let (existing, rev, has_ttl) = {
             let mt = self.db.get_or_create_memtable(&self.name)?;
             let mt = mt.read().unwrap_or_else(|e| e.into_inner());
             match mt.lookup_with_revision(key) {
-                MemLookupRev::Found(v, rev) => (v.clone(), rev),
+                MemLookupRev::Found(v, rev) => {
+                    let has_ttl = matches!(mt.ttl(key), Some(Some(_)));
+                    (v.clone(), rev, has_ttl)
+                }
                 MemLookupRev::Tombstone | MemLookupRev::NotFound => {
                     drop(mt);
-                    match self.db.get_from_sstables(&self.name, key)? {
-                        Some((v, rev)) if !v.is_tombstone() => (v, rev),
+                    match self.db.get_from_sstables_full(&self.name, key)? {
+                        Some((v, rev, expires_at_ms)) if !v.is_tombstone() => {
+                            (v, rev, expires_at_ms != 0)
+                        }
                         _ => return Ok(None),
                     }
                 }
             }
         };
 
+        if has_ttl {
+            return Ok(None);
+        }
+
         // Resolve pointer + decrypt to get raw value for comparison
         let existing = self.db.resolve_value(&self.name, &existing)?;
         let existing = self.decrypt_value(existing)?;
         if existing != *value {
             return Ok(None);
-        }
-
-        // Check that existing key has no TTL (memtable only — fast path)
-        {
-            let mt = self.db.get_or_create_memtable(&self.name)?;
-            let mt = mt.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(Some(_)) = mt.ttl(key) {
-                return Ok(None); // existing has TTL, don't dedup
-            }
         }
 
         self.db.inc_dedup_skips();

@@ -3642,6 +3642,37 @@ impl DB {
         Ok(None)
     }
 
+    /// Like `get_from_sstables`, but also returns the raw `expires_at_ms`.
+    /// Used by dedup to check TTL without a separate memtable lookup.
+    pub(crate) fn get_from_sstables_full(
+        &self,
+        ns: &str,
+        key: &Key,
+    ) -> Result<Option<(Value, revision::RevisionID, u64)>> {
+        let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(levels) = sst.get(ns) {
+            let key_buf = {
+                let mut buf = Vec::with_capacity(key.encoded_len());
+                key.write_bytes_to(&mut buf);
+                buf
+            };
+
+            for level_readers in levels {
+                for reader in level_readers {
+                    if let Some((value, rev, expires_at_ms)) =
+                        reader.get_with_key_bytes(&key_buf, self.config.verify_checksums)?
+                    {
+                        if is_expired(expires_at_ms) {
+                            return Ok(Some((Value::tombstone(), rev, expires_at_ms)));
+                        }
+                        return Ok(Some((value, rev, expires_at_ms)));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Count all non-expired revisions for a key across all SSTable levels.
     pub(crate) fn count_revisions_from_sstables(&self, ns: &str, key: &Key) -> Result<u64> {
         let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
