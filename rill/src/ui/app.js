@@ -137,30 +137,6 @@ function renderToolbar() {
   }
   toolbar.appendChild(newBtn);
 
-  if (canAdmin()) {
-    var dedupBtn = el("button", {
-      className: "btn dedup-toggle is-off",
-      id: "dedup-btn",
-      textContent: "DEDUP",
-      title: "Loading\u2026",
-      onClick: function () {
-        var cur = dedupBtn.classList.contains("is-on");
-        api("PUT", "/admin/dedup", { enabled: !cur })
-          .then(function () {
-            setDedupStyle(dedupBtn, !cur);
-            showToast("Dedup " + (!cur ? "enabled" : "disabled"), "success");
-          })
-          .catch(function (e) {
-            showToast("Dedup: " + e.message, "error");
-          });
-      },
-    });
-    toolbar.appendChild(dedupBtn);
-    api("GET", "/admin/dedup").then(function (r) {
-      setDedupStyle(dedupBtn, r.data.dedup);
-    });
-  }
-
   toolbar.appendChild(
     el("button", {
       className: "btn",
@@ -303,6 +279,37 @@ function renderQueueList() {
             popMessage();
           },
         }),
+        (function () {
+          if (!canAdmin()) return document.createTextNode("");
+          var btn = el("button", {
+            className: "btn dedup-toggle btn-sm is-off",
+            textContent: "DEDUP",
+            title: "Loading\u2026",
+            onClick: function (e) {
+              e.stopPropagation();
+              var cur = btn.classList.contains("is-on");
+              api("PUT", "/queues/" + encodeURIComponent(name) + "/dedup", {
+                enabled: !cur,
+              })
+                .then(function () {
+                  setDedupStyle(btn, !cur);
+                  showToast(
+                    name + " dedup " + (!cur ? "enabled" : "disabled"),
+                    "success",
+                  );
+                })
+                .catch(function (e) {
+                  showToast("Dedup: " + e.message, "error");
+                });
+            },
+          });
+          api("GET", "/queues/" + encodeURIComponent(name) + "/dedup").then(
+            function (r) {
+              setDedupStyle(btn, r.data.dedup);
+            },
+          );
+          return btn;
+        })(),
         (function () {
           var btn = el("button", {
             className: canAdmin()
