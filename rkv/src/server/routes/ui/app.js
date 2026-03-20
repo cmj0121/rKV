@@ -999,6 +999,13 @@ function renderAdmin(app) {
     compactBtn,
     dedupGlobalBtn,
     el("button", { textContent: "Refresh", onClick: loadStats }),
+    el("button", {
+      className: "btn-blue",
+      textContent: "API Docs",
+      onClick: function () {
+        window.open("/docs", "_blank");
+      },
+    }),
   ]);
   app.appendChild(actions);
 

@@ -146,6 +146,16 @@ function renderToolbar() {
       },
     }),
   );
+
+  toolbar.appendChild(
+    el("button", {
+      className: "btn btn-blue",
+      textContent: "API Docs",
+      onClick: function () {
+        window.open("/docs", "_blank");
+      },
+    }),
+  );
 }
 
 function setDedupStyle(btn, isOn) {
