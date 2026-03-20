@@ -974,14 +974,15 @@ function renderAdmin(app) {
     },
   });
   var dedupGlobalBtn = el("button", {
-    className: "btn-yellow",
+    className: "ns-dedup-btn is-off",
     id: "dedup-global-btn",
-    textContent: "Dedup: ...",
+    textContent: "Dedup",
+    title: "Global dedup: loading\u2026",
     onClick: function () {
-      var cur = dedupGlobalBtn.textContent.indexOf("on") !== -1;
+      var cur = dedupGlobalBtn.classList.contains("is-on");
       api("PUT", "/api/admin/dedup", { enabled: !cur })
         .then(function () {
-          dedupGlobalBtn.textContent = "Dedup: " + (!cur ? "on" : "off");
+          applyDedupStyle(dedupGlobalBtn, !cur);
           toast("Global dedup " + (!cur ? "enabled" : "disabled"), true);
         })
         .catch(function (e) {
@@ -990,7 +991,7 @@ function renderAdmin(app) {
     },
   });
   api("GET", "/api/admin/config").then(function (r) {
-    dedupGlobalBtn.textContent = "Dedup: " + (r.data.dedup ? "on" : "off");
+    applyDedupStyle(dedupGlobalBtn, r.data.dedup);
   });
   var actions = el("div", { className: "toolbar" }, [
     flushBtn,
@@ -1137,7 +1138,7 @@ function loadNsList() {
       }
       ns.forEach(function (name) {
         var dropBtn = el("button", {
-          className: "btn-red",
+          className: "btn-red ns-drop-btn",
           textContent: "Drop",
           onClick: function () {
             dropNs(name);
@@ -1145,8 +1146,9 @@ function loadNsList() {
         });
         if (state.role === "replica") dropBtn.disabled = true;
         var dedupBtn = el("button", {
-          className: "btn-yellow",
-          textContent: "Dedup: ...",
+          className: "ns-dedup-btn is-off",
+          textContent: "Dedup",
+          title: "Dedup: loading\u2026",
           onClick: function () {
             toggleNsDedup(name, dedupBtn);
           },
@@ -1155,7 +1157,7 @@ function loadNsList() {
         (function (btn, nsName) {
           api("GET", "/api/" + encodeURIComponent(nsName) + "/dedup").then(
             function (r) {
-              btn.textContent = "Dedup: " + (r.data.dedup ? "on" : "off");
+              applyDedupStyle(btn, r.data.dedup);
             },
           );
         })(dedupBtn, name);
@@ -1172,14 +1174,21 @@ function loadNsList() {
     });
 }
 
+function applyDedupStyle(btn, isOn) {
+  btn.className = "ns-dedup-btn " + (isOn ? "is-on" : "is-off");
+  btn.title =
+    "Dedup: " +
+    (isOn ? "on \u2014 click to disable" : "off \u2014 click to enable");
+}
+
 function toggleNsDedup(nsName, btn) {
-  var current = btn.textContent.indexOf("on") !== -1;
+  var current = btn.classList.contains("is-on");
   var next = !current;
   api("PUT", "/api/" + encodeURIComponent(nsName) + "/dedup", {
     enabled: next,
   })
     .then(function () {
-      btn.textContent = "Dedup: " + (next ? "on" : "off");
+      applyDedupStyle(btn, next);
       toast(
         "Dedup " + (next ? "enabled" : "disabled") + " for " + nsName,
         true,

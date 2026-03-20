@@ -530,13 +530,45 @@ dialog .dialog-actions {
 
 .ns-item .ns-actions {
   display: flex;
-  gap: 8px;
+  gap: 6px;
   flex-shrink: 0;
 }
 
 .ns-item .ns-actions button {
-  min-width: 90px;
   text-align: center;
+  padding: 6px 10px;
+}
+
+.ns-dedup-btn {
+  width: 68px;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.ns-dedup-btn.is-on {
+  color: var(--green);
+  border-color: var(--green);
+}
+
+.ns-dedup-btn.is-off {
+  color: var(--text-dim);
+  border-color: var(--border);
+}
+
+.ns-dedup-btn.is-on:hover {
+  background: rgba(102, 187, 106, 0.15);
+}
+
+.ns-dedup-btn.is-off:hover {
+  background: rgba(136, 146, 164, 0.1);
+}
+
+.ns-drop-btn {
+  padding: 6px 10px;
+  font-size: 12px;
 }
 
 /* ---- Toast ---- */
