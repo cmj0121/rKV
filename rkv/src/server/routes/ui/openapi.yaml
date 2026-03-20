@@ -598,6 +598,8 @@ paths:
                     type: integer
                   op_deletes:
                     type: integer
+                  dedup_checks:
+                    type: integer
                   dedup_skips:
                     type: integer
                   cache_hits:

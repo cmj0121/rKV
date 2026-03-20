@@ -505,6 +505,8 @@ pub struct DB {
     dedup_global: AtomicBool,
     /// Per-namespace dedup overrides. `true` = dedup on, `false` = dedup off.
     dedup_overrides: Mutex<HashMap<String, bool>>,
+    /// Counter for dedup checks attempted.
+    dedup_checks: AtomicU64,
     /// Counter for writes skipped by dedup-on-write.
     dedup_skips: AtomicU64,
     // Peer replication
@@ -786,6 +788,7 @@ impl DB {
             conflicts_resolved: Arc::new(AtomicU64::new(0)),
             dedup_global: AtomicBool::new(dedup_default),
             dedup_overrides: Mutex::new(HashMap::new()),
+            dedup_checks: AtomicU64::new(0),
             dedup_skips: AtomicU64::new(0),
             peer_sessions: Arc::new(Mutex::new(Vec::new())),
             peer_listener: None,
@@ -849,6 +852,7 @@ impl DB {
             conflicts_resolved: Arc::new(AtomicU64::new(0)),
             dedup_global: AtomicBool::new(dedup_default),
             dedup_overrides: Mutex::new(HashMap::new()),
+            dedup_checks: AtomicU64::new(0),
             dedup_skips: AtomicU64::new(0),
             peer_sessions: Arc::new(Mutex::new(Vec::new())),
             peer_listener: None,
@@ -1767,6 +1771,7 @@ impl DB {
                 .unwrap_or_else(|e| e.into_inner())
                 .len() as u64,
             conflicts_resolved: self.conflicts_resolved.load(Ordering::Relaxed),
+            dedup_checks: self.dedup_checks.load(Ordering::Relaxed),
             dedup_skips: self.dedup_skips.load(Ordering::Relaxed),
         }
     }
@@ -3928,6 +3933,10 @@ impl DB {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         overrides.remove(ns);
+    }
+
+    pub(crate) fn inc_dedup_checks(&self) {
+        self.dedup_checks.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn inc_dedup_skips(&self) {

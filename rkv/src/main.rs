@@ -713,6 +713,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("  op_deletes:        {}", s.op_deletes);
             println!("  cache_hits:        {}", s.cache_hits);
             println!("  cache_misses:      {}", s.cache_misses);
+            println!("  dedup_checks:      {}", s.dedup_checks);
             println!("  dedup_skips:       {}", s.dedup_skips);
             println!("Replication:");
             println!("  role:              {}", s.role);

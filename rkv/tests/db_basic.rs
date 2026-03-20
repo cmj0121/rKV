@@ -6920,3 +6920,68 @@ fn dedup_skipped_when_existing_ttl_flushed_to_sstable() {
     let _ = rev1_rev;
     db.close().unwrap();
 }
+
+#[test]
+fn dedup_checks_counter_tracks_attempts() {
+    let mut config = Config::in_memory();
+    config.dedup = true;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put("k", "v", None).unwrap();
+    // Second put triggers a dedup check (hit)
+    ns.put("k", "v", None).unwrap();
+    // Third put with different value triggers a dedup check (miss)
+    ns.put("k", "v2", None).unwrap();
+
+    let s = db.stats();
+    // All 3 puts trigger dedup checks (dedup is on): first = key not found,
+    // second = match (skip), third = different value (proceed)
+    assert_eq!(s.dedup_checks, 3, "three dedup checks attempted");
+    assert_eq!(s.dedup_skips, 1, "one dedup skip (identical value)");
+}
+
+#[test]
+fn dedup_checks_not_counted_when_disabled() {
+    let config = Config::in_memory();
+    assert!(!config.dedup);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put("k", "v", None).unwrap();
+    ns.put("k", "v", None).unwrap();
+
+    assert_eq!(db.stats().dedup_checks, 0, "no checks when dedup disabled");
+}
+
+#[test]
+fn dedup_hash_fast_path_for_large_values() {
+    // Large values (> object_size) are stored as bin objects with BLAKE3 hash.
+    // Dedup should compare hashes without reading the full object from disk.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path().join("db"));
+    config.dedup = true;
+    config.object_size = 64; // low threshold to trigger value separation
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let large_value = "x".repeat(128); // > object_size
+    let rev1 = ns.put("k", large_value.as_str(), None).unwrap();
+    db.flush().unwrap();
+    db.wait_for_compaction();
+
+    // Second put with same large value — should dedup via hash comparison
+    // (checks: 1 for initial put + 1 for this put = 2)
+    let rev2 = ns.put("k", large_value.as_str(), None).unwrap();
+    assert_eq!(rev1, rev2, "large value dedup via hash fast path");
+    assert_eq!(db.stats().dedup_skips, 1);
+    assert_eq!(db.stats().dedup_checks, 2);
+
+    // Different large value — should NOT dedup
+    let different = "y".repeat(128);
+    let rev3 = ns.put("k", different.as_str(), None).unwrap();
+    assert_ne!(rev2, rev3, "different large value proceeds");
+    assert_eq!(db.stats().dedup_checks, 3);
+    assert_eq!(db.stats().dedup_skips, 1);
+    db.close().unwrap();
+}

@@ -91,6 +91,7 @@ impl<'db> Namespace<'db> {
     /// if the value is identical and neither side has a TTL.
     ///
     /// Uses raw memtable/SSTable lookups to avoid inflating `op_gets` stats.
+    /// For bin objects (ValuePointer), compares BLAKE3 hashes to avoid disk reads.
     fn try_dedup(
         &self,
         key: &Key,
@@ -103,9 +104,9 @@ impl<'db> Namespace<'db> {
             return Ok(None);
         }
 
+        self.db.inc_dedup_checks();
+
         // Look up existing value+revision and TTL status without inflating op_gets.
-        // `has_ttl` tracks whether the existing entry has a non-zero expiration,
-        // regardless of whether it lives in the memtable or SSTables.
         let (existing, rev, has_ttl) = {
             let mt = self.db.get_or_create_memtable(&self.name)?;
             let mt = mt.read().unwrap_or_else(|e| e.into_inner());
@@ -130,7 +131,21 @@ impl<'db> Namespace<'db> {
             return Ok(None);
         }
 
-        // Resolve pointer + decrypt to get raw value for comparison
+        // Hash-based fast path for bin objects: compare BLAKE3 hashes without
+        // reading the full object from disk.
+        if let Value::Pointer(vp) = &existing {
+            if let Value::Data(incoming) = value {
+                let incoming_hash: [u8; 32] = blake3::hash(incoming).into();
+                if vp.hash == incoming_hash {
+                    self.db.inc_dedup_skips();
+                    return Ok(Some(rev));
+                }
+            }
+            // Pointer vs non-Data (Null, Tombstone) → not equal
+            return Ok(None);
+        }
+
+        // Inline values: resolve pointer (no-op for non-pointer) + decrypt, then compare
         let existing = self.db.resolve_value(&self.name, &existing)?;
         let existing = self.decrypt_value(existing)?;
         if existing != *value {
