@@ -284,6 +284,46 @@ impl Backend {
             }
         }
     }
+    /// Get the global dedup setting.
+    pub async fn dedup(&self) -> Result<bool, String> {
+        match self {
+            Backend::Embed(db, _) => Ok(db.dedup()),
+            Backend::Remote(client) => {
+                let resp = client
+                    .client
+                    .get(format!("{}/api/admin/config", client.base_url))
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+                Ok(json["dedup"].as_bool().unwrap_or(false))
+            }
+        }
+    }
+
+    /// Set the global dedup flag.
+    pub async fn set_dedup(&self, enabled: bool) -> Result<(), String> {
+        match self {
+            Backend::Embed(db, _) => {
+                db.set_dedup(enabled);
+                Ok(())
+            }
+            Backend::Remote(client) => {
+                let resp = client
+                    .client
+                    .put(format!("{}/api/admin/dedup", client.base_url))
+                    .json(&serde_json::json!({ "enabled": enabled }))
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if !resp.status().is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(format!("set_dedup failed: {body}"));
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[cfg(test)]

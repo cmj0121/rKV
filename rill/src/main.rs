@@ -397,6 +397,38 @@ async fn queue_info(
     Ok(Json(json!({"queue": name, "length": length})))
 }
 
+// --- Admin: dedup ---
+
+async fn get_dedup(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.require_role(&headers, Role::Admin)?;
+    let enabled = state.backend.dedup().await.map_err(ApiError::Internal)?;
+    Ok(Json(json!({"dedup": enabled})))
+}
+
+#[derive(Deserialize)]
+struct SetDedupRequest {
+    enabled: bool,
+}
+
+async fn set_dedup(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<SetDedupRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.require_role(&headers, Role::Admin)?;
+    state
+        .backend
+        .set_dedup(body.enabled)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(json!({"ok": true, "dedup": body.enabled})))
+}
+
+// --- UI ---
+
 async fn ui_index(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     if !state.ui_enabled {
         return Err(ApiError::NotFound("UI not enabled. Start with --ui flag."));
@@ -452,6 +484,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/queues/{name}", delete(delete_queue))
         .route("/queues/{name}/info", get(queue_info))
         .route("/queues/{name}/batch", post(batch_push).get(batch_pop))
+        .route("/admin/dedup", get(get_dedup).put(set_dedup))
         .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
         .layer(TraceLayer::new_for_http())
         .with_state(state)
