@@ -75,7 +75,9 @@ pub fn router(state: Arc<AppState>, enable_ui: bool) -> Router {
         r = r
             .route("/ui", get(ui::index))
             .route("/ui/app.js", get(ui::app_js))
-            .route("/ui/style.css", get(ui::style_css));
+            .route("/ui/style.css", get(ui::style_css))
+            .route("/docs", get(ui::docs))
+            .route("/docs/openapi.yaml", get(ui::openapi_yaml));
     }
 
     r

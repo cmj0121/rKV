@@ -1,0 +1,763 @@
+openapi: 3.1.0
+info:
+  title: rKV
+  description: Revision-aware key-value store with LSM-tree storage engine.
+  version: 0.1.0
+  license:
+    name: MIT
+
+servers:
+  - url: /
+
+paths:
+  /:
+    get:
+      tags: [Health]
+      summary: Root
+      operationId: root
+      responses:
+        "200":
+          description: Empty response
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: ""
+
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      operationId: health
+      responses:
+        "200":
+          description: Server health and diagnostics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  role:
+                    type: string
+                    example: standalone
+                  uptime_secs:
+                    type: integer
+                    example: 120
+
+  /api/namespaces:
+    get:
+      tags: [Namespaces]
+      summary: List namespaces
+      operationId: listNamespaces
+      responses:
+        "200":
+          description: Array of namespace names
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+                example: ["_", "users", "logs"]
+    post:
+      tags: [Namespaces]
+      summary: Create namespace
+      operationId: createNamespace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  example: users
+                password:
+                  type: string
+                  description: Optional encryption password
+      responses:
+        "201":
+          description: Namespace created
+
+  /api/{ns}:
+    delete:
+      tags: [Namespaces]
+      summary: Drop namespace
+      operationId: dropNamespace
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "202":
+          description: Namespace dropped
+
+  /api/{ns}/dedup:
+    get:
+      tags: [Namespaces]
+      summary: Get namespace dedup status
+      operationId: getNsDedup
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Dedup status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  namespace:
+                    type: string
+                  dedup:
+                    type: boolean
+                  global:
+                    type: boolean
+    put:
+      tags: [Namespaces]
+      summary: Set namespace dedup override
+      operationId: setNsDedup
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled:
+                  type: boolean
+                  description: "true to enable, false to disable, null to reset to global"
+                  nullable: true
+      responses:
+        "200":
+          description: Dedup override set
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  namespace:
+                    type: string
+                  dedup:
+                    type: boolean
+
+  /api/{ns}/keys/{key}:
+    get:
+      tags: [Keys]
+      summary: Get value by key
+      operationId: getKey
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Value found
+          headers:
+            X-RKV-Revision:
+              schema:
+                type: string
+            Expires:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema: {}
+        "204":
+          description: Key exists with null value
+        "404":
+          description: Key not found
+        "410":
+          description: Key was deleted (tombstone)
+    put:
+      tags: [Keys]
+      summary: Store a key-value pair
+      operationId: putKey
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: ttl
+          in: query
+          description: "TTL duration (e.g. 60s, 5m, 1h, 1d)"
+          schema:
+            type: string
+        - name: dedup
+          in: query
+          description: "Per-request dedup override (true/false)"
+          schema:
+            type: boolean
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              description: "JSON string, number, boolean, or null"
+              example: "hello world"
+      responses:
+        "201":
+          description: Key stored
+          headers:
+            X-RKV-Revision:
+              schema:
+                type: string
+    delete:
+      tags: [Keys]
+      summary: Delete a key
+      operationId: deleteKey
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "202":
+          description: Key deleted
+    head:
+      tags: [Keys]
+      summary: Check if key exists
+      operationId: headKey
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Key exists with data value
+        "204":
+          description: Key exists with null value
+        "404":
+          description: Key not found
+
+  /api/{ns}/keys:
+    get:
+      tags: [Scan]
+      summary: Scan keys
+      operationId: listKeys
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: prefix
+          in: query
+          schema:
+            type: string
+        - name: offset
+          in: query
+          schema:
+            type: integer
+        - name: reverse
+          in: query
+          schema:
+            type: boolean
+        - name: deleted
+          in: query
+          description: Include tombstoned keys
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: Array of key-value pairs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    key:
+                      type: string
+                    value: {}
+                    revision:
+                      type: string
+    delete:
+      tags: [Scan]
+      summary: Delete keys by prefix or range
+      operationId: deleteKeys
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: prefix
+          in: query
+          schema:
+            type: string
+        - name: start
+          in: query
+          schema:
+            type: string
+        - name: end
+          in: query
+          schema:
+            type: string
+        - name: inclusive
+          in: query
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: Number of keys deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: integer
+
+  /api/{ns}/count:
+    get:
+      tags: [Scan]
+      summary: Count keys
+      operationId: countKeys
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: prefix
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Key count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+
+  /api/{ns}/pop:
+    post:
+      tags: [Keys]
+      summary: Pop first key (atomic scan + delete)
+      operationId: popFirst
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: prefix
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Popped key-value pair
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  key:
+                    type: string
+                  value: {}
+        "204":
+          description: No keys to pop
+
+  /api/{ns}/batch:
+    post:
+      tags: [Batch]
+      summary: Atomic batch write
+      operationId: writeBatch
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ops]
+              properties:
+                ops:
+                  type: array
+                  items:
+                    oneOf:
+                      - type: object
+                        required: [op, key, value]
+                        properties:
+                          op:
+                            type: string
+                            enum: [put]
+                          key:
+                            type: string
+                          value: {}
+                          ttl:
+                            type: integer
+                            description: TTL in seconds
+                          dedup:
+                            type: boolean
+                            description: Per-op dedup override
+                      - type: object
+                        required: [op, key]
+                        properties:
+                          op:
+                            type: string
+                            enum: [delete]
+                          key:
+                            type: string
+            example:
+              ops:
+                - op: put
+                  key: k1
+                  value: v1
+                - op: put
+                  key: k2
+                  value: v2
+                  ttl: 3600
+                  dedup: true
+                - op: delete
+                  key: k3
+      responses:
+        "200":
+          description: Revision IDs for each operation
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        key:
+                          type: string
+                        revision:
+                          type: string
+
+  /api/{ns}/keys/{key}/revisions:
+    get:
+      tags: [Revisions]
+      summary: Get revision count for a key
+      operationId: revCount
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Revision count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  key:
+                    type: string
+                  count:
+                    type: integer
+
+  /api/{ns}/keys/{key}/revisions/{index}:
+    get:
+      tags: [Revisions]
+      summary: Get value at revision index
+      operationId: revGet
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: index
+          in: path
+          required: true
+          description: "0 = oldest revision"
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Value at revision
+          content:
+            application/json:
+              schema: {}
+
+  /api/{ns}/keys/{key}/ttl:
+    get:
+      tags: [Revisions]
+      summary: Get remaining TTL for a key
+      operationId: getTtl
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: TTL in seconds (null if no expiration)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ttl:
+                    type: number
+                    nullable: true
+                    example: 3600
+
+  /api/admin/stats:
+    get:
+      tags: [Admin]
+      summary: Database statistics
+      operationId: getStats
+      responses:
+        "200":
+          description: Live database statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_keys:
+                    type: integer
+                  namespace_count:
+                    type: integer
+                  sstable_count:
+                    type: integer
+                  op_puts:
+                    type: integer
+                  op_gets:
+                    type: integer
+                  op_deletes:
+                    type: integer
+                  dedup_skips:
+                    type: integer
+                  cache_hits:
+                    type: integer
+                  cache_misses:
+                    type: integer
+                  cache_hit_rate:
+                    type: number
+                  uptime_secs:
+                    type: integer
+
+  /api/admin/config:
+    get:
+      tags: [Admin]
+      summary: Current configuration
+      operationId: getConfig
+      responses:
+        "200":
+          description: Runtime configuration values
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/admin/dedup:
+    put:
+      tags: [Admin]
+      summary: Set global dedup flag
+      operationId: setGlobalDedup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+            example:
+              enabled: true
+      responses:
+        "200":
+          description: Global dedup updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  dedup:
+                    type: boolean
+
+  /api/admin/flush:
+    post:
+      tags: [Admin]
+      summary: Flush write buffer to disk
+      operationId: flush
+      responses:
+        "200":
+          description: Flush completed
+
+  /api/admin/sync:
+    post:
+      tags: [Admin]
+      summary: Flush and fsync to durable storage
+      operationId: sync
+      responses:
+        "200":
+          description: Sync completed
+
+  /api/admin/compact:
+    post:
+      tags: [Admin]
+      summary: Trigger manual compaction
+      operationId: compact
+      responses:
+        "200":
+          description: Compaction completed
+
+  /api/admin/analyze:
+    post:
+      tags: [Admin]
+      summary: Re-derive stats and persist counters
+      operationId: analyze
+      responses:
+        "200":
+          description: Analysis completed
+
+  /api/admin/force-sync:
+    post:
+      tags: [Admin]
+      summary: Force full sync (replica only)
+      operationId: forceSync
+      responses:
+        "200":
+          description: Force sync triggered
+        "403":
+          description: Not a replica
+
+  /api/admin/cluster:
+    get:
+      tags: [Cluster]
+      summary: Cluster routing table
+      operationId: getCluster
+      responses:
+        "200":
+          description: Shard group and routing info
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/admin/route:
+    post:
+      tags: [Cluster]
+      summary: Update namespace-to-shard mapping
+      operationId: setRoute
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [namespace, shard_group]
+              properties:
+                namespace:
+                  type: string
+                shard_group:
+                  type: integer
+            example:
+              namespace: users
+              shard_group: 2
+      responses:
+        "200":
+          description: Route updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  namespace:
+                    type: string
+                  shard_group:
+                    type: integer
+                  version:
+                    type: integer
+
+  /metrics:
+    get:
+      tags: [Health]
+      summary: Prometheus metrics
+      operationId: prometheusMetrics
+      responses:
+        "200":
+          description: Prometheus exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
