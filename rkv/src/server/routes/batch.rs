@@ -24,6 +24,7 @@ pub enum BatchOpRequest {
         key: String,
         value: serde_json::Value,
         ttl: Option<u64>,
+        dedup: Option<bool>,
     },
     Delete {
         key: String,
@@ -64,11 +65,16 @@ pub async fn write_batch(
 
     for op in req.ops {
         match op {
-            BatchOpRequest::Put { key, value, ttl } => {
+            BatchOpRequest::Put {
+                key,
+                value,
+                ttl,
+                dedup,
+            } => {
                 let parsed_key = parse_key(&key);
                 let parsed_value = json_to_value(&value)?;
                 let ttl = ttl.map(Duration::from_secs);
-                batch = batch.put(parsed_key, parsed_value, ttl);
+                batch = batch.put_dedup(parsed_key, parsed_value, ttl, dedup);
                 keys.push(key);
             }
             BatchOpRequest::Delete { key } => {

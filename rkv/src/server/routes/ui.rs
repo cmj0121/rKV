@@ -22,3 +22,16 @@ pub async fn style_css() -> Response {
     )
         .into_response()
 }
+
+pub async fn docs() -> Html<&'static str> {
+    Html(include_str!("ui/docs.html"))
+}
+
+pub async fn openapi_yaml() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/yaml")],
+        include_str!("ui/openapi.yaml"),
+    )
+        .into_response()
+}

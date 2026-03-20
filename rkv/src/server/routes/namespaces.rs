@@ -58,3 +58,49 @@ pub async fn drop_namespace(
         .remove(&ns_name);
     Ok(StatusCode::ACCEPTED)
 }
+
+#[derive(Deserialize)]
+pub struct SetNsDedupRequest {
+    enabled: Option<bool>,
+}
+
+/// PUT /api/{ns}/dedup — set or clear per-namespace dedup override
+///
+/// Request body: `{"enabled": true}` to override, `{}` or `{"enabled": null}` to reset.
+pub async fn set_ns_dedup(
+    State(state): State<Arc<AppState>>,
+    Path(ns_name): Path<String>,
+    Json(req): Json<SetNsDedupRequest>,
+) -> Json<serde_json::Value> {
+    match req.enabled {
+        Some(v) => {
+            state.db.set_namespace_dedup(&ns_name, v);
+            Json(serde_json::json!({
+                "ok": true,
+                "namespace": ns_name,
+                "dedup": v,
+            }))
+        }
+        None => {
+            state.db.clear_namespace_dedup(&ns_name);
+            Json(serde_json::json!({
+                "ok": true,
+                "namespace": ns_name,
+                "dedup": state.db.dedup_enabled(&ns_name),
+                "source": "global",
+            }))
+        }
+    }
+}
+
+/// GET /api/{ns}/dedup — check dedup status for a namespace
+pub async fn get_ns_dedup(
+    State(state): State<Arc<AppState>>,
+    Path(ns_name): Path<String>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "namespace": ns_name,
+        "dedup": state.db.dedup_enabled(&ns_name),
+        "global": state.db.dedup(),
+    }))
+}

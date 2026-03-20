@@ -328,6 +328,9 @@ pub struct Config {
     /// compaction threads are not started. Replication and encryption are
     /// disallowed.
     pub in_memory: bool,
+    /// Skip writes when the value is identical to the existing one (default: false).
+    /// Only applies to non-TTL writes where the existing key also has no TTL.
+    pub dedup: bool,
 }
 
 impl fmt::Debug for Config {
@@ -378,6 +381,7 @@ impl Config {
             owned_namespaces: Vec::new(),
             object_sync_interval: 128,
             in_memory: false,
+            dedup: false,
         }
     }
 
@@ -497,6 +501,14 @@ pub struct DB {
     repl_force_sync: Option<Arc<AtomicBool>>,
     /// Counter for LWW conflict resolutions (peer replication).
     conflicts_resolved: Arc<AtomicU64>,
+    /// Global dedup flag (runtime-mutable mirror of config.dedup).
+    dedup_global: AtomicBool,
+    /// Per-namespace dedup overrides. `true` = dedup on, `false` = dedup off.
+    dedup_overrides: Mutex<HashMap<String, bool>>,
+    /// Counter for dedup checks attempted.
+    dedup_checks: AtomicU64,
+    /// Counter for writes skipped by dedup-on-write.
+    dedup_skips: AtomicU64,
     // Peer replication
     peer_sessions: Arc<Mutex<Vec<repl_peer::PeerSession>>>,
     peer_listener: Option<repl_peer::PeerListener>,
@@ -745,6 +757,7 @@ impl DB {
         // Load persisted operation counters
         let (op_puts, op_gets, op_deletes) = Self::load_stats_meta(&config.path);
         let event_listener = config.event_listener.clone();
+        let dedup_default = config.dedup;
 
         let mut db = Self {
             config,
@@ -773,6 +786,10 @@ impl DB {
             repl_receiver: None,
             repl_force_sync: None,
             conflicts_resolved: Arc::new(AtomicU64::new(0)),
+            dedup_global: AtomicBool::new(dedup_default),
+            dedup_overrides: Mutex::new(HashMap::new()),
+            dedup_checks: AtomicU64::new(0),
+            dedup_skips: AtomicU64::new(0),
             peer_sessions: Arc::new(Mutex::new(Vec::new())),
             peer_listener: None,
             peer_connectors: Vec::new(),
@@ -798,6 +815,7 @@ impl DB {
         let revision_gen = revision::RevisionGen::new(config.cluster_id);
         let metrics_arc = Arc::new(metrics::Metrics::new());
         let event_listener = config.event_listener.clone();
+        let dedup_default = config.dedup;
 
         let mut ns_map: HashMap<String, NamespaceState> = HashMap::new();
         ns_map.insert(
@@ -832,6 +850,10 @@ impl DB {
             repl_receiver: None,
             repl_force_sync: None,
             conflicts_resolved: Arc::new(AtomicU64::new(0)),
+            dedup_global: AtomicBool::new(dedup_default),
+            dedup_overrides: Mutex::new(HashMap::new()),
+            dedup_checks: AtomicU64::new(0),
+            dedup_skips: AtomicU64::new(0),
             peer_sessions: Arc::new(Mutex::new(Vec::new())),
             peer_listener: None,
             peer_connectors: Vec::new(),
@@ -1749,6 +1771,8 @@ impl DB {
                 .unwrap_or_else(|e| e.into_inner())
                 .len() as u64,
             conflicts_resolved: self.conflicts_resolved.load(Ordering::Relaxed),
+            dedup_checks: self.dedup_checks.load(Ordering::Relaxed),
+            dedup_skips: self.dedup_skips.load(Ordering::Relaxed),
         }
     }
 
@@ -3623,6 +3647,37 @@ impl DB {
         Ok(None)
     }
 
+    /// Like `get_from_sstables`, but also returns the raw `expires_at_ms`.
+    /// Used by dedup to check TTL without a separate memtable lookup.
+    pub(crate) fn get_from_sstables_full(
+        &self,
+        ns: &str,
+        key: &Key,
+    ) -> Result<Option<(Value, revision::RevisionID, u64)>> {
+        let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(levels) = sst.get(ns) {
+            let key_buf = {
+                let mut buf = Vec::with_capacity(key.encoded_len());
+                key.write_bytes_to(&mut buf);
+                buf
+            };
+
+            for level_readers in levels {
+                for reader in level_readers {
+                    if let Some((value, rev, expires_at_ms)) =
+                        reader.get_with_key_bytes(&key_buf, self.config.verify_checksums)?
+                    {
+                        if is_expired(expires_at_ms) {
+                            return Ok(Some((Value::tombstone(), rev, expires_at_ms)));
+                        }
+                        return Ok(Some((value, rev, expires_at_ms)));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Count all non-expired revisions for a key across all SSTable levels.
     pub(crate) fn count_revisions_from_sstables(&self, ns: &str, key: &Key) -> Result<u64> {
         let sst = self.sstables.read().unwrap_or_else(|e| e.into_inner());
@@ -3837,6 +3892,55 @@ impl DB {
 
     pub(crate) fn inc_op_deletes_by(&self, n: u64) {
         self.op_deletes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Check if dedup is enabled for a given namespace.
+    /// Per-namespace overrides take precedence over the global config.
+    pub fn dedup_enabled(&self, ns: &str) -> bool {
+        let overrides = self
+            .dedup_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(&v) = overrides.get(ns) {
+            return v;
+        }
+        self.dedup_global.load(Ordering::Relaxed)
+    }
+
+    /// Returns the global dedup setting.
+    pub fn dedup(&self) -> bool {
+        self.dedup_global.load(Ordering::Relaxed)
+    }
+
+    /// Set the global dedup flag at runtime.
+    pub fn set_dedup(&self, enabled: bool) {
+        self.dedup_global.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Set a per-namespace dedup override.
+    pub fn set_namespace_dedup(&self, ns: &str, enabled: bool) {
+        let mut overrides = self
+            .dedup_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides.insert(ns.to_owned(), enabled);
+    }
+
+    /// Remove a per-namespace dedup override, falling back to global config.
+    pub fn clear_namespace_dedup(&self, ns: &str) {
+        let mut overrides = self
+            .dedup_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides.remove(ns);
+    }
+
+    pub(crate) fn inc_dedup_checks(&self) {
+        self.dedup_checks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn inc_dedup_skips(&self) {
+        self.dedup_skips.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Load operation counters from `stats.meta`. Returns (0,0,0) if the file

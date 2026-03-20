@@ -500,22 +500,75 @@ dialog .dialog-actions {
 .ns-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  max-width: 400px;
+  gap: 6px;
+  max-width: 560px;
 }
 
 .ns-item {
   display: flex;
-  justify-content: space-between;
   align-items: center;
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 10px 14px;
+  gap: 10px;
+  transition: border-color 0.15s;
+}
+
+.ns-item:hover {
+  border-color: var(--accent);
 }
 
 .ns-item .ns-name {
   font-weight: bold;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ns-item .ns-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.ns-item .ns-actions button {
+  text-align: center;
+  padding: 6px 10px;
+}
+
+.ns-dedup-btn {
+  width: 68px;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.ns-dedup-btn.is-on {
+  color: var(--green);
+  border-color: var(--green);
+}
+
+.ns-dedup-btn.is-off {
+  color: var(--text-dim);
+  border-color: var(--border);
+}
+
+.ns-dedup-btn.is-on:hover {
+  background: rgba(102, 187, 106, 0.15);
+}
+
+.ns-dedup-btn.is-off:hover {
+  background: rgba(136, 146, 164, 0.1);
+}
+
+.ns-drop-btn {
+  padding: 6px 10px;
+  font-size: 12px;
 }
 
 /* ---- Toast ---- */

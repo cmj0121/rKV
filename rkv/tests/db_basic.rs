@@ -6648,3 +6648,365 @@ fn cache_hit_rate_zero_with_disabled_cache() {
         stats.cache_hit_rate
     );
 }
+
+// ── Dedup-on-write tests ───────────────────────────────────────────────
+
+#[test]
+fn dedup_basic_skips_identical_write() {
+    let mut config = Config::in_memory();
+    config.dedup = true;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let rev1 = ns.put("k", "v", None).unwrap();
+    let rev2 = ns.put("k", "v", None).unwrap();
+    assert_eq!(rev1, rev2, "identical write should return same revision");
+    assert_eq!(db.stats().dedup_skips, 1);
+    assert_eq!(
+        db.stats().op_puts,
+        1,
+        "deduped write should not increment op_puts"
+    );
+}
+
+#[test]
+fn dedup_different_value_proceeds() {
+    let mut config = Config::in_memory();
+    config.dedup = true;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let rev1 = ns.put("k", "v1", None).unwrap();
+    let rev2 = ns.put("k", "v2", None).unwrap();
+    assert_ne!(rev1, rev2, "different value should produce new revision");
+    assert_eq!(db.stats().dedup_skips, 0);
+}
+
+#[test]
+fn dedup_disabled_by_default() {
+    let config = Config::in_memory();
+    assert!(!config.dedup);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let rev1 = ns.put("k", "v", None).unwrap();
+    let rev2 = ns.put("k", "v", None).unwrap();
+    assert_ne!(
+        rev1, rev2,
+        "dedup off: identical write should produce new revision"
+    );
+    assert_eq!(db.stats().dedup_skips, 0);
+}
+
+#[test]
+fn dedup_skipped_when_new_write_has_ttl() {
+    let mut config = Config::in_memory();
+    config.dedup = true;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let rev1 = ns.put("k", "v", None).unwrap();
+    let rev2 = ns.put("k", "v", Some(Duration::from_secs(60))).unwrap();
+    assert_ne!(rev1, rev2, "TTL write should not be deduped");
+    assert_eq!(db.stats().dedup_skips, 0);
+}
+
+#[test]
+fn dedup_skipped_when_existing_has_ttl() {
+    let mut config = Config::in_memory();
+    config.dedup = true;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put("k", "v", Some(Duration::from_secs(3600))).unwrap();
+    let rev2 = ns.put("k", "v", None).unwrap();
+    // existing key has TTL, so dedup should not apply
+    assert_eq!(db.stats().dedup_skips, 0);
+    // Verify value is still there
+    assert_eq!(ns.get("k").unwrap(), Value::from("v"));
+    let _ = rev2;
+}
+
+#[test]
+fn dedup_per_namespace_override() {
+    let mut config = Config::in_memory();
+    config.dedup = false; // global off
+    let db = DB::open(config).unwrap();
+
+    // Enable dedup for namespace "a" only
+    db.set_namespace_dedup("a", true);
+    let ns_a = db.namespace("a", None).unwrap();
+    let ns_b = db.namespace("b", None).unwrap();
+
+    let rev_a1 = ns_a.put("k", "v", None).unwrap();
+    let rev_a2 = ns_a.put("k", "v", None).unwrap();
+    assert_eq!(rev_a1, rev_a2, "ns 'a' has dedup on");
+
+    let rev_b1 = ns_b.put("k", "v", None).unwrap();
+    let rev_b2 = ns_b.put("k", "v", None).unwrap();
+    assert_ne!(rev_b1, rev_b2, "ns 'b' uses global (off)");
+}
+
+#[test]
+fn dedup_clear_override_falls_back_to_global() {
+    let mut config = Config::in_memory();
+    config.dedup = true; // global on
+    let db = DB::open(config).unwrap();
+
+    db.set_namespace_dedup("_", false); // override off
+    assert!(!db.dedup_enabled("_"));
+    db.clear_namespace_dedup("_"); // remove override
+    assert!(db.dedup_enabled("_")); // falls back to global
+}
+
+#[test]
+fn dedup_batch_skips_identical_ops() {
+    let mut config = Config::in_memory();
+    config.dedup = true;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let rev1 = ns.put("k1", "v1", None).unwrap();
+    ns.put("k2", "v2", None).unwrap();
+
+    let batch = WriteBatch::new()
+        .put("k1", "v1", None) // same — dedup
+        .put("k2", "changed", None) // different — no dedup
+        .put("k3", "new", None); // new key — no dedup
+    let revs = ns.write_batch(batch).unwrap();
+
+    assert_eq!(
+        revs[0], rev1,
+        "batch dedup: same value returns existing rev"
+    );
+    assert_eq!(db.stats().dedup_skips, 1);
+    assert_eq!(ns.get("k2").unwrap(), Value::from("changed"));
+    assert_eq!(ns.get("k3").unwrap(), Value::from("new"));
+}
+
+#[test]
+fn dedup_delete_then_put_same_value() {
+    let mut config = Config::in_memory();
+    config.dedup = true;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put("k", "v", None).unwrap();
+    ns.delete("k").unwrap();
+    // Key is deleted — put should proceed (get_with_revision returns KeyNotFound)
+    let rev2 = ns.put("k", "v", None).unwrap();
+    assert_eq!(ns.get("k").unwrap(), Value::from("v"));
+    assert_eq!(db.stats().dedup_skips, 0);
+    let _ = rev2;
+}
+
+#[test]
+fn dedup_null_value() {
+    let mut config = Config::in_memory();
+    config.dedup = true;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let rev1 = ns.put("k", Value::Null, None).unwrap();
+    let rev2 = ns.put("k", Value::Null, None).unwrap();
+    assert_eq!(rev1, rev2, "Null value dedup should work");
+    assert_eq!(db.stats().dedup_skips, 1);
+}
+
+#[test]
+fn dedup_stats_counter_accumulates() {
+    let mut config = Config::in_memory();
+    config.dedup = true;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put("k", "v", None).unwrap();
+    for _ in 0..5 {
+        ns.put("k", "v", None).unwrap();
+    }
+    assert_eq!(db.stats().dedup_skips, 5);
+}
+
+#[test]
+fn dedup_per_request_override_on() {
+    // Global dedup OFF, but per-request dedup=true
+    let config = Config::in_memory();
+    assert!(!config.dedup);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let rev1 = ns.put("k", "v", None).unwrap();
+    let rev2 = ns.put_opt("k", "v", None, Some(true)).unwrap();
+    assert_eq!(
+        rev1, rev2,
+        "per-request dedup=true should skip identical write"
+    );
+    assert_eq!(db.stats().dedup_skips, 1);
+}
+
+#[test]
+fn dedup_per_request_override_off() {
+    // Global dedup ON, but per-request dedup=false forces write
+    let mut config = Config::in_memory();
+    config.dedup = true;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let rev1 = ns.put("k", "v", None).unwrap();
+    let rev2 = ns.put_opt("k", "v", None, Some(false)).unwrap();
+    assert_ne!(rev1, rev2, "per-request dedup=false should force write");
+    assert_eq!(db.stats().dedup_skips, 0);
+}
+
+#[test]
+fn dedup_per_request_none_uses_namespace() {
+    let mut config = Config::in_memory();
+    config.dedup = true;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let rev1 = ns.put("k", "v", None).unwrap();
+    let rev2 = ns.put_opt("k", "v", None, None).unwrap();
+    assert_eq!(
+        rev1, rev2,
+        "per-request dedup=None falls back to namespace setting"
+    );
+}
+
+#[test]
+fn dedup_batch_per_op_override() {
+    // Global dedup OFF
+    let config = Config::in_memory();
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let rev1 = ns.put("k1", "v1", None).unwrap();
+    ns.put("k2", "v2", None).unwrap();
+
+    let batch = WriteBatch::new()
+        .put_dedup("k1", "v1", None, Some(true)) // same + dedup on → skip
+        .put_dedup("k2", "v2", None, Some(false)) // same + dedup off → write
+        .put_dedup("k3", "new", None, Some(true)); // new key → write
+    let revs = ns.write_batch(batch).unwrap();
+
+    assert_eq!(revs[0], rev1, "batch per-op dedup=true skips identical");
+    assert_eq!(db.stats().dedup_skips, 1);
+    assert_eq!(ns.get("k3").unwrap(), Value::from("new"));
+}
+
+#[test]
+fn dedup_skipped_when_existing_ttl_flushed_to_sstable() {
+    // Key with TTL is flushed to SSTable. Dedup should NOT skip the write
+    // because the existing entry has a TTL (even though it's in SSTable, not memtable).
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path().join("db"));
+    config.dedup = true;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    // Write key with 1-hour TTL, then flush to SSTable
+    ns.put("k", "v", Some(Duration::from_secs(3600))).unwrap();
+    db.flush().unwrap();
+    db.wait_for_compaction();
+
+    // Now try dedup write without TTL — should NOT be deduped
+    // because the existing SSTable entry has a TTL
+    let rev1_rev = ns.put("k", "v", None).unwrap();
+    assert_eq!(
+        db.stats().dedup_skips,
+        0,
+        "should not dedup when SSTable entry has TTL"
+    );
+    let _ = rev1_rev;
+    db.close().unwrap();
+}
+
+#[test]
+fn dedup_checks_counter_tracks_attempts() {
+    let mut config = Config::in_memory();
+    config.dedup = true;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put("k", "v", None).unwrap();
+    // Second put triggers a dedup check (hit)
+    ns.put("k", "v", None).unwrap();
+    // Third put with different value triggers a dedup check (miss)
+    ns.put("k", "v2", None).unwrap();
+
+    let s = db.stats();
+    // All 3 puts trigger dedup checks (dedup is on): first = key not found,
+    // second = match (skip), third = different value (proceed)
+    assert_eq!(s.dedup_checks, 3, "three dedup checks attempted");
+    assert_eq!(s.dedup_skips, 1, "one dedup skip (identical value)");
+}
+
+#[test]
+fn dedup_checks_not_counted_when_disabled() {
+    let config = Config::in_memory();
+    assert!(!config.dedup);
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    ns.put("k", "v", None).unwrap();
+    ns.put("k", "v", None).unwrap();
+
+    assert_eq!(db.stats().dedup_checks, 0, "no checks when dedup disabled");
+}
+
+#[test]
+fn dedup_hash_fast_path_for_large_values() {
+    // Large values (> object_size) are stored as bin objects with BLAKE3 hash.
+    // Dedup should compare hashes without reading the full object from disk.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path().join("db"));
+    config.dedup = true;
+    config.object_size = 64; // low threshold to trigger value separation
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("_", None).unwrap();
+
+    let large_value = "x".repeat(128); // > object_size
+    let rev1 = ns.put("k", large_value.as_str(), None).unwrap();
+    db.flush().unwrap();
+    db.wait_for_compaction();
+
+    // Second put with same large value — should dedup via hash comparison
+    // (checks: 1 for initial put + 1 for this put = 2)
+    let rev2 = ns.put("k", large_value.as_str(), None).unwrap();
+    assert_eq!(rev1, rev2, "large value dedup via hash fast path");
+    assert_eq!(db.stats().dedup_skips, 1);
+    assert_eq!(db.stats().dedup_checks, 2);
+
+    // Different large value — should NOT dedup
+    let different = "y".repeat(128);
+    let rev3 = ns.put("k", different.as_str(), None).unwrap();
+    assert_ne!(rev2, rev3, "different large value proceeds");
+    assert_eq!(db.stats().dedup_checks, 3);
+    assert_eq!(db.stats().dedup_skips, 1);
+    db.close().unwrap();
+}
+
+#[test]
+fn dedup_with_encrypted_namespace() {
+    // Dedup compares raw plaintext before encryption — identical plaintext
+    // produces different ciphertext (nonce-based), so dedup must compare
+    // at the plaintext layer.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::new(tmp.path().join("db"));
+    config.dedup = true;
+    let db = DB::open(config).unwrap();
+    let ns = db.namespace("secret", Some("password123")).unwrap();
+
+    let rev1 = ns.put("k", "sensitive-data", None).unwrap();
+    let rev2 = ns.put("k", "sensitive-data", None).unwrap();
+    assert_eq!(rev1, rev2, "dedup should work with encrypted namespace");
+    assert_eq!(db.stats().dedup_skips, 1);
+
+    // Different value should proceed
+    let rev3 = ns.put("k", "different-data", None).unwrap();
+    assert_ne!(rev2, rev3);
+
+    // Verify data is readable and correct
+    assert_eq!(ns.get("k").unwrap(), Value::from("different-data"));
+    db.close().unwrap();
+}

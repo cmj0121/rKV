@@ -713,6 +713,13 @@ function setTtlHeader(headers, value) {
   }
 }
 
+function buildPutUrl(key, dedup) {
+  var url =
+    "/api/" + encodeURIComponent(state.ns) + "/keys/" + encodeURIComponent(key);
+  if (dedup) url += "?dedup=true";
+  return url;
+}
+
 function openCreateDialog() {
   showKeyDialog(
     "Create Key",
@@ -720,20 +727,14 @@ function openCreateDialog() {
     "",
     false,
     "",
-    function (key, value, expires) {
+    function (key, value, expires, dedup) {
       var opts = {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
       };
       if (expires) setTtlHeader(opts.headers, expires);
       opts.body = JSON.stringify(value);
-      fetch(
-        "/api/" +
-          encodeURIComponent(state.ns) +
-          "/keys/" +
-          encodeURIComponent(key),
-        opts,
-      )
+      fetch(buildPutUrl(key, dedup), opts)
         .then(function (r) {
           if (!r.ok)
             return r.text().then(function (t) {
@@ -757,20 +758,14 @@ function openEditDialog(key, currentValue, isNull, currentExpires) {
     valStr,
     isNull,
     currentExpires || "",
-    function (_k, value, expires) {
+    function (_k, value, expires, dedup) {
       var opts = {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
       };
       if (expires) setTtlHeader(opts.headers, expires);
       opts.body = JSON.stringify(value);
-      fetch(
-        "/api/" +
-          encodeURIComponent(state.ns) +
-          "/keys/" +
-          encodeURIComponent(key),
-        opts,
-      )
+      fetch(buildPutUrl(key, dedup), opts)
         .then(function (r) {
           if (!r.ok)
             return r.text().then(function (t) {
@@ -905,6 +900,13 @@ function showKeyDialog(title, keyVal, valueVal, isNull, expiresVal, onSubmit) {
   });
   dlg.appendChild(expInput);
 
+  var dedupBox = el("input", { type: "checkbox", id: "dedup-check" });
+  var dedupLabel = el("label", { className: "null-label" }, [
+    dedupBox,
+    document.createTextNode(" Dedup (skip if value unchanged)"),
+  ]);
+  dlg.appendChild(dedupLabel);
+
   var actions = el("div", { className: "dialog-actions" }, [
     el("button", {
       textContent: "Cancel",
@@ -929,7 +931,7 @@ function showKeyDialog(title, keyVal, valueVal, isNull, expiresVal, onSubmit) {
             : valInput.value;
         dlg.close();
         dlg.remove();
-        onSubmit(k, v, expInput.value.trim());
+        onSubmit(k, v, expInput.value.trim(), dedupBox.checked);
       },
     }),
   ]);
@@ -971,11 +973,39 @@ function renderAdmin(app) {
       adminAction("compact");
     },
   });
+  var dedupGlobalBtn = el("button", {
+    className: "ns-dedup-btn is-off",
+    id: "dedup-global-btn",
+    textContent: "Dedup",
+    title: "Global dedup: loading\u2026",
+    onClick: function () {
+      var cur = dedupGlobalBtn.classList.contains("is-on");
+      api("PUT", "/api/admin/dedup", { enabled: !cur })
+        .then(function () {
+          applyDedupStyle(dedupGlobalBtn, !cur);
+          toast("Global dedup " + (!cur ? "enabled" : "disabled"), true);
+        })
+        .catch(function (e) {
+          toast("Dedup: " + e.message);
+        });
+    },
+  });
+  api("GET", "/api/admin/config").then(function (r) {
+    applyDedupStyle(dedupGlobalBtn, r.data.dedup);
+  });
   var actions = el("div", { className: "toolbar" }, [
     flushBtn,
     syncBtn,
     compactBtn,
+    dedupGlobalBtn,
     el("button", { textContent: "Refresh", onClick: loadStats }),
+    el("button", {
+      className: "btn-blue",
+      textContent: "API Docs",
+      onClick: function () {
+        window.open("/docs", "_blank");
+      },
+    }),
   ]);
   app.appendChild(actions);
 
@@ -1011,6 +1041,8 @@ function loadStats() {
         ["Deletes", s.op_deletes],
         ["Cache Hits", s.cache_hits],
         ["Cache Misses", s.cache_misses],
+        ["Dedup Checks", s.dedup_checks],
+        ["Dedup Skips", s.dedup_skips],
         ["Peers", s.peer_count],
         ["Conflicts Resolved", s.conflicts_resolved],
         ["Uptime", s.uptime_secs + "s"],
@@ -1114,23 +1146,64 @@ function loadNsList() {
       }
       ns.forEach(function (name) {
         var dropBtn = el("button", {
-          className: "btn-red",
+          className: "btn-red ns-drop-btn",
           textContent: "Drop",
           onClick: function () {
             dropNs(name);
           },
         });
         if (state.role === "replica") dropBtn.disabled = true;
+        var dedupBtn = el("button", {
+          className: "ns-dedup-btn is-off",
+          textContent: "Dedup",
+          title: "Dedup: loading\u2026",
+          onClick: function () {
+            toggleNsDedup(name, dedupBtn);
+          },
+        });
+        // Load initial dedup state
+        (function (btn, nsName) {
+          api("GET", "/api/" + encodeURIComponent(nsName) + "/dedup").then(
+            function (r) {
+              applyDedupStyle(btn, r.data.dedup);
+            },
+          );
+        })(dedupBtn, name);
         list.appendChild(
           el("div", { className: "ns-item" }, [
             el("span", { className: "ns-name", textContent: name }),
-            dropBtn,
+            el("div", { className: "ns-actions" }, [dedupBtn, dropBtn]),
           ]),
         );
       });
     })
     .catch(function (e) {
       toast("Namespaces: " + e.message);
+    });
+}
+
+function applyDedupStyle(btn, isOn) {
+  btn.className = "ns-dedup-btn " + (isOn ? "is-on" : "is-off");
+  btn.title =
+    "Dedup: " +
+    (isOn ? "on \u2014 click to disable" : "off \u2014 click to enable");
+}
+
+function toggleNsDedup(nsName, btn) {
+  var current = btn.classList.contains("is-on");
+  var next = !current;
+  api("PUT", "/api/" + encodeURIComponent(nsName) + "/dedup", {
+    enabled: next,
+  })
+    .then(function () {
+      applyDedupStyle(btn, next);
+      toast(
+        "Dedup " + (next ? "enabled" : "disabled") + " for " + nsName,
+        true,
+      );
+    })
+    .catch(function (e) {
+      toast("Dedup: " + e.message);
     });
 }
 

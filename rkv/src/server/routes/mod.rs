@@ -9,7 +9,7 @@ mod ui;
 
 use std::sync::Arc;
 
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 
 use super::AppState;
@@ -61,6 +61,12 @@ pub fn router(state: Arc<AppState>, enable_ui: bool) -> Router {
         // Cluster admin
         .route("/api/admin/cluster", get(admin::get_cluster))
         .route("/api/admin/route", post(admin::set_route))
+        .route("/api/admin/dedup", put(admin::set_dedup))
+        // Per-namespace dedup
+        .route(
+            "/api/{ns}/dedup",
+            get(namespaces::get_ns_dedup).put(namespaces::set_ns_dedup),
+        )
         // Prometheus metrics endpoint
         .route("/metrics", get(admin::prometheus_metrics))
         .with_state(state);
@@ -69,7 +75,9 @@ pub fn router(state: Arc<AppState>, enable_ui: bool) -> Router {
         r = r
             .route("/ui", get(ui::index))
             .route("/ui/app.js", get(ui::app_js))
-            .route("/ui/style.css", get(ui::style_css));
+            .route("/ui/style.css", get(ui::style_css))
+            .route("/docs", get(ui::docs))
+            .route("/docs/openapi.yaml", get(ui::openapi_yaml));
     }
 
     r

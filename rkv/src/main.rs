@@ -713,6 +713,8 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
             println!("  op_deletes:        {}", s.op_deletes);
             println!("  cache_hits:        {}", s.cache_hits);
             println!("  cache_misses:      {}", s.cache_misses);
+            println!("  dedup_checks:      {}", s.dedup_checks);
+            println!("  dedup_skips:       {}", s.dedup_skips);
             println!("Replication:");
             println!("  role:              {}", s.role);
             println!("  peer_count:        {}", s.peer_count);
@@ -837,6 +839,13 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                     "  object.sync_interval",
                     "pack sync threshold (0 = per-record)",
                     c.object_sync_interval.to_string(),
+                ),
+                ("", "", String::new()),
+                ("Behavior", "", String::new()),
+                (
+                    "  storage.dedup",
+                    "skip duplicate writes",
+                    db.dedup().to_string(),
                 ),
                 ("", "", String::new()),
                 ("I/O", "", String::new()),
@@ -1052,6 +1061,32 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
         "batch" => {
             run_batch_mode(db, ns);
         }
+        "dedup" => {
+            if tokens.len() < 2 {
+                let enabled = db.dedup_enabled(ns.name());
+                println!("dedup: {enabled} (namespace: {})", ns.name());
+            } else {
+                match tokens[1] {
+                    "on" => {
+                        db.set_namespace_dedup(ns.name(), true);
+                        println!("OK (dedup enabled for namespace '{}')", ns.name());
+                    }
+                    "off" => {
+                        db.set_namespace_dedup(ns.name(), false);
+                        println!("OK (dedup disabled for namespace '{}')", ns.name());
+                    }
+                    "reset" => {
+                        db.clear_namespace_dedup(ns.name());
+                        println!(
+                            "OK (namespace '{}' using global dedup: {})",
+                            ns.name(),
+                            db.dedup()
+                        );
+                    }
+                    _ => eprintln!("usage: dedup [on|off|reset]"),
+                }
+            }
+        }
         "help" | "?" => {
             if let Some(cmd) = tokens.get(1) {
                 print_command_help(cmd);
@@ -1080,6 +1115,7 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
                 );
                 println!("  namespaces           List all namespaces");
                 println!("  drop <namespace>     Drop a namespace and all its data");
+                println!("  dedup [on|off|reset] View or set per-namespace dedup");
                 println!();
                 println!("Admin:");
                 println!("  stats                Print database statistics");
@@ -1111,6 +1147,18 @@ fn execute(db: &DB, ns: &Namespace<'_>, line: &str) -> Action {
 }
 
 fn set_config(db: &mut DB, key: &str, value: &str) {
+    // behavior.dedup needs both config_mut and set_dedup — handle before borrow
+    if key == "storage.dedup" {
+        match value.parse::<bool>() {
+            Ok(v) => {
+                db.config_mut().dedup = v;
+                db.set_dedup(v);
+                println!("OK");
+            }
+            Err(_) => eprintln!("error: expected true or false"),
+        }
+        return;
+    }
     let c = db.config_mut();
     match key {
         "storage.create_if_missing" => match value.parse::<bool>() {

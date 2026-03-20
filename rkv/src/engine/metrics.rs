@@ -365,6 +365,14 @@ pub(crate) fn render_prometheus(stats: &super::Stats, metrics: &Metrics) -> Stri
         stats.conflicts_resolved,
     );
 
+    // Dedup
+    out.push_str("# HELP rkv_dedup_checks_total Dedup checks attempted.\n");
+    out.push_str("# TYPE rkv_dedup_checks_total counter\n");
+    prom_counter(&mut out, "rkv_dedup_checks_total", stats.dedup_checks);
+    out.push_str("# HELP rkv_dedup_skips_total Writes skipped by dedup-on-write.\n");
+    out.push_str("# TYPE rkv_dedup_skips_total counter\n");
+    prom_counter(&mut out, "rkv_dedup_skips_total", stats.dedup_skips);
+
     // Gauges
     out.push_str("# HELP rkv_keys Current total keys in memtables.\n");
     out.push_str("# TYPE rkv_keys gauge\n");

@@ -146,6 +146,23 @@ function renderToolbar() {
       },
     }),
   );
+
+  toolbar.appendChild(
+    el("button", {
+      className: "btn btn-blue",
+      textContent: "API Docs",
+      onClick: function () {
+        window.open("/docs", "_blank");
+      },
+    }),
+  );
+}
+
+function setDedupStyle(btn, isOn) {
+  btn.className = "btn dedup-toggle " + (isOn ? "is-on" : "is-off");
+  btn.title =
+    "Dedup: " +
+    (isOn ? "on \u2014 click to disable" : "off \u2014 click to enable");
 }
 
 function renderQueues(app) {
@@ -272,6 +289,37 @@ function renderQueueList() {
             popMessage();
           },
         }),
+        (function () {
+          if (!canAdmin()) return document.createTextNode("");
+          var btn = el("button", {
+            className: "btn dedup-toggle btn-sm is-off",
+            textContent: "DEDUP",
+            title: "Loading\u2026",
+            onClick: function (e) {
+              e.stopPropagation();
+              var cur = btn.classList.contains("is-on");
+              api("PUT", "/queues/" + encodeURIComponent(name) + "/dedup", {
+                enabled: !cur,
+              })
+                .then(function () {
+                  setDedupStyle(btn, !cur);
+                  showToast(
+                    name + " dedup " + (!cur ? "enabled" : "disabled"),
+                    "success",
+                  );
+                })
+                .catch(function (e) {
+                  showToast("Dedup: " + e.message, "error");
+                });
+            },
+          });
+          api("GET", "/queues/" + encodeURIComponent(name) + "/dedup").then(
+            function (r) {
+              setDedupStyle(btn, r.data.dedup);
+            },
+          );
+          return btn;
+        })(),
         (function () {
           var btn = el("button", {
             className: canAdmin()

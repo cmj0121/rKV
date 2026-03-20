@@ -29,6 +29,8 @@ pub async fn get_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         "role": s.role,
         "peer_count": s.peer_count,
         "conflicts_resolved": s.conflicts_resolved,
+        "dedup_checks": s.dedup_checks,
+        "dedup_skips": s.dedup_skips,
         "level_stats": s.level_stats.iter().map(|l| {
             serde_json::json!({"file_count": l.file_count, "size_bytes": l.size_bytes})
         }).collect::<Vec<_>>(),
@@ -118,6 +120,7 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> Json<serde_json::
         "default_max_size": c.default_max_size,
         "shard_group": c.shard_group,
         "owned_namespaces": c.owned_namespaces,
+        "dedup": state.db.dedup(),
     }))
 }
 
@@ -141,6 +144,26 @@ pub async fn get_cluster(State(state): State<Arc<AppState>>) -> Json<serde_json:
             "routes": routes,
             "default_group": rt.default_group.id,
         },
+    }))
+}
+
+/// Request body for `PUT /api/admin/dedup`.
+#[derive(serde::Deserialize)]
+pub(crate) struct SetDedupRequest {
+    enabled: bool,
+}
+
+/// PUT /api/admin/dedup — set global dedup flag
+///
+/// Request body: `{"enabled": true}`
+pub async fn set_dedup(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SetDedupRequest>,
+) -> Json<serde_json::Value> {
+    state.db.set_dedup(body.enabled);
+    Json(serde_json::json!({
+        "ok": true,
+        "dedup": body.enabled,
     }))
 }
 

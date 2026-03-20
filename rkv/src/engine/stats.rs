@@ -32,4 +32,7 @@ pub struct Stats {
     pub role: String,
     pub peer_count: u64,
     pub conflicts_resolved: u64,
+    // Dedup
+    pub dedup_checks: u64,
+    pub dedup_skips: u64,
 }

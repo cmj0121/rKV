@@ -284,6 +284,48 @@ impl Backend {
             }
         }
     }
+    /// Get the dedup setting for a queue.
+    pub async fn queue_dedup(&self, name: &str) -> Result<bool, String> {
+        let ns_name = queue_ns(name);
+        match self {
+            Backend::Embed(db, _) => Ok(db.dedup_enabled(&ns_name)),
+            Backend::Remote(client) => {
+                let resp = client
+                    .client
+                    .get(format!("{}/api/{}/dedup", client.base_url, ns_name))
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+                Ok(json["dedup"].as_bool().unwrap_or(false))
+            }
+        }
+    }
+
+    /// Set the dedup flag for a queue.
+    pub async fn set_queue_dedup(&self, name: &str, enabled: bool) -> Result<(), String> {
+        let ns_name = queue_ns(name);
+        match self {
+            Backend::Embed(db, _) => {
+                db.set_namespace_dedup(&ns_name, enabled);
+                Ok(())
+            }
+            Backend::Remote(client) => {
+                let resp = client
+                    .client
+                    .put(format!("{}/api/{}/dedup", client.base_url, ns_name))
+                    .json(&serde_json::json!({ "enabled": enabled }))
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if !resp.status().is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(format!("set_queue_dedup failed: {body}"));
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -538,6 +538,7 @@ The `Config` struct controls database behavior and LSM tuning parameters:
 | `shard_group`          | `u16`             | 0          | Shard group ID (0 = standalone)            |
 | `owned_namespaces`     | `Vec<String>`     | `[]`       | Namespaces owned by this shard node        |
 | `in_memory`            | `bool`            | `false`    | Pure in-memory mode (no disk I/O)          |
+| `dedup`                | `bool`            | `false`    | Skip writes when value is unchanged        |
 
 The CLI uses dot-notation keys for `config <key> <value>`:
 
@@ -573,9 +574,32 @@ The CLI uses dot-notation keys for `config <key> <value>`:
 | `shard_group`          | `cluster.shard_group`           |
 | `owned_namespaces`     | `cluster.owned_namespaces`      |
 | `in_memory`            | `storage.in_memory` (read-only) |
+| `dedup`                | `storage.dedup`                 |
 
 `Config::new(path)` initializes all fields to their defaults. `Config::in_memory()` creates
 a pure in-memory configuration. Fields can be overridden before passing the config to `DB::open`.
+
+### Dedup-on-Write
+
+When `dedup` is enabled (`Config.dedup = true` or `config storage.dedup true`), `put()` compares
+the incoming value against the current value before writing. If the values are identical and neither
+the new write nor the existing key has a TTL, the write is skipped and the existing revision is
+returned. This eliminates unnecessary AOL entries, revision churn, and compaction work for workloads
+with idempotent writes (config stores, CDC retries, sensor data with stable readings).
+
+The dedup check runs **before** encryption and value separation, so it compares raw plaintext
+values even in encrypted namespaces. The check uses `get_with_revision()` internally, which means
+it reads from the memtable or SSTables — a minor overhead for the first read that is offset by
+the saved write I/O.
+
+Dedup can also be controlled per-namespace via `DB::set_namespace_dedup(ns, bool)`, which overrides
+the global config for that namespace. Use `DB::clear_namespace_dedup(ns)` to fall back to the
+global setting. In the CLI: `dedup on`, `dedup off`, or `dedup reset`.
+
+`WriteBatch` applies dedup per-op: each `Put` in the batch is checked individually, and deduped
+ops are excluded from the AOL append and memtable insert while preserving the 1:1 revision mapping.
+
+The `dedup_skips` counter in `Stats` tracks how many writes were skipped by dedup.
 
 ### I/O Modes
 
