@@ -2,10 +2,11 @@
 
 > Tie your data together.
 
-**Knot** is a schema-free, graph-based database built on rKV. It provides the simplest
-possible interface to store your data, make relationships between it, and query it.
-Without connections, Knot serves as a simple schema-free data store. With connections,
-it becomes a powerful graph database.
+**Knot** is a schema-free, graph-based, temporal database built on rKV. It provides the
+simplest possible interface to store your data, make relationships between it, and query
+it. Without connections, Knot serves as a simple schema-free data store. With connections,
+it becomes a powerful graph database. Every change is versioned — query the present or
+any point in the past.
 
 ## Concept
 
@@ -30,10 +31,11 @@ attached to nodes or links.
 
 ### As data store
 
-A **namespace** is an isolated environment, like a database. Within a namespace,
-**tables** group related nodes. Tables must be explicitly created before use and
-exist even when empty. Dropping a table deletes all its nodes, indexes, and any
-link tables that reference it.
+A **namespace** is an isolated environment, like a database. Namespaces must be
+explicitly created and can be dropped (which deletes everything within). Within a
+namespace, **tables** group related nodes. Tables must be explicitly created before
+use and exist even when empty. Dropping a table deletes all its nodes, indexes,
+and any link tables that reference it.
 
 Each node has a unique name (the primary key) within its table. The same name can
 exist in different tables — they are separate nodes.
@@ -45,13 +47,14 @@ exist in different tables — they are separate nodes.
 
 **Property values:**
 
-| Type    | Description                            | Indexable |
-| ------- | -------------------------------------- | --------- |
-| String  | UTF-8 text                             | Yes       |
-| Number  | Integer (i64) or floating point (f64)  | Yes       |
-| Boolean | true / false                           | Yes       |
-| Binary  | Raw bytes; large values auto-offloaded | No        |
-| Null    | Removes the property (null = missing)  | N/A       |
+| Type    | Description                            | Indexable     |
+| ------- | -------------------------------------- | ------------- |
+| String  | UTF-8 text                             | Yes           |
+| Number  | Integer (i64) or floating point (f64)  | Yes           |
+| Boolean | true / false                           | Yes           |
+| Binary  | Raw bytes; large values auto-offloaded | No            |
+| Geo     | Latitude/longitude point               | Yes (spatial) |
+| Null    | Removes the property (null = missing)  | N/A           |
 
 Setting a property to null removes it. Nodes without any properties act as a
 pure set — membership only, no data attached.
@@ -126,9 +129,9 @@ databases within the same Knot instance.
 
 ### Querying
 
-Nodes can be queried by their properties — find all persons where role is teacher,
-or where age is greater than 30. Queries target one table at a time; cross-table
-data discovery uses traversal.
+Nodes and links can be queried by their properties — find all persons where role
+is teacher, or all attends links where year is greater than 2019. Queries target
+one table at a time; cross-table data discovery uses traversal.
 
 | Operation  | Description                                                      |
 | ---------- | ---------------------------------------------------------------- |
@@ -152,6 +155,8 @@ data discovery uses traversal.
 | Not exists    | Property is missing (null)                  |
 | Pattern match | String prefix or wildcard match             |
 | In list       | Property matches one of several values      |
+| Near          | Geo property within a distance of a point   |
+| Within        | Geo property inside a bounding box          |
 
 Conditions can be combined with AND and OR. AND binds tighter than OR. Grouping
 overrides precedence.
@@ -247,6 +252,41 @@ Start from alice, discover up to 2 hops:
 | Direction       | Follows link direction; bidirectional links traversed both ways |
 | Result shape    | Destination nodes by default; full paths available on request   |
 | Pagination      | Same position-based cursor as queries                           |
+
+### Revision history and temporal queries
+
+Every node and link retains its full revision history. Each write creates a new
+revision with a timestamp — past versions are never lost.
+
+| Operation          | Description                                            |
+| ------------------ | ------------------------------------------------------ |
+| History            | List all revisions of a node or link                   |
+| Point-in-time      | Query a node or link as it was at a specific timestamp |
+| Temporal traversal | Traverse the graph pinned to a past timestamp          |
+
+Temporal traversal resolves every node and link at the specified time — follow
+links and read properties as they existed at that moment. This enables questions
+like "what schools did alice attend as of 2024-01-01?"
+
+Deleting a node preserves its revision history — temporal queries can still visit
+it at past timestamps. TTL expiry is different: it erases the node and all its
+history completely.
+
+Revision history also supports time-series patterns naturally. A node whose
+property is updated repeatedly over time (e.g., a sensor writing temperature
+readings) can be queried by time range — the revision history IS the time series.
+
+Revision history can be compacted — remove all revisions before a specified time
+to reclaim storage. Temporal queries before the compaction point return no results.
+
+### Reliability
+
+Knot is safe for concurrent access from multiple threads. Last write wins for
+conflicting updates to the same node or link.
+
+Writes are durable — data survives process crashes and restarts. On restart, Knot
+automatically recovers from incomplete operations. Corrupted data is detected and
+can be repaired.
 
 ### Why flat properties
 
