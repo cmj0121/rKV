@@ -32,7 +32,8 @@ attached to nodes or links.
 
 A **namespace** is an isolated environment, like a database. Within a namespace,
 **tables** group related nodes. Tables must be explicitly created before use and
-exist even when empty. Dropping a table deletes all its nodes and indexes.
+exist even when empty. Dropping a table deletes all its nodes, indexes, and any
+link tables that reference it.
 
 Each node has a unique name (the primary key) within its table. The same name can
 exist in different tables — they are separate nodes.
@@ -84,13 +85,23 @@ Knot becomes a graph database when you add **link tables**. A link table defines
 named relationship between two tables — connecting nodes from one table to nodes in
 another. Links can carry optional properties just like nodes.
 
-Link tables are declared with specific endpoints: `attends` connects `person → school`.
-Only person nodes can be the source and only school nodes can be the target. Multiple
-link tables can connect the same table pair, and a table can link to itself
-(e.g., `friends: person → person`). One link entry per (source, target) pair.
+**Link table rules:**
+
+- Declared with specific endpoints: `attends` connects `person → school`
+- Both endpoints must exist when creating a link — no dangling links
+- Multiple link tables can connect the same table pair
+- A table can link to itself (e.g., `friends: person → person`)
+- One link entry per (source, target) pair; duplicates overwrite (upsert)
+- For multiple instances of the same relationship, use an intermediate table
+  (e.g., `enrollment` between person and school for separate BS and MS records)
+- Link tables must be explicitly created and can be independently dropped
+- Dropping a link table removes its entries but does not affect connected data tables
+- Link tables can be listed when inspecting a namespace
 
 Links are directed by default (source → target). They can also be declared
-bidirectional, meaning they can be traversed in both directions.
+bidirectional, meaning they can be traversed in both directions. For bidirectional
+links, creating alice → bob also makes bob → alice queryable. Only one entry is
+stored; the reverse direction is derived automatically.
 
 ```text
 ┌───────────┐    teaches (course=cs101)   ┌───────────┐
@@ -105,6 +116,10 @@ bidirectional, meaning they can be traversed in both directions.
 │  (person) │
 └───────────┘
 ```
+
+**Link queries:** Link tables are queryable just like data tables — scan, query by
+properties, count, sort, projection, and pagination all work. Reverse lookup (given
+a target, find all sources) works on all link tables including directional ones.
 
 Namespaces provide physical isolation between independent datasets — like separate
 databases within the same Knot instance.
@@ -185,20 +200,18 @@ Nodes and links support the same set of operations:
 | Batch          | Multiple operations in one call              | Same — not a transaction        |
 
 Deleting a node **always** removes all links to and from it — no dangling links.
-
-Cascade delete has two levels of control:
-
-- **Schema-level** — a link table can declare cascade as mandatory. Deleting a node
-  always cascades through that link. Cannot be disabled per operation.
-- **Operation-level** — the caller chooses cascade at delete time. Default off.
+Cascade delete optionally propagates to connected nodes (default off, chosen per
+operation). A link table can also declare cascade as mandatory at schema level —
+deleting a node always cascades through that link, regardless of the operation flag.
 
 Batch operations execute in order but are not a transaction — a failure mid-batch
 does not roll back prior operations.
 
 ### Traversal
 
-Traversal is the core operation of a graph database — starting from a node, follow
-links to discover connected data. Knot supports two modes:
+Traversal is the core operation of a graph database — starting from a node or a
+set of nodes matching a query, follow links to discover connected data. Knot
+supports two modes:
 
 **Directed traversal** — you specify which links to follow, in order. Each step
 follows one link type.
@@ -229,9 +242,10 @@ Start from alice, discover up to 2 hops:
 | Behavior        | Description                                                     |
 | --------------- | --------------------------------------------------------------- |
 | Cycle detection | Each node visited at most once — no infinite loops              |
-| Link filtering  | Filter by link properties during traversal (e.g., year > 2019)  |
+| Link filtering  | Filter by link properties at each hop (e.g., year > 2019)       |
+| Node filtering  | Filter by destination node properties at each hop               |
 | Direction       | Follows link direction; bidirectional links traversed both ways |
-| Path tracking   | Results include the path taken, not just the destination        |
+| Result shape    | Destination nodes by default; full paths available on request   |
 | Pagination      | Same position-based cursor as queries                           |
 
 ### Why flat properties
