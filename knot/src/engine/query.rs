@@ -40,17 +40,11 @@ pub fn query_nodes(
     let ns = db.namespace(ns_name, None).map_err(error::storage)?;
 
     // Full scan — collect all matching nodes
-    let scan_prefix = match cursor {
-        Some(c) => Key::Str(c.to_owned()),
-        None => Key::Str(String::new()),
-    };
-
     let keys = ns
-        .scan(&scan_prefix, usize::MAX, 0, false)
+        .scan(&Key::Str(String::new()), usize::MAX, 0, false)
         .map_err(error::storage)?;
 
     let mut nodes = Vec::new();
-    let mut skip_cursor = cursor.is_some();
 
     for key in keys {
         let key_str = match key.as_str() {
@@ -58,10 +52,11 @@ pub fn query_nodes(
             None => continue,
         };
 
-        // Skip the cursor key itself (start after it)
-        if skip_cursor {
-            skip_cursor = false;
-            continue;
+        // Skip keys at or before cursor position
+        if let Some(c) = cursor {
+            if key_str <= c {
+                continue;
+            }
         }
 
         let value = match ns.get(key_str) {
