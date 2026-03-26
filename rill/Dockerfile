@@ -9,14 +9,17 @@ COPY Cargo.toml Cargo.lock ./
 COPY rkv/Cargo.toml rkv/Cargo.toml
 COPY rkv-ffi/Cargo.toml rkv-ffi/Cargo.toml
 COPY rill/Cargo.toml rill/Cargo.toml
+COPY knot/Cargo.toml knot/Cargo.toml
 
 # Stub lib files so cargo can resolve the workspace and cache dependencies
-RUN mkdir -p rkv/src rkv-ffi/src rill/src \
+RUN mkdir -p rkv/src rkv-ffi/src rill/src knot/src \
     && echo "fn main() {}" > rill/src/main.rs \
     && echo "" > rill/src/lib.rs \
     && echo "fn main() {}" > rkv/src/main.rs \
     && echo "" > rkv/src/lib.rs \
-    && echo "" > rkv-ffi/src/lib.rs
+    && echo "" > rkv-ffi/src/lib.rs \
+    && echo "fn main() {}" > knot/src/main.rs \
+    && echo "" > knot/src/lib.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
