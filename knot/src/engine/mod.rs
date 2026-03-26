@@ -1,3 +1,4 @@
+pub mod condition;
 pub mod error;
 pub mod link;
 mod metadata;
