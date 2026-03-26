@@ -3,3 +3,4 @@
 mod engine;
 
 pub use engine::error::{Error, Result};
+pub use engine::Knot;
