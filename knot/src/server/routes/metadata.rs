@@ -18,7 +18,7 @@ pub struct CreateTable {
 }
 
 pub async fn list_tables(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path(ns): Path<String>,
 ) -> Result<Json<Vec<String>>, (StatusCode, Json<ErrorBody>)> {
     state
@@ -37,7 +37,7 @@ pub async fn list_tables(
 }
 
 pub async fn create_table(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path(ns): Path<String>,
     Json(body): Json<CreateTable>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorBody>)> {
@@ -66,7 +66,7 @@ pub async fn create_table(
 }
 
 pub async fn drop_table(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path((ns, table)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
     state
@@ -106,7 +106,7 @@ pub struct AlterLink {
 }
 
 pub async fn list_links(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path(ns): Path<String>,
 ) -> Result<Json<Vec<String>>, (StatusCode, Json<ErrorBody>)> {
     state
@@ -125,7 +125,7 @@ pub async fn list_links(
 }
 
 pub async fn create_link(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path(ns): Path<String>,
     Json(body): Json<CreateLink>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ErrorBody>)> {
@@ -172,7 +172,7 @@ pub async fn create_link(
 }
 
 pub async fn drop_link(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path((ns, link)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
     state
@@ -191,7 +191,7 @@ pub async fn drop_link(
 }
 
 pub async fn alter_link(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path((ns, link)): Path<(String, String)>,
     Json(body): Json<AlterLink>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {

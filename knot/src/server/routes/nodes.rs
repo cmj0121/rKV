@@ -18,7 +18,7 @@ pub struct ScanParams {
 }
 
 pub async fn get_node(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path((ns, table, key)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     state
@@ -44,7 +44,7 @@ pub async fn get_node(
 }
 
 pub async fn put_node(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path((ns, table, key)): Path<(String, String, String)>,
     body: Option<Json<HashMap<String, serde_json::Value>>>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
@@ -72,7 +72,7 @@ pub async fn put_node(
 }
 
 pub async fn patch_node(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path((ns, table, key)): Path<(String, String, String)>,
     Json(map): Json<HashMap<String, serde_json::Value>>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
@@ -102,7 +102,7 @@ pub async fn patch_node(
 }
 
 pub async fn delete_node(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path((ns, table, key)): Path<(String, String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
@@ -126,7 +126,7 @@ pub async fn delete_node(
 }
 
 pub async fn head_node(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path((ns, table, key)): Path<(String, String, String)>,
 ) -> StatusCode {
     let Ok(()) = state.get_knot(&ns) else {
@@ -146,7 +146,7 @@ pub async fn head_node(
 }
 
 pub async fn scan_nodes(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path((ns, table)): Path<(String, String)>,
     Query(params): Query<ScanParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {

@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 
-use rkv::{Key, DB};
 use rmpv::Value as MsgValue;
 
-use super::error::{self, Result};
+use super::backend::Backend;
+use super::error::Result;
 
 /// In-memory catalog of tables, link tables, and indexes.
 #[derive(Debug, Default)]
@@ -34,23 +34,14 @@ pub struct LinkDef {
 impl Metadata {
     /// Load metadata from the rKV metadata namespace, rebuilding the in-memory
     /// catalog. Returns an empty catalog if the namespace is new.
-    pub fn load(db: &DB, namespace: &str) -> Result<Self> {
+    pub fn load(backend: &dyn Backend, namespace: &str) -> Result<Self> {
         let meta_ns = format!("knot.{namespace}.meta");
-        let ns = db.namespace(&meta_ns, None).map_err(error::storage)?;
 
         let mut meta = Self::default();
 
-        // Scan all keys in the metadata namespace
-        let keys = ns
-            .scan(&Key::Str(String::new()), usize::MAX, 0, false)
-            .map_err(error::storage)?;
+        let keys = backend.scan(&meta_ns, "", usize::MAX)?;
 
-        for key in keys {
-            let key_str = match key.as_str() {
-                Some(s) => s,
-                None => continue,
-            };
-
+        for key_str in &keys {
             if let Some(table_name) = key_str.strip_prefix("table:") {
                 meta.tables.insert(
                     table_name.to_owned(),
@@ -59,9 +50,10 @@ impl Metadata {
                     },
                 );
             } else if let Some(link_name) = key_str.strip_prefix("link:") {
-                let value = ns.get(key_str).map_err(error::storage)?;
-                if let Some(def) = Self::parse_link_def(link_name, &value) {
-                    meta.links.insert(link_name.to_owned(), def);
+                if let Some(value) = backend.get(&meta_ns, key_str)? {
+                    if let Some(def) = Self::parse_link_def(link_name, &value) {
+                        meta.links.insert(link_name.to_owned(), def);
+                    }
                 }
             }
         }

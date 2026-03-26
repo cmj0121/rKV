@@ -4,7 +4,7 @@ use super::parser::{Expr, SortSpec};
 use super::State;
 
 /// Execute a parsed expression against the Knot engine.
-pub fn execute(state: &mut State<'_>, expr: Expr) {
+pub fn execute(state: &mut State, expr: Expr) {
     match expr {
         Expr::InsertNode {
             table,
@@ -44,12 +44,7 @@ pub fn execute(state: &mut State<'_>, expr: Expr) {
     }
 }
 
-fn exec_insert_node(
-    state: &State<'_>,
-    table: &str,
-    key: &str,
-    properties: Option<knot::Properties>,
-) {
+fn exec_insert_node(state: &State, table: &str, key: &str, properties: Option<knot::Properties>) {
     let knot = state.knot().unwrap();
     let tbl = match knot.table(table) {
         Ok(t) => t,
@@ -69,7 +64,7 @@ fn exec_insert_node(
 }
 
 fn exec_insert_link(
-    state: &State<'_>,
+    state: &State,
     link: &str,
     from: &str,
     to: &str,
@@ -93,7 +88,7 @@ fn exec_insert_link(
     }
 }
 
-fn exec_delete_node(state: &State<'_>, table: &str, key: &str) {
+fn exec_delete_node(state: &State, table: &str, key: &str) {
     let knot = state.knot().unwrap();
     let tbl = match knot.table(table) {
         Ok(t) => t,
@@ -108,7 +103,7 @@ fn exec_delete_node(state: &State<'_>, table: &str, key: &str) {
     }
 }
 
-fn exec_cascade_delete_node(state: &State<'_>, table: &str, key: &str) {
+fn exec_cascade_delete_node(state: &State, table: &str, key: &str) {
     let knot = state.knot().unwrap();
     let tbl = match knot.table(table) {
         Ok(t) => t,
@@ -123,7 +118,7 @@ fn exec_cascade_delete_node(state: &State<'_>, table: &str, key: &str) {
     }
 }
 
-fn exec_delete_link(state: &State<'_>, link: &str, from: &str, to: &str) {
+fn exec_delete_link(state: &State, link: &str, from: &str, to: &str) {
     let knot = state.knot().unwrap();
     let lnk = match knot.link(link) {
         Ok(l) => l,
@@ -138,13 +133,13 @@ fn exec_delete_link(state: &State<'_>, link: &str, from: &str, to: &str) {
     }
 }
 
-fn exec_cascade_delete_link(state: &State<'_>, link: &str, from: &str, to: &str) {
+fn exec_cascade_delete_link(state: &State, link: &str, from: &str, to: &str) {
     // For now, cascade delete on link just deletes the link
     // Full cascade to target node would need more work
     exec_delete_link(state, link, from, to);
 }
 
-fn exec_get_node(state: &State<'_>, table: &str, key: &str) {
+fn exec_get_node(state: &State, table: &str, key: &str) {
     let knot = state.knot().unwrap();
     let tbl = match knot.table(table) {
         Ok(t) => t,
@@ -168,7 +163,7 @@ fn exec_get_node(state: &State<'_>, table: &str, key: &str) {
 }
 
 fn exec_query_nodes(
-    state: &State<'_>,
+    state: &State,
     table: &str,
     filter: Option<&knot::Condition>,
     sort: Option<&SortSpec>,
@@ -218,7 +213,7 @@ fn exec_query_nodes(
     }
 }
 
-fn exec_traverse(state: &State<'_>, table: &str, key: &str, hops: &[super::parser::TraversalHop]) {
+fn exec_traverse(state: &State, table: &str, key: &str, hops: &[super::parser::TraversalHop]) {
     let knot = state.knot().unwrap();
     let link_names: Vec<&str> = hops.iter().map(|h| h.link.as_str()).collect();
 
@@ -233,7 +228,7 @@ fn exec_traverse(state: &State<'_>, table: &str, key: &str, hops: &[super::parse
     }
 }
 
-fn exec_discover(state: &State<'_>, table: &str, key: &str, max_hops: usize, bidi: bool) {
+fn exec_discover(state: &State, table: &str, key: &str, max_hops: usize, bidi: bool) {
     let knot = state.knot().unwrap();
 
     match knot.discover(table, key, max_hops, bidi) {

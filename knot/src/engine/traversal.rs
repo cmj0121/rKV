@@ -17,7 +17,7 @@ pub struct TraversalResult {
 /// Directed traversal: follow a specified sequence of link tables.
 #[allow(dead_code)]
 pub fn directed(
-    knot: &Knot<'_>,
+    knot: &Knot,
     start_table: &str,
     start_key: &str,
     link_names: &[&str],
@@ -133,7 +133,7 @@ pub fn directed(
 /// Discovery traversal: follow all applicable links up to max_hops.
 #[allow(dead_code)]
 pub fn discovery(
-    knot: &Knot<'_>,
+    knot: &Knot,
     start_table: &str,
     start_key: &str,
     max_hops: usize,
@@ -212,7 +212,7 @@ pub fn discovery(
 fn filter_entries(
     entries: &[LinkEntry],
     link_filter: Option<&Condition>,
-    knot: &Knot<'_>,
+    knot: &Knot,
     target_table: &str,
     node_filter: Option<&Condition>,
 ) -> Result<Vec<LinkEntry>> {
@@ -229,15 +229,14 @@ fn filter_entries(
         // Node property filter
         if let Some(cond) = node_filter {
             let ns_name = format!("knot.{}.t.{target_table}", knot.namespace);
-            let ns = knot.db.namespace(&ns_name, None).map_err(error::storage)?;
-            match ns.get(entry.to.as_str()) {
-                Ok(rkv::Value::Data(bytes)) => {
+            match knot.backend.get(&ns_name, &entry.to)? {
+                Some(rkv::Value::Data(bytes)) => {
                     let props = super::property::decode_properties(&bytes)?;
                     if !condition::evaluate(cond, &props) {
                         continue;
                     }
                 }
-                _ => continue, // node doesn't exist or has no props — skip
+                _ => continue,
             }
         }
 

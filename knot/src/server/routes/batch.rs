@@ -46,7 +46,7 @@ pub enum BatchOp {
 }
 
 pub async fn batch(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path(ns): Path<String>,
     Json(body): Json<BatchRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
@@ -94,7 +94,7 @@ pub async fn batch(
 }
 
 fn exec_put(
-    knot: &crate::Knot<'_>,
+    knot: &crate::Knot,
     table: &str,
     key: &str,
     properties: Option<&HashMap<String, serde_json::Value>>,
@@ -113,7 +113,7 @@ fn exec_put(
 }
 
 fn exec_del(
-    knot: &crate::Knot<'_>,
+    knot: &crate::Knot,
     table: &str,
     key: &str,
     cascade: bool,
@@ -128,7 +128,7 @@ fn exec_del(
 }
 
 fn exec_put_link(
-    knot: &crate::Knot<'_>,
+    knot: &crate::Knot,
     link: &str,
     from: &str,
     to: &str,
@@ -148,7 +148,7 @@ fn exec_put_link(
 }
 
 fn exec_del_link(
-    knot: &crate::Knot<'_>,
+    knot: &crate::Knot,
     link: &str,
     from: &str,
     to: &str,

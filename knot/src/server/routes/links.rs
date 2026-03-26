@@ -10,7 +10,7 @@ use super::nodes::{json_map_to_props, props_to_json};
 use crate::server::AppState;
 
 pub async fn get_link(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path((ns, link, from, to)): Path<(String, String, String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
     state
@@ -37,7 +37,7 @@ pub async fn get_link(
 }
 
 pub async fn put_link(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path((ns, link, from, to)): Path<(String, String, String, String)>,
     body: Option<Json<HashMap<String, serde_json::Value>>>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
@@ -65,7 +65,7 @@ pub async fn put_link(
 }
 
 pub async fn delete_link(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path((ns, link, from, to)): Path<(String, String, String, String)>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
     state
@@ -90,7 +90,7 @@ pub struct LinkScanParams {
 }
 
 pub async fn scan_links(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path((ns, link)): Path<(String, String)>,
     Query(params): Query<LinkScanParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
