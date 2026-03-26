@@ -1,7 +1,11 @@
+use base64::Engine as _;
 use rkv::{RevisionID, Value};
 
 use super::backend::Backend;
 use super::error::{Error, Result};
+
+const B64: base64::engine::general_purpose::GeneralPurpose =
+    base64::engine::general_purpose::STANDARD;
 
 /// Remote backend — connects to an rKV HTTP server.
 pub struct RemoteBackend {
@@ -55,27 +59,40 @@ impl Backend for RemoteBackend {
             return Ok(Some(Value::Null));
         }
 
-        let bytes = res
-            .bytes()
-            .map_err(|e| Error::StorageError(e.to_string()))?;
+        let text = res.text().map_err(|e| Error::StorageError(e.to_string()))?;
 
-        if bytes.is_empty() {
-            Ok(Some(Value::Null))
-        } else {
-            Ok(Some(Value::Data(bytes.to_vec())))
+        // rKV returns JSON — values stored by Knot are base64 strings or "null"
+        let json: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| Error::StorageError(format!("json parse: {e}")))?;
+
+        match json {
+            serde_json::Value::Null => Ok(Some(Value::Null)),
+            serde_json::Value::String(s) => {
+                // Decode base64 → msgpack bytes
+                match B64.decode(&s) {
+                    Ok(bytes) => Ok(Some(Value::Data(bytes))),
+                    Err(_) => Ok(Some(Value::Data(s.into_bytes()))),
+                }
+            }
+            _ => Ok(Some(Value::Null)),
         }
     }
 
     fn put(&self, ns: &str, key: &str, value: Value) -> Result<()> {
-        let body = match &value {
-            Value::Data(bytes) => bytes.clone(),
-            Value::Null => vec![],
-            _ => vec![],
+        let json_body = match &value {
+            Value::Data(bytes) => {
+                // Encode binary data as base64 JSON string
+                let encoded = B64.encode(bytes);
+                serde_json::Value::String(encoded)
+            }
+            Value::Null => serde_json::Value::Null,
+            _ => serde_json::Value::Null,
         };
 
         self.client
             .put(self.url(&format!("{ns}/keys/{key}")))
-            .body(body)
+            .header("Content-Type", "application/json")
+            .json(&json_body)
             .send()
             .map_err(|e| Error::StorageError(e.to_string()))?;
         Ok(())
