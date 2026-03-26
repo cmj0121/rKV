@@ -46,6 +46,11 @@ pub fn build_router(state: Arc<AppState<'static>>) -> Router {
         .route("/", axum::routing::get(routes::ui::index))
         .route("/ui/app.js", axum::routing::get(routes::ui::app_js))
         .route("/ui/style.css", axum::routing::get(routes::ui::style_css))
+        .route("/docs", axum::routing::get(routes::ui::docs))
+        .route(
+            "/api/openapi.yaml",
+            axum::routing::get(routes::ui::openapi_yaml),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

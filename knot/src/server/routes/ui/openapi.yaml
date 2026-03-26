@@ -1,0 +1,303 @@
+openapi: "3.1.0"
+info:
+  title: Knot API
+  description: Schema-free, graph-based, temporal database
+  version: "0.1.0"
+paths:
+  /api/namespaces:
+    get:
+      summary: List namespaces
+      responses:
+        "200":
+          description: Array of namespace names
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+    post:
+      summary: Create namespace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+              required: [name]
+      responses:
+        "201":
+          description: Created
+  /api/{ns}/m/tables:
+    get:
+      summary: List tables
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: detail
+          in: query
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: Array of table names
+    post:
+      summary: Create table
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                if_not_exists:
+                  type: boolean
+              required: [name]
+      responses:
+        "201":
+          description: Created
+  /api/{ns}/m/tables/{table}:
+    delete:
+      summary: Drop table
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: table
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+  /api/{ns}/m/links:
+    get:
+      summary: List link tables
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Array of link table names
+    post:
+      summary: Create link table
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                source:
+                  type: string
+                target:
+                  type: string
+                bidirectional:
+                  type: boolean
+                cascade:
+                  type: boolean
+              required: [name, source, target]
+      responses:
+        "201":
+          description: Created
+  /api/{ns}/t/{table}/{key}:
+    get:
+      summary: Get node
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: table
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Node with properties
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  key:
+                    type: string
+                  properties:
+                    type: object
+                    nullable: true
+        "404":
+          description: Not found
+    put:
+      summary: Insert/replace node
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: table
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Properties map (null/empty for set mode)
+      responses:
+        "201":
+          description: Created
+    delete:
+      summary: Delete node
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: table
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: cascade
+          in: query
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: OK
+  /api/{ns}/t/{table}:
+    get:
+      summary: Scan/query/count nodes
+      parameters:
+        - name: ns
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: table
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: count
+          in: query
+          schema:
+            type: boolean
+        - name: detail
+          in: query
+          schema:
+            type: boolean
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Scan results or count
+  /api/{ns}/l/{link}/{from}/{to}:
+    get:
+      summary: Get link entry
+      responses:
+        "200":
+          description: Link entry with properties
+    put:
+      summary: Create/upsert link
+      responses:
+        "201":
+          description: Created
+    delete:
+      summary: Delete link
+      responses:
+        "200":
+          description: OK
+  /api/{ns}/l/{link}:
+    get:
+      summary: Scan links
+      parameters:
+        - name: from
+          in: query
+          schema:
+            type: string
+        - name: to
+          in: query
+          schema:
+            type: string
+        - name: detail
+          in: query
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: Scan results
+  /api/{ns}/batch:
+    post:
+      summary: Execute batch operations
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ops:
+                  type: array
+                  items:
+                    type: object
+      responses:
+        "200":
+          description: Batch results
+  /health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: OK
