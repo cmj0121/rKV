@@ -14,7 +14,7 @@ use axum::Router;
 
 use super::AppState;
 
-pub fn api_routes() -> Router<Arc<AppState<'static>>> {
+pub fn api_routes() -> Router<Arc<AppState>> {
     Router::new()
         // Namespace routes
         .route(

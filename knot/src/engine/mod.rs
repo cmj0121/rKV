@@ -1,5 +1,7 @@
+pub mod backend;
 mod cascade;
 pub mod condition;
+pub mod embedded;
 pub mod error;
 pub mod link;
 mod metadata;
@@ -9,43 +11,50 @@ pub mod revision;
 pub mod table;
 pub mod traversal;
 
-use rkv::DB;
+use std::sync::Arc;
 
+use backend::Backend;
 use error::Result;
 use metadata::Metadata;
 
-/// One Knot instance serves one namespace. Borrows an rKV `DB` reference.
-#[allow(dead_code)]
-pub struct Knot<'db> {
-    db: &'db DB,
-    namespace: String,
-    meta: Metadata,
+/// One Knot instance serves one namespace.
+pub struct Knot {
+    pub(crate) backend: Arc<dyn Backend>,
+    pub(crate) namespace: String,
+    pub(crate) meta: Metadata,
 }
 
-impl<'db> Knot<'db> {
-    /// Open or create a Knot namespace.
-    pub fn new(db: &'db DB, namespace: &str) -> Result<Self> {
+impl Knot {
+    /// Open or create a Knot namespace with a given backend.
+    pub fn open(backend: Arc<dyn Backend>, namespace: &str) -> Result<Self> {
         error::validate_name(namespace)?;
         let meta_ns = format!("knot.{namespace}.meta");
-        let _ = db.namespace(&meta_ns, None).map_err(error::storage)?;
-        let meta = Metadata::load(db, namespace)?;
+        backend.ensure_namespace(&meta_ns)?;
+        let meta = Metadata::load(&*backend, namespace)?;
         Ok(Self {
-            db,
+            backend,
             namespace: namespace.to_owned(),
             meta,
         })
     }
 
+    /// Open with an embedded rKV database (convenience).
+    ///
+    /// # Safety
+    /// The DB must outlive this Knot instance.
+    pub fn new(db: &rkv::DB, namespace: &str) -> Result<Self> {
+        let backend = Arc::new(unsafe { embedded::EmbeddedBackend::new(db) });
+        Self::open(backend, namespace)
+    }
+
     /// Returns the namespace name.
-    #[allow(dead_code)]
     pub fn namespace(&self) -> &str {
         &self.namespace
     }
 
-    /// Returns a reference to the underlying rKV database.
-    #[allow(dead_code)]
-    pub fn db(&self) -> &'db DB {
-        self.db
+    /// Returns the backend.
+    pub fn backend(&self) -> &dyn Backend {
+        &*self.backend
     }
 
     /// Directed traversal: follow a sequence of link tables from a start node.

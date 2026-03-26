@@ -8,17 +8,13 @@ mod repl;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("repl");
 
     match command {
         "serve" => run_server(&args),
         "repl" => run_repl(&args),
         "--help" | "-h" | "help" => print_usage(),
-        _ => {
-            // Default: treat first arg as path for REPL
-            run_repl(&args);
-        }
+        _ => run_repl(&args),
     }
 }
 
@@ -27,13 +23,9 @@ fn print_usage() {
         r#"knot — schema-free, graph-based, temporal database
 
 Usage:
-  knot repl [path]           Start interactive REPL (default)
-  knot serve [path] [--port PORT]  Start HTTP server
-  knot help                  Show this help
-
-Options:
-  path    Database directory (default: .knot-data)
-  --port  HTTP server port (default: 8400)
+  knot repl [path]                    Start interactive REPL (default)
+  knot serve [path] [--port PORT]     Start HTTP server (embedded rKV)
+  knot help                           Show this help
 "#
     );
 }
@@ -43,7 +35,6 @@ fn open_db(args: &[String], default_arg_pos: usize) -> (PathBuf, rkv::DB) {
         .get(default_arg_pos)
         .map(|s| s.to_owned())
         .unwrap_or_else(|| ".knot-data".to_owned());
-
     let path = PathBuf::from(&path);
     let config = rkv::Config::new(&path);
     let db = match rkv::DB::open(config) {
@@ -56,6 +47,10 @@ fn open_db(args: &[String], default_arg_pos: usize) -> (PathBuf, rkv::DB) {
     (path, db)
 }
 
+fn make_embedded_backend(db: &rkv::DB) -> Arc<dyn knot::engine::backend::Backend> {
+    Arc::new(unsafe { knot::engine::embedded::EmbeddedBackend::new(db) })
+}
+
 fn run_repl(args: &[String]) {
     let (_path, db) = open_db(
         args,
@@ -65,9 +60,9 @@ fn run_repl(args: &[String]) {
             1
         },
     );
-
+    let backend = make_embedded_backend(&db);
     let mut rl = DefaultEditor::new().expect("failed to create editor");
-    let mut state = repl::State::new(&db);
+    let mut state = repl::State::new(backend);
 
     loop {
         let prompt = state.prompt();
@@ -96,7 +91,6 @@ fn run_server(args: &[String]) {
     let mut port: u16 = 8400;
     let mut db_path_idx = 2;
 
-    // Parse --port flag
     let mut i = 2;
     while i < args.len() {
         if args[i] == "--port" {
@@ -114,10 +108,9 @@ fn run_server(args: &[String]) {
     }
 
     let (path, db) = open_db(args, db_path_idx);
-    // Leak the DB to get 'static lifetime for the server
     let db: &'static rkv::DB = Box::leak(Box::new(db));
-
-    let state = Arc::new(knot::server::AppState::new(db));
+    let backend = make_embedded_backend(db);
+    let state = Arc::new(knot::server::AppState::new(backend));
     let router = knot::server::build_router(state);
 
     println!("Knot server starting on http://0.0.0.0:{port}");

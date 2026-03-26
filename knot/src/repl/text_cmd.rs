@@ -1,7 +1,7 @@
 use super::{Action, State};
 
 /// Execute a text command (schema/navigation).
-pub fn execute(state: &mut State<'_>, line: &str) -> Action {
+pub fn execute(state: &mut State, line: &str) -> Action {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     if tokens.is_empty() {
         return Action::Continue;
@@ -72,7 +72,7 @@ fn print_help() {
     );
 }
 
-fn require_namespace<'a, 'db>(state: &'a State<'db>) -> Option<&'a knot::Knot<'db>> {
+fn require_namespace(state: &State) -> Option<&knot::Knot> {
     match state.knot() {
         Some(k) => Some(k),
         None => {
@@ -82,7 +82,7 @@ fn require_namespace<'a, 'db>(state: &'a State<'db>) -> Option<&'a knot::Knot<'d
     }
 }
 
-fn cmd_use(state: &mut State<'_>, tokens: &[&str]) {
+fn cmd_use(state: &mut State, tokens: &[&str]) {
     if tokens.len() < 2 {
         eprintln!("Usage: USE <namespace>");
         return;
@@ -93,13 +93,13 @@ fn cmd_use(state: &mut State<'_>, tokens: &[&str]) {
     }
 }
 
-fn cmd_namespaces(_state: &State<'_>) {
+fn cmd_namespaces(_state: &State) {
     // rKV doesn't have a "list namespaces" API that filters knot namespaces.
     // For now, print a message.
     eprintln!("ERROR: NAMESPACES not yet implemented");
 }
 
-fn cmd_create(state: &mut State<'_>, tokens: &[&str]) {
+fn cmd_create(state: &mut State, tokens: &[&str]) {
     if tokens.len() < 3 {
         eprintln!("Usage: CREATE TABLE|LINK|NAMESPACE <name> ...");
         return;
@@ -114,7 +114,7 @@ fn cmd_create(state: &mut State<'_>, tokens: &[&str]) {
     }
 }
 
-fn cmd_create_table(state: &mut State<'_>, tokens: &[&str]) {
+fn cmd_create_table(state: &mut State, tokens: &[&str]) {
     let knot = match state.knot_mut() {
         Some(k) => k,
         None => {
@@ -141,7 +141,7 @@ fn cmd_create_table(state: &mut State<'_>, tokens: &[&str]) {
     }
 }
 
-fn cmd_create_link(state: &mut State<'_>, tokens: &[&str]) {
+fn cmd_create_link(state: &mut State, tokens: &[&str]) {
     // CREATE LINK name source -> target [BIDI] [CASCADE]
     if tokens.len() < 6 {
         eprintln!("Usage: CREATE LINK <name> <source> -> <target> [BIDI] [CASCADE]");
@@ -184,7 +184,7 @@ fn cmd_create_link(state: &mut State<'_>, tokens: &[&str]) {
     }
 }
 
-fn cmd_create_namespace(state: &mut State<'_>, tokens: &[&str]) {
+fn cmd_create_namespace(state: &mut State, tokens: &[&str]) {
     let name = tokens[2];
     match state.use_namespace(name) {
         Ok(()) => println!("OK"),
@@ -192,7 +192,7 @@ fn cmd_create_namespace(state: &mut State<'_>, tokens: &[&str]) {
     }
 }
 
-fn cmd_drop(state: &mut State<'_>, tokens: &[&str]) {
+fn cmd_drop(state: &mut State, tokens: &[&str]) {
     if tokens.len() < 3 {
         eprintln!("Usage: DROP TABLE|LINK|NAMESPACE <name>");
         return;
@@ -233,7 +233,7 @@ fn cmd_drop(state: &mut State<'_>, tokens: &[&str]) {
     }
 }
 
-fn cmd_alter(state: &mut State<'_>, tokens: &[&str]) {
+fn cmd_alter(state: &mut State, tokens: &[&str]) {
     // ALTER LINK name CASCADE|BIDI
     if tokens.len() < 4 {
         eprintln!("Usage: ALTER LINK <name> CASCADE|BIDI");
@@ -271,7 +271,7 @@ fn cmd_alter(state: &mut State<'_>, tokens: &[&str]) {
     }
 }
 
-fn cmd_tables(state: &State<'_>) {
+fn cmd_tables(state: &State) {
     let knot = match require_namespace(state) {
         Some(k) => k,
         None => return,
@@ -284,7 +284,7 @@ fn cmd_tables(state: &State<'_>) {
     println!("({} tables)", tables.len());
 }
 
-fn cmd_links(state: &State<'_>) {
+fn cmd_links(state: &State) {
     let knot = match require_namespace(state) {
         Some(k) => k,
         None => return,

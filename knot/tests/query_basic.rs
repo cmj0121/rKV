@@ -7,7 +7,7 @@ fn temp_db() -> (tempfile::TempDir, rkv::DB) {
     (dir, db)
 }
 
-fn setup_people(db: &rkv::DB) -> Knot<'_> {
+fn setup_people(db: &rkv::DB) -> Knot {
     let mut knot = Knot::new(db, "test").unwrap();
     knot.create_table("person").unwrap();
 

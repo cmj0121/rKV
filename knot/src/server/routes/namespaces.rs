@@ -17,14 +17,14 @@ pub struct NamespaceInfo {
     pub name: String,
 }
 
-pub async fn list(State(state): State<Arc<AppState<'static>>>) -> Json<Vec<String>> {
+pub async fn list(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
     let ns = state.namespaces.read().unwrap();
     let names: Vec<String> = ns.keys().cloned().collect();
     Json(names)
 }
 
 pub async fn create(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Json(body): Json<CreateNamespace>,
 ) -> Result<(StatusCode, Json<NamespaceInfo>), (StatusCode, Json<ErrorBody>)> {
     state

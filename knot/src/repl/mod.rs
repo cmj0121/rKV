@@ -2,14 +2,16 @@ mod executor;
 pub mod parser;
 mod text_cmd;
 
-use knot::Knot;
-use rkv::DB;
+use std::sync::Arc;
 
-/// REPL state: holds the DB reference and current namespace.
-pub struct State<'db> {
-    db: &'db DB,
+use knot::engine::backend::Backend;
+use knot::Knot;
+
+/// REPL state: holds the backend and current namespace.
+pub struct State {
+    backend: Arc<dyn Backend>,
     namespace: Option<String>,
-    knot: Option<Knot<'db>>,
+    knot: Option<Knot>,
 }
 
 /// What the REPL should do after executing a command.
@@ -18,10 +20,10 @@ pub enum Action {
     Exit,
 }
 
-impl<'db> State<'db> {
-    pub fn new(db: &'db DB) -> Self {
+impl State {
+    pub fn new(backend: Arc<dyn Backend>) -> Self {
         Self {
-            db,
+            backend,
             namespace: None,
             knot: None,
         }
@@ -34,33 +36,28 @@ impl<'db> State<'db> {
         }
     }
 
-    /// Switch to a namespace, creating a Knot instance.
     pub fn use_namespace(&mut self, ns: &str) -> Result<(), knot::Error> {
-        let knot = Knot::new(self.db, ns)?;
+        let knot = Knot::open(self.backend.clone(), ns)?;
         self.namespace = Some(ns.to_owned());
         self.knot = Some(knot);
         Ok(())
     }
 
-    /// Get the current Knot instance, or print an error.
-    pub fn knot(&self) -> Option<&Knot<'db>> {
+    pub fn knot(&self) -> Option<&Knot> {
         self.knot.as_ref()
     }
 
-    /// Get a mutable reference to the current Knot instance.
-    pub fn knot_mut(&mut self) -> Option<&mut Knot<'db>> {
+    pub fn knot_mut(&mut self) -> Option<&mut Knot> {
         self.knot.as_mut()
     }
 }
 
 /// Execute a single REPL line.
-pub fn execute(state: &mut State<'_>, line: &str) -> Action {
+pub fn execute(state: &mut State, line: &str) -> Action {
     let trimmed = line.trim();
 
-    // Dispatch based on first character
     match trimmed.chars().next() {
         Some('?') | Some('+') | Some('-') => {
-            // Expression command — requires namespace
             if state.knot().is_none() {
                 eprintln!("ERROR: no namespace selected. Use: USE <namespace>");
                 return Action::Continue;
@@ -68,15 +65,12 @@ pub fn execute(state: &mut State<'_>, line: &str) -> Action {
             execute_expression(state, trimmed);
             Action::Continue
         }
-        Some(_) => {
-            // Text command
-            text_cmd::execute(state, trimmed)
-        }
+        Some(_) => text_cmd::execute(state, trimmed),
         None => Action::Continue,
     }
 }
 
-fn execute_expression(state: &mut State<'_>, line: &str) {
+fn execute_expression(state: &mut State, line: &str) {
     match parser::parse(line) {
         Ok(expr) => executor::execute(state, expr),
         Err(e) => eprintln!("ERROR: {e}"),

@@ -16,7 +16,7 @@ pub struct TraversalParams {
 }
 
 pub async fn directed(
-    State(state): State<Arc<AppState<'static>>>,
+    State(state): State<Arc<AppState>>,
     Path((ns, path)): Path<(String, String)>,
     Query(params): Query<TraversalParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
