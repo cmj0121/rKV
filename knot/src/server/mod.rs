@@ -42,6 +42,10 @@ pub fn build_router(state: Arc<AppState<'static>>) -> Router {
     Router::new()
         .nest("/api", routes::api_routes())
         .route("/health", axum::routing::get(routes::health::health))
+        // Web UI
+        .route("/", axum::routing::get(routes::ui::index))
+        .route("/ui/app.js", axum::routing::get(routes::ui::app_js))
+        .route("/ui/style.css", axum::routing::get(routes::ui::style_css))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

@@ -5,6 +5,7 @@ pub mod links;
 pub mod metadata;
 pub mod namespaces;
 pub mod nodes;
+pub mod ui;
 
 use std::sync::Arc;
 

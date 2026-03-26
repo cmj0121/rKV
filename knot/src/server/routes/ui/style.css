@@ -1,0 +1,149 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+  color: #222;
+  background: #f8f9fa;
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  grid-template-rows: 48px 1fr;
+  height: 100vh;
+}
+
+header {
+  grid-column: 1 / -1;
+  background: #1a1a2e;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  gap: 12px;
+}
+
+header h1 {
+  font-size: 18px;
+  font-weight: 600;
+}
+header .subtitle {
+  font-size: 12px;
+  opacity: 0.6;
+}
+
+nav {
+  background: #fff;
+  border-right: 1px solid #e0e0e0;
+  padding: 12px;
+  overflow-y: auto;
+}
+
+.nav-section {
+  margin-bottom: 16px;
+}
+.nav-section label {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: #888;
+  margin-bottom: 6px;
+}
+
+.nav-section select,
+.nav-section button {
+  font-size: 13px;
+  padding: 4px 8px;
+}
+
+.nav-section ul {
+  list-style: none;
+  padding: 0;
+}
+
+.nav-section li {
+  padding: 4px 8px;
+  cursor: pointer;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.nav-section li:hover {
+  background: #e8f0fe;
+}
+.nav-section li.active {
+  background: #d2e3fc;
+  font-weight: 600;
+}
+
+main {
+  padding: 16px;
+  overflow-y: auto;
+}
+
+#toolbar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+#toolbar select,
+#toolbar input,
+#toolbar button {
+  font-size: 13px;
+  padding: 6px 10px;
+}
+
+#toolbar input {
+  flex: 1;
+}
+
+#results {
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  padding: 12px;
+  min-height: 200px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+th {
+  font-weight: 600;
+  color: #555;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+tr:hover td {
+  background: #f8f9fa;
+}
+
+.empty {
+  color: #999;
+  font-style: italic;
+  padding: 20px;
+  text-align: center;
+}
+
+.badge {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  background: #e8f0fe;
+  color: #1a73e8;
+}
