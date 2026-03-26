@@ -2,20 +2,19 @@ const API = "/api";
 let currentNs = "";
 let currentTable = "";
 let currentLink = "";
+let currentView = "nodes";
 
-// --- Init ---
 document.addEventListener("DOMContentLoaded", () => {
   loadNamespaces();
   document.getElementById("ns-select").addEventListener("change", onNsChange);
-  document.getElementById("view-select").addEventListener("change", refresh);
 });
 
-// --- Namespace ---
+// ===== Namespace =====
 async function loadNamespaces() {
   const res = await fetch(`${API}/namespaces`);
   const names = await res.json();
   const sel = document.getElementById("ns-select");
-  sel.innerHTML = '<option value="">— select —</option>';
+  sel.innerHTML = '<option value="">choose...</option>';
   names.forEach((n) => {
     const opt = document.createElement("option");
     opt.value = n;
@@ -39,22 +38,18 @@ async function createNamespace() {
 
 async function onNsChange() {
   currentNs = document.getElementById("ns-select").value;
-  if (!currentNs) {
-    document.getElementById("tables-nav").style.display = "none";
-    document.getElementById("links-nav").style.display = "none";
-    document.getElementById("content").style.display = "none";
-    document.getElementById("welcome").style.display = "block";
-    return;
+  const show = !!currentNs;
+  document.getElementById("tables-nav").style.display = show ? "" : "none";
+  document.getElementById("links-nav").style.display = show ? "" : "none";
+  document.getElementById("content").style.display = show ? "" : "none";
+  document.getElementById("welcome").style.display = show ? "none" : "";
+  if (show) {
+    await loadTables();
+    await loadLinks();
   }
-  document.getElementById("welcome").style.display = "none";
-  document.getElementById("content").style.display = "block";
-  document.getElementById("tables-nav").style.display = "block";
-  document.getElementById("links-nav").style.display = "block";
-  await loadTables();
-  await loadLinks();
 }
 
-// --- Tables ---
+// ===== Tables =====
 async function loadTables() {
   const res = await fetch(`${API}/${currentNs}/m/tables`);
   const tables = await res.json();
@@ -89,13 +84,13 @@ async function createTable() {
 function selectTable(name) {
   currentTable = name;
   currentLink = "";
-  document.getElementById("view-select").value = "nodes";
+  switchView("nodes");
   loadTables();
   loadLinks();
   refresh();
 }
 
-// --- Links ---
+// ===== Links =====
 async function loadLinks() {
   const res = await fetch(`${API}/${currentNs}/m/links`);
   const links = await res.json();
@@ -119,7 +114,6 @@ async function createLink() {
   const target = prompt("Target table:");
   if (!target) return;
   const bidi = confirm("Bidirectional?");
-
   const res = await fetch(`${API}/${currentNs}/m/links`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -136,21 +130,29 @@ async function createLink() {
 function selectLink(name) {
   currentLink = name;
   currentTable = "";
-  document.getElementById("view-select").value = "links";
+  switchView("links");
   loadTables();
   loadLinks();
   refresh();
 }
 
-// --- Add Node ---
+// ===== View Switching =====
+function switchView(view) {
+  currentView = view;
+  document.querySelectorAll(".tab").forEach((t) => {
+    t.classList.toggle("active", t.dataset.view === view);
+  });
+  refresh();
+}
+
+// ===== Add Node / Link =====
 async function addNode() {
   if (!currentTable) return alert("Select a table first");
   const key = prompt("Node key:");
   if (!key) return;
   const propsStr = prompt(
-    'Properties (JSON, e.g. {"age":30} or empty for set mode):',
+    'Properties as JSON (e.g. {"age":30}) or leave empty:',
   );
-
   let body = null;
   if (propsStr && propsStr.trim()) {
     try {
@@ -159,28 +161,25 @@ async function addNode() {
       return alert("Invalid JSON: " + e.message);
     }
   }
-
   const res = await fetch(`${API}/${currentNs}/t/${currentTable}/${key}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : null,
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "request failed" }));
+    const err = await res.json().catch(() => ({ error: "failed" }));
     return alert("Error: " + err.error);
   }
   refresh();
 }
 
-// --- Add Link Entry ---
 async function addLink() {
   if (!currentLink) return alert("Select a link table first");
   const from = prompt("From key:");
   if (!from) return;
   const to = prompt("To key:");
   if (!to) return;
-  const propsStr = prompt("Properties (JSON or empty):");
-
+  const propsStr = prompt("Properties as JSON or leave empty:");
   let body = null;
   if (propsStr && propsStr.trim()) {
     try {
@@ -189,7 +188,6 @@ async function addLink() {
       return alert("Invalid JSON: " + e.message);
     }
   }
-
   const res = await fetch(
     `${API}/${currentNs}/l/${currentLink}/${from}/${to}`,
     {
@@ -199,41 +197,38 @@ async function addLink() {
     },
   );
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "request failed" }));
+    const err = await res.json().catch(() => ({ error: "failed" }));
     return alert("Error: " + err.error);
   }
   refresh();
 }
 
-// --- Refresh ---
+// ===== Refresh =====
 async function refresh() {
-  const view = document.getElementById("view-select").value;
-  const results = document.getElementById("results");
-
-  if (view === "nodes" && currentTable) {
-    await showNodes(results);
-  } else if (view === "links" && currentLink) {
-    await showLinkEntries(results);
-  } else if (view === "traverse") {
-    await showTraverseForm(results);
+  const el = document.getElementById("results");
+  if (currentView === "nodes" && currentTable) {
+    await showNodes(el);
+  } else if (currentView === "links" && currentLink) {
+    await showLinkEntries(el);
+  } else if (currentView === "traverse") {
+    showTraverseForm(el);
   } else {
-    results.innerHTML =
-      '<div class="empty">Select a table or link from the sidebar</div>';
+    el.innerHTML =
+      '<div class="empty">Select a table or link table from the sidebar.</div>';
   }
 }
 
+// ===== Nodes =====
 async function showNodes(el) {
   const res = await fetch(
-    `${API}/${currentNs}/t/${currentTable}?detail=true&limit=50`,
+    `${API}/${currentNs}/t/${currentTable}?detail=true&limit=100`,
   );
   const data = await res.json();
-
   if (!data.entries || data.entries.length === 0) {
     el.innerHTML =
-      '<div class="empty">No nodes in this table. Click "+ Node" to add one.</div>';
+      '<div class="empty">Empty table. Click <b>+ Node</b> to insert.</div>';
     return;
   }
-
   const allKeys = new Set();
   data.entries.forEach((e) => {
     if (e.properties) Object.keys(e.properties).forEach((k) => allKeys.add(k));
@@ -241,108 +236,108 @@ async function showNodes(el) {
   const keys = [...allKeys].sort();
 
   let html = "<table><thead><tr><th>Key</th>";
-  keys.forEach((k) => {
-    html += `<th>${esc(k)}</th>`;
-  });
+  keys.forEach((k) => (html += `<th>${esc(k)}</th>`));
   html += "<th></th></tr></thead><tbody>";
-
   data.entries.forEach((e) => {
     html += `<tr><td><strong>${esc(e.key)}</strong></td>`;
     keys.forEach((k) => {
       const v = e.properties ? e.properties[k] : null;
       html += `<td>${
-        v !== null && v !== undefined
+        v != null
           ? esc(String(v))
-          : '<span class="empty">—</span>'
+          : '<span style="color:var(--text-muted)">—</span>'
       }</td>`;
     });
-    html += `<td><button class="btn-sm btn-danger" onclick="deleteNode('${esc(
+    html += `<td><button class="btn-del" onclick="deleteNode('${esc(
       e.key,
-    )}')">×</button></td>`;
-    html += "</tr>";
+    )}')">✕</button></td></tr>`;
   });
-
   html += "</tbody></table>";
-  if (data.has_more)
-    html +=
-      '<p style="margin-top:8px;color:#666">More results available...</p>';
+  html += `<div class="count-bar">${data.entries.length} node${
+    data.entries.length !== 1 ? "s" : ""
+  }${data.has_more ? " (more available)" : ""}</div>`;
   el.innerHTML = html;
 }
 
+// ===== Links =====
 async function showLinkEntries(el) {
-  // Try scanning from all known source nodes — show first available
   const tablesRes = await fetch(`${API}/${currentNs}/m/tables`);
   const tables = await tablesRes.json();
-
   let allEntries = [];
   for (const t of tables) {
-    const nodesRes = await fetch(`${API}/${currentNs}/t/${t}?limit=50`);
-    const nodesData = await nodesRes.json();
-    if (!nodesData.keys) continue;
-
-    for (const key of nodesData.keys) {
-      const linksRes = await fetch(
+    const nr = await fetch(`${API}/${currentNs}/t/${t}?limit=100`);
+    const nd = await nr.json();
+    if (!nd.keys) continue;
+    for (const key of nd.keys) {
+      const lr = await fetch(
         `${API}/${currentNs}/l/${currentLink}?from=${encodeURIComponent(
           key,
         )}&detail=true`,
       );
-      if (!linksRes.ok) continue;
-      const linksData = await linksRes.json();
-      if (linksData.entries) allEntries.push(...linksData.entries);
+      if (!lr.ok) continue;
+      const ld = await lr.json();
+      if (ld.entries) allEntries.push(...ld.entries);
     }
     if (allEntries.length > 0) break;
   }
-
   if (allEntries.length === 0) {
     el.innerHTML =
-      '<div class="empty">No link entries. Click "+ Link" to add one.</div>';
+      '<div class="empty">No link entries. Click <b>+ Link</b> to create.</div>';
     return;
   }
-
   const allKeys = new Set();
   allEntries.forEach((e) => {
     if (e.properties) Object.keys(e.properties).forEach((k) => allKeys.add(k));
   });
   const keys = [...allKeys].sort();
-
   let html = "<table><thead><tr><th>From</th><th>To</th>";
-  keys.forEach((k) => {
-    html += `<th>${esc(k)}</th>`;
-  });
+  keys.forEach((k) => (html += `<th>${esc(k)}</th>`));
   html += "<th></th></tr></thead><tbody>";
-
   allEntries.forEach((e) => {
-    html += `<tr><td>${esc(e.from)}</td><td>${esc(e.to)}</td>`;
+    html += `<tr><td><strong>${esc(e.from)}</strong></td><td><strong>${esc(
+      e.to,
+    )}</strong></td>`;
     keys.forEach((k) => {
       const v = e.properties ? e.properties[k] : null;
       html += `<td>${
-        v !== null && v !== undefined
+        v != null
           ? esc(String(v))
-          : '<span class="empty">—</span>'
+          : '<span style="color:var(--text-muted)">—</span>'
       }</td>`;
     });
-    html += `<td><button class="btn-sm btn-danger" onclick="deleteLinkEntry('${esc(
+    html += `<td><button class="btn-del" onclick="deleteLinkEntry('${esc(
       e.from,
-    )}','${esc(e.to)}')">×</button></td>`;
-    html += "</tr>";
+    )}','${esc(e.to)}')">✕</button></td></tr>`;
   });
-
   html += "</tbody></table>";
+  html += `<div class="count-bar">${allEntries.length} link${
+    allEntries.length !== 1 ? "s" : ""
+  }</div>`;
   el.innerHTML = html;
 }
 
-async function showTraverseForm(el) {
+// ===== Traverse =====
+function showTraverseForm(el) {
   el.innerHTML = `
-    <div style="max-width:500px">
-      <h3>Traverse</h3>
-      <p style="margin:8px 0;color:#666">Follow links from a starting node.</p>
-      <label>Table: <input id="tr-table" type="text" value="${esc(
-        currentTable,
-      )}" /></label><br/>
-      <label>Key: <input id="tr-key" type="text" placeholder="alice" /></label><br/>
-      <label>Links (comma-separated): <input id="tr-links" type="text" placeholder="attends,located-in" /></label><br/>
-      <button class="btn-primary" onclick="doTraverse()" style="margin-top:8px">Traverse</button>
-      <div id="tr-results" style="margin-top:12px"></div>
+    <div class="traverse-form">
+      <h3>Graph Traversal</h3>
+      <p>Follow links from a starting node to discover connected data.</p>
+      <div class="form-field">
+        <label>Start Table</label>
+        <input id="tr-table" type="text" value="${esc(
+          currentTable,
+        )}" placeholder="person" />
+      </div>
+      <div class="form-field">
+        <label>Start Key</label>
+        <input id="tr-key" type="text" placeholder="alice" />
+      </div>
+      <div class="form-field">
+        <label>Links (comma-separated)</label>
+        <input id="tr-links" type="text" placeholder="attends, located-in" />
+      </div>
+      <button class="action-btn" onclick="doTraverse()" style="margin-top:4px">Traverse</button>
+      <div id="tr-results"></div>
     </div>`;
 }
 
@@ -351,7 +346,6 @@ async function doTraverse() {
   const key = document.getElementById("tr-key").value;
   const links = document.getElementById("tr-links").value;
   if (!table || !key || !links) return alert("Fill all fields");
-
   const path = links
     .split(",")
     .map((s) => s.trim())
@@ -361,29 +355,27 @@ async function doTraverse() {
   );
   const data = await res.json();
   const el = document.getElementById("tr-results");
-
   if (data.leaves && data.leaves.length > 0) {
-    let html = "<strong>Results:</strong><ul>";
-    data.leaves.forEach((l) => {
-      html += `<li>${esc(l)}</li>`;
-    });
+    let html =
+      '<div class="traverse-results"><strong>Destinations</strong><ul>';
+    data.leaves.forEach((l) => (html += `<li>${esc(l)}</li>`));
     html += "</ul>";
     if (data.paths) {
-      html += "<strong>Paths:</strong><ul>";
-      data.paths.forEach((p) => {
-        html += `<li>${p.map(esc).join(" → ")}</li>`;
-      });
+      html += "<strong>Paths</strong><ul>";
+      data.paths.forEach((p) => (html += `<li>${p.map(esc).join(" → ")}</li>`));
       html += "</ul>";
     }
+    html += "</div>";
     el.innerHTML = html;
   } else {
-    el.innerHTML = '<div class="empty">No results</div>';
+    el.innerHTML =
+      '<div class="traverse-results empty">No results found.</div>';
   }
 }
 
-// --- Delete ---
+// ===== Delete =====
 async function deleteNode(key) {
-  if (!confirm(`Delete node "${key}"?`)) return;
+  if (!confirm(`Delete "${key}"?`)) return;
   await fetch(`${API}/${currentNs}/t/${currentTable}/${key}`, {
     method: "DELETE",
   });
@@ -391,7 +383,7 @@ async function deleteNode(key) {
 }
 
 async function deleteLinkEntry(from, to) {
-  if (!confirm(`Delete link ${from} → ${to}?`)) return;
+  if (!confirm(`Delete ${from} → ${to}?`)) return;
   await fetch(`${API}/${currentNs}/l/${currentLink}/${from}/${to}`, {
     method: "DELETE",
   });
