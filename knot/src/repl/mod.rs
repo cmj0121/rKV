@@ -1,3 +1,4 @@
+mod executor;
 pub mod parser;
 mod text_cmd;
 
@@ -75,7 +76,9 @@ pub fn execute(state: &mut State<'_>, line: &str) -> Action {
     }
 }
 
-fn execute_expression(_state: &mut State<'_>, _line: &str) {
-    // TODO: implement expression parsing
-    eprintln!("ERROR: expression commands not yet implemented");
+fn execute_expression(state: &mut State<'_>, line: &str) {
+    match parser::parse(line) {
+        Ok(expr) => executor::execute(state, expr),
+        Err(e) => eprintln!("ERROR: {e}"),
+    }
 }
