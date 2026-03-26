@@ -1,0 +1,14 @@
+[package]
+name = "knot"
+version = "0.1.0"
+edition = "2021"
+description = "Schema-free, graph-based, temporal database built on rKV"
+
+[dependencies]
+rkv = { path = "../rkv" }
+rmp-serde = "1"
+rmpv = "1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
