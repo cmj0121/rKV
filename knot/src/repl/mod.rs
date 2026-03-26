@@ -1,3 +1,4 @@
+pub mod parser;
 mod text_cmd;
 
 use knot::Knot;
