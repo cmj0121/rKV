@@ -10,6 +10,7 @@
     <header>
       <h1>Knot</h1>
       <span class="subtitle">schema-free · graph · temporal</span>
+      <a href="/docs" class="header-link">API Docs</a>
     </header>
 
     <nav id="nav">
@@ -21,11 +22,16 @@
         <button onclick="createNamespace()">+</button>
       </div>
       <div class="nav-section" id="tables-nav" style="display: none">
-        <label>Tables</label>
+        <label
+          >Tables
+          <button class="btn-sm" onclick="createTable()">+</button></label
+        >
         <ul id="tables-list"></ul>
       </div>
       <div class="nav-section" id="links-nav" style="display: none">
-        <label>Links</label>
+        <label
+          >Links <button class="btn-sm" onclick="createLink()">+</button></label
+        >
         <ul id="links-list"></ul>
       </div>
     </nav>
@@ -41,6 +47,8 @@
             <option value="links">Links</option>
             <option value="traverse">Traverse</option>
           </select>
+          <button class="btn-primary" onclick="addNode()">+ Node</button>
+          <button class="btn-primary" onclick="addLink()">+ Link</button>
           <input id="search" type="text" placeholder="key or filter..." />
           <button onclick="refresh()">Refresh</button>
         </div>

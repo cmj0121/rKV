@@ -139,6 +139,70 @@ tr:hover td {
   text-align: center;
 }
 
+.btn-sm {
+  font-size: 11px;
+  padding: 1px 6px;
+  cursor: pointer;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  background: #fff;
+}
+
+.btn-sm:hover {
+  background: #f0f0f0;
+}
+
+.btn-primary {
+  background: #1a73e8;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.btn-primary:hover {
+  background: #1557b0;
+}
+
+.btn-danger {
+  color: #d93025;
+  border-color: #d93025;
+}
+
+.btn-danger:hover {
+  background: #fce8e6;
+}
+
+.header-link {
+  margin-left: auto;
+  color: #aaa;
+  text-decoration: none;
+  font-size: 13px;
+}
+
+.header-link:hover {
+  color: #fff;
+}
+
+label {
+  display: block;
+  margin: 6px 0 4px;
+  font-size: 13px;
+}
+
+label input {
+  margin-left: 4px;
+  padding: 4px 8px;
+  font-size: 13px;
+}
+
+h3 {
+  font-size: 16px;
+  margin-bottom: 8px;
+}
+
 .badge {
   display: inline-block;
   padding: 2px 6px;
