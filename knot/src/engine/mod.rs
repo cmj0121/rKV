@@ -1,5 +1,6 @@
 pub mod error;
 mod metadata;
+pub mod property;
 
 use rkv::DB;
 

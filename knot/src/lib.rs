@@ -3,4 +3,5 @@
 mod engine;
 
 pub use engine::error::{Error, Result};
+pub use engine::property::{Node, Properties, PropertyValue};
 pub use engine::Knot;
