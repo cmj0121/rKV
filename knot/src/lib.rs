@@ -3,5 +3,6 @@
 mod engine;
 
 pub use engine::error::{Error, Result};
+pub use engine::link::LinkEntry;
 pub use engine::property::{Node, Properties, PropertyValue};
 pub use engine::Knot;
