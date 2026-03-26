@@ -1,6 +1,7 @@
 //! Knot — schema-free, graph-based, temporal database built on rKV.
 
-mod engine;
+pub mod engine;
+pub mod server;
 
 pub use engine::condition::Condition;
 pub use engine::error::{Error, Result};

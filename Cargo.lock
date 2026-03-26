@@ -1311,12 +1311,16 @@ dependencies = [
 name = "knot"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "rkv",
  "rmp-serde",
  "rmpv",
  "rustyline 14.0.0",
  "serde",
+ "serde_json",
  "tempfile",
+ "tokio",
+ "tower-http",
 ]
 
 [[package]]
