@@ -22,6 +22,14 @@ impl<'k, 'db> Table<'k, 'db> {
         }
     }
 
+    pub(crate) fn knot(&self) -> &'k Knot<'db> {
+        self.knot
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
     /// rKV namespace for this table.
     fn rkv_ns(&self) -> String {
         format!("knot.{}.t.{}", self.knot.namespace, self.name)

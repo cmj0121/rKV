@@ -5,6 +5,7 @@ pub mod link;
 mod metadata;
 pub mod property;
 pub mod query;
+pub mod revision;
 pub mod table;
 pub mod traversal;
 
