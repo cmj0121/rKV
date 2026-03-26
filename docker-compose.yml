@@ -112,6 +112,23 @@ services:
       primary:
         condition: service_healthy
 
+  # --- Knot graph database (launches by default alongside primary) ---
+  knot:
+    build:
+      context: .
+      dockerfile: knot/Dockerfile
+    platform: linux/amd64
+    ports:
+      - "8400:8400"
+    volumes:
+      - .data/knot:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8400/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
   # --- Cluster mode (docker compose --profile cluster up) ---
   # Adds 2 shard groups alongside the primary/replicas.
   # Primary serves as the default shard (all unassigned namespaces).
