@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Knot — Explorer</title>
+    <link rel="stylesheet" href="/ui/style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Knot</h1>
+      <span class="subtitle">schema-free · graph · temporal</span>
+    </header>
+
+    <nav id="nav">
+      <div class="nav-section">
+        <label>Namespace</label>
+        <select id="ns-select">
+          <option value="">— select —</option>
+        </select>
+        <button onclick="createNamespace()">+</button>
+      </div>
+      <div class="nav-section" id="tables-nav" style="display: none">
+        <label>Tables</label>
+        <ul id="tables-list"></ul>
+      </div>
+      <div class="nav-section" id="links-nav" style="display: none">
+        <label>Links</label>
+        <ul id="links-list"></ul>
+      </div>
+    </nav>
+
+    <main id="main">
+      <div id="welcome">
+        <p>Select a namespace to begin exploring.</p>
+      </div>
+      <div id="content" style="display: none">
+        <div id="toolbar">
+          <select id="view-select">
+            <option value="nodes">Nodes</option>
+            <option value="links">Links</option>
+            <option value="traverse">Traverse</option>
+          </select>
+          <input id="search" type="text" placeholder="key or filter..." />
+          <button onclick="refresh()">Refresh</button>
+        </div>
+        <div id="results"></div>
+      </div>
+    </main>
+
+    <script src="/ui/app.js"></script>
+  </body>
+</html>
