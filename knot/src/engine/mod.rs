@@ -6,6 +6,7 @@ mod metadata;
 pub mod property;
 pub mod query;
 pub mod table;
+pub mod traversal;
 
 use rkv::DB;
 
