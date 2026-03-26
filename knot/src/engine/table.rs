@@ -1,8 +1,10 @@
 use rkv::Value;
 
+use super::condition::Condition;
 use super::error::{self, Error, Result};
 use super::metadata::TableDef;
 use super::property::{self, Node, Properties, PropertyValue};
+use super::query::{self, Page, Sort};
 use super::Knot;
 
 /// Handle to a data table within a Knot namespace.
@@ -169,6 +171,31 @@ impl<'k, 'db> Table<'k, 'db> {
             Err(rkv::Error::KeyNotFound) => Ok(()), // no-op
             Err(e) => Err(error::storage(e)),
         }
+    }
+
+    /// Query nodes with optional filter, sort, projection, and pagination.
+    pub fn query(
+        &self,
+        filter: Option<&Condition>,
+        sort: Option<&Sort>,
+        projection: Option<&[String]>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Page> {
+        query::query_nodes(
+            self.knot.db,
+            &self.rkv_ns(),
+            filter,
+            sort,
+            projection,
+            limit,
+            cursor,
+        )
+    }
+
+    /// Count nodes, optionally filtered.
+    pub fn count(&self, filter: Option<&Condition>) -> Result<u64> {
+        query::count_nodes(self.knot.db, &self.rkv_ns(), filter)
     }
 }
 

@@ -3,6 +3,7 @@ pub mod error;
 pub mod link;
 mod metadata;
 pub mod property;
+pub mod query;
 pub mod table;
 
 use rkv::DB;
