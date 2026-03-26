@@ -46,4 +46,36 @@ impl<'db> Knot<'db> {
     pub fn db(&self) -> &'db DB {
         self.db
     }
+
+    /// Directed traversal: follow a sequence of link tables from a start node.
+    pub fn traverse(
+        &self,
+        start_table: &str,
+        start_key: &str,
+        link_names: &[&str],
+        link_filter: Option<&condition::Condition>,
+        node_filter: Option<&condition::Condition>,
+        with_paths: bool,
+    ) -> Result<traversal::TraversalResult> {
+        traversal::directed(
+            self,
+            start_table,
+            start_key,
+            link_names,
+            link_filter,
+            node_filter,
+            with_paths,
+        )
+    }
+
+    /// Discovery traversal: follow all applicable links up to max_hops.
+    pub fn discover(
+        &self,
+        start_table: &str,
+        start_key: &str,
+        max_hops: usize,
+        bidi: bool,
+    ) -> Result<traversal::TraversalResult> {
+        traversal::discovery(self, start_table, start_key, max_hops, bidi)
+    }
 }
