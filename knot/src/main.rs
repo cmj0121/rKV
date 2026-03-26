@@ -23,9 +23,15 @@ fn print_usage() {
         r#"knot — schema-free, graph-based, temporal database
 
 Usage:
-  knot repl [path]                    Start interactive REPL (default)
-  knot serve [path] [--port PORT]     Start HTTP server (embedded rKV)
-  knot help                           Show this help
+  knot repl [path]                              Start interactive REPL (embedded)
+  knot serve [path] [--port PORT]               Start HTTP server (embedded rKV)
+  knot serve --remote <rkv-url> [--port PORT]   Start HTTP server (remote rKV)
+  knot help                                     Show this help
+
+Options:
+  path       Database directory (default: .knot-data)
+  --port     HTTP server port (default: 8400)
+  --remote   Connect to a remote rKV server instead of embedded
 "#
     );
 }
@@ -89,32 +95,56 @@ fn run_repl(args: &[String]) {
 
 fn run_server(args: &[String]) {
     let mut port: u16 = 8400;
-    let mut db_path_idx = 2;
+    let mut remote_url: Option<String> = None;
+    let mut db_path_idx: Option<usize> = None;
 
     let mut i = 2;
     while i < args.len() {
-        if args[i] == "--port" {
-            if let Some(p) = args.get(i + 1) {
-                port = p.parse().unwrap_or_else(|_| {
-                    eprintln!("ERROR: invalid port: {p}");
+        match args[i].as_str() {
+            "--port" => {
+                if let Some(p) = args.get(i + 1) {
+                    port = p.parse().unwrap_or_else(|_| {
+                        eprintln!("ERROR: invalid port: {p}");
+                        std::process::exit(1);
+                    });
+                    i += 2;
+                    continue;
+                }
+            }
+            "--remote" => {
+                if let Some(url) = args.get(i + 1) {
+                    remote_url = Some(url.clone());
+                    i += 2;
+                    continue;
+                } else {
+                    eprintln!("ERROR: --remote requires a URL");
                     std::process::exit(1);
-                });
-                i += 2;
-                continue;
+                }
+            }
+            _ => {
+                db_path_idx = Some(i);
             }
         }
-        db_path_idx = i;
         i += 1;
     }
 
-    let (path, db) = open_db(args, db_path_idx);
-    let db: &'static rkv::DB = Box::leak(Box::new(db));
-    let backend = make_embedded_backend(db);
+    let (backend, mode_label): (Arc<dyn knot::engine::backend::Backend>, String) =
+        if let Some(url) = &remote_url {
+            let backend = Arc::new(knot::engine::remote::RemoteBackend::new(url));
+            (backend, format!("remote ({url})"))
+        } else {
+            let path_idx = db_path_idx.unwrap_or(2);
+            let (path, db) = open_db(args, path_idx);
+            let db: &'static rkv::DB = Box::leak(Box::new(db));
+            let backend = make_embedded_backend(db);
+            (backend, format!("embedded ({})", path.display()))
+        };
+
     let state = Arc::new(knot::server::AppState::new(backend));
     let router = knot::server::build_router(state);
 
     println!("Knot server starting on http://0.0.0.0:{port}");
-    println!("  Database: {}", path.display());
+    println!("  Backend:  {mode_label}");
     println!("  UI:       http://localhost:{port}/");
     println!("  API:      http://localhost:{port}/api/");
     println!("  Docs:     http://localhost:{port}/docs");

@@ -112,7 +112,7 @@ services:
       primary:
         condition: service_healthy
 
-  # --- Knot graph database (launches by default alongside primary) ---
+  # --- Knot graph database (remote backend to primary rKV) ---
   knot:
     build:
       context: .
@@ -120,14 +120,16 @@ services:
     platform: linux/amd64
     ports:
       - "8400:8400"
-    volumes:
-      - .data/knot:/data
+    command: ["serve", "--remote", "http://primary:8321", "--port", "8400"]
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8400/health"]
       interval: 10s
       timeout: 3s
       retries: 3
       start_period: 10s
+    depends_on:
+      primary:
+        condition: service_healthy
 
   # --- Cluster mode (docker compose --profile cluster up) ---
   # Adds 2 shard groups alongside the primary/replicas.
