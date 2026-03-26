@@ -36,11 +36,15 @@ pub fn node_history(knot: &Knot<'_>, table_name: &str, key: &str) -> Result<Vec<
     Ok(revisions)
 }
 
-/// Get the number of revisions for a node.
+/// Get the number of revisions for a node. Returns 0 if key doesn't exist.
 pub fn node_rev_count(knot: &Knot<'_>, table_name: &str, key: &str) -> Result<u64> {
     let ns_name = format!("knot.{}.t.{table_name}", knot.namespace);
     let ns = knot.db.namespace(&ns_name, None).map_err(error::storage)?;
-    ns.rev_count(key).map_err(error::storage)
+    match ns.rev_count(key) {
+        Ok(count) => Ok(count),
+        Err(rkv::Error::KeyNotFound) => Ok(0),
+        Err(e) => Err(error::storage(e)),
+    }
 }
 
 /// Get a node at a specific revision index.
