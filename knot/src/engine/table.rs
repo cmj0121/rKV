@@ -1,5 +1,6 @@
 use rkv::Value;
 
+use super::cascade;
 use super::condition::Condition;
 use super::error::{self, Error, Result};
 use super::metadata::TableDef;
@@ -156,8 +157,7 @@ impl<'k, 'db> Table<'k, 'db> {
         }
     }
 
-    /// Delete a node. No-op if node does not exist.
-    /// Note: link cleanup is handled by the cascade controller (not here).
+    /// Delete a node (raw — no link cleanup). No-op if not found.
     pub fn delete(&self, key: &str) -> Result<()> {
         error::validate_key(key)?;
         let ns = self
@@ -171,6 +171,14 @@ impl<'k, 'db> Table<'k, 'db> {
             Err(rkv::Error::KeyNotFound) => Ok(()), // no-op
             Err(e) => Err(error::storage(e)),
         }
+    }
+
+    /// Delete a node with link cleanup and optional cascade.
+    /// Always removes all links to/from the node.
+    /// If cascade=true, connected nodes are also deleted recursively.
+    pub fn delete_cascade(&self, key: &str, do_cascade: bool) -> Result<()> {
+        error::validate_key(key)?;
+        cascade::delete_node(self.knot, &self.name, key, do_cascade)
     }
 
     /// Query nodes with optional filter, sort, projection, and pagination.
