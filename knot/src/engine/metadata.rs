@@ -42,7 +42,7 @@ impl Metadata {
 
         // Scan all keys in the metadata namespace
         let keys = ns
-            .scan(&Key::Str(String::new()), 0, 0, false)
+            .scan(&Key::Str(String::new()), usize::MAX, 0, false)
             .map_err(error::storage)?;
 
         for key in keys {

@@ -213,8 +213,8 @@ impl<'k, 'db> Link<'k, 'db> {
         let keys = ns
             .scan(
                 &rkv::Key::Str(scan_prefix),
-                0, // no limit
-                0, // no offset
+                usize::MAX, // unlimited
+                0,
                 false,
             )
             .map_err(error::storage)?;
