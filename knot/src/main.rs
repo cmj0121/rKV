@@ -32,6 +32,12 @@ Options:
   path       Database directory (default: .knot-data)
   --port     HTTP server port (default: 8400)
   --remote   Connect to a remote rKV server instead of embedded
+
+Environment variables:
+  KNOT_RKV_MODE    "remote" to use remote backend
+  KNOT_RKV_URL     Remote rKV server URL (required when mode=remote)
+  KNOT_PORT        HTTP server port (default: 8400)
+  KNOT_STORAGE_PATH  Database directory for embedded mode
 "#
     );
 }
@@ -94,10 +100,21 @@ fn run_repl(args: &[String]) {
 }
 
 fn run_server(args: &[String]) {
-    let mut port: u16 = 8400;
-    let mut remote_url: Option<String> = None;
-    let mut db_path_idx: Option<usize> = None;
+    // Env vars (lowest priority, overridden by CLI args)
+    let mut port: u16 = std::env::var("KNOT_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8400);
+    let mut remote_url: Option<String> = std::env::var("KNOT_RKV_URL").ok();
+    let mut db_path: Option<String> = std::env::var("KNOT_STORAGE_PATH").ok();
 
+    // If KNOT_RKV_MODE=remote, require KNOT_RKV_URL
+    if std::env::var("KNOT_RKV_MODE").ok().as_deref() == Some("remote") && remote_url.is_none() {
+        eprintln!("ERROR: KNOT_RKV_MODE=remote requires KNOT_RKV_URL");
+        std::process::exit(1);
+    }
+
+    // CLI args (highest priority)
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -122,7 +139,7 @@ fn run_server(args: &[String]) {
                 }
             }
             _ => {
-                db_path_idx = Some(i);
+                db_path = Some(args[i].clone());
             }
         }
         i += 1;
@@ -133,8 +150,16 @@ fn run_server(args: &[String]) {
             let backend = Arc::new(knot::engine::remote::RemoteBackend::new(url));
             (backend, format!("remote ({url})"))
         } else {
-            let path_idx = db_path_idx.unwrap_or(2);
-            let (path, db) = open_db(args, path_idx);
+            let path = db_path.unwrap_or_else(|| ".knot-data".to_owned());
+            let path = PathBuf::from(&path);
+            let config = rkv::Config::new(&path);
+            let db = match rkv::DB::open(config) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("ERROR: failed to open database at {}: {e}", path.display());
+                    std::process::exit(1);
+                }
+            };
             let db: &'static rkv::DB = Box::leak(Box::new(db));
             let backend = make_embedded_backend(db);
             (backend, format!("embedded ({})", path.display()))

@@ -120,7 +120,10 @@ services:
     platform: linux/amd64
     ports:
       - "8400:8400"
-    command: ["serve", "--remote", "http://primary:8321", "--port", "8400"]
+    environment:
+      KNOT_RKV_MODE: "remote"
+      KNOT_RKV_URL: "http://primary:8321"
+      KNOT_PORT: "8400"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8400/health"]
       interval: 10s
