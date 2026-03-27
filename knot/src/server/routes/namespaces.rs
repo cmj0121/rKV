@@ -18,9 +18,7 @@ pub struct NamespaceInfo {
 }
 
 pub async fn list(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
-    let ns = state.namespaces.read().unwrap();
-    let names: Vec<String> = ns.keys().cloned().collect();
-    Json(names)
+    Json(state.discover_namespaces())
 }
 
 pub async fn create(

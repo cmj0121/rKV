@@ -37,4 +37,7 @@ pub trait Backend: Send + Sync {
 
     /// Get the current revision ID for a key.
     fn get_revision_id(&self, ns: &str, key: &str) -> Result<RevisionID>;
+
+    /// List all rKV namespaces matching a prefix. Used to discover knot namespaces.
+    fn list_namespaces(&self, prefix: &str) -> Result<Vec<String>>;
 }
