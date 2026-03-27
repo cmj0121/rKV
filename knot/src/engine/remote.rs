@@ -194,4 +194,15 @@ impl Backend for RemoteBackend {
         // Remote backend cannot easily get revision IDs — return ZERO
         Ok(RevisionID::ZERO)
     }
+
+    fn list_namespaces(&self, prefix: &str) -> Result<Vec<String>> {
+        let res = self
+            .client
+            .get(format!("{}/api/namespaces", self.base_url))
+            .send()
+            .map_err(|e| Error::StorageError(e.to_string()))?;
+
+        let all: Vec<String> = res.json().map_err(|e| Error::StorageError(e.to_string()))?;
+        Ok(all.into_iter().filter(|n| n.starts_with(prefix)).collect())
+    }
 }

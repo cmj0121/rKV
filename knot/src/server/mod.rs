@@ -33,6 +33,35 @@ impl AppState {
         write.insert(ns.to_owned(), knot);
         Ok(())
     }
+
+    /// Discover all existing knot namespaces from the backend.
+    /// Scans for rKV namespaces matching `knot.*.meta` pattern.
+    pub fn discover_namespaces(&self) -> Vec<String> {
+        let all = match self.backend.list_namespaces("knot.") {
+            Ok(ns) => ns,
+            Err(_) => return Vec::new(),
+        };
+        let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for ns_name in &all {
+            // Parse knot.{namespace}.meta → extract {namespace}
+            if let Some(rest) = ns_name.strip_prefix("knot.") {
+                if let Some(name) = rest.strip_suffix(".meta") {
+                    names.insert(name.to_owned());
+                }
+            }
+        }
+
+        // Also include any already-loaded namespaces
+        let loaded = self.namespaces.read().unwrap();
+        for key in loaded.keys() {
+            names.insert(key.clone());
+        }
+
+        let mut result: Vec<String> = names.into_iter().collect();
+        result.sort();
+        result
+    }
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {

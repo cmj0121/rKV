@@ -113,4 +113,9 @@ impl Backend for EmbeddedBackend {
             Err(_) => Ok(RevisionID::ZERO),
         }
     }
+
+    fn list_namespaces(&self, prefix: &str) -> Result<Vec<String>> {
+        let all = self.db().list_namespaces().map_err(error::storage)?;
+        Ok(all.into_iter().filter(|n| n.starts_with(prefix)).collect())
+    }
 }
