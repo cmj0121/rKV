@@ -26,11 +26,15 @@ async function loadNamespaces() {
 async function createNamespace() {
   const name = prompt("Namespace name:");
   if (!name) return;
-  await fetch(`${API}/namespaces`, {
+  const res = await fetch(`${API}/namespaces`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name }),
   });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: "request failed" }));
+    return alert("Error creating namespace: " + err.error);
+  }
   await loadNamespaces();
   document.getElementById("ns-select").value = name;
   onNsChange();
@@ -74,7 +78,7 @@ async function createTable() {
     body: JSON.stringify({ name }),
   });
   if (!res.ok) {
-    const err = await res.json();
+    const err = await res.json().catch(() => ({ error: "request failed" }));
     return alert("Error: " + err.error);
   }
   await loadTables();
@@ -120,7 +124,7 @@ async function createLink() {
     body: JSON.stringify({ name, source, target, bidirectional: bidi }),
   });
   if (!res.ok) {
-    const err = await res.json();
+    const err = await res.json().catch(() => ({ error: "request failed" }));
     return alert("Error: " + err.error);
   }
   await loadLinks();
@@ -147,7 +151,12 @@ function switchView(view) {
 
 // ===== Add Node / Link =====
 async function addNode() {
-  if (!currentTable) return alert("Select a table first");
+  if (!currentNs) return alert("Select a namespace first");
+  let table = currentTable;
+  if (!table) {
+    table = prompt("Table name:");
+    if (!table) return;
+  }
   const key = prompt("Node key:");
   if (!key) return;
   const propsStr = prompt(
@@ -161,21 +170,31 @@ async function addNode() {
       return alert("Invalid JSON: " + e.message);
     }
   }
-  const res = await fetch(`${API}/${currentNs}/t/${currentTable}/${key}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : null,
-  });
+  const opts = { method: "PUT" };
+  if (body) {
+    opts.headers = { "Content-Type": "application/json" };
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(`${API}/${currentNs}/t/${table}/${key}`, opts);
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "failed" }));
+    const err = await res.json().catch(() => ({ error: "request failed" }));
     return alert("Error: " + err.error);
   }
-  refresh();
+  if (!currentTable) {
+    selectTable(table);
+  } else {
+    refresh();
+  }
 }
 
 async function addLink() {
-  if (!currentLink) return alert("Select a link table first");
-  const from = prompt("From key:");
+  if (!currentNs) return alert("Select a namespace first");
+  let link = currentLink;
+  if (!link) {
+    link = prompt("Link table name:");
+    if (!link) return;
+  }
+  const from = prompt("From key (table.key):");
   if (!from) return;
   const to = prompt("To key:");
   if (!to) return;
@@ -188,19 +207,21 @@ async function addLink() {
       return alert("Invalid JSON: " + e.message);
     }
   }
-  const res = await fetch(
-    `${API}/${currentNs}/l/${currentLink}/${from}/${to}`,
-    {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: body ? JSON.stringify(body) : null,
-    },
-  );
+  const opts = { method: "PUT" };
+  if (body) {
+    opts.headers = { "Content-Type": "application/json" };
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(`${API}/${currentNs}/l/${link}/${from}/${to}`, opts);
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "failed" }));
+    const err = await res.json().catch(() => ({ error: "request failed" }));
     return alert("Error: " + err.error);
   }
-  refresh();
+  if (!currentLink) {
+    selectLink(link);
+  } else {
+    refresh();
+  }
 }
 
 // ===== Refresh =====
