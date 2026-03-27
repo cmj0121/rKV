@@ -112,6 +112,28 @@ services:
       primary:
         condition: service_healthy
 
+  # --- Knot graph database (remote backend to primary rKV) ---
+  knot:
+    build:
+      context: .
+      dockerfile: knot/Dockerfile
+    platform: linux/amd64
+    ports:
+      - "8400:8400"
+    environment:
+      KNOT_RKV_MODE: "remote"
+      KNOT_RKV_URL: "http://primary:8321"
+      KNOT_PORT: "8400"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8400/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      primary:
+        condition: service_healthy
+
   # --- Cluster mode (docker compose --profile cluster up) ---
   # Adds 2 shard groups alongside the primary/replicas.
   # Primary serves as the default shard (all unassigned namespaces).

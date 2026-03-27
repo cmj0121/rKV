@@ -23,35 +23,34 @@ RUN mkdir -p rkv/src rkv-ffi/src rill/src knot/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --target x86_64-unknown-linux-musl -p rkv --features server --bin rkv \
+    cargo build --release --target x86_64-unknown-linux-musl --bin knot \
     || true
 
 # Copy real source and build
 COPY rkv/src rkv/src
 COPY rkv/tests rkv/tests
 COPY rkv-ffi/src rkv-ffi/src
+COPY knot/src knot/src
+COPY knot/tests knot/tests
 
 # Touch source to invalidate cargo fingerprints from the dependency-cache step
-RUN find rkv/src -name '*.rs' -exec touch {} +
+RUN find knot/src -name '*.rs' -exec touch {} + \
+    && find rkv/src -name '*.rs' -exec touch {} +
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --target x86_64-unknown-linux-musl -p rkv --features server --bin rkv \
-    && strip /src/target/x86_64-unknown-linux-musl/release/rkv \
-    && cp /src/target/x86_64-unknown-linux-musl/release/rkv /rkv
+    cargo build --release --target x86_64-unknown-linux-musl --bin knot \
+    && strip /src/target/x86_64-unknown-linux-musl/release/knot \
+    && cp /src/target/x86_64-unknown-linux-musl/release/knot /knot
 
 # --- Runtime stage ---
 FROM busybox:musl
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=builder /rkv /usr/local/bin/rkv
+COPY --from=builder /knot /usr/local/bin/knot
 
-EXPOSE 8321 8322
+EXPOSE 8400
 VOLUME /data
 
-ENV RKV_STORAGE_PATH=/data \
-    RKV_SERVER_BIND=0.0.0.0 \
-    RKV_SERVER_ALLOW_ALL=true
-
-ENTRYPOINT ["rkv"]
-CMD ["serve"]
+ENTRYPOINT ["knot"]
+CMD ["serve", "/data", "--port", "8400"]
