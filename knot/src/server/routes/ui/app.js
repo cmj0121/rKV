@@ -7,9 +7,97 @@ let currentView = "nodes";
 document.addEventListener("DOMContentLoaded", () => {
   loadNamespaces();
   document.getElementById("ns-select").addEventListener("change", onNsChange);
+  document.getElementById("modal-overlay").addEventListener("click", (e) => {
+    if (e.target === e.currentTarget) closeModal();
+  });
 });
 
-// ===== Namespace =====
+// ==================== MODAL / TOAST ====================
+
+function showModal(html) {
+  document.getElementById("modal-box").innerHTML = html;
+  document.getElementById("modal-overlay").style.display = "";
+}
+
+function closeModal() {
+  document.getElementById("modal-overlay").style.display = "none";
+}
+
+function toast(msg, type = "info") {
+  const c = document.getElementById("toast-container");
+  const t = document.createElement("div");
+  t.className = `toast ${type}`;
+  t.textContent = msg;
+  c.appendChild(t);
+  setTimeout(() => t.remove(), 3000);
+}
+
+// Helper: create a form modal that resolves with field values or null
+function formModal(title, desc, fields) {
+  return new Promise((resolve) => {
+    let html = `<h3>${esc(title)}</h3>`;
+    if (desc) html += `<p>${esc(desc)}</p>`;
+    fields.forEach((f) => {
+      html += `<div class="form-field"><label>${esc(f.label)}</label>`;
+      html += `<input id="modal-${f.name}" type="text" placeholder="${esc(
+        f.placeholder || "",
+      )}" value="${esc(f.value || "")}" /></div>`;
+    });
+    html += `<div class="modal-actions">`;
+    html += `<button class="action-btn ghost" id="modal-cancel">Cancel</button>`;
+    html += `<button class="action-btn" id="modal-ok">OK</button>`;
+    html += `</div>`;
+    showModal(html);
+    const first = document.getElementById(`modal-${fields[0].name}`);
+    if (first) first.focus();
+    document.getElementById("modal-cancel").onclick = () => {
+      closeModal();
+      resolve(null);
+    };
+    document.getElementById("modal-ok").onclick = () => {
+      const result = {};
+      fields.forEach((f) => {
+        result[f.name] = document.getElementById(`modal-${f.name}`).value;
+      });
+      closeModal();
+      resolve(result);
+    };
+    // Enter key submits
+    fields.forEach((f) => {
+      document
+        .getElementById(`modal-${f.name}`)
+        .addEventListener("keydown", (e) => {
+          if (e.key === "Enter") document.getElementById("modal-ok").click();
+        });
+    });
+  });
+}
+
+function confirmModal(title, desc, danger = false) {
+  return new Promise((resolve) => {
+    let html = `<h3>${esc(title)}</h3>`;
+    if (desc) html += `<p>${desc}</p>`;
+    html += `<div class="modal-actions">`;
+    html += `<button class="action-btn ghost" id="modal-cancel">Cancel</button>`;
+    html += `<button class="action-btn ${
+      danger ? "danger" : ""
+    }" id="modal-ok">${danger ? "Drop" : "OK"}</button>`;
+    html += `</div>`;
+    showModal(html);
+    document.getElementById("modal-ok").focus();
+    document.getElementById("modal-cancel").onclick = () => {
+      closeModal();
+      resolve(false);
+    };
+    document.getElementById("modal-ok").onclick = () => {
+      closeModal();
+      resolve(true);
+    };
+  });
+}
+
+// ==================== NAMESPACE ====================
+
 async function loadNamespaces() {
   const res = await fetch(`${API}/namespaces`);
   const names = await res.json();
@@ -24,20 +112,47 @@ async function loadNamespaces() {
 }
 
 async function createNamespace() {
-  const name = prompt("Namespace name:");
-  if (!name) return;
+  const r = await formModal("New Namespace", null, [
+    { name: "name", label: "Name", placeholder: "campus" },
+  ]);
+  if (!r || !r.name) return;
   const res = await fetch(`${API}/namespaces`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name: r.name }),
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "request failed" }));
-    return alert("Error creating namespace: " + err.error);
+    const err = await res.json().catch(() => ({ error: "failed" }));
+    return toast("Error: " + err.error, "error");
   }
+  toast(`Namespace "${r.name}" created`, "success");
   await loadNamespaces();
-  document.getElementById("ns-select").value = name;
+  document.getElementById("ns-select").value = r.name;
   onNsChange();
+}
+
+async function dropNamespace() {
+  if (!currentNs) return;
+  const ok = await confirmModal(
+    "Drop Namespace",
+    `This will permanently delete <strong>${esc(
+      currentNs,
+    )}</strong> and all its tables, links, and data.`,
+    true,
+  );
+  if (!ok) return;
+  const res = await fetch(`${API}/${currentNs}`, { method: "DELETE" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: "failed" }));
+    return toast("Error: " + err.error, "error");
+  }
+  toast(`Namespace "${currentNs}" dropped`, "success");
+  currentNs = "";
+  currentTable = "";
+  currentLink = "";
+  document.getElementById("ns-select").value = "";
+  onNsChange();
+  await loadNamespaces();
 }
 
 async function onNsChange() {
@@ -53,7 +168,8 @@ async function onNsChange() {
   }
 }
 
-// ===== Tables =====
+// ==================== TABLES ====================
+
 async function loadTables() {
   const res = await fetch(`${API}/${currentNs}/m/tables`);
   const tables = await res.json();
@@ -81,20 +197,47 @@ async function loadTables() {
 }
 
 async function createTable() {
-  if (!currentNs) return alert("Select a namespace first");
-  const name = prompt("Table name:");
-  if (!name) return;
+  if (!currentNs) return toast("Select a namespace first", "error");
+  const r = await formModal("New Table", null, [
+    { name: "name", label: "Table Name", placeholder: "person" },
+  ]);
+  if (!r || !r.name) return;
   const res = await fetch(`${API}/${currentNs}/m/tables`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name: r.name }),
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "request failed" }));
-    return alert("Error: " + err.error);
+    const err = await res.json().catch(() => ({ error: "failed" }));
+    return toast("Error: " + err.error, "error");
+  }
+  toast(`Table "${r.name}" created`, "success");
+  await loadTables();
+  selectTable(r.name);
+}
+
+async function dropTable(name) {
+  const ok = await confirmModal(
+    "Drop Table",
+    `Drop <strong>${esc(name)}</strong> and all its nodes and indexes?`,
+    true,
+  );
+  if (!ok) return;
+  const res = await fetch(`${API}/${currentNs}/m/tables/${name}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: "failed" }));
+    return toast("Error: " + err.error, "error");
+  }
+  toast(`Table "${name}" dropped`, "success");
+  if (currentTable === name) {
+    currentTable = "";
+    document.getElementById("results").innerHTML =
+      '<div class="empty">Table dropped.</div>';
   }
   await loadTables();
-  selectTable(name);
+  await loadLinks();
 }
 
 function selectTable(name) {
@@ -106,7 +249,8 @@ function selectTable(name) {
   refresh();
 }
 
-// ===== Links =====
+// ==================== LINKS ====================
+
 async function loadLinks() {
   const res = await fetch(`${API}/${currentNs}/m/links`);
   const links = await res.json();
@@ -134,25 +278,57 @@ async function loadLinks() {
 }
 
 async function createLink() {
-  if (!currentNs) return alert("Select a namespace first");
-  const name = prompt("Link table name:");
-  if (!name) return;
-  const source = prompt("Source table:");
-  if (!source) return;
-  const target = prompt("Target table:");
-  if (!target) return;
-  const bidi = confirm("Bidirectional?");
+  if (!currentNs) return toast("Select a namespace first", "error");
+  const r = await formModal(
+    "New Link Table",
+    "Connect two tables with a named relationship.",
+    [
+      { name: "name", label: "Link Name", placeholder: "attends" },
+      { name: "source", label: "Source Table", placeholder: "person" },
+      { name: "target", label: "Target Table", placeholder: "school" },
+    ],
+  );
+  if (!r || !r.name || !r.source || !r.target) return;
   const res = await fetch(`${API}/${currentNs}/m/links`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, source, target, bidirectional: bidi }),
+    body: JSON.stringify({
+      name: r.name,
+      source: r.source,
+      target: r.target,
+      bidirectional: false,
+    }),
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "request failed" }));
-    return alert("Error: " + err.error);
+    const err = await res.json().catch(() => ({ error: "failed" }));
+    return toast("Error: " + err.error, "error");
+  }
+  toast(`Link table "${r.name}" created`, "success");
+  await loadLinks();
+  selectLink(r.name);
+}
+
+async function dropLink(name) {
+  const ok = await confirmModal(
+    "Drop Link Table",
+    `Drop <strong>${esc(name)}</strong> and all its entries?`,
+    true,
+  );
+  if (!ok) return;
+  const res = await fetch(`${API}/${currentNs}/m/links/${name}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: "failed" }));
+    return toast("Error: " + err.error, "error");
+  }
+  toast(`Link table "${name}" dropped`, "success");
+  if (currentLink === name) {
+    currentLink = "";
+    document.getElementById("results").innerHTML =
+      '<div class="empty">Link table dropped.</div>';
   }
   await loadLinks();
-  selectLink(name);
 }
 
 function selectLink(name) {
@@ -164,7 +340,8 @@ function selectLink(name) {
   refresh();
 }
 
-// ===== View Switching =====
+// ==================== VIEW ====================
+
 function switchView(view) {
   currentView = view;
   document.querySelectorAll(".tab").forEach((t) => {
@@ -173,25 +350,32 @@ function switchView(view) {
   refresh();
 }
 
-// ===== Add Node / Link =====
+// ==================== ADD NODE / LINK ====================
+
 async function addNode() {
-  if (!currentNs) return alert("Select a namespace first");
-  let table = currentTable;
-  if (!table) {
-    table = prompt("Table name:");
-    if (!table) return;
-  }
-  const key = prompt("Node key:");
-  if (!key) return;
-  const propsStr = prompt(
-    'Properties as JSON (e.g. {"age":30}) or leave empty:',
-  );
+  if (!currentNs) return toast("Select a namespace first", "error");
+  const fields = [];
+  if (!currentTable)
+    fields.push({ name: "table", label: "Table", placeholder: "person" });
+  fields.push({ name: "key", label: "Key", placeholder: "alice" });
+  fields.push({
+    name: "props",
+    label: "Properties (JSON)",
+    placeholder: '{"age":30}',
+  });
+
+  const r = await formModal("Insert Node", null, fields);
+  if (!r || !r.key) return;
+
+  const table = r.table || currentTable;
+  if (!table) return toast("Table name required", "error");
+
   let body = null;
-  if (propsStr && propsStr.trim()) {
+  if (r.props && r.props.trim()) {
     try {
-      body = JSON.parse(propsStr);
+      body = JSON.parse(r.props);
     } catch (e) {
-      return alert("Invalid JSON: " + e.message);
+      return toast("Invalid JSON: " + e.message, "error");
     }
   }
   const opts = { method: "PUT" };
@@ -199,36 +383,41 @@ async function addNode() {
     opts.headers = { "Content-Type": "application/json" };
     opts.body = JSON.stringify(body);
   }
-  const res = await fetch(`${API}/${currentNs}/t/${table}/${key}`, opts);
+  const res = await fetch(`${API}/${currentNs}/t/${table}/${r.key}`, opts);
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "request failed" }));
-    return alert("Error: " + err.error);
+    const err = await res.json().catch(() => ({ error: "failed" }));
+    return toast("Error: " + err.error, "error");
   }
-  if (!currentTable) {
-    selectTable(table);
-  } else {
-    refresh();
-  }
+  toast(`Node "${r.key}" inserted`, "success");
+  if (!currentTable) selectTable(table);
+  else refresh();
 }
 
 async function addLink() {
-  if (!currentNs) return alert("Select a namespace first");
-  let link = currentLink;
-  if (!link) {
-    link = prompt("Link table name:");
-    if (!link) return;
-  }
-  const from = prompt("From key (table.key):");
-  if (!from) return;
-  const to = prompt("To key:");
-  if (!to) return;
-  const propsStr = prompt("Properties as JSON or leave empty:");
+  if (!currentNs) return toast("Select a namespace first", "error");
+  const fields = [];
+  if (!currentLink)
+    fields.push({ name: "link", label: "Link Table", placeholder: "attends" });
+  fields.push({ name: "from", label: "From Key", placeholder: "alice" });
+  fields.push({ name: "to", label: "To Key", placeholder: "mit" });
+  fields.push({
+    name: "props",
+    label: "Properties (JSON)",
+    placeholder: '{"year":2020}',
+  });
+
+  const r = await formModal("Insert Link Entry", null, fields);
+  if (!r || !r.from || !r.to) return;
+
+  const link = r.link || currentLink;
+  if (!link) return toast("Link table name required", "error");
+
   let body = null;
-  if (propsStr && propsStr.trim()) {
+  if (r.props && r.props.trim()) {
     try {
-      body = JSON.parse(propsStr);
+      body = JSON.parse(r.props);
     } catch (e) {
-      return alert("Invalid JSON: " + e.message);
+      return toast("Invalid JSON: " + e.message, "error");
     }
   }
   const opts = { method: "PUT" };
@@ -236,34 +425,31 @@ async function addLink() {
     opts.headers = { "Content-Type": "application/json" };
     opts.body = JSON.stringify(body);
   }
-  const res = await fetch(`${API}/${currentNs}/l/${link}/${from}/${to}`, opts);
+  const res = await fetch(
+    `${API}/${currentNs}/l/${link}/${r.from}/${r.to}`,
+    opts,
+  );
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "request failed" }));
-    return alert("Error: " + err.error);
+    const err = await res.json().catch(() => ({ error: "failed" }));
+    return toast("Error: " + err.error, "error");
   }
-  if (!currentLink) {
-    selectLink(link);
-  } else {
-    refresh();
-  }
+  toast(`Link ${r.from} → ${r.to} created`, "success");
+  if (!currentLink) selectLink(link);
+  else refresh();
 }
 
-// ===== Refresh =====
+// ==================== REFRESH ====================
+
 async function refresh() {
   const el = document.getElementById("results");
-  if (currentView === "nodes" && currentTable) {
-    await showNodes(el);
-  } else if (currentView === "links" && currentLink) {
-    await showLinkEntries(el);
-  } else if (currentView === "traverse") {
-    showTraverseForm(el);
-  } else {
+  if (currentView === "nodes" && currentTable) await showNodes(el);
+  else if (currentView === "links" && currentLink) await showLinkEntries(el);
+  else if (currentView === "traverse") showTraverseForm(el);
+  else
     el.innerHTML =
       '<div class="empty">Select a table or link table from the sidebar.</div>';
-  }
 }
 
-// ===== Nodes =====
 async function showNodes(el) {
   const res = await fetch(
     `${API}/${currentNs}/t/${currentTable}?detail=true&limit=100`,
@@ -304,7 +490,6 @@ async function showNodes(el) {
   el.innerHTML = html;
 }
 
-// ===== Links =====
 async function showLinkEntries(el) {
   const tablesRes = await fetch(`${API}/${currentNs}/m/tables`);
   const tables = await tablesRes.json();
@@ -361,26 +546,19 @@ async function showLinkEntries(el) {
   el.innerHTML = html;
 }
 
-// ===== Traverse =====
 function showTraverseForm(el) {
   el.innerHTML = `
     <div class="traverse-form">
       <h3>Graph Traversal</h3>
       <p>Follow links from a starting node to discover connected data.</p>
-      <div class="form-field">
-        <label>Start Table</label>
+      <div class="form-field"><label>Start Table</label>
         <input id="tr-table" type="text" value="${esc(
           currentTable,
-        )}" placeholder="person" />
-      </div>
-      <div class="form-field">
-        <label>Start Key</label>
-        <input id="tr-key" type="text" placeholder="alice" />
-      </div>
-      <div class="form-field">
-        <label>Links (comma-separated)</label>
-        <input id="tr-links" type="text" placeholder="attends, located-in" />
-      </div>
+        )}" placeholder="person" /></div>
+      <div class="form-field"><label>Start Key</label>
+        <input id="tr-key" type="text" placeholder="alice" /></div>
+      <div class="form-field"><label>Links (comma-separated)</label>
+        <input id="tr-links" type="text" placeholder="attends, located-in" /></div>
       <button class="action-btn" onclick="doTraverse()" style="margin-top:4px">Traverse</button>
       <div id="tr-results"></div>
     </div>`;
@@ -390,7 +568,7 @@ async function doTraverse() {
   const table = document.getElementById("tr-table").value;
   const key = document.getElementById("tr-key").value;
   const links = document.getElementById("tr-links").value;
-  if (!table || !key || !links) return alert("Fill all fields");
+  if (!table || !key || !links) return toast("Fill all fields", "error");
   const path = links
     .split(",")
     .map((s) => s.trim())
@@ -418,77 +596,32 @@ async function doTraverse() {
   }
 }
 
-// ===== Delete =====
+// ==================== DELETE ====================
+
 async function deleteNode(key) {
-  if (!confirm(`Delete "${key}"?`)) return;
+  const ok = await confirmModal(
+    "Delete Node",
+    `Delete <strong>${esc(key)}</strong>?`,
+  );
+  if (!ok) return;
   await fetch(`${API}/${currentNs}/t/${currentTable}/${key}`, {
     method: "DELETE",
   });
+  toast(`Node "${key}" deleted`, "success");
   refresh();
 }
 
 async function deleteLinkEntry(from, to) {
-  if (!confirm(`Delete ${from} → ${to}?`)) return;
+  const ok = await confirmModal(
+    "Delete Link",
+    `Delete <strong>${esc(from)} → ${esc(to)}</strong>?`,
+  );
+  if (!ok) return;
   await fetch(`${API}/${currentNs}/l/${currentLink}/${from}/${to}`, {
     method: "DELETE",
   });
+  toast(`Link ${from} → ${to} deleted`, "success");
   refresh();
-}
-
-async function dropTable(name) {
-  if (!confirm(`Drop table "${name}" and all its data?`)) return;
-  const res = await fetch(`${API}/${currentNs}/m/tables/${name}`, {
-    method: "DELETE",
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "request failed" }));
-    return alert("Error: " + err.error);
-  }
-  if (currentTable === name) {
-    currentTable = "";
-    document.getElementById("results").innerHTML =
-      '<div class="empty">Table dropped.</div>';
-  }
-  await loadTables();
-  await loadLinks();
-}
-
-async function dropLink(name) {
-  if (!confirm(`Drop link table "${name}" and all its entries?`)) return;
-  const res = await fetch(`${API}/${currentNs}/m/links/${name}`, {
-    method: "DELETE",
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "request failed" }));
-    return alert("Error: " + err.error);
-  }
-  if (currentLink === name) {
-    currentLink = "";
-    document.getElementById("results").innerHTML =
-      '<div class="empty">Link table dropped.</div>';
-  }
-  await loadLinks();
-}
-
-async function dropNamespace() {
-  if (!currentNs) return;
-  if (
-    !confirm(
-      `Drop namespace "${currentNs}" and ALL its tables, links, and data?`,
-    )
-  )
-    return;
-  const res = await fetch(`${API}/${currentNs}`, { method: "DELETE" });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "request failed" }));
-    return alert("Error: " + err.error);
-  }
-  currentNs = "";
-  currentTable = "";
-  currentLink = "";
-  document.getElementById("ns-select").value = "";
-  onNsChange();
-  await loadNamespaces();
 }
 
 function esc(s) {
@@ -496,5 +629,6 @@ function esc(s) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/'/g, "&#39;");
+    .replace(/'/g, "&#39;")
+    .replace(/"/g, "&quot;");
 }
