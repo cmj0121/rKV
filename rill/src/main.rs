@@ -477,11 +477,13 @@ async fn docs_openapi() -> impl IntoResponse {
     )
 }
 
-async fn ui_favicon() -> impl IntoResponse {
+async fn ui_favicon() -> Response {
     (
+        StatusCode::OK,
         [(header::CONTENT_TYPE, "image/svg+xml")],
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22"><path d="M2 11c3-5 6-5 9 0s6 5 9 0" fill="none" stroke="#4caf7c" stroke-width="1.5" stroke-linecap="round"/><circle cx="5" cy="8.5" r="1.5" fill="#4caf7c"/><circle cx="11" cy="11" r="1.5" fill="#4caf7c"/><circle cx="17" cy="8.5" r="1.5" fill="#4caf7c"/></svg>"##,
     )
+        .into_response()
 }
 
 fn build_router(state: Arc<AppState>) -> Router {
