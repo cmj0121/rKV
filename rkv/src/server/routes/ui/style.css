@@ -1,17 +1,20 @@
 :root {
-  --bg: #1a1a2e;
-  --bg-surface: #16213e;
-  --bg-card: #1c2541;
-  --bg-input: #0f1626;
-  --border: #2a3a5c;
-  --text: #e0e0e0;
-  --text-dim: #8892a4;
+  --bg: #0e0f12;
+  --bg-surface: #16171c;
+  --bg-card: #1c1d24;
+  --bg-input: #16171c;
+  --border: #2a2b35;
+  --text: #d4d5db;
+  --text-dim: #7a7b88;
   --accent: #4fc3f7;
-  --green: #66bb6a;
+  --accent-glow: rgba(79, 195, 247, 0.15);
+  --green: #4caf7c;
   --blue: #42a5f5;
-  --red: #ef5350;
-  --yellow: #ffca28;
+  --red: #e05252;
+  --yellow: #e8a84c;
   --radius: 6px;
+  --font-display: "Outfit", sans-serif;
+  --font-mono: "DM Mono", "Menlo", monospace;
 }
 
 * {
@@ -21,13 +24,27 @@
 }
 
 body {
-  font-family: "SF Mono", "Menlo", "Consolas", monospace;
+  font-family: var(--font-display);
   font-size: 14px;
   color: var(--text);
   background: var(--bg);
   display: grid;
-  grid-template-columns: 180px 1fr;
+  grid-template-columns: 220px 1fr;
   min-height: 100vh;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3d3e4a;
 }
 
 /* ---- Sidebar ---- */
@@ -40,12 +57,22 @@ body {
 }
 
 .logo {
-  font-size: 22px;
-  font-weight: bold;
-  color: var(--accent);
-  padding: 0 20px 20px;
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text);
+  padding: 0 20px 16px;
   border-bottom: 1px solid var(--border);
   margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.logo-icon {
+  color: var(--accent);
+  flex-shrink: 0;
 }
 
 .role-badge {

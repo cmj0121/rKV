@@ -477,6 +477,15 @@ async fn docs_openapi() -> impl IntoResponse {
     )
 }
 
+async fn ui_favicon() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "image/svg+xml")],
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22"><path d="M2 11c3-5 6-5 9 0s6 5 9 0" fill="none" stroke="#4caf7c" stroke-width="1.5" stroke-linecap="round"/><circle cx="5" cy="8.5" r="1.5" fill="#4caf7c"/><circle cx="11" cy="11" r="1.5" fill="#4caf7c"/><circle cx="17" cy="8.5" r="1.5" fill="#4caf7c"/></svg>"##,
+    )
+        .into_response()
+}
+
 fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(root))
@@ -486,6 +495,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/ui", get(ui_index))
         .route("/ui/app.js", get(ui_app_js))
         .route("/ui/style.css", get(ui_style_css))
+        .route("/favicon.svg", get(ui_favicon))
+        .route("/favicon.ico", get(ui_favicon))
         .route("/auth/me", get(auth_me))
         .route("/queues", post(create_queue))
         .route("/queues", get(list_queues))

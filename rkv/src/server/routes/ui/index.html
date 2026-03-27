@@ -4,11 +4,58 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>rKV</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link
+      rel="preconnect"
+      href="https://fonts.googleapis.com"
+      crossorigin="anonymous"
+    />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Outfit:wght@300;400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
     <link rel="stylesheet" href="/ui/style.css" />
   </head>
   <body>
     <nav id="sidebar">
-      <div class="logo">rKV</div>
+      <div class="logo">
+        <svg class="logo-icon" viewBox="0 0 22 22" width="20" height="20">
+          <rect
+            x="2"
+            y="3"
+            width="18"
+            height="4"
+            rx="1.5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+          />
+          <rect
+            x="2"
+            y="9"
+            width="18"
+            height="4"
+            rx="1.5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+          />
+          <rect
+            x="2"
+            y="15"
+            width="18"
+            height="4"
+            rx="1.5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+          />
+          <circle cx="6" cy="5" r="1" fill="currentColor" />
+          <circle cx="6" cy="11" r="1" fill="currentColor" />
+          <circle cx="6" cy="17" r="1" fill="currentColor" />
+        </svg>
+        rKV
+      </div>
       <a href="#keys" class="nav-link" data-route="keys">Keys</a>
       <a href="#admin" class="nav-link" data-route="admin">Admin</a>
       <a href="#namespaces" class="nav-link" data-route="namespaces"
