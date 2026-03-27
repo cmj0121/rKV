@@ -628,6 +628,23 @@ tr:hover .btn-del {
   max-width: 100%;
 }
 
+.form-check label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-display);
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.form-check input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
 .modal-actions {
   display: flex;
   gap: 8px;

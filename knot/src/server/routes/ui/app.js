@@ -38,10 +38,18 @@ function formModal(title, desc, fields) {
     let html = `<h3>${esc(title)}</h3>`;
     if (desc) html += `<p>${esc(desc)}</p>`;
     fields.forEach((f) => {
-      html += `<div class="form-field"><label>${esc(f.label)}</label>`;
-      html += `<input id="modal-${f.name}" type="text" placeholder="${esc(
-        f.placeholder || "",
-      )}" value="${esc(f.value || "")}" /></div>`;
+      if (f.type === "checkbox") {
+        html += `<div class="form-field form-check"><label><input id="modal-${
+          f.name
+        }" type="checkbox" ${f.checked ? "checked" : ""} /> ${esc(
+          f.label,
+        )}</label></div>`;
+      } else {
+        html += `<div class="form-field"><label>${esc(f.label)}</label>`;
+        html += `<input id="modal-${f.name}" type="text" placeholder="${esc(
+          f.placeholder || "",
+        )}" value="${esc(f.value || "")}" /></div>`;
+      }
     });
     html += `<div class="modal-actions">`;
     html += `<button class="action-btn ghost" id="modal-cancel">Cancel</button>`;
@@ -57,7 +65,8 @@ function formModal(title, desc, fields) {
     document.getElementById("modal-ok").onclick = () => {
       const result = {};
       fields.forEach((f) => {
-        result[f.name] = document.getElementById(`modal-${f.name}`).value;
+        const el = document.getElementById(`modal-${f.name}`);
+        result[f.name] = f.type === "checkbox" ? el.checked : el.value;
       });
       closeModal();
       resolve(result);
@@ -286,6 +295,12 @@ async function createLink() {
       { name: "name", label: "Link Name", placeholder: "attends" },
       { name: "source", label: "Source Table", placeholder: "person" },
       { name: "target", label: "Target Table", placeholder: "school" },
+      {
+        name: "bidi",
+        label: "Bidirectional",
+        type: "checkbox",
+        checked: false,
+      },
     ],
   );
   if (!r || !r.name || !r.source || !r.target) return;
@@ -296,7 +311,7 @@ async function createLink() {
       name: r.name,
       source: r.source,
       target: r.target,
-      bidirectional: false,
+      bidirectional: r.bidi,
     }),
   });
   if (!res.ok) {
