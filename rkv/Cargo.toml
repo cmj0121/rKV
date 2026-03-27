@@ -52,7 +52,7 @@ rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 toml = "1"
-sysinfo = "0.34"
+sysinfo = "0.38"
 rustyline = "17"
 tempfile = "3"
 thiserror = "2"
