@@ -21,6 +21,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/namespaces",
             get(namespaces::list).post(namespaces::create),
         )
+        .route("/{ns}", delete(namespaces::drop))
         // Metadata — tables
         .route(
             "/{ns}/m/tables",
