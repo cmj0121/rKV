@@ -152,7 +152,7 @@ fn bench_rkv_batch(ds: &Dataset) -> Duration {
 mod bench_redb {
     use super::*;
 
-    use redb::ReadableTable;
+    use redb::{ReadableDatabase, ReadableTable};
 
     const TABLE: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("bench");
 
@@ -346,95 +346,78 @@ mod bench_sled {
 mod bench_fjall {
     use super::*;
 
+    fn open_db_and_keyspace(path: &Path) -> (fjall::Database, fjall::Keyspace) {
+        let db = fjall::Database::open(fjall::Config::new(path)).unwrap();
+        let ks = db
+            .keyspace("bench", fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        (db, ks)
+    }
+
     pub fn put(ds: &Dataset) -> Duration {
         let tmp = tempfile::tempdir().unwrap();
-        let keyspace = fjall::Config::new(tmp.path().join("bench.fjall"))
-            .open()
-            .unwrap();
-        let partition = keyspace
-            .open_partition("bench", Default::default())
-            .unwrap();
+        let (_db, ks) = open_db_and_keyspace(&tmp.path().join("bench.fjall"));
 
         let start = Instant::now();
         for key in &ds.keys {
-            partition.insert(key.as_slice(), VALUE.as_slice()).unwrap();
+            ks.insert(key.as_slice(), VALUE.as_slice()).unwrap();
         }
         start.elapsed()
     }
 
     pub fn get(ds: &Dataset) -> Duration {
         let tmp = tempfile::tempdir().unwrap();
-        let keyspace = fjall::Config::new(tmp.path().join("bench.fjall"))
-            .open()
-            .unwrap();
-        let partition = keyspace
-            .open_partition("bench", Default::default())
-            .unwrap();
+        let (_db, ks) = open_db_and_keyspace(&tmp.path().join("bench.fjall"));
 
         for key in &ds.keys {
-            partition.insert(key.as_slice(), VALUE.as_slice()).unwrap();
+            ks.insert(key.as_slice(), VALUE.as_slice()).unwrap();
         }
 
         let start = Instant::now();
         for &idx in &ds.shuffled {
-            partition.get(ds.keys[idx].as_slice()).unwrap().unwrap();
+            ks.get(ds.keys[idx].as_slice()).unwrap().unwrap();
         }
         start.elapsed()
     }
 
     pub fn delete(ds: &Dataset) -> Duration {
         let tmp = tempfile::tempdir().unwrap();
-        let keyspace = fjall::Config::new(tmp.path().join("bench.fjall"))
-            .open()
-            .unwrap();
-        let partition = keyspace
-            .open_partition("bench", Default::default())
-            .unwrap();
+        let (_db, ks) = open_db_and_keyspace(&tmp.path().join("bench.fjall"));
 
         for key in &ds.keys {
-            partition.insert(key.as_slice(), VALUE.as_slice()).unwrap();
+            ks.insert(key.as_slice(), VALUE.as_slice()).unwrap();
         }
 
         let start = Instant::now();
         for key in &ds.keys {
-            partition.remove(key.as_slice()).unwrap();
+            ks.remove(key.as_slice()).unwrap();
         }
         start.elapsed()
     }
 
     pub fn scan(ds: &Dataset) -> Duration {
         let tmp = tempfile::tempdir().unwrap();
-        let keyspace = fjall::Config::new(tmp.path().join("bench.fjall"))
-            .open()
-            .unwrap();
-        let partition = keyspace
-            .open_partition("bench", Default::default())
-            .unwrap();
+        let (_db, ks) = open_db_and_keyspace(&tmp.path().join("bench.fjall"));
 
         for key in &ds.keys {
-            partition.insert(key.as_slice(), VALUE.as_slice()).unwrap();
+            ks.insert(key.as_slice(), VALUE.as_slice()).unwrap();
         }
 
         let start = Instant::now();
-        let count = partition.iter().count();
+        let count = ks.iter().count();
         assert_eq!(count, ds.n);
         start.elapsed()
     }
 
     pub fn batch(ds: &Dataset) -> Duration {
         let tmp = tempfile::tempdir().unwrap();
-        let keyspace = fjall::Config::new(tmp.path().join("bench.fjall"))
-            .open()
-            .unwrap();
-        let partition = keyspace
-            .open_partition("bench", Default::default())
-            .unwrap();
+        let (db, ks) = open_db_and_keyspace(&tmp.path().join("bench.fjall"));
 
         let start = Instant::now();
         for chunk in ds.keys.chunks(BATCH_SIZE) {
-            let mut batch = keyspace.batch();
+            let mut batch = db.batch();
             for key in chunk {
-                batch.insert(&partition, key.as_slice(), VALUE.as_slice());
+                batch.insert(&ks, key.as_slice(), VALUE.as_slice());
             }
             batch.commit().unwrap();
         }
