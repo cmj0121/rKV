@@ -46,13 +46,13 @@ dirs-sys = "0.5"
 fast32 = "1.0.3"
 fastrand = "2"
 libc = "0.2"
-lz4_flex = "0.11"
+lz4_flex = "0.13"
 memmap2 = "0.9"
-rpassword = "5"
+rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
-toml = { version = "0.8", features = ["display"] }
-sysinfo = "0.34"
+toml = "1"
+sysinfo = "0.38"
 rustyline = "17"
 tempfile = "3"
 thiserror = "2"
@@ -70,7 +70,7 @@ tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 # Comparison benchmarks (optional — enabled by `bench-compare` feature)
-redb = { version = "2", optional = true }
+redb = { version = "3", optional = true }
 sled = { version = "0.34", optional = true }
-fjall = { version = "2", optional = true }
-rocksdb = { version = "0.22", optional = true }
+fjall = { version = "3", optional = true }
+rocksdb = { version = "0.24", optional = true }
