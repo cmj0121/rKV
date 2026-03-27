@@ -1,5 +1,7 @@
 # Rill
 
+![Rill](../docs/icon-rill.svg)
+
 > Save your time, not your data.
 
 The unlimited message queue for your data.

@@ -1,5 +1,7 @@
 # Knot
 
+![Knot](../docs/icon-knot.svg)
+
 > Tie your data together.
 
 **Knot** is a schema-free, graph-based, temporal database built on rKV. It provides the

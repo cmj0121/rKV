@@ -1,5 +1,7 @@
 # rKV
 
+![rKV](docs/icon-rkv.svg)
+
 > A persistent, revision-aware key-value store in a single binary
 
 **rKV** is a lightweight key-value storage engine built on LSM-tree architecture. It ships as one
