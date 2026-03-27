@@ -176,6 +176,37 @@ select:focus {
   background: var(--accent-glow);
 }
 
+.icon-btn.danger:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: var(--danger-dim);
+}
+
+.sidebar-del {
+  display: none;
+  width: 18px;
+  height: 18px;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  border-radius: 3px;
+  flex-shrink: 0;
+  transition: all var(--transition);
+}
+
+.item-list li:hover .sidebar-del {
+  display: inline-flex;
+}
+
+.sidebar-del:hover {
+  color: var(--danger);
+  background: var(--danger-dim);
+}
+
 .item-list {
   list-style: none;
 }

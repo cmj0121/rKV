@@ -61,8 +61,20 @@ async function loadTables() {
   ul.innerHTML = "";
   tables.forEach((t) => {
     const li = document.createElement("li");
-    li.textContent = t;
-    li.onclick = () => selectTable(t);
+    const span = document.createElement("span");
+    span.textContent = t;
+    span.style.flex = "1";
+    span.onclick = () => selectTable(t);
+    li.appendChild(span);
+    const del = document.createElement("button");
+    del.className = "sidebar-del";
+    del.textContent = "✕";
+    del.title = "Drop table";
+    del.onclick = (e) => {
+      e.stopPropagation();
+      dropTable(t);
+    };
+    li.appendChild(del);
     if (t === currentTable) li.className = "active";
     ul.appendChild(li);
   });
@@ -102,8 +114,20 @@ async function loadLinks() {
   ul.innerHTML = "";
   links.forEach((l) => {
     const li = document.createElement("li");
-    li.textContent = l;
-    li.onclick = () => selectLink(l);
+    const span = document.createElement("span");
+    span.textContent = l;
+    span.style.flex = "1";
+    span.onclick = () => selectLink(l);
+    li.appendChild(span);
+    const del = document.createElement("button");
+    del.className = "sidebar-del";
+    del.textContent = "✕";
+    del.title = "Drop link table";
+    del.onclick = (e) => {
+      e.stopPropagation();
+      dropLink(l);
+    };
+    li.appendChild(del);
     if (l === currentLink) li.className = "active";
     ul.appendChild(li);
   });
@@ -409,6 +433,62 @@ async function deleteLinkEntry(from, to) {
     method: "DELETE",
   });
   refresh();
+}
+
+async function dropTable(name) {
+  if (!confirm(`Drop table "${name}" and all its data?`)) return;
+  const res = await fetch(`${API}/${currentNs}/m/tables/${name}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: "request failed" }));
+    return alert("Error: " + err.error);
+  }
+  if (currentTable === name) {
+    currentTable = "";
+    document.getElementById("results").innerHTML =
+      '<div class="empty">Table dropped.</div>';
+  }
+  await loadTables();
+  await loadLinks();
+}
+
+async function dropLink(name) {
+  if (!confirm(`Drop link table "${name}" and all its entries?`)) return;
+  const res = await fetch(`${API}/${currentNs}/m/links/${name}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: "request failed" }));
+    return alert("Error: " + err.error);
+  }
+  if (currentLink === name) {
+    currentLink = "";
+    document.getElementById("results").innerHTML =
+      '<div class="empty">Link table dropped.</div>';
+  }
+  await loadLinks();
+}
+
+async function dropNamespace() {
+  if (!currentNs) return;
+  if (
+    !confirm(
+      `Drop namespace "${currentNs}" and ALL its tables, links, and data?`,
+    )
+  )
+    return;
+  const res = await fetch(`${API}/${currentNs}`, { method: "DELETE" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: "request failed" }));
+    return alert("Error: " + err.error);
+  }
+  currentNs = "";
+  currentTable = "";
+  currentLink = "";
+  document.getElementById("ns-select").value = "";
+  onNsChange();
+  await loadNamespaces();
 }
 
 function esc(s) {
