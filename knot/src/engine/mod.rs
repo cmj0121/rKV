@@ -58,6 +58,27 @@ impl Knot {
         &*self.backend
     }
 
+    // Centralized namespace formatters (used in follow-up refactors)
+    #[allow(dead_code)]
+    pub(crate) fn meta_ns(&self) -> String {
+        format!("knot.{}.meta", self.namespace)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn table_ns(&self, table: &str) -> String {
+        format!("knot.{}.t.{table}", self.namespace)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn link_fwd_ns(&self, link: &str) -> String {
+        format!("knot.{}.l.{link}", self.namespace)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn link_rev_ns(&self, link: &str) -> String {
+        format!("knot.{}.r.{link}", self.namespace)
+    }
+
     /// Directed traversal: follow a sequence of link tables from a start node.
     pub fn traverse(
         &self,

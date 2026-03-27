@@ -63,6 +63,13 @@ pub async fn drop(
     Ok(StatusCode::OK)
 }
 
+pub fn not_found(what: &str) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorBody::new(&format!("{what} not found"))),
+    )
+}
+
 impl From<crate::Error> for ErrorBody {
     fn from(e: crate::Error) -> Self {
         Self {

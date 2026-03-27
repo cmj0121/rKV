@@ -4,7 +4,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 
-use super::namespaces::ErrorBody;
+use super::namespaces::{not_found, ErrorBody};
 use crate::server::AppState;
 
 #[derive(serde::Deserialize)]
@@ -87,11 +87,4 @@ pub async fn directed(
             "cursor": null,
         })))
     }
-}
-
-fn not_found(what: &str) -> (StatusCode, Json<ErrorBody>) {
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorBody::new(&format!("{what} not found"))),
-    )
 }

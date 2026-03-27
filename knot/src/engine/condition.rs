@@ -89,7 +89,6 @@ impl Condition {
 }
 
 /// Evaluate a condition against a property map.
-#[allow(dead_code)]
 pub fn evaluate(
     cond: &Condition,
     props: &std::collections::HashMap<String, PropertyValue>,

@@ -38,6 +38,7 @@ pub fn query_nodes(
     cursor: Option<&str>,
 ) -> Result<Page> {
     let keys = backend.scan(ns_name, "", usize::MAX)?;
+    let empty_props = std::collections::HashMap::new();
 
     let mut nodes = Vec::new();
     for key_str in &keys {
@@ -55,8 +56,8 @@ pub fn query_nodes(
         let node = value_to_node(key_str, &value)?;
 
         if let Some(cond) = filter {
-            let props = node.properties.as_ref().cloned().unwrap_or_default();
-            if !condition::evaluate(cond, &props) {
+            let props = node.properties.as_ref().map_or(&empty_props, |p| p);
+            if !condition::evaluate(cond, props) {
                 continue;
             }
         }
@@ -113,6 +114,7 @@ pub fn count_nodes(
     }
 
     let keys = backend.scan(ns_name, "", usize::MAX)?;
+    let empty_props = std::collections::HashMap::new();
     let mut count = 0u64;
     for key_str in &keys {
         let value = match backend.get(ns_name, key_str)? {
@@ -121,8 +123,8 @@ pub fn count_nodes(
         };
         let node = value_to_node(key_str, &value)?;
         if let Some(cond) = filter {
-            let props = node.properties.as_ref().cloned().unwrap_or_default();
-            if !condition::evaluate(cond, &props) {
+            let props = node.properties.as_ref().map_or(&empty_props, |p| p);
+            if !condition::evaluate(cond, props) {
                 continue;
             }
         }

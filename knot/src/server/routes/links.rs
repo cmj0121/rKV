@@ -5,7 +5,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 
-use super::namespaces::ErrorBody;
+use super::namespaces::{not_found, ErrorBody};
 use super::nodes::{json_map_to_props, props_to_json};
 use crate::server::AppState;
 
@@ -141,11 +141,4 @@ pub async fn scan_links(
             "has_more": false,
         })))
     }
-}
-
-fn not_found(what: &str) -> (StatusCode, Json<ErrorBody>) {
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorBody::new(&format!("{what} not found"))),
-    )
 }

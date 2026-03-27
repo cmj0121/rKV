@@ -27,7 +27,6 @@ pub struct Node {
 }
 
 /// Encode properties to MessagePack bytes.
-#[allow(dead_code)]
 pub fn encode_properties(props: &Properties) -> Vec<u8> {
     let pairs: Vec<(MsgValue, MsgValue)> = props
         .iter()
@@ -40,7 +39,6 @@ pub fn encode_properties(props: &Properties) -> Vec<u8> {
 }
 
 /// Decode properties from MessagePack bytes.
-#[allow(dead_code)]
 pub fn decode_properties(bytes: &[u8]) -> Result<Properties> {
     let msg = rmpv::decode::read_value(&mut Cursor::new(bytes))
         .map_err(|e| Error::StorageError(format!("msgpack decode: {e}")))?;
