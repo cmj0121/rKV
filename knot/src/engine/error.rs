@@ -70,14 +70,12 @@ impl std::error::Error for Error {}
 pub const MAX_KEY_SIZE: usize = 511;
 
 /// Convert an rKV error into a Knot StorageError.
-#[allow(dead_code)]
 pub fn storage(e: rkv::Error) -> Error {
     Error::StorageError(e.to_string())
 }
 
 /// Validate a name (table, namespace, link, property). No dots, no control
 /// characters, non-empty, max 511 bytes.
-#[allow(dead_code)]
 pub fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::InvalidName("name must not be empty".into()));
@@ -102,7 +100,6 @@ pub fn validate_name(name: &str) -> Result<()> {
 
 /// Validate a primary key. No control characters, non-empty, max 511 bytes.
 /// Dots ARE allowed in keys.
-#[allow(dead_code)]
 pub fn validate_key(key: &str) -> Result<()> {
     if key.is_empty() {
         return Err(Error::InvalidKey("key must not be empty".into()));

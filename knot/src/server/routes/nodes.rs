@@ -5,7 +5,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 
-use super::namespaces::ErrorBody;
+use super::namespaces::{not_found, ErrorBody};
 use crate::server::AppState;
 use crate::PropertyValue;
 
@@ -198,13 +198,6 @@ pub async fn scan_nodes(
 }
 
 // --- Helpers ---
-
-fn not_found(what: &str) -> (StatusCode, Json<ErrorBody>) {
-    (
-        StatusCode::NOT_FOUND,
-        Json(ErrorBody::new(&format!("{what} not found"))),
-    )
-}
 
 pub fn props_to_json(props: &crate::Properties) -> serde_json::Value {
     let map: serde_json::Map<String, serde_json::Value> = props

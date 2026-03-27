@@ -97,7 +97,6 @@ impl Metadata {
     }
 
     /// Encode a link definition as MessagePack bytes.
-    #[allow(dead_code)]
     pub fn encode_link_def(def: &LinkDef) -> Vec<u8> {
         let map = vec![
             (

@@ -15,7 +15,6 @@ pub struct TraversalResult {
 }
 
 /// Directed traversal: follow a specified sequence of link tables.
-#[allow(dead_code)]
 pub fn directed(
     knot: &Knot,
     start_table: &str,
@@ -131,7 +130,6 @@ pub fn directed(
 }
 
 /// Discovery traversal: follow all applicable links up to max_hops.
-#[allow(dead_code)]
 pub fn discovery(
     knot: &Knot,
     start_table: &str,
@@ -216,12 +214,13 @@ fn filter_entries(
     target_table: &str,
     node_filter: Option<&Condition>,
 ) -> Result<Vec<LinkEntry>> {
+    let empty_props = std::collections::HashMap::new();
     let mut result = Vec::new();
     for entry in entries {
         // Link property filter
         if let Some(cond) = link_filter {
-            let props = entry.properties.as_ref().cloned().unwrap_or_default();
-            if !condition::evaluate(cond, &props) {
+            let props = entry.properties.as_ref().map_or(&empty_props, |p| p);
+            if !condition::evaluate(cond, props) {
                 continue;
             }
         }
