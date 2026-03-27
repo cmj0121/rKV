@@ -76,6 +76,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/openapi.yaml",
             axum::routing::get(routes::ui::openapi_yaml),
         )
+        .route("/favicon.svg", axum::routing::get(routes::ui::favicon))
+        .route("/favicon.ico", axum::routing::get(routes::ui::favicon))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
